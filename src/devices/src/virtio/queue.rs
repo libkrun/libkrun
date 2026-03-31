@@ -219,6 +219,18 @@ pub struct DescriptorChain<'a> {
     pub next: u16,
 }
 
+impl<'a> fmt::Debug for DescriptorChain<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DescriptorChain")
+            .field("index", &self.index)
+            .field("addr", &format_args!("{:#018x}", self.addr.raw_value()))
+            .field("len", &self.len)
+            .field("flags", &format_args!("{:#06x}", self.flags))
+            .field("next", &self.next)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> DescriptorChain<'a> {
     pub fn checked_new(
         mem: &GuestMemoryMmap,

@@ -35,6 +35,8 @@ mod queue;
 pub mod rng;
 #[cfg(feature = "vhost-user")]
 pub mod vhost_user;
+#[cfg(all(feature = "batch_queue", test))]
+pub(crate) mod test_utils;
 pub mod vsock;
 
 #[cfg(not(feature = "tee"))]
