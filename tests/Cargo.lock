@@ -592,6 +592,7 @@ dependencies = [
  "lru",
  "nix 0.30.1",
  "rand",
+ "smallvec",
  "virtio-bindings",
  "vm-fdt",
  "vm-memory",
@@ -1068,6 +1069,12 @@ name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
+name = "smallvec"
+version = "1.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
 
 [[package]]
 name = "strsim"
