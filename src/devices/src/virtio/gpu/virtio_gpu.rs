@@ -47,6 +47,14 @@ use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::VIRTIO_GPU_FLAG_INFO_RING_IDX;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 
+// These constants match libkrun.h and virglrenderer.
+const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
+const VIRGLRENDERER_USE_GLES: u32 = 1 << 4;
+const VIRGLRENDERER_VENUS: u32 = 1 << 6;
+const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
+const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
+const VIRGLRENDERER_DRM: u32 = 1 << 10;
+
 struct ExportTableLookup {
     table: ExportTable,
 }
@@ -294,35 +302,7 @@ impl VirtioGpu {
         let fence =
             Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
 
-        // Translate virgl_flags to capset_mask and builder configuration
-        // These constants match libkrun.h FFI definitions and rutabaga_gfx's internal constants.
-        // They're redefined here because rutabaga_gfx doesn't export them publicly.
-        // TODO: Consider making these public in rutabaga_gfx to avoid duplication.
-        const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
-        const VIRGLRENDERER_USE_GLES: u32 = 1 << 4;
-        const VIRGLRENDERER_VENUS: u32 = 1 << 6;
-        const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
-        const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
-        const VIRGLRENDERER_DRM: u32 = 1 << 10;
-
-        let mut capset_mask: u64 = 0;
-
-        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_CROSS_DOMAIN;
-
-        if virgl_flags & VIRGLRENDERER_NO_VIRGL == 0 {
-            capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL;
-            capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL2;
-        }
-
-        // Enable Venus if requested (requires render server mode)
-        if virgl_flags & VIRGLRENDERER_VENUS != 0 {
-            capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VENUS;
-        }
-
-        // Enable DRM native context if requested (in-process mode)
-        if virgl_flags & VIRGLRENDERER_DRM != 0 {
-            capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_DRM;
-        }
+        let capset_mask: u64 = virgl_flags_to_capsets(virgl_flags);
 
         let use_egl = virgl_flags & VIRGLRENDERER_USE_EGL != 0;
         let use_gles = virgl_flags & VIRGLRENDERER_USE_GLES != 0;
@@ -1152,4 +1132,29 @@ mod test {
             .for_each(|scanout| scanouts.disable(scanout));
         assert!(!scanouts.has_any_enabled());
     }
+}
+
+/// Translate virglrenderer flags (which became part of the libkrun 1.x public API) to a rutabaga_gfx capset mask.
+/// Won't be necessary anymore when libkrun 2.x removes these from the API.
+pub fn virgl_flags_to_capsets(flags: u32) -> u64 {
+    let mut capset_mask = 0;
+
+    capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_CROSS_DOMAIN;
+
+    if flags & VIRGLRENDERER_NO_VIRGL == 0 {
+        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL;
+        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL2;
+    }
+
+    // Enable Venus if requested (requires render server mode)
+    if flags & VIRGLRENDERER_VENUS != 0 {
+        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VENUS;
+    }
+
+    // Enable DRM native context if requested (in-process mode)
+    if flags & VIRGLRENDERER_DRM != 0 {
+        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_DRM;
+    }
+
+    capset_mask
 }
