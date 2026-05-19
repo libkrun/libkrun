@@ -1,0 +1,15 @@
+name: AI Trailers
+
+on: [pull_request]
+
+jobs:
+  check-ai-trailers:
+    name: AI attribution trailers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check AI trailers
+        run: python3 .github/scripts/check-ai-trailers.py "${{ github.event.pull_request.base.sha }}"
