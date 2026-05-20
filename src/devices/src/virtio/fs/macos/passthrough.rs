@@ -37,6 +37,8 @@ use super::super::multikey::MultikeyBTreeMap;
 const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
 const SECURITY_CAPABILITY: &[u8] = b"security.capability\0";
 
+const MACOS_XATTR_PREFIX: &[u8] = b"com.apple.";
+
 const UID_MAX: u32 = u32::MAX - 1;
 
 type Inode = u64;
@@ -2344,6 +2346,10 @@ impl FileSystem for PassthroughFs {
             return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
         }
 
+        if name.to_bytes().starts_with(MACOS_XATTR_PREFIX) {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+        }
+
         let mut mflags: i32 = 0;
         if (flags as i32) & bindings::LINUX_XATTR_CREATE != 0 {
             mflags |= libc::XATTR_CREATE;
@@ -2398,6 +2404,10 @@ impl FileSystem for PassthroughFs {
 
         if name.to_bytes() == XATTR_KEY {
             return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
+        }
+
+        if name.to_bytes().starts_with(MACOS_XATTR_PREFIX) {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENODATA)));
         }
 
         let mut buf = vec![0; size as usize];
@@ -2492,6 +2502,9 @@ impl FileSystem for PassthroughFs {
             for attr in buf.split(|c| *c == 0) {
                 if attr.starts_with(&XATTR_KEY[..XATTR_KEY.len() - 1]) {
                     clean_size -= XATTR_KEY.len();
+                } else if attr.starts_with(MACOS_XATTR_PREFIX) {
+                    // attr does not include the null terminator; add 1 for it.
+                    clean_size -= attr.len() + 1;
                 }
             }
 
@@ -2500,7 +2513,10 @@ impl FileSystem for PassthroughFs {
             let mut clean_buf = Vec::new();
 
             for attr in buf.split(|c| *c == 0) {
-                if attr.is_empty() || attr.starts_with(&XATTR_KEY[..XATTR_KEY.len() - 1]) {
+                if attr.is_empty()
+                    || attr.starts_with(&XATTR_KEY[..XATTR_KEY.len() - 1])
+                    || attr.starts_with(MACOS_XATTR_PREFIX)
+                {
                     continue;
                 }
 
@@ -2527,6 +2543,10 @@ impl FileSystem for PassthroughFs {
             return Err(linux_error(io::Error::from_raw_os_error(
                 bindings::LINUX_EACCES,
             )));
+        }
+
+        if name.to_bytes().starts_with(MACOS_XATTR_PREFIX) {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENODATA)));
         }
 
         // Safe because this doesn't modify any memory and we check the return value.
