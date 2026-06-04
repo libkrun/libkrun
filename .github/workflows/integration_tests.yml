@@ -26,7 +26,7 @@ jobs:
         run: sudo apt-get install -y --no-install-recommends libarchive-tools
       
       - name: Build FreeBSD sysroot and init
-        run: make BUILD_BSD_INIT=1 -- init/init-freebsd
+        run: make BUILD_BSD_INIT=1 -- init/init-binary/init-freebsd
       
       - name: Install gvproxy
         run: |
@@ -115,7 +115,7 @@ jobs:
         run: sudo apt-get install -y --no-install-recommends libarchive-tools
       
       - name: Build FreeBSD sysroot and init
-        run: make BUILD_BSD_INIT=1 -- init/init-freebsd
+        run: make BUILD_BSD_INIT=1 -- init/init-binary/init-freebsd
       
       - name: Install gvproxy
         run: |

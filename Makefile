@@ -156,12 +156,12 @@ else
 endif
 
 ifeq ($(BUILD_BSD_INIT),1)
-INIT_BINARY_BSD = init/init-freebsd
-$(INIT_BINARY_BSD): $(shell find init/src -name '*.rs') init/Cargo.toml $(SYSROOT_BSD_TARGET)
+INIT_BINARY_BSD = init/init-binary/init-freebsd
+$(INIT_BINARY_BSD): $(shell find init/init-binary/src -name '*.rs') init/init-binary/Cargo.toml $(SYSROOT_BSD_TARGET)
 	RUSTFLAGS="$(CARGO_BSD_RUSTFLAGS)" \
 	cargo $(CARGO_BSD_TOOLCHAIN) build --release \
 		$(CARGO_BSD_EXTRA_FLAGS) \
-		--manifest-path init/Cargo.toml \
+		--manifest-path init/init-binary/Cargo.toml \
 		--target $(FREEBSD_RUST_TARGET)
 	cp target/$(FREEBSD_RUST_TARGET)/release/krun-init $@
 endif

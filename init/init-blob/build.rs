@@ -63,7 +63,7 @@ fn find_musl_rustc(default_rustc: &str) -> Option<PathBuf> {
 fn build_rust_init() -> PathBuf {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let workspace_root = manifest_dir.join("../..");
-    let init_manifest = workspace_root.join("init/Cargo.toml");
+    let init_manifest = workspace_root.join("init/init-binary/Cargo.toml");
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     // Separate target dir avoids conflicting with the parent workspace cargo lock.
@@ -77,7 +77,7 @@ fn build_rust_init() -> PathBuf {
 
     println!(
         "cargo:rerun-if-changed={}",
-        workspace_root.join("init/src").display()
+        workspace_root.join("init/init-binary/src").display()
     );
     println!("cargo:rerun-if-changed={}", init_manifest.display());
     // Resolve which rustc (and paired cargo) to use for the init binary.

@@ -34,7 +34,7 @@ krun_display = { package = "krun-display", version = "0.1.0", path = "../display
 krun_input = { package = "krun-input", version = "0.1.0", path = "../input", optional = true, features = ["bindgen_clang_runtime"] }
 
 devices = { package = "krun-devices", version = "=0.1.0-2.0.0-dev", path = "../devices" }
-init-blob = { package = "krun-init-blob", version = "=0.1.0-2.0.0-dev", path = "../init_blob", optional = true }
+init-blob = { package = "krun-init-blob", version = "=0.1.0-2.0.0-dev", path = "../../init/init-blob", optional = true }
 polly = { package = "krun-polly", version = "=0.1.0-2.0.0-dev", path = "../polly" }
 utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }
 vmm = { package = "krun-vmm", version = "=0.1.0-2.0.0-dev", path = "../vmm" }
