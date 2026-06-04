@@ -114,16 +114,8 @@ mod host {
                     std::io::stderr().as_raw_fd(),
                 ))?;
 
-                let argv = [test_case.as_ptr(), std::ptr::null()];
-                let envp = [std::ptr::null()];
-                krun_call!(krun_set_exec(
-                    ctx,
-                    c"/guest-agent".as_ptr(),
-                    argv.as_ptr(),
-                    envp.as_ptr(),
-                ))?;
-
-                krun_call!(krun_set_workdir(ctx, c"/".as_ptr()))?;
+                // Disable implicit init — we inject explicitly below.
+                krun_call!(krun_disable_implicit_init(ctx))?;
 
                 // Add a block device with the ext4 image.
                 krun_call!(krun_add_disk(

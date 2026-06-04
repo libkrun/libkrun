@@ -67,6 +67,15 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     {
         fs::mount_filesystems()?;
+    }
+
+    // Load config before block root pivot — /.krun_config.json lives on the
+    // initial (virtiofs) root and is inaccessible after pivot_root.
+    #[cfg(target_os = "linux")]
+    let cfg = config::load(fs::is_mount_point);
+
+    #[cfg(target_os = "linux")]
+    {
         fs::mount_block_root_device()?;
         fs::mount_shared_root()?;
     }
@@ -92,8 +101,6 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "freebsd")]
     let iso_mounted = std::env::var("KRUN_CONFIG").is_err() && freebsd::mount_config_iso();
 
-    #[cfg(target_os = "linux")]
-    let cfg = config::load(fs::is_mount_point);
     #[cfg(not(target_os = "linux"))]
     let cfg = config::load();
 
