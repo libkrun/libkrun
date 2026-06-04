@@ -5,6 +5,7 @@
  * Virtual Machine created and managed by libkrun.
  */
 
+#include <alloca.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -15,6 +16,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <libkrun.h>
+#include <libkrun_init.h>
 #include <getopt.h>
 #include <stdbool.h>
 #include <assert.h>
@@ -55,6 +57,31 @@ static void print_help(char *const name)
         name
     );
 }
+
+static bool push_to_stderr(void *userdata, KrunStr s)
+{
+    (void)userdata;
+    fwrite(s.data, 1, s.len, stderr);
+    return true;
+}
+
+static KrunVtableHandle stderr_writer = KRUN_VTABLE_HANDLE(
+    KRUN_INIT_PUSH_STR_TYPE_TAG,
+    ((KrunInitPushStrVtable){ .drop = NULL, .push = push_to_stderr }),
+    NULL);
+
+#define TRY(call)                                                              \
+    err = NULL;                                                                \
+    call;                                                                      \
+    if (err) {                                                                 \
+        flockfile(stderr);                                                     \
+        fprintf(stderr, "%s failed: ", #call);                                 \
+        krun_init_error_message(err, &stderr_writer);                          \
+        fputc('\n', stderr);                                                   \
+        funlockfile(stderr);                                                   \
+        krun_init_error_destroy(err);                                          \
+        return -1;                                                             \
+    }
 
 static bool check_krun_error(int err, const char *msg)
 {
@@ -480,25 +507,22 @@ int main(int argc, char *const argv[])
         }
     }
 
-    // Configure the rlimits that will be set in the guest
-    if (err = krun_set_rlimits(ctx_id, &rlimits[0])) {
-        errno = -err;
-        perror("Error configuring rlimits");
-        return -1;
-    }
+    // Build the init configuration (executable, args, env, workdir, rlimits).
+    {
+        KrunInitError err;
+        KrunInitBuilder builder = krun_init_config_builder();
 
-    // Set the working directory to "/", just for the sake of completeness.
-    if (err = krun_set_workdir(ctx_id, "/")) {
-        errno = -err;
-        perror("Error configuring \"/\" as working directory");
-        return -1;
-    }
+        for (int i = 0; cmdline.guest_argv[i]; i++)
+            krun_init_builder_arg(&builder, KRUN_STR(cmdline.guest_argv[i]));
+        for (int i = 0; envp[i]; i++)
+            krun_init_builder_env_var(&builder, KRUN_STR(envp[i]));
+        for (int i = 0; rlimits[i]; i++)
+            krun_init_builder_rlimit(&builder, KRUN_STR(rlimits[i]));
+        krun_init_builder_workdir(&builder, KRUN_STR("/"));
 
-    // Specify the path of the binary to be executed in the isolated context, relative to the root path.
-    if (err = krun_set_exec(ctx_id, cmdline.guest_argv[0], (const char* const*) &cmdline.guest_argv[1], &envp[0])) {
-        errno = -err;
-        perror("Error configuring the parameters for the executable to be run");
-        return -1;
+        KrunInitConfig config = krun_init_builder_build(&builder);
+        TRY(krun_init_config_apply(config, NULL, ctx_id,
+                                   KRUN_STR("/dev/root"), &err));
     }
 
     if (err = krun_split_irqchip(ctx_id, false)) {

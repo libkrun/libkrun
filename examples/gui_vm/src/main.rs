@@ -11,8 +11,8 @@ use krun_sys::{
     VIRGLRENDERER_USE_EGL, VIRGLRENDERER_VENUS, krun_add_display, krun_add_input_device,
     krun_add_input_device_fd, krun_add_virtio_console_default, krun_add_virtiofs3, krun_create_ctx,
     krun_display_set_dpi, krun_display_set_physical_size, krun_display_set_refresh_rate,
-    krun_init_log, krun_set_display_backend, krun_set_exec, krun_set_gpu_options2,
-    krun_set_vm_config, krun_start_enter,
+    krun_init_log, krun_set_display_backend, krun_set_gpu_options2, krun_set_vm_config,
+    krun_start_enter,
 };
 use log::LevelFilter;
 use regex::{Captures, Regex};
@@ -25,7 +25,6 @@ use anyhow::Context;
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::PathBuf;
 use std::process::exit;
-use std::ptr::null;
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::thread;
@@ -175,15 +174,15 @@ fn krun_thread(
             false
         ))?;
 
-        let executable = args.executable.as_ref().unwrap().as_ptr();
-        let argv: Vec<_> = args.argv.iter().map(|a| a.as_ptr()).collect();
-        let argv_ptr = if argv.is_empty() {
-            null()
-        } else {
-            argv.as_ptr()
-        };
-        let envp = [null()];
-        krun_call!(krun_set_exec(ctx, executable, argv_ptr, envp.as_ptr()))?;
+        // Build init configuration.
+        let exec = args.executable.as_ref().unwrap().to_str().unwrap();
+        let argv_strs: Vec<&str> = args.argv.iter().map(|a| a.to_str().unwrap()).collect();
+        let mut full_argv: Vec<&str> = vec![exec];
+        full_argv.extend_from_slice(&argv_strs);
+        let init_config = krun_init::Config::builder().args(&full_argv).build();
+        init_config
+            .apply(std::ptr::null_mut(), ctx, "/dev/root")
+            .expect("apply init config");
 
         for display in &args.display {
             let display_id = krun_call_u32!(krun_add_display(ctx, display.width, display.height))?;

@@ -1,9 +1,9 @@
 ARCH = $(shell uname -m)
 OS = $(shell uname -s)
-LDFLAGS_x86_64_Linux = -lkrun
-LDFLAGS_aarch64_Linux = -lkrun
-LDFLAGS_riscv64_Linux = -lkrun
-LDFLAGS_arm64_Darwin = -L/opt/homebrew/lib -lkrun
+LDFLAGS_x86_64_Linux = -lkrun -lkrun_init
+LDFLAGS_aarch64_Linux = -lkrun -lkrun_init
+LDFLAGS_riscv64_Linux = -lkrun -lkrun_init
+LDFLAGS_arm64_Darwin = -L/opt/homebrew/lib -lkrun -lkrun_init
 LDFLAGS_sev = -lkrun-sev
 LDFLAGS_tdx = -lkrun-tdx
 LDFLAGS_nitro = -lkrun-awsnitro
