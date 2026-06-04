@@ -1,14 +1,13 @@
-//! Common utilities used by multiple test
+//! Common utilities used by multiple tests.
 
 use anyhow::Context;
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::CString;
 use std::fs;
 use std::fs::create_dir;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::ptr::null;
 
-use crate::{TestSetup, krun_call};
+use crate::{TestSetup, krun_call, krun_init};
 use krun_sys::*;
 
 fn copy_guest_agent(dir: &Path) -> anyhow::Result<()> {
@@ -33,6 +32,15 @@ pub fn setup_rootfs(test_setup: &TestSetup) -> anyhow::Result<PathBuf> {
     Ok(root_dir)
 }
 
+/// Build an init config for running the guest-agent with the given test case.
+pub fn build_init_config(test_case: &str, guest_env: &[&str]) -> krun_init::Config {
+    krun_init::Config::builder()
+        .args(&["/guest-agent", test_case])
+        .workdir("/")
+        .env(guest_env)
+        .build()
+}
+
 /// Sets up the root filesystem, copies the guest agent into it, and enters the VM.
 pub fn setup_fs_and_enter(ctx: u32, test_setup: TestSetup) -> anyhow::Result<()> {
     setup_fs_and_enter_with_env(ctx, test_setup, &[])
@@ -41,16 +49,13 @@ pub fn setup_fs_and_enter(ctx: u32, test_setup: TestSetup) -> anyhow::Result<()>
 pub fn setup_fs_and_enter_with_env(
     ctx: u32,
     test_setup: TestSetup,
-    guest_env: &[&CStr],
+    guest_env: &[&str],
 ) -> anyhow::Result<()> {
     let root_dir = setup_rootfs(&test_setup)?;
-
     let path_str = CString::new(root_dir.as_os_str().as_bytes()).context("CString::new")?;
-    let mut envp: Vec<*const c_char> = guest_env
-        .iter()
-        .map(|entry| entry.as_ptr().cast())
-        .collect();
-    envp.push(null());
+
+    let init_config = build_init_config(&test_setup.test_case, guest_env);
+
     unsafe {
         krun_call!(krun_add_virtiofs3(
             ctx,
@@ -59,15 +64,11 @@ pub fn setup_fs_and_enter_with_env(
             0,
             false,
         ))?;
-        krun_call!(krun_set_workdir(ctx, c"/".as_ptr()))?;
-        let test_case_cstr = CString::new(test_setup.test_case).context("CString::new")?;
-        let argv = [test_case_cstr.as_ptr(), null()];
-        krun_call!(krun_set_exec(
-            ctx,
-            c"/guest-agent".as_ptr(),
-            argv.as_ptr(),
-            envp.as_ptr(),
-        ))?;
+    }
+    init_config
+        .apply(std::ptr::null_mut(), ctx, "/dev/root")
+        .expect("apply init config");
+    unsafe {
         krun_call!(krun_start_enter(ctx))?;
     }
     unreachable!()

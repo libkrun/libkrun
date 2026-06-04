@@ -1,3 +1,6 @@
+#[cfg(feature = "host")]
+extern crate krun_init_blob_via_cdylib as krun_init;
+
 mod test_vm_config;
 use test_vm_config::TestVmConfig;
 

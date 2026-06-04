@@ -13,6 +13,7 @@ pub struct TestRootDiskRemount;
 mod host {
     use super::*;
 
+    use crate::common;
     use crate::{ShouldRun, krun_call, krun_call_u32};
     use crate::{Test, TestSetup};
     use krun_sys::*;
@@ -20,7 +21,6 @@ mod host {
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
     use std::process::Command;
-    use std::ptr::null;
 
     type KrunAddDiskFn = unsafe extern "C" fn(
         ctx_id: u32,
@@ -114,8 +114,8 @@ mod host {
                     std::io::stderr().as_raw_fd(),
                 ))?;
 
-                let argv = [test_case.as_ptr(), null()];
-                let envp = [null()];
+                let argv = [test_case.as_ptr(), std::ptr::null()];
+                let envp = [std::ptr::null()];
                 krun_call!(krun_set_exec(
                     ctx,
                     c"/guest-agent".as_ptr(),
@@ -140,6 +140,12 @@ mod host {
                     c"ext4".as_ptr(),
                     std::ptr::null(),
                 ))?;
+
+                // Inject init config into the NullFs root.
+                let init_config = common::build_init_config(test_case.to_str().unwrap(), &[]);
+                init_config
+                    .apply(std::ptr::null_mut(), ctx, "/dev/root")
+                    .expect("apply init config");
 
                 krun_call!(krun_start_enter(ctx))?;
             }

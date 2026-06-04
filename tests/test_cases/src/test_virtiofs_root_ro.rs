@@ -24,7 +24,6 @@ mod host {
     use std::fs;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
-    use std::ptr::null;
 
     impl Test for TestVirtiofsRootRo {
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
@@ -39,8 +38,6 @@ mod host {
             fs::write(root_dir.join(TEST_FILE), TEST_CONTENT)?;
             let root_path = CString::new(root_dir.as_os_str().as_bytes())?;
             let test_case = CString::new(test_setup.test_case)?;
-            let argv = [test_case.as_ptr(), null()];
-            let envp = [null()];
 
             unsafe {
                 krun_call!(krun_init_log(
@@ -67,13 +64,11 @@ mod host {
                     true,
                 ))?;
 
-                krun_call!(krun_set_workdir(ctx, c"/".as_ptr()))?;
-                krun_call!(krun_set_exec(
-                    ctx,
-                    c"/guest-agent".as_ptr(),
-                    argv.as_ptr(),
-                    envp.as_ptr(),
-                ))?;
+                let init_config =
+                    crate::common::build_init_config(test_case.to_str().unwrap(), &[]);
+                init_config
+                    .apply(std::ptr::null_mut(), ctx, "/dev/root")
+                    .expect("apply init config");
                 krun_call!(krun_start_enter(ctx))?;
             }
             Ok(())

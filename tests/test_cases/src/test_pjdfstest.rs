@@ -8,7 +8,6 @@ mod host {
     use crate::common::setup_fs_and_enter_with_env;
     use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
     use krun_sys::*;
-    use std::ffi::CString;
     use std::os::fd::AsRawFd;
 
     use macros::env_or_default;
@@ -51,7 +50,7 @@ mod host {
             } else {
                 "Linux"
             };
-            let host_os_env = CString::new(format!("PJDFSTEST_HOST_OS={host_os}"))?;
+            let host_os_env = format!("PJDFSTEST_HOST_OS={host_os}");
             unsafe {
                 let ctx = krun_call_u32!(krun_create_ctx())?;
                 krun_call!(krun_set_vm_config(ctx, 2, 1024))?;
@@ -61,7 +60,7 @@ mod host {
                     std::io::stdout().as_raw_fd(),
                     std::io::stderr().as_raw_fd(),
                 ))?;
-                setup_fs_and_enter_with_env(ctx, test_setup, &[host_os_env.as_c_str()])?;
+                setup_fs_and_enter_with_env(ctx, test_setup, &[host_os_env.as_str()])?;
             }
             Ok(())
         }

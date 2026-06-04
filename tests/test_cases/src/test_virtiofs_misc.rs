@@ -46,9 +46,9 @@ mod host {
 
                 // Forward KRUN_NO_UNSHARE to the guest so UID/GID mapping
                 // subtests can skip themselves when no user namespace is active.
-                let mut guest_env: Vec<&std::ffi::CStr> = Vec::new();
+                let mut guest_env: Vec<&str> = Vec::new();
                 if std::env::var_os("KRUN_NO_UNSHARE").is_some() {
-                    guest_env.push(c"KRUN_NO_UNSHARE=1");
+                    guest_env.push("KRUN_NO_UNSHARE=1");
                 }
                 setup_fs_and_enter_with_env(ctx, test_setup, &guest_env)?;
             }
