@@ -11,6 +11,16 @@ build = "build.rs"
 amd-sev = []
 tdx = []
 timesync = []
+ffi = []
+
+[dependencies]
+ffier = { git = "https://github.com/mtjhrc/ffier.git", rev = "9ee67e2" }
+libloading = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
 
 [lib]
+name = "krun_init"
 path = "src/lib.rs"
+crate-type = ["lib", "cdylib"]

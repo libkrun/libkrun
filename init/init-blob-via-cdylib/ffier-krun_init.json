@@ -1,0 +1,679 @@
+{
+  "prefix": "krun_init",
+  "primitives_prefix": "krun",
+  "type_registry": {
+    "*mut core::ffi::c_void": {
+      "kind": {
+        "primitive": {
+          "c_type": "void*"
+        }
+      }
+    },
+    "ApplyError": {
+      "kind": {
+        "error": {
+          "c_name": "KrunInitApplyError"
+        }
+      },
+      "type_tag": 33554438
+    },
+    "Builder": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunInitBuilder"
+        }
+      },
+      "type_tag": 33554437
+    },
+    "Config": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunInitConfig"
+        }
+      },
+      "type_tag": 33554436
+    },
+    "ConfigError": {
+      "kind": {
+        "error": {
+          "c_name": "KrunInitConfigError"
+        }
+      },
+      "type_tag": 33554435
+    },
+    "Error": {
+      "kind": {
+        "trait": {
+          "c_name": "KrunInitError"
+        }
+      },
+      "type_tag": 33554434,
+      "bless": "error_trait"
+    },
+    "FfierObject": {
+      "kind": {
+        "primitive": {
+          "c_type": "KrunObject"
+        }
+      },
+      "bless": "object"
+    },
+    "FfierObjectArray": {
+      "kind": {
+        "primitive": {
+          "c_type": "KrunObjectArray"
+        }
+      },
+      "bless": "object_array"
+    },
+    "FfierResult": {
+      "kind": {
+        "primitive": {
+          "c_type": "KrunResult"
+        }
+      },
+      "bless": "result"
+    },
+    "FfierVtableHandle": {
+      "kind": {
+        "primitive": {
+          "c_type": "KrunVtableHandle"
+        }
+      },
+      "bless": "vtable_handle"
+    },
+    "PushStr": {
+      "kind": {
+        "trait": {
+          "c_name": "KrunInitPushStr"
+        }
+      },
+      "type_tag": 33554433,
+      "bless": "push_str"
+    },
+    "Self": {
+      "kind": {
+        "primitive": {
+          "c_type": "void"
+        }
+      },
+      "bless": "replaces_self"
+    },
+    "bool": {
+      "kind": {
+        "primitive": {
+          "c_type": "bool"
+        }
+      }
+    },
+    "str": {
+      "kind": {
+        "string": {
+          "c_name": "KrunStr"
+        }
+      },
+      "bless": "str"
+    },
+    "u32": {
+      "kind": {
+        "primitive": {
+          "c_type": "uint32_t"
+        }
+      }
+    },
+    "u64": {
+      "kind": {
+        "primitive": {
+          "c_type": "uint64_t"
+        }
+      }
+    }
+  },
+  "exported_types": [
+    {
+      "name": "Config",
+      "destroy_ffi_name": "krun_init_config_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "builder",
+          "doc": [
+            " Start building a new init configuration."
+          ],
+          "receiver": "none",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "Builder"
+          },
+          "ffi_name": "krun_init_config_builder"
+        },
+        {
+          "name": "apply",
+          "doc": [
+            " Apply this init configuration to a libkrun VM context.",
+            "",
+            " Adds the init binary and associated configuration file(s) as",
+            " overlay files on the specified virtiofs device, and appends",
+            " the appropriate kernel command line argument to specify the",
+            " init binary.",
+            "",
+            " `lib_handle` is the result of `dlopen(\"libkrun.so\")`. Pass NULL to",
+            " search the global symbol namespace (requires libkrun was linked or",
+            " opened with `RTLD_GLOBAL`).",
+            "",
+            " # Safety",
+            "",
+            " - If `lib_handle` is non-null it must be a valid handle returned by",
+            "   `dlopen` (or equivalent) that remains open for the duration of",
+            "   this call.",
+            " - The caller must keep this `Config` alive for the entire lifetime",
+            "   of the VM. `apply` passes data pointers to libkrun that remain",
+            "   borrowed until the VM exits."
+          ],
+          "receiver": "ref",
+          "params": [
+            {
+              "name": "lib_handle",
+              "param_kind": "regular",
+              "type": "*mut core::ffi::c_void"
+            },
+            {
+              "name": "ctx_id",
+              "param_kind": "regular",
+              "type": "u32"
+            },
+            {
+              "name": "fs_tag",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "ApplyError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_init_config_apply"
+        }
+      ]
+    },
+    {
+      "name": "Builder",
+      "destroy_ffi_name": "krun_init_builder_destroy",
+      "is_builder_type": true,
+      "methods": [
+        {
+          "name": "from_oci_json",
+          "doc": [
+            " Parse an OCI runtime-spec config.json string into a builder.",
+            "",
+            " Unknown fields are silently ignored. The caller can further",
+            " modify the builder (e.g. add rlimits, mounts) before calling",
+            " [`build()`](Self::build)."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "json",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Builder"
+            },
+            "err_type": "ConfigError",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_init_builder_from_oci_json"
+        },
+        {
+          "name": "arg",
+          "doc": [
+            " Append a single argument to argv."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "arg",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_builder_arg"
+        },
+        {
+          "name": "args",
+          "doc": [
+            " Append multiple arguments to argv."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "argv",
+              "param_kind": "slice",
+              "element": {
+                "type": "str",
+                "ref_kind": "shared"
+              },
+              "c_params": [
+                {
+                  "name": "argv",
+                  "c_type": "const KrunStr*"
+                },
+                {
+                  "name": "argv_len",
+                  "c_type": "size_t"
+                }
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_builder_args"
+        },
+        {
+          "name": "env_var",
+          "doc": [
+            " Append a single environment variable (`\"KEY=value\"`)."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "var",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_builder_env_var"
+        },
+        {
+          "name": "env",
+          "doc": [
+            " Append multiple environment variables."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "vars",
+              "param_kind": "slice",
+              "element": {
+                "type": "str",
+                "ref_kind": "shared"
+              },
+              "c_params": [
+                {
+                  "name": "vars",
+                  "c_type": "const KrunStr*"
+                },
+                {
+                  "name": "vars_len",
+                  "c_type": "size_t"
+                }
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_builder_env"
+        },
+        {
+          "name": "workdir",
+          "doc": [
+            " Set the guest working directory."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "dir",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_builder_workdir"
+        },
+        {
+          "name": "mount",
+          "doc": [
+            " Add a mount specification."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "destination",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "fs_type",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "source",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_builder_mount"
+        },
+        {
+          "name": "rlimit",
+          "doc": [
+            " Append a single resource limit (`\"id=cur:max\"`, e.g. `\"7=0:0\"`)."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "limit",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_builder_rlimit"
+        },
+        {
+          "name": "rlimits",
+          "doc": [
+            " Append multiple resource limits."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "limits",
+              "param_kind": "slice",
+              "element": {
+                "type": "str",
+                "ref_kind": "shared"
+              },
+              "c_params": [
+                {
+                  "name": "limits",
+                  "c_type": "const KrunStr*"
+                },
+                {
+                  "name": "limits_len",
+                  "c_type": "size_t"
+                }
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_builder_rlimits"
+        },
+        {
+          "name": "build",
+          "doc": [
+            " Consume the builder, serialize the config, and return the",
+            " finished [`Config`]."
+          ],
+          "receiver": "value",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "Config"
+          },
+          "ffi_name": "krun_init_builder_build"
+        }
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "name": "ConfigError",
+      "variants": [
+        {
+          "name": "InvalidJson",
+          "c_name": "KRUN_INIT_ERROR_CONFIG_INVALID_JSON",
+          "code": 1,
+          "message": "InvalidJson(...)",
+          "fields": [
+            {
+              "type": "str",
+              "owned": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ApplyError",
+      "variants": [
+        {
+          "name": "SymbolNotFound",
+          "c_name": "KRUN_INIT_ERROR_APPLY_SYMBOL_NOT_FOUND",
+          "code": 1,
+          "message": "SymbolNotFound(...)",
+          "fields": [
+            {
+              "type": "str",
+              "owned": true
+            }
+          ]
+        },
+        {
+          "name": "OverlayFile",
+          "c_name": "KRUN_INIT_ERROR_APPLY_OVERLAY_FILE",
+          "code": 2,
+          "message": "OverlayFile(...)",
+          "fields": [
+            {
+              "type": "i32"
+            }
+          ]
+        },
+        {
+          "name": "KernelCmdline",
+          "c_name": "KRUN_INIT_ERROR_APPLY_KERNEL_CMDLINE",
+          "code": 3,
+          "message": "KernelCmdline(...)",
+          "fields": [
+            {
+              "type": "i32"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "traits": [
+    {
+      "name": "PushStr",
+      "destroy_ffi_name": "krun_init_push_str_destroy",
+      "type_tag_constant": "KRUN_INIT_PUSH_STR_TYPE_TAG",
+      "vtable_struct_c_name": "KrunInitPushStrVtable",
+      "wrapper_c_name": "KrunInitVtablePushStr",
+      "vtable_struct_name": "PushStrVtable",
+      "wrapper_name": "VtablePushStr",
+      "methods": [
+        {
+          "name": "push",
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "s",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "bool"
+          },
+          "ffi_name": "krun_init_push_str_push",
+          "trait_definition": {
+            "index": 0,
+            "has_default": false
+          }
+        }
+      ],
+      "own_method_count": 1,
+      "max_vtable_slot": 0
+    },
+    {
+      "name": "Error",
+      "destroy_ffi_name": "krun_init_error_destroy",
+      "type_tag_constant": "KRUN_INIT_ERROR_TYPE_TAG",
+      "vtable_struct_c_name": "KrunInitErrorVtable",
+      "wrapper_c_name": "KrunInitVtableError",
+      "vtable_struct_name": "ErrorVtable",
+      "wrapper_name": "VtableError",
+      "methods": [
+        {
+          "name": "code",
+          "receiver": "ref",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "u32"
+          },
+          "ffi_name": "krun_init_error_code",
+          "trait_definition": {
+            "index": 0,
+            "has_default": false
+          }
+        },
+        {
+          "name": "message",
+          "receiver": "ref",
+          "params": [
+            {
+              "name": "writer",
+              "param_kind": "impl_trait",
+              "trait_name": "PushStr"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_init_error_message",
+          "trait_definition": {
+            "index": 1,
+            "has_default": false
+          }
+        },
+        {
+          "name": "result",
+          "receiver": "none",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "u64"
+          },
+          "ffi_name": "krun_init_error_result",
+          "trait_definition": {
+            "index": 2,
+            "has_default": true
+          }
+        }
+      ],
+      "own_method_count": 3,
+      "max_vtable_slot": 2
+    }
+  ],
+  "trait_impls": [
+    {
+      "trait_name": "Error",
+      "struct_name": "ConfigError",
+      "methods": [
+        {
+          "name": "code",
+          "receiver": "ref",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "u32"
+          },
+          "ffi_name": "krun_init_config_error_code"
+        },
+        {
+          "name": "message",
+          "receiver": "ref",
+          "params": [
+            {
+              "name": "writer",
+              "param_kind": "impl_trait",
+              "trait_name": "PushStr"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_init_config_error_message"
+        }
+      ]
+    },
+    {
+      "trait_name": "Error",
+      "struct_name": "ApplyError",
+      "methods": [
+        {
+          "name": "code",
+          "receiver": "ref",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "u32"
+          },
+          "ffi_name": "krun_init_apply_error_code"
+        },
+        {
+          "name": "message",
+          "receiver": "ref",
+          "params": [
+            {
+              "name": "writer",
+              "param_kind": "impl_trait",
+              "trait_name": "PushStr"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_init_apply_error_message"
+        }
+      ]
+    }
+  ]
+}

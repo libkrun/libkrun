@@ -9,11 +9,9 @@ license = "Apache-2.0"
 repository = "https://github.com/containers/libkrun"
 
 [features]
-default = ["init-blob"]
-init-blob = ["dep:init-blob"]
 tee = ["vmm/tee", "devices/tee"]
-amd-sev = ["blk", "tee", "vmm/amd-sev", "devices/amd-sev", "init-blob/amd-sev"]
-tdx = ["blk", "tee", "vmm/tdx", "devices/tdx", "init-blob/tdx"]
+amd-sev = ["blk", "tee", "vmm/amd-sev", "devices/amd-sev"]
+tdx = ["blk", "tee", "vmm/tdx", "devices/tdx"]
 net = ["devices/net", "vmm/net"]
 blk = ["devices/blk", "vmm/blk"]
 gpu = ["vmm/gpu", "devices/gpu", "krun_display"]
@@ -21,7 +19,7 @@ input = ["krun_input", "vmm/input", "devices/input"]
 virgl_resource_map2 = ["devices/virgl_resource_map2"]
 aws-nitro = ["vmm/aws-nitro", "devices/aws-nitro", "dep:aws-nitro", "dep:nitro-enclaves"]
 vhost-user = ["vmm/vhost-user", "devices/vhost-user"]
-timesync = ["devices/timesync", "init-blob/timesync"]
+timesync = ["devices/timesync"]
 
 [dependencies]
 crossbeam-channel = ">=0.5.15"
@@ -34,7 +32,6 @@ krun_display = { package = "krun-display", version = "0.1.0", path = "../display
 krun_input = { package = "krun-input", version = "0.1.0", path = "../input", optional = true, features = ["bindgen_clang_runtime"] }
 
 devices = { package = "krun-devices", version = "=0.1.0-2.0.0-dev", path = "../devices" }
-init-blob = { package = "krun-init-blob", version = "=0.1.0-2.0.0-dev", path = "../../init/init-blob", optional = true }
 polly = { package = "krun-polly", version = "=0.1.0-2.0.0-dev", path = "../polly" }
 utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }
 vmm = { package = "krun-vmm", version = "=0.1.0-2.0.0-dev", path = "../vmm" }

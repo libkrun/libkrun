@@ -1,0 +1,22 @@
+[package]
+name = "krun-init-blob-via-cdylib"
+version = "0.1.0-1.18.1"
+edition = "2021"
+description = "Strong Rust client for libkrun-init (links libkrun_init.so)"
+license = "Apache-2.0"
+repository = "https://github.com/containers/libkrun"
+build = "build.rs"
+
+[lib]
+# Tests live in the integration test suite, not here. Disable to avoid
+# requiring libkrun_init.so during `cargo test` in the workspace.
+test = false
+doctest = false
+
+[build-dependencies]
+anyhow = "1"
+ffier-gen-rust-client = { git = "https://github.com/mtjhrc/ffier.git", rev = "9ee67e2" }
+pkg-config = "0.3"
+
+[dependencies]
+ffier = { git = "https://github.com/mtjhrc/ffier.git", rev = "9ee67e2" }
