@@ -186,6 +186,9 @@ struct ContextConfig {
         not(any(feature = "tee", feature = "aws-nitro"))
     ))]
     disable_implicit_init: bool,
+    /// Extra kernel command-line arguments appended via `krun_append_kernel_cmdline`.
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    extra_kernel_cmdline: Vec<String>,
 }
 
 impl ContextConfig {
@@ -2310,6 +2313,32 @@ pub extern "C" fn krun_disable_implicit_init(_ctx_id: u32) -> i32 {
     KRUN_SUCCESS
 }
 
+/// Append an argument to the kernel command line.
+///
+/// May be called multiple times; each argument is appended in order,
+/// separated by spaces.
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub unsafe extern "C" fn krun_append_kernel_cmdline(ctx_id: u32, c_arg: *const c_char) -> i32 {
+    if c_arg.is_null() {
+        return -libc::EINVAL;
+    }
+
+    let arg = match unsafe { CStr::from_ptr(c_arg).to_str() } {
+        Ok(s) => s,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg.get_mut().extra_kernel_cmdline.push(arg.to_string());
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+    KRUN_SUCCESS
+}
+
 /// Resolve a path like "a/b/c" into parent directory children + leaf name.
 /// Errors with a libc errno if any intermediate component is missing or not a Dir.
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -2891,8 +2920,14 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         return -libc::EINVAL;
     }
 
+    let mut prolog = format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}");
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    for arg in &ctx_cfg.extra_kernel_cmdline {
+        prolog.push(' ');
+        prolog.push_str(arg);
+    }
     let kernel_cmdline = KernelCmdlineConfig {
-        prolog: Some(format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")),
+        prolog: Some(prolog),
         krun_env: Some(format!(
             " {} {} {} {} {}",
             ctx_cfg.get_exec_path(),

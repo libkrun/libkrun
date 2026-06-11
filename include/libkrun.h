@@ -1032,6 +1032,21 @@ int32_t krun_split_irqchip(uint32_t ctx_id, bool enable);
 int32_t krun_disable_implicit_init(uint32_t ctx_id);
 
 /**
+ * Append an argument to the kernel command line.
+ *
+ * May be called multiple times; each argument is appended in order,
+ * separated by spaces.
+ *
+ * Arguments:
+ *  "ctx_id"  - the configuration context ID.
+ *  "arg"     - the argument to append (e.g. "init=/init.krun").
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_append_kernel_cmdline(uint32_t ctx_id, const char *arg);
+
+/**
  * Get a pointer to the built-in default init binary.
  *
  * This is the same binary that libkrun injects as /init.krun by default.
