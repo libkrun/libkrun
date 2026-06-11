@@ -97,9 +97,6 @@ const KRUNFW_NAME: &str = "libkrunfw.5.dylib";
 #[cfg(feature = "aws-nitro")]
 static KRUN_NITRO_DEBUG: Mutex<bool> = Mutex::new(false);
 
-// Path to the init binary to be executed inside the VM.
-const INIT_PATH: &str = "/init.krun";
-
 static KRUNFW: LazyLock<Result<libloading::Library, String>> = LazyLock::new(|| unsafe {
     libloading::Library::new(KRUNFW_NAME).map_err(|err| err.to_string())
 });
@@ -181,11 +178,7 @@ struct ContextConfig {
     nitro_console_output: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
-    #[cfg(all(
-        feature = "init-blob",
-        not(any(feature = "tee", feature = "aws-nitro"))
-    ))]
-    disable_implicit_init: bool,
+
     /// Extra kernel command-line arguments appended via `krun_append_kernel_cmdline`.
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     extra_kernel_cmdline: Vec<String>,
@@ -632,19 +625,12 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
 
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
-                let cfg = ctx_cfg.get_mut();
-                #[allow(unused_mut)]
-                let mut virtual_entries = Vec::new();
-                #[cfg(feature = "init-blob")]
-                if tag == "/dev/root" && !cfg.disable_implicit_init {
-                    virtual_entries.push(init_virtual_entry());
-                }
-                cfg.vmr.add_fs_device(FsDeviceConfig {
+                ctx_cfg.get_mut().vmr.add_fs_device(FsDeviceConfig {
                     fs_id: tag.to_string(),
                     shared_dir: path.map(|p| p.to_string()),
                     shm_size: shm,
                     read_only,
-                    virtual_entries,
+                    virtual_entries: Vec::new(),
                 });
             }
             Entry::Vacant(_) => return -libc::ENOENT,
@@ -2251,11 +2237,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                 // serve init.krun and provide mount points for /dev, /proc, /sys.
                 // Use a NullFs (no host directory) with the inode overlay.
                 let mut virtual_entries = Vec::new();
-                #[cfg(feature = "init-blob")]
-                if !ctx_cfg.disable_implicit_init {
-                    virtual_entries.push(init_virtual_entry());
-                }
-                // init.c needs these directories as mount points before
+                // The init binary needs these directories as mount points before
                 // pivoting to the block device root.
                 for name in ["dev", "proc", "sys", "newroot"] {
                     virtual_entries.push(VirtualDirEntry {
@@ -2288,29 +2270,25 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
     }
 }
 
+/// No-op stub: libkrun no longer injects a default init binary.
+///
+/// Returns `-ENOTSUP`. Callers should use `libkrun_init`'s `Config::apply()`
+/// to install init and config explicitly.
 #[unsafe(no_mangle)]
-#[cfg(all(
-    feature = "init-blob",
-    not(any(feature = "tee", feature = "aws-nitro"))
-))]
-pub extern "C" fn krun_disable_implicit_init(ctx_id: u32) -> i32 {
-    match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => {
-            ctx_cfg.get_mut().disable_implicit_init = true;
-        }
-        Entry::Vacant(_) => return -libc::ENOENT,
-    }
-
-    KRUN_SUCCESS
+pub extern "C" fn krun_disable_implicit_init(_ctx_id: u32) -> i32 {
+    -libc::ENOTSUP
 }
 
+/// The default init binary now lives in `libkrun_init.so`, not libkrun.
+///
+/// Returns `-ENOTSUP`.
+#[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
-#[cfg(all(
-    not(feature = "init-blob"),
-    not(any(feature = "tee", feature = "aws-nitro"))
-))]
-pub extern "C" fn krun_disable_implicit_init(_ctx_id: u32) -> i32 {
-    KRUN_SUCCESS
+pub unsafe extern "C" fn krun_get_default_init(
+    _data_out: *mut *const u8,
+    _len_out: *mut size_t,
+) -> i32 {
+    -libc::ENOTSUP
 }
 
 /// Append an argument to the kernel command line.
@@ -2338,7 +2316,6 @@ pub unsafe extern "C" fn krun_append_kernel_cmdline(ctx_id: u32, c_arg: *const c
     }
     KRUN_SUCCESS
 }
-
 /// Resolve a path like "a/b/c" into parent directory children + leaf name.
 /// Errors with a libc errno if any intermediate component is missing or not a Dir.
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -2472,39 +2449,6 @@ pub unsafe extern "C" fn krun_fs_add_overlay_dir(
             },
         },
     )
-}
-
-#[allow(clippy::missing_safety_doc)]
-#[unsafe(no_mangle)]
-#[cfg(all(
-    feature = "init-blob",
-    not(any(feature = "tee", feature = "aws-nitro"))
-))]
-pub unsafe extern "C" fn krun_get_default_init(
-    data_out: *mut *const u8,
-    len_out: *mut size_t,
-) -> i32 {
-    if data_out.is_null() || len_out.is_null() {
-        return -libc::EINVAL;
-    }
-    unsafe {
-        *data_out = DEFAULT_INIT_PAYLOAD.as_ptr();
-        *len_out = DEFAULT_INIT_PAYLOAD.len();
-    }
-    KRUN_SUCCESS
-}
-
-#[allow(clippy::missing_safety_doc)]
-#[unsafe(no_mangle)]
-#[cfg(all(
-    not(feature = "init-blob"),
-    not(any(feature = "tee", feature = "aws-nitro"))
-))]
-pub unsafe extern "C" fn krun_get_default_init(
-    _data_out: *mut *const u8,
-    _len_out: *mut size_t,
-) -> i32 {
-    -libc::ENOTSUP
 }
 
 #[unsafe(no_mangle)]
@@ -2920,7 +2864,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         return -libc::EINVAL;
     }
 
-    let mut prolog = format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}");
+    let mut prolog = DEFAULT_KERNEL_CMDLINE.to_string();
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     for arg in &ctx_cfg.extra_kernel_cmdline {
         prolog.push(' ');
@@ -3089,30 +3033,5 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 
             -libc::EINVAL
         }
-    }
-}
-
-#[cfg(all(test, feature = "init-blob", not(feature = "tee")))]
-mod test_disable_implicit_init {
-    use super::*;
-
-    #[test]
-    fn test_disable_implicit_init() {
-        let ctx = unsafe { krun_create_ctx() } as u32;
-        unsafe {
-            krun_disable_implicit_init(ctx);
-            krun_add_virtiofs3(ctx, c"/dev/root".as_ptr(), c"/tmp".as_ptr(), 0, false);
-        }
-
-        let ctx_map = CTX_MAP.lock().unwrap();
-        let cfg = ctx_map.get(&ctx).unwrap();
-        assert_eq!(cfg.vmr.fs.len(), 1);
-        assert!(
-            cfg.vmr.fs[0].virtual_entries.is_empty(),
-            "root virtiofs should not inject init.krun after krun_disable_implicit_init()"
-        );
-        drop(ctx_map);
-
-        assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
     }
 }

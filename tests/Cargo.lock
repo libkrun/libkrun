@@ -200,6 +200,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ffier-gen-rust-client"
+version = "0.2.0"
+source = "git+https://github.com/mtjhrc/ffier.git?rev=9ee67e2#9ee67e2b0fcc7fbc32a60dc40de12c774101c7ae"
+dependencies = [
+ "ffier-schema",
+ "serde_json",
+]
+
+[[package]]
 name = "ffier-impl"
 version = "0.2.0"
 source = "git+https://github.com/mtjhrc/ffier.git?rev=9ee67e2#9ee67e2b0fcc7fbc32a60dc40de12c774101c7ae"
@@ -278,6 +287,7 @@ version = "0.1.0-1.18.1"
 dependencies = [
  "anyhow",
  "ffier",
+ "ffier-gen-rust-client",
  "pkg-config",
 ]
 
