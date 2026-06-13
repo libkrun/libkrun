@@ -69,13 +69,16 @@ struct LinuxDirent64 {
 unsafe impl ByteValued for LinuxDirent64 {}
 
 macro_rules! scoped_cred {
-    ($name:ident, $ty:ty, $syscall_nr:expr) => {
+    ($name:ident, $ty:ty, $syscall_nr:expr_2021, $get_current:expr_2021) => {
         #[derive(Debug)]
-        struct $name;
+        struct $name {
+            old: $ty,
+        }
 
         impl $name {
             // Changes the effective uid/gid of the current thread to `val`.  Changes
-            // the thread's credentials back to root when the returned struct is dropped.
+            // the thread's credentials back to the previous value when the returned
+            // struct is dropped.
             fn new(val: $ty) -> io::Result<Option<$name>> {
                 // We want credential changes to be per-thread because otherwise
                 // we might interfere with operations being carried out on other
@@ -89,11 +92,22 @@ macro_rules! scoped_cred {
                 // setfsgid systems calls.   However since those calls have no way to
                 // return an error, it's preferable to do this instead.
 
+                // Remember the current effective id so Drop can restore it.
+                // Restoring a hardcoded 0 instead is wrong when the server
+                // runs as an unprivileged user granted CAP_SETUID/CAP_SETGID:
+                // the first Drop parks the thread at euid 0, the next switch
+                // to a non-zero uid then clears the thread's effective
+                // capability set (see capabilities(7), "Effect of user ID
+                // changes on capabilities"), and the restore after that fails
+                // with EPERM -- leaving the worker thread stuck with the guest
+                // uid's credentials for every subsequent request.
+                let old = unsafe { $get_current() } as $ty;
+
                 // This call is safe because it doesn't modify any memory and we
                 // check the return value.
                 let res = unsafe { libc::syscall($syscall_nr, -1, val, -1) };
                 if res == 0 {
-                    Ok(Some($name))
+                    Ok(Some($name { old }))
                 } else {
                     Err(io::Error::last_os_error())
                 }
@@ -102,10 +116,10 @@ macro_rules! scoped_cred {
 
         impl Drop for $name {
             fn drop(&mut self) {
-                let res = unsafe { libc::syscall($syscall_nr, -1, 0, -1) };
+                let res = unsafe { libc::syscall($syscall_nr, -1, self.old, -1) };
                 if res < 0 {
                     error!(
-                        "failed to change credentials back to root: {}",
+                        "failed to restore credentials: {}",
                         io::Error::last_os_error(),
                     );
                 }
@@ -113,8 +127,8 @@ macro_rules! scoped_cred {
         }
     };
 }
-scoped_cred!(ScopedUid, libc::uid_t, libc::SYS_setresuid);
-scoped_cred!(ScopedGid, libc::gid_t, libc::SYS_setresgid);
+scoped_cred!(ScopedUid, libc::uid_t, libc::SYS_setresuid, libc::geteuid);
+scoped_cred!(ScopedGid, libc::gid_t, libc::SYS_setresgid, libc::getegid);
 
 #[must_use]
 pub struct ScopedCaps {
