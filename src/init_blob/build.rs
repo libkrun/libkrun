@@ -94,11 +94,9 @@ fn build_rust_init() -> PathBuf {
             (musl_rustc.to_string_lossy().into_owned(), cargo, true)
         }
         None => {
-            println!(
-                "cargo:warning=musl target not available; krun-init will be dynamically linked. \
-                 Run `rustup target add $(uname -m)-unknown-linux-musl` for a static binary."
+            panic!(
+                "musl target not available for krun-init; Run `rustup target add $(uname -m)-unknown-linux-musl` to obtain."
             );
-            (default_rustc, default_cargo, false)
         }
     };
 
