@@ -24,6 +24,12 @@ pub mod macos;
 pub use macos::fs_utils;
 #[cfg(target_os = "macos")]
 pub use macos::passthrough;
+#[cfg(target_os = "windows")]
+pub mod windows;
+#[cfg(target_os = "windows")]
+pub use windows::fs_utils;
+#[cfg(target_os = "windows")]
+pub use windows::passthrough;
 
 use super::bindings;
 use super::descriptor_utils;
