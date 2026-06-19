@@ -1368,4 +1368,396 @@ impl FileSystem for PassthroughFs {
 
         Ok(opts)
     }
+
+    fn destroy(&self) {
+        self.dir_caches.write().unwrap().clear();
+        self.inodes.write().unwrap().clear();
+        let h = std::mem::replace(
+            &mut *self.root_handle.write().unwrap(),
+            INVALID_HANDLE_VALUE,
+        );
+        if h != INVALID_HANDLE_VALUE {
+            unsafe { CloseHandle(h) };
+        }
+    }
+
+    fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<bindings::statvfs64> {
+        let data = self.inode_data(inode)?;
+        let wide_path = data.get_wide_path();
+
+        // Dynamically size the buffer based on the input path.
+        // Add +1 to safely handle cases like "C:" expanding to "C:\"
+        let mut volume_root = vec![0u16; wide_path.len() + 1];
+        // Resolve any input path down to its absolute host volume
+        // GetDiskFreeSpaceExW only expects a directory but on linux we could
+        // execute commands on simple files (e.g. df -h file)
+        // which would fail if we directly call GetDiskFreeSpaceExW
+        let vol_ok = unsafe {
+            GetVolumePathNameW(
+                wide_path.as_ptr(),
+                volume_root.as_mut_ptr(),
+                volume_root.len() as u32,
+            )
+        };
+
+        let fallback_buffer;
+        let path_to_query = if vol_ok != 0 {
+            volume_root.as_ptr()
+        } else {
+            fallback_buffer = path_to_wide(Path::new(&self.cfg.root_dir));
+            fallback_buffer.as_ptr()
+        };
+
+        let (mut free_avail, mut total, mut total_free) = (0u64, 0u64, 0u64);
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(path_to_query, &mut free_avail, &mut total, &mut total_free)
+        };
+        if ok == 0 {
+            return Err(win_err_to_linux(io::Error::last_os_error()));
+        }
+
+        let bsize: u64 = 4096;
+        Ok(bindings::statvfs64 {
+            f_bsize: bsize,
+            f_frsize: bsize,
+            f_blocks: total / bsize,
+            f_bfree: total_free / bsize,
+            f_bavail: free_avail / bsize,
+            f_files: i64::MAX as u64,
+            f_ffree: i64::MAX as u64,
+            f_favail: i64::MAX as u64,
+            f_fsid: self.cfg.export_fsid,
+            f_flag: 0,
+            f_namemax: 255,
+        })
+    }
+
+    fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        self.do_lookup(parent, name)
+    }
+
+    fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
+        let mut inodes = self.inodes.write().unwrap();
+        forget_one(&mut inodes, inode, count);
+    }
+
+    fn batch_forget(&self, _ctx: Context, requests: Vec<(Inode, u64)>) {
+        let mut inodes = self.inodes.write().unwrap();
+        for (inode, count) in requests {
+            forget_one(&mut inodes, inode, count);
+        }
+    }
+
+    fn opendir(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        flags: u32,
+    ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        self.do_open(inode, false, flags | LINUX_O_DIRECTORY as u32)
+    }
+
+    fn releasedir(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        _flags: u32,
+        handle: Handle,
+    ) -> io::Result<()> {
+        self.do_release(inode, handle)
+    }
+
+    fn mkdir(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        mode: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        // Colon is used to define a stream name in the ADS, so we need to prevent it from being used in the filename
+        if name.to_bytes().contains(&b':') {
+            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
+        }
+
+        let parent_data = self.inode_data(parent)?;
+        let root_h = *self.root_handle.read().unwrap();
+        let parent_g = HandleGuard(
+            open_by_id(
+                root_h,
+                parent_data.file_index,
+                &OpenFlags {
+                    desired_access: GENERIC_READ,
+                    create_disposition: FILE_OPEN,
+                    create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_DIRECTORY_FILE,
+                },
+            )
+            .map_err(win_err_to_linux)?,
+        );
+
+        let child_g = HandleGuard(
+            open_relative(
+                parent_g.as_raw(),
+                name,
+                &OpenFlags {
+                    desired_access: GENERIC_READ | GENERIC_WRITE,
+                    create_disposition: FILE_CREATE,
+                    create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_DIRECTORY_FILE,
+                },
+            )
+            .map_err(win_err_to_linux)?,
+        );
+
+        if let Some(secctx) = extensions.secctx {
+            let stream_name = format!(":{}", secctx.name.to_string_lossy());
+            write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
+        }
+
+        let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, mode & !umask);
+        write_ads_by_handle(child_g.as_raw(), OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
+        self.do_lookup(parent, name)
+    }
+
+    fn rmdir(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        let parent_data = self.inode_data(parent)?;
+        let root_h = *self.root_handle.read().unwrap();
+        let parent_g = HandleGuard(
+            open_by_id(
+                root_h,
+                parent_data.file_index,
+                &OpenFlags {
+                    desired_access: GENERIC_READ,
+                    create_disposition: FILE_OPEN,
+                    create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_DIRECTORY_FILE,
+                },
+            )
+            .map_err(win_err_to_linux)?,
+        );
+
+        let child_g = HandleGuard(
+            open_relative(
+                parent_g.as_raw(),
+                name,
+                &OpenFlags {
+                    desired_access: DELETE,
+                    create_disposition: FILE_OPEN,
+                    create_options: FILE_SYNCHRONOUS_IO_NONALERT
+                        | FILE_DIRECTORY_FILE
+                        | FILE_OPEN_REPARSE_POINT,
+                },
+            )
+            .map_err(win_err_to_linux)?,
+        );
+
+        set_delete_disposition(child_g.as_raw()).map_err(win_err_to_linux)
+    }
+
+    fn readdir<F>(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        _size: u32,
+        offset: u64,
+        mut add_entry: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(DirEntry) -> io::Result<usize>,
+    {
+        self.fill_dir_cache(inode, handle)?;
+        let caches = self.dir_caches.read().unwrap();
+        let entries = caches.get(&handle).ok_or_else(ebadf)?;
+        let entries = entries.lock().unwrap();
+
+        for (i, de) in entries.iter().enumerate().skip(offset as usize) {
+            let entry = DirEntry {
+                ino: de.ino,
+                offset: (i + 1) as u64,
+                type_: de.type_,
+                name: &de.name,
+            };
+            match add_entry(entry) {
+                Ok(size) => {
+                    if size == 0 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "virtio-fs: error adding entry {}: {:?}",
+                        String::from_utf8_lossy(&de.name),
+                        e
+                    );
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn readdirplus<F>(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        _size: u32,
+        offset: u64,
+        mut add_entry: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(DirEntry, Entry) -> io::Result<usize>,
+    {
+        self.fill_dir_cache(inode, handle)?;
+        let caches = self.dir_caches.read().unwrap();
+        let entries = caches.get(&handle).ok_or_else(ebadf)?;
+        let entries = entries.lock().unwrap();
+
+        for (i, de) in entries.iter().enumerate().skip(offset as usize) {
+            let name_cstr = match std::ffi::CString::new(de.name.clone()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let entry = match self.do_lookup(inode, &name_cstr) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let written = add_entry(
+                DirEntry {
+                    ino: entry.inode,
+                    offset: (i + 1) as u64,
+                    type_: de.type_,
+                    name: &de.name,
+                },
+                entry,
+            )?;
+            if written == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn getattr(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Option<Handle>,
+    ) -> io::Result<(stat64, Duration)> {
+        self.do_getattr(inode, handle)
+    }
+
+    fn setattr(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        attr: stat64,
+        handle: Option<Handle>,
+        valid: SetattrValid,
+    ) -> io::Result<(stat64, Duration)> {
+        let path = self.inode_path(inode)?;
+
+        // Extract or read current cached state cleanly to avoid overwriting conflicts
+        let (mut current_uid, mut current_gid, mut current_mode) =
+            read_override_stat(&path).unwrap_or((Some(u32::MAX), Some(u32::MAX), None));
+
+        let mut override_changed = false;
+
+        if valid.contains(SetattrValid::MODE) {
+            current_mode = Some(attr.st_mode);
+            override_changed = true;
+        }
+
+        if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
+            if valid.contains(SetattrValid::UID) {
+                current_uid = Some(attr.st_uid);
+            }
+            if valid.contains(SetattrValid::GID) {
+                current_gid = Some(attr.st_gid);
+            };
+
+            remove_security_capability(&path);
+
+            if !valid.contains(SetattrValid::MODE) {
+                if let Some(mode) = current_mode {
+                    let new_mode = clear_suid_sgid(mode);
+                    current_mode = Some(new_mode);
+                }
+            }
+
+            override_changed = true;
+        }
+
+        if valid.contains(SetattrValid::SIZE) {
+            if let Some(h) = handle {
+                // POSIX Compliance: Allocating space on a Read-Only FD should return EBADF
+                if is_handle_read_only(h) {
+                    return Err(ebadf());
+                }
+
+                let file = self
+                    .reopen_inode(inode, h, GENERIC_READ | GENERIC_WRITE)
+                    .map_err(win_err_to_linux)?;
+                file.set_len(attr.st_size as u64)
+                    .map_err(win_err_to_linux)?;
+            } else {
+                let file = fs::OpenOptions::new()
+                    .write(true)
+                    .open(&*path)
+                    .map_err(win_err_to_linux)?;
+                file.set_len(attr.st_size as u64)
+                    .map_err(win_err_to_linux)?;
+            }
+
+            remove_security_capability(&path);
+
+            if let Some(mode) = current_mode {
+                let new_mode = clear_suid_sgid(mode);
+                if new_mode != mode {
+                    current_mode = Some(new_mode);
+                    override_changed = true;
+                }
+            }
+        }
+
+        if override_changed {
+            let owner_param = match (current_uid, current_gid) {
+                (Some(u), Some(g)) => Some((u, g)),
+                _ => None,
+            };
+            write_override_stat(&path, owner_param, current_mode)?;
+        }
+
+        if valid.intersects(
+            SetattrValid::ATIME
+                | SetattrValid::MTIME
+                | SetattrValid::ATIME_NOW
+                | SetattrValid::MTIME_NOW,
+        ) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let now_ft = unix_to_filetime(now.as_secs() as i64, now.subsec_nanos());
+
+            let atime = if valid.contains(SetattrValid::ATIME_NOW) {
+                Some(now_ft)
+            } else if valid.contains(SetattrValid::ATIME) {
+                Some(unix_to_filetime(attr.st_atime, attr.st_atime_nsec))
+            } else {
+                None
+            };
+
+            let mtime = if valid.contains(SetattrValid::MTIME_NOW) {
+                Some(now_ft)
+            } else if valid.contains(SetattrValid::MTIME) {
+                Some(unix_to_filetime(attr.st_mtime, attr.st_mtime_nsec))
+            } else {
+                None
+            };
+            set_file_times(&path, atime, mtime).map_err(win_err_to_linux)?;
+        }
+
+        self.do_getattr(inode, handle)
+    }
 }
