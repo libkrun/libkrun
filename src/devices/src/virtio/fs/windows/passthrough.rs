@@ -655,6 +655,66 @@ fn clear_suid_sgid(mode: u32) -> u32 {
     new_mode
 }
 
+// ADS-backed generic xattr helpers
+fn ads_xattr_path(base: &Path, name: &CStr) -> PathBuf {
+    let attr_name = name.to_string_lossy();
+    let mut s = base.as_os_str().to_os_string();
+    s.push(&format!(":{}", attr_name));
+    PathBuf::from(s)
+}
+
+fn ads_list_streams(path: &Path) -> io::Result<Vec<String>> {
+    use windows_sys::Win32::Storage::FileSystem::*;
+
+    let wide = path_to_wide(path);
+    let mut fsd: WIN32_FIND_STREAM_DATA = unsafe { mem::zeroed() };
+    let h = unsafe {
+        FindFirstStreamW(
+            wide.as_ptr(),
+            FindStreamInfoStandard,
+            &mut fsd as *mut _ as *mut _,
+            0,
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(38) {
+            return Ok(Vec::new());
+        }
+        return Err(e);
+    }
+
+    let mut out = Vec::new();
+    loop {
+        let len = fsd
+            .cStreamName
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(fsd.cStreamName.len());
+        let name = OsString::from_wide(&fsd.cStreamName[..len])
+            .to_string_lossy()
+            .to_string();
+
+        if name != "::$DATA" {
+            if let Some(stripped) = name.strip_prefix(':') {
+                if let Some(attr) = stripped.strip_suffix(":$DATA") {
+                    if !attr.is_empty() {
+                        out.push(attr.to_string());
+                    }
+                }
+            }
+        }
+
+        if unsafe { FindNextStreamW(h, &mut fsd as *mut _ as *mut _) } == 0 {
+            break;
+        }
+    }
+    unsafe {
+        FindClose(h);
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Copy)]
 struct OpenFlags {
     desired_access: u32,
@@ -2283,6 +2343,311 @@ impl FileSystem for PassthroughFs {
             && st.st_mode & 0o001 == 0
         {
             return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES)));
+        }
+
+        Ok(())
+    }
+
+    fn setxattr(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        name: &CStr,
+        value: &[u8],
+        flags: u32,
+    ) -> io::Result<()> {
+        if !self.cfg.xattr {
+            return Err(enosys());
+        }
+
+        // Prevent the guest from directly modifying these attributes
+        // If the guest could directly modify this xattr, it could bypass security boundaries or corrupt the emulation.
+        let attr_name = name.to_bytes();
+        if attr_name == b"user.containers.override_stat" || attr_name == b"security.capability" {
+            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES)));
+        }
+
+        let path = self.inode_path(inode)?;
+        let stream = ads_xattr_path(&path, name);
+
+        if flags & XATTR_CREATE != 0 && stream.exists() {
+            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EEXIST)));
+        }
+        if flags & XATTR_REPLACE != 0 && !stream.exists() {
+            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::ENODATA)));
+        }
+
+        fs::write(&stream, value).map_err(win_err_to_linux)
+    }
+
+    fn getxattr(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        name: &CStr,
+        size: u32,
+    ) -> io::Result<GetxattrReply> {
+        if !self.cfg.xattr {
+            return Err(enosys());
+        }
+
+        // Prevent the guest from reading them directly.
+        // The guest should only see these values through standard stat calls, not raw getxattr queries
+        let attr_name = name.to_bytes();
+        if attr_name == b"user.containers.override_stat" || attr_name == b"security.capability" {
+            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES)));
+        }
+
+        let path = self.inode_path(inode)?;
+        let stream = ads_xattr_path(&path, name);
+
+        let data = fs::read(&stream).map_err(|e| {
+            let code = e.raw_os_error().unwrap_or(0) as u32;
+            if code == 2 || code == 3 {
+                // Windows treats ADS as part of the path, so if the ADS has not been set it
+                // returns ERROR_FILE_NOT_FOUND (2) or ERROR_PATH_NOT_FOUND (3).
+                // This is normally mapped to ENOENT, but we map it to ENODATA instead to match Linux behavior.
+                // If we return ENOENT, the guest will think the file does not exist, which is not what we want.
+                io::Error::from_raw_os_error(linux_errno_raw(libc::ENODATA))
+            } else {
+                win_err_to_linux(e)
+            }
+        })?;
+
+        if size == 0 {
+            Ok(GetxattrReply::Count(data.len() as u32))
+        } else if size < data.len() as u32 {
+            Err(io::Error::from_raw_os_error(linux_errno_raw(libc::ERANGE)))
+        } else {
+            Ok(GetxattrReply::Value(data))
+        }
+    }
+
+    fn listxattr(&self, _ctx: Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
+        if !self.cfg.xattr {
+            return Err(enosys());
+        }
+
+        let path = self.inode_path(inode)?;
+        let streams = ads_list_streams(&path).unwrap_or_default();
+
+        let mut buf = Vec::new();
+        for s in &streams {
+            if s == "user.containers.override_stat" || s == "security.capability" {
+                continue;
+            }
+            buf.extend_from_slice(s.as_bytes());
+            buf.push(0);
+        }
+
+        if size == 0 {
+            Ok(ListxattrReply::Count(buf.len() as u32))
+        } else if size < buf.len() as u32 {
+            Err(io::Error::from_raw_os_error(linux_errno_raw(libc::ERANGE)))
+        } else {
+            Ok(ListxattrReply::Names(buf))
+        }
+    }
+
+    fn removexattr(&self, _ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
+        if !self.cfg.xattr {
+            return Err(enosys());
+        }
+
+        let attr_name = name.to_bytes();
+        if attr_name == b"user.containers.override_stat" || attr_name == b"security.capability" {
+            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES)));
+        }
+
+        let path = self.inode_path(inode)?;
+        let stream = ads_xattr_path(&path, name);
+
+        fs::remove_file(&stream).map_err(|e| {
+            let code = e.raw_os_error().unwrap_or(0) as u32;
+            // Windows treats ADS as part of the path, so if the ADS has not been set it
+            // returns ERROR_FILE_NOT_FOUND (2) or ERROR_PATH_NOT_FOUND (3).
+            // This is normally mapped to ENOENT, but we map it to ENODATA instead to match Linux behavior.
+            // If we return ENOENT, the guest will think the file does not exist, which is not what we want.
+            if code == 2 || code == 3 {
+                io::Error::from_raw_os_error(linux_errno_raw(libc::ENODATA))
+            } else {
+                win_err_to_linux(e)
+            }
+        })
+    }
+
+    fn fallocate(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        _mode: u32,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<()> {
+        // EBADF - fd is not a valid file descriptor, or is not opened for writing.
+        if is_handle_read_only(handle) {
+            return Err(ebadf());
+        }
+
+        let file = self
+            .reopen_inode(inode, handle, GENERIC_READ | GENERIC_WRITE)
+            .map_err(win_err_to_linux)?;
+
+        // EFBIG - offset+size exceeds the maximum file size.
+        let target = offset
+            .checked_add(length)
+            .ok_or_else(|| io::Error::from_raw_os_error(linux_errno_raw(libc::EFBIG)))?;
+        let current = file.metadata().map_err(win_err_to_linux)?.len();
+        if target > current {
+            file.set_len(target).map_err(win_err_to_linux)?;
+        }
+        Ok(())
+    }
+
+    fn lseek(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        offset: u64,
+        whence: u32,
+    ) -> io::Result<u64> {
+        // All I/O uses explicit offsets (pread/pwrite), so there is no
+        // persistent file-position cursor. SEEK_SET and SEEK_CUR are
+        // pure arithmetic; SEEK_END needs the current file length.
+        match whence {
+            0 => Ok(offset), // SEEK_SET
+            1 => Ok(offset), // SEEK_CUR (cursor always at 0)
+            2 => {
+                // SEEK_END
+                let file = self
+                    .reopen_inode(inode, handle, FILE_READ_ATTRIBUTES)
+                    .map_err(win_err_to_linux)?;
+                let len = file.metadata().map_err(win_err_to_linux)?.len();
+                Ok((len as i64 + offset as i64) as u64)
+            }
+            3 => Ok(offset), // SEEK_DATA
+            4 => {
+                // SEEK_HOLE — return EOF
+                let file = self
+                    .reopen_inode(inode, handle, FILE_READ_ATTRIBUTES)
+                    .map_err(win_err_to_linux)?;
+                let len = file.metadata().map_err(win_err_to_linux)?.len();
+                Ok(len)
+            }
+            _ => Err(einval()),
+        }
+    }
+
+    fn setupmapping(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        foffset: u64,
+        len: u64,
+        flags: u64,
+        moffset: u64,
+        host_shm_base: u64,
+        shm_size: u64,
+    ) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use std::ptr;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFileEx, PAGE_READONLY,
+            PAGE_READWRITE,
+        };
+
+        let mut sys_info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+        unsafe { GetSystemInfo(&mut sys_info) };
+        let granularity = sys_info.dwAllocationGranularity as u64;
+
+        if foffset % granularity != 0 {
+            error!("foffset {foffset} is not aligned to {granularity}");
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        if (moffset + len) > shm_size {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        let is_write = (flags & (fuse::SetupmappingFlags::WRITE.bits() as u64)) != 0;
+        let page_flags = if is_write {
+            PAGE_READWRITE
+        } else {
+            PAGE_READONLY
+        };
+        let map_flags = if is_write {
+            FILE_MAP_READ | FILE_MAP_WRITE
+        } else {
+            FILE_MAP_READ
+        };
+
+        let addr = host_shm_base + moffset;
+        debug!("setupmapping: ino {inode:?} addr={addr:x} len={len}");
+
+        let file = self
+            .reopen_inode(inode, handle, GENERIC_READ)
+            .map_err(win_err_to_linux)?;
+        let handle_raw = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+
+        // 1. Create a file mapping object from the open file handle
+        let mapping_handle =
+            unsafe { CreateFileMappingW(handle_raw, ptr::null(), page_flags, 0, 0, ptr::null()) };
+
+        if mapping_handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        // 2. Map the view exactly into the guest's DAX window address
+        let ret = unsafe {
+            MapViewOfFileEx(
+                mapping_handle,
+                map_flags,
+                (foffset >> 32) as u32,
+                (foffset & 0xFFFFFFFF) as u32,
+                len as usize,
+                addr as *mut _,
+            )
+        };
+
+        // The mapping handle can be safely closed after the view is mapped;
+        // the mapping remains valid until UnmapViewOfFile is called.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(mapping_handle) };
+
+        if ret.Value.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    fn removemapping(
+        &self,
+        _ctx: Context,
+        requests: Vec<fuse::RemovemappingOne>,
+        host_shm_base: u64,
+        shm_size: u64,
+    ) -> io::Result<()> {
+        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+
+        for req in requests {
+            let addr = host_shm_base + req.moffset;
+            if (req.moffset + req.len) > shm_size {
+                return Err(einval());
+            }
+            debug!("removemapping: addr={addr:x} len={}", req.len);
+
+            // Unmap the file view from the guest's DAX window
+            let ret = unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: addr as *mut _,
+                })
+            };
+            if ret == 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
 
         Ok(())
