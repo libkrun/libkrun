@@ -305,6 +305,7 @@ impl<W: ZeroCopyWriter> ZeroCopyWriter for &mut W {
 }
 
 /// Additional context associated with requests.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub struct Context {
     /// The user ID of the calling process.
@@ -315,6 +316,19 @@ pub struct Context {
 
     /// The thread group ID of the calling process.
     pub pid: libc::pid_t,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub struct Context {
+    /// The user ID of the calling process.
+    pub uid: u32,
+
+    /// The group ID of the calling process.
+    pub gid: u32,
+
+    /// The thread group ID of the calling process.
+    pub pid: i32,
 }
 
 impl From<fuse::InHeader> for Context {

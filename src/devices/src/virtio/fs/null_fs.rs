@@ -40,7 +40,11 @@ impl FileSystem for NullFs {
         if inode == fuse::ROOT_ID {
             let mut st: bindings::stat64 = unsafe { mem::zeroed() };
             st.st_ino = fuse::ROOT_ID;
-            st.st_mode = libc::S_IFDIR | 0o755;
+            #[cfg(not(target_os = "windows"))]
+            let ifdir = libc::S_IFDIR;
+            #[cfg(target_os = "windows")]
+            let ifdir = libc::S_IFDIR as u32;
+            st.st_mode = ifdir | 0o755;
             st.st_nlink = 2;
             st.st_blksize = VIRTUAL_BLKSIZE as _;
             return Ok((st, Duration::MAX));

@@ -29,6 +29,9 @@ use super::fuse::*;
 use super::{FsError as Error, Result};
 use crate::virtio::VirtioShmRegion;
 
+#[cfg(windows)]
+use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+
 const MAX_BUFFER_SIZE: u32 = 1 << 20;
 const BUFFER_HEADER_SIZE: u32 = 0x1000;
 const DIRENT_PADDING: [u8; 8] = [0; 8];
@@ -145,7 +148,7 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::CopyFileRange as u32 => self.copyfilerange(in_header, r, w),
             x if (x == Opcode::SetupMapping as u32) && shm_region.is_some() => {
                 let shm = shm_region.as_ref().unwrap();
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 let shm_base_addr = shm.host_addr;
                 #[cfg(target_os = "macos")]
                 let shm_base_addr = shm.guest_addr;
@@ -161,7 +164,7 @@ impl<F: FileSystem + Sync> Server<F> {
             }
             x if (x == Opcode::RemoveMapping as u32) && shm_region.is_some() => {
                 let shm = shm_region.as_ref().unwrap();
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 let shm_base_addr = shm.host_addr;
                 #[cfg(target_os = "macos")]
                 let shm_base_addr = shm.guest_addr;
@@ -905,7 +908,18 @@ impl<F: FileSystem + Sync> Server<F> {
         let flags_64 = ((flags2 as u64) << 32) | (flags as u64);
         let capable = FsOptions::from_bits_truncate(flags_64);
 
-        let page_size: u32 = unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() };
+        let page_size: u32 = {
+            #[cfg(unix)]
+            unsafe {
+                libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap()
+            }
+            #[cfg(windows)]
+            unsafe {
+                let mut info: SYSTEM_INFO = std::mem::zeroed();
+                GetSystemInfo(&mut info);
+                info.dwPageSize
+            }
+        };
         let max_pages = ((MAX_BUFFER_SIZE - 1) / page_size) + 1;
 
         match self.fs.init(capable) {

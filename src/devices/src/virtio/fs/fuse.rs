@@ -570,7 +570,12 @@ impl Attr {
         Attr {
             ino: st.st_ino,
             size: st.st_size as u64,
+            #[cfg(unix)]
             blocks: st.st_blocks as u64,
+            // Windows doesn't provide st_blocks. 
+            // A common fallback is calculating it based on 512-byte units.          
+            #[cfg(windows)]
+            blocks: ((st.st_size + 511) / 512) as u64,
             atime: st.st_atime as u64,
             mtime: st.st_mtime as u64,
             ctime: st.st_ctime as u64,
@@ -579,7 +584,7 @@ impl Attr {
             ctimensec: st.st_ctime_nsec as u32,
             #[cfg(target_os = "linux")]
             mode: st.st_mode,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             mode: st.st_mode as u32,
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             nlink: st.st_nlink as u32,
@@ -588,12 +593,16 @@ impl Attr {
                 any(target_arch = "aarch64", target_arch = "riscv64")
             ))]
             nlink: st.st_nlink,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             nlink: st.st_nlink as u32,
             uid: st.st_uid,
             gid: st.st_gid,
             rdev: st.st_rdev as u32,
+            #[cfg(unix)]
             blksize: st.st_blksize as u32,
+            #[cfg(windows)]
+            // Windows doesn't have a preferred block size in stat; 4096 is a safe default.
+            blksize: 4096,
             flags,
         }
     }
@@ -631,7 +640,7 @@ impl From<bindings::statvfs64> for Kstatfs {
         }
     }
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl From<bindings::statvfs64> for Kstatfs {
     fn from(st: bindings::statvfs64) -> Self {
         Kstatfs {

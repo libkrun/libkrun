@@ -4,10 +4,13 @@ use crossbeam_channel::Sender;
 use utils::worker_message::WorkerMessage;
 
 use std::io;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::thread;
+#[cfg(windows)]
+use utils::windows::AsRawFd;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
