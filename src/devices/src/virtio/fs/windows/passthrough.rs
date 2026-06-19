@@ -595,6 +595,50 @@ fn write_ads_by_handle(file_handle: HANDLE, stream_suffix: &str, data: &[u8]) ->
     }
 }
 
+/// Store a security context as an ADS named after `secctx.name`.
+/// When `symlink` is true, opens with `FILE_OPEN_REPARSE_POINT` so the
+/// ADS is placed on the symlink itself rather than following to the target.
+fn write_secctx(path: &Path, secctx: SecContext, symlink: bool) -> io::Result<()> {
+    let stream_name = format!(":{}", secctx.name.to_string_lossy());
+    let ads = ads_stream_path(path, &stream_name);
+
+    if symlink {
+        let h = open_handle(
+            &ads,
+            &OpenFlags {
+                desired_access: GENERIC_WRITE,
+                create_disposition: FILE_OVERWRITE_IF,
+                create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            },
+        )
+        .map_err(win_err_to_linux)?;
+
+        let mut iosb: IO_STATUS_BLOCK = unsafe { mem::zeroed() };
+        let status = unsafe {
+            NtWriteFile(
+                h,
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null(),
+                &mut iosb,
+                secctx.secctx.as_ptr() as *const core::ffi::c_void,
+                secctx.secctx.len() as u32,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        unsafe { CloseHandle(h) };
+
+        if status >= 0 {
+            Ok(())
+        } else {
+            Err(nt_status_to_io_error(status))
+        }
+    } else {
+        fs::write(&ads, &secctx.secctx).map_err(win_err_to_linux)
+    }
+}
+
 /// Clear suid/sgid bits from mode.
 /// sgid is cleared only if group executable bit is set.
 fn clear_suid_sgid(mode: u32) -> u32 {
@@ -1759,5 +1803,488 @@ impl FileSystem for PassthroughFs {
         }
 
         self.do_getattr(inode, handle)
+    }
+
+    fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
+        let data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+
+        let path = data.get_path();
+
+        let target = fs::read_link(&*path).map_err(win_err_to_linux)?;
+
+        // Convert Windows path formatting back to a Linux-friendly format.
+        // Windows symlinks use '\', but the FUSE Linux guest expects '/'
+        let unix_path = target.to_string_lossy().replace('\\', "/");
+        let mut buf = unix_path.into_bytes();
+
+        // Cap to PATH_MAX (4096) to match Linux parity exactly.
+        // While Windows NT paths can be 32k, FUSE/Linux expects a max of 4096 bytes.
+        buf.truncate(4096);
+
+        Ok(buf)
+    }
+
+    /*
+     * Current implementation relies on standard Windows symlink APIs,
+     * which enforce host-side path validation.
+     *
+     * The Limitation is that absolute paths from the guest (e.g., "/etc/passwd") are treated as drive-relative
+     * on Windows, causing `symlink_file` to fail with EINVAL.
+     *
+     * TODO:
+     * To support true absolute guest symlinks, we need to bypass the Win32 API
+     * and manually set an IO_REPARSE_TAG_LX_SYMLINK reparse point using
+     * DeviceIoControl. This will allow storing arbitrary Linux-style paths
+     * without host-side resolution.
+     */
+    fn symlink(
+        &self,
+        ctx: Context,
+        linkname: &CStr,
+        parent: Inode,
+        name: &CStr,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        // Colon is used to define a stream name in the ADS, so we need to prevent it from being used in the filename
+        if name.to_bytes().contains(&b':') {
+            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
+        }
+
+        let parent_path = self.inode_path(parent)?;
+        let link_path = parent_path.join(cstr_to_path(name));
+        let target = cstr_to_path(linkname);
+
+        // Windows requires knowing if a symlink target is a file or a directory.
+        // FUSE doesn't provide this distinction upfront, so we try file first,
+        // and safely fall back to directory if it fails.
+        std::os::windows::fs::symlink_file(&target, &link_path)
+            .or_else(|_| std::os::windows::fs::symlink_dir(&target, &link_path))
+            .map_err(win_err_to_linux)?;
+
+        if let Some(secctx) = extensions.secctx {
+            write_secctx(&link_path, secctx, true)?;
+        }
+
+        write_override_stat(
+            &link_path,
+            Some((ctx.uid, ctx.gid)),
+            Some(S_IFLNK as u32 | 0o777),
+        )?;
+
+        self.do_lookup(parent, name)
+    }
+
+    fn mknod(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        mode: u32,
+        _rdev: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        // Colon is used to define a stream name in the ADS, so we need to prevent it from being used in the filename
+        if name.to_bytes().contains(&b':') {
+            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
+        }
+
+        let parent_data = self.inode_data(parent)?;
+        let root_h = *self.root_handle.read().unwrap();
+
+        // Open parent directory securely (matching Linux mknodat's dirfd behavior)
+        let parent_g = HandleGuard(
+            open_by_id(
+                root_h,
+                parent_data.file_index,
+                &OpenFlags {
+                    desired_access: GENERIC_READ,
+                    create_disposition: FILE_OPEN,
+                    create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_DIRECTORY_FILE,
+                },
+            )
+            .map_err(win_err_to_linux)?,
+        );
+
+        // Create the child file/node case-sensitively via NtCreateFile
+        let child_g = HandleGuard(
+            open_relative(
+                parent_g.as_raw(),
+                name,
+                &OpenFlags {
+                    desired_access: GENERIC_READ | GENERIC_WRITE,
+                    create_disposition: FILE_CREATE,
+                    // Ensure FILE_DIRECTORY_FILE is NOT set, as mknod creates files/device nodes
+                    create_options: FILE_SYNCHRONOUS_IO_NONALERT,
+                },
+            )
+            .map_err(win_err_to_linux)?,
+        );
+
+        // Write security context via the active handle
+        if let Some(secctx) = extensions.secctx {
+            let stream_name = format!(":{}", secctx.name.to_string_lossy());
+            write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
+        }
+
+        // Write ownership and mode to ADS via the active handle
+        // Note: The `mode` parameter naturally contains the file type bits
+        // (S_IFIFO, S_IFCHR, S_IFSOCK, etc.) which will be persisted here.
+        let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, mode & !umask);
+        write_ads_by_handle(child_g.as_raw(), OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
+
+        self.do_lookup(parent, name)
+    }
+
+    // There is one minor edge-case to be aware of
+    // Windows explicitly blocks DELETE access on files marked with the Windows READONLY attribute, returning an Access Denied error
+    // Linux does not care if the file itself is read-only; Linux unlink succeeds as long as the parent directory has write permissions
+    // This means that a Linux guest attempting to unlink a readonly file will fail with Access Denied, even if the parent directory is writable
+    fn unlink(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        let parent_data = self.inode_data(parent)?;
+        let root_h = *self.root_handle.read().unwrap();
+        let parent_g = HandleGuard(
+            open_by_id(
+                root_h,
+                parent_data.file_index,
+                &OpenFlags {
+                    desired_access: GENERIC_READ,
+                    create_disposition: FILE_OPEN,
+                    create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_DIRECTORY_FILE,
+                },
+            )
+            .map_err(win_err_to_linux)?,
+        );
+
+        let child_g = HandleGuard(
+            open_relative(
+                parent_g.as_raw(),
+                name,
+                &OpenFlags {
+                    desired_access: DELETE,
+                    create_disposition: FILE_OPEN,
+                    create_options: FILE_SYNCHRONOUS_IO_NONALERT
+                        | FILE_OPEN_REPARSE_POINT
+                        | FILE_NON_DIRECTORY_FILE,
+                },
+            )
+            .map_err(win_err_to_linux)?,
+        );
+
+        set_delete_disposition(child_g.as_raw()).map_err(win_err_to_linux)
+    }
+
+    fn rename(
+        &self,
+        _ctx: Context,
+        olddir: Inode,
+        oldname: &CStr,
+        newdir: Inode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        let old_path = self.inode_path(olddir)?.join(cstr_to_path(oldname));
+        let new_path = self.inode_path(newdir)?.join(cstr_to_path(newname));
+
+        // RENAME_EXCHANGE (Swap two files)
+        if (flags as i32 & LINUX_RENAME_EXCHANGE) != 0 {
+            // Atomic exchange is not natively supported by the base Win32 API without TxF;
+            // emulate via a temporary file exchange sequence.
+            let tmp = new_path.with_extension(".__exchange_tmp__");
+            fs::rename(&new_path, &tmp).map_err(win_err_to_linux)?;
+            if let Err(e) = fs::rename(&old_path, &new_path) {
+                let _ = fs::rename(&tmp, &new_path); // Rollback
+                return Err(win_err_to_linux(e));
+            }
+            fs::rename(&tmp, &old_path).map_err(win_err_to_linux)?;
+            return Ok(());
+        }
+
+        // RENAME_NOREPLACE (Strictly do not overwrite)
+        if (flags as i32 & LINUX_RENAME_NOREPLACE) != 0 {
+            use windows_sys::Win32::Storage::FileSystem::MoveFileW;
+
+            let old_wide = path_to_wide(&old_path);
+            let new_wide = path_to_wide(&new_path);
+
+            // MoveFileW inherently fails atomically if the target exists
+            let res = unsafe { MoveFileW(old_wide.as_ptr(), new_wide.as_ptr()) };
+            if res == 0 {
+                return Err(win_err_to_linux(io::Error::last_os_error()));
+            }
+            return Ok(());
+        }
+
+        fs::rename(&old_path, &new_path).map_err(win_err_to_linux)
+    }
+
+    fn link(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        newparent: Inode,
+        newname: &CStr,
+    ) -> io::Result<Entry> {
+        let existing = self.inode_path(inode)?;
+        let new_path = self.inode_path(newparent)?.join(cstr_to_path(newname));
+
+        // Note: fs::hard_link wraps CreateHardLinkW. If the target already exists,
+        // it fails with an error that win_err_to_linux perfectly maps to EEXIST.
+        // Because NTFS shares MFT records for hard links, the existing ADS
+        // permissions are natively shared with the new link!
+        fs::hard_link(&*existing, &new_path).map_err(win_err_to_linux)?;
+        self.do_lookup(newparent, newname)
+    }
+
+    fn open(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        kill_priv: bool,
+        flags: u32,
+    ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        self.do_open(inode, kill_priv, flags)
+    }
+
+    fn release(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        _flags: u32,
+        handle: Handle,
+        _flush: bool,
+        _flock_release: bool,
+        _lock_owner: Option<u64>,
+    ) -> io::Result<()> {
+        self.do_release(inode, handle)
+    }
+
+    fn create(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        mode: u32,
+        kill_priv: bool,
+        flags: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
+        // Colon is used to define a stream name in the ADS, so we need to prevent it from being used in the filename
+        if name.to_bytes().contains(&b':') {
+            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
+        }
+
+        let parent_path = self.inode_path(parent)?;
+        let child_path = parent_path.join(cstr_to_path(name));
+
+        let wb = self.writeback.load(Ordering::Relaxed);
+        let oflags = parse_linux_open_flags(flags as i32 | LINUX_O_CREAT, wb);
+        let h = open_handle(&child_path, &oflags).map_err(win_err_to_linux)?;
+
+        if let Some(secctx) = extensions.secctx {
+            let stream_name = format!(":{}", secctx.name.to_string_lossy());
+            if let Err(e) = write_ads_by_handle(h, &stream_name, &secctx.secctx) {
+                unsafe { CloseHandle(h) };
+                return Err(e);
+            }
+        }
+
+        // Write the ownership and mode using the open handle directly
+        let stat_str = format!(
+            "{}:{}:0{:o}",
+            ctx.uid,
+            ctx.gid,
+            S_IFREG as u32 | (mode & !(umask & 0o777))
+        );
+        if let Err(e) = write_ads_by_handle(h, OVERRIDE_STAT_STREAM, stat_str.as_bytes()) {
+            unsafe { CloseHandle(h) };
+            return Err(e);
+        }
+
+        // If O_TRUNC and kill_priv are set, strip capabilities
+        if (flags as i32 & LINUX_O_TRUNC) != 0 && kill_priv {
+            remove_security_capability(&child_path);
+        }
+
+        let entry = match self.do_lookup(parent, name) {
+            Ok(e) => e,
+            Err(e) => {
+                unsafe { CloseHandle(h) };
+                return Err(e);
+            }
+        };
+
+        let mut opts = OpenOptions::empty();
+        match self.cfg.cache_policy {
+            CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
+            CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
+            _ => {}
+        }
+
+        Ok((entry, Some(h as u64), opts))
+    }
+
+    fn read<W: io::Write + ZeroCopyWriter>(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        mut w: W,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _flags: u32,
+    ) -> io::Result<usize> {
+        debug!("read: {inode:?}");
+
+        let file = self
+            .reopen_inode(inode, handle, GENERIC_READ)
+            .map_err(win_err_to_linux)?;
+        w.write_from(&file, size as usize, offset)
+    }
+
+    fn write<R: io::Read + ZeroCopyReader>(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        mut r: R,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
+        kill_priv: bool,
+        _flags: u32,
+    ) -> io::Result<usize> {
+        // POSIX Compliance: Writing to a Read-Only FD should return EBADF
+        if is_handle_read_only(handle) {
+            return Err(ebadf());
+        }
+
+        let result = {
+            let file = self
+                .reopen_inode(inode, handle, GENERIC_READ | GENERIC_WRITE)
+                .map_err(win_err_to_linux)?;
+            r.read_to(&file, size as usize, offset)
+        };
+
+        // Only process kill_priv if the write was successful, and log any errors
+        if result.is_ok() && kill_priv {
+            let path = self.inode_path(inode)?;
+            remove_security_capability(&path);
+
+            if let Ok((_, _, Some(mode))) = read_override_stat(&path) {
+                let new_mode = clear_suid_sgid(mode);
+                if new_mode != mode {
+                    // Update mode in xattr (ADS)
+                    if let Err(err) = write_override_stat(&path, None, Some(new_mode)) {
+                        error!("Couldn't clear suid/sgid for inode {inode}: {err}");
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    fn flush(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        _lock_owner: u64,
+    ) -> io::Result<()> {
+        // On Windows, to perform a flush we need to have a file handle with write access.
+        // If the file has been open as read-only, there is nothing to flush
+        if is_handle_read_only(handle) {
+            return Ok(());
+        }
+
+        let file = self.reopen_inode(inode, handle, GENERIC_READ | GENERIC_WRITE)?;
+
+        file.sync_all().map_err(win_err_to_linux)
+    }
+
+    fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
+        if is_handle_read_only(handle) {
+            // A read-only handle has no pending write buffers, so fsync is a no-op!
+            return Ok(());
+        }
+
+        let file = self
+            .reopen_inode(inode, handle, GENERIC_READ | GENERIC_WRITE)
+            .map_err(win_err_to_linux)?;
+
+        // Respect the datasync flag just like Linux fdatasync vs fsync
+        if datasync {
+            file.sync_data().map_err(win_err_to_linux)
+        } else {
+            file.sync_all().map_err(win_err_to_linux)
+        }
+    }
+
+    fn fsyncdir(
+        &self,
+        ctx: Context,
+        inode: Inode,
+        datasync: bool,
+        handle: Handle,
+    ) -> io::Result<()> {
+        self.fsync(ctx, inode, datasync, handle)
+    }
+
+    fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
+        // POSIX access mode constants (since Windows libc doesn't define them)
+        const F_OK: u32 = 0;
+        const X_OK: u32 = 1;
+        const W_OK: u32 = 2;
+        const R_OK: u32 = 4;
+
+        // Get the emulated POSIX stats from the ADS override stream
+        let (st, _) = self.do_getattr(inode, None)?;
+
+        let mode = mask & (R_OK | W_OK | X_OK);
+
+        if mode == F_OK {
+            // The file exists since we were able to call `do_getattr` on it.
+            return Ok(());
+        }
+
+        // Emulate Linux's POSIX access checks based on Context UID/GID
+        if (mode & R_OK) != 0
+            && ctx.uid != 0
+            && (st.st_uid != ctx.uid || st.st_mode & 0o400 == 0)
+            && (st.st_gid != ctx.gid || st.st_mode & 0o040 == 0)
+            && st.st_mode & 0o004 == 0
+        {
+            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES)));
+        }
+
+        if (mode & W_OK) != 0
+            && ctx.uid != 0
+            && (st.st_uid != ctx.uid || st.st_mode & 0o200 == 0)
+            && (st.st_gid != ctx.gid || st.st_mode & 0o020 == 0)
+            && st.st_mode & 0o002 == 0
+        {
+            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES)));
+        }
+
+        if (mode & X_OK) != 0
+            && (ctx.uid != 0 || st.st_mode & 0o111 == 0)
+            && (st.st_uid != ctx.uid || st.st_mode & 0o100 == 0)
+            && (st.st_gid != ctx.gid || st.st_mode & 0o010 == 0)
+            && st.st_mode & 0o001 == 0
+        {
+            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES)));
+        }
+
+        Ok(())
     }
 }
