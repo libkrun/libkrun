@@ -64,17 +64,36 @@ fn pop_head_blocking<'mem>(
     stop: &AtomicBool,
 ) -> Option<DescriptorChain<'mem>> {
     loop {
-        match queue.pop(mem) {
-            Some(descriptor) => break Some(descriptor),
-            None => {
-                interrupt.signal_used_queue();
-                if stop.load(Ordering::Acquire) {
-                    break None;
-                }
-                thread::park();
-                log::trace!("tx unparked, queue len {}", queue.len(mem))
-            }
+        // Suppress guest notifications while draining to avoid a TOCTOU race:
+        // without suppression, the guest could add a descriptor and send a
+        // notification between queue.pop() returning None and thread::park(),
+        // and the notification would be lost if the TX thread is stopping.
+        queue.disable_notification(mem).unwrap_or_default();
+
+        // Pop one descriptor if available.
+        if let Some(descriptor) = queue.pop(mem) {
+            return Some(descriptor);
         }
+
+        // Re-enable notifications. enable_notification re-reads avail_idx with
+        // a SeqCst fence; if new entries arrived while we had notifications
+        // suppressed, it returns Ok(true) and we must drain again.  On Err,
+        // treat conservatively as if new entries may have arrived (notifications
+        // may not be fully armed), so also retry the drain.
+        if !matches!(queue.enable_notification(mem), Ok(false)) {
+            continue;
+        }
+
+        // Queue is confirmed empty and notifications are armed.  Check stop
+        // only after the drain+fence: if stop was set while the guest was
+        // writing its final bytes, we still flush them before returning None.
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+
+        interrupt.signal_used_queue();
+        thread::park();
+        log::trace!("tx unparked, queue len {}", queue.len(mem));
     }
 }
 
