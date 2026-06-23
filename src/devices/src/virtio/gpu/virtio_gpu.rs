@@ -905,7 +905,14 @@ impl VirtioGpu {
         let map_ptr = self.rutabaga.map_ptr(resource_id).map_err(|_| ErrUnspec)?;
 
         if let Ok(export) = self.rutabaga.export_blob(resource_id) {
-            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE {
+            debug!(
+                "resource_map_blob: export handle_type={} map_ptr={:x}",
+                export.handle_type, map_ptr
+            );
+
+            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE
+                || export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM
+            {
                 if offset + resource.size > shm_region.size as u64 {
                     error!("mapping DOES NOT FIT");
                     return Err(ErrUnspec);
