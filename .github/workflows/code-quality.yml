@@ -4,7 +4,7 @@ on: [pull_request]
 jobs:
   code-quality-linux-x86_64:
     name: libkrun (Linux x86_64)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       
@@ -28,7 +28,7 @@ jobs:
 
   code-quality-linux-aarch64:
     name: libkrun (Linux aarch64)
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
     steps:
       - uses: actions/checkout@v4
       
@@ -67,10 +67,10 @@ jobs:
       matrix:
         include:
           - name: "Examples (Linux x86_64)"
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
           
           - name: "Examples (Linux aarch64)"
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -78,83 +78,11 @@ jobs:
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
       
-      - name: Cache GLib 2.82 + GTK 4.16 build
-        uses: actions/cache@v4
-        id: gtk-cache
-        with:
-          path: ~/gtk-prefix
-          key: ${{ runner.os }}-${{ runner.arch }}-gtk-4.16.0
-      
       - name: Install GTK system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -yqq --no-install-recommends \
-            libffi-dev \
-            libmount-dev \
-            libpcre2-dev \
-            zlib1g-dev \
-            libcairo2-dev \
-            libpango1.0-dev \
-            libgdk-pixbuf-2.0-dev \
-            libgraphene-1.0-dev \
-            libepoxy-dev \
-            libxkbcommon-dev \
-            wayland-protocols \
-            libwayland-dev
-      
-      - name: Add GLib + GTK paths to environment
-        run: |
-          case "$(uname -m)" in
-            x86_64)
-              GTK_PKG_CONFIG_PATH="$HOME/gtk-prefix/lib/x86_64-linux-gnu/pkgconfig"
-              GTK_LIB_PATH="$HOME/gtk-prefix/lib/x86_64-linux-gnu" ;;
-            aarch64)
-              GTK_PKG_CONFIG_PATH="$HOME/gtk-prefix/lib/aarch64-linux-gnu/pkgconfig"
-              GTK_LIB_PATH="$HOME/gtk-prefix/lib/aarch64-linux-gnu" ;;
-            *)
-              echo "ERROR: Unsupported architecture: $(uname -m)"
-              exit 1 ;;
-          esac
-          
-          echo "PKG_CONFIG_PATH=$GTK_PKG_CONFIG_PATH:$PKG_CONFIG_PATH" >> $GITHUB_ENV
-          echo "LD_LIBRARY_PATH=$GTK_LIB_PATH:$LD_LIBRARY_PATH" >> $GITHUB_ENV
-
-      - name: Build and install GTK 4.16 from source
-        if: steps.gtk-cache.outputs.cache-hit != 'true'
-        run: |
-          # Install build-only dependencies  
-          sudo apt-get install -yqq --no-install-recommends \
-            build-essential \
-            meson \
-            ninja-build
-          
-          
-          # Build GLib first
-          cd /tmp
-          curl -L -o glib-2.82.2.tar.xz https://download.gnome.org/sources/glib/2.82/glib-2.82.2.tar.xz
-          tar -xf glib-2.82.2.tar.xz
-          cd glib-2.82.2
-          meson setup builddir --prefix=$HOME/gtk-prefix --buildtype=release
-          meson compile -C builddir
-          meson install -C builddir
-          
-          # Build GTK
-          cd /tmp
-          curl -L -o gtk-4.16.0.tar.xz https://download.gnome.org/sources/gtk/4.16/gtk-4.16.0.tar.xz
-          tar -xf gtk-4.16.0.tar.xz
-          cd gtk-4.16.0
-          meson setup builddir --prefix=$HOME/gtk-prefix --buildtype=release \
-            -Dmedia-gstreamer=disabled \
-            -Dintrospection=disabled \
-            -Dx11-backend=false \
-            -Dprint-cups=disabled \
-            -Dcloudproviders=disabled \
-            -Dtracker=disabled \
-            -Dcolord=disabled \
-            -Dsysprof=disabled \
-            -Dvulkan=disabled
-          meson compile -C builddir
-          meson install -C builddir
+            libgtk-4-dev
       
       - name: Build and install libkrun to local prefix
         run: |
