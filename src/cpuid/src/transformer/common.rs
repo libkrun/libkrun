@@ -38,6 +38,8 @@ pub fn update_feature_info_entry(
     // X86 hypervisor feature
     entry.ecx.write_bit(ecx::HYPERVISOR_BITINDEX, true);
 
+    entry.ecx.write_bit(ecx::TSC_DEADLINE_TIMER_BITINDEX, true);
+
     entry
         .ebx
         .write_bits_in_range(&ebx::APICID_BITRANGE, u32::from(vm_spec.cpu_id))
@@ -165,7 +167,8 @@ mod tests {
 
         assert!(update_feature_info_entry(&mut entry, &vm_spec).is_ok());
 
-        assert!(entry.edx.read_bit(edx::HTT_BITINDEX) == expected_htt)
+        assert!(entry.edx.read_bit(edx::HTT_BITINDEX) == expected_htt);
+        assert!(entry.ecx.read_bit(ecx::TSC_DEADLINE_TIMER_BITINDEX));
     }
 
     fn check_update_cache_parameters_entry(
