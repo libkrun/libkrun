@@ -10,6 +10,50 @@ mod fs;
 #[cfg(feature = "timesync")]
 mod timesync;
 
+/// Ensure init has open stdin/stdout/stderr.
+///
+/// The kernel hands init closed fds 0/1/2 when the console (hvc0) is not yet
+/// registered as it execs init, and Rust std's sanitize_standard_fds() aborts on
+/// that before main() runs. Open them first (the console, else /dev/null);
+/// setup_redirects() rewires them to the krun ports later.
+#[cfg(target_os = "linux")]
+extern "C" fn ensure_stdio() {
+    use nix::fcntl::{self, OFlag};
+    use nix::mount::{self, MsFlags};
+    use nix::sys::stat::Mode;
+    use nix::unistd;
+    use std::os::fd::AsRawFd;
+
+    if unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFD) } >= 0 {
+        return;
+    }
+    let _ = std::fs::create_dir_all("/dev");
+    let _ = mount::mount(
+        Some("devtmpfs"),
+        "/dev",
+        Some("devtmpfs"),
+        MsFlags::empty(),
+        None::<&str>,
+    );
+
+    let Ok(fd) = fcntl::open(c"/dev/console", OFlag::O_RDWR, Mode::empty())
+        .or_else(|_| fcntl::open(c"/dev/null", OFlag::O_RDWR, Mode::empty()))
+    else {
+        return;
+    };
+    let _ = unistd::dup2_stdin(&fd);
+    let _ = unistd::dup2_stdout(&fd);
+    let _ = unistd::dup2_stderr(&fd);
+    if fd.as_raw_fd() <= libc::STDERR_FILENO {
+        // fd is a stdio slot that dup2 just wrote to — don't close it.
+        std::mem::forget(fd);
+    }
+}
+#[cfg(target_os = "linux")]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static ENSURE_STDIO_CTOR: extern "C" fn() = ensure_stdio;
+
 fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "freebsd")]
     freebsd::open_console();
