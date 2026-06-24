@@ -2,23 +2,48 @@ use macros::{guest, host};
 
 pub struct TestVirtioFsMisc;
 
+/// Name of the file created on the host before VM boot, used by the
+/// uid_gid_mapping_preexisting guest subtest.
+const HOST_OWNED_FILE: &str = "host_owned_file";
+
 #[host]
 mod host {
     use super::*;
 
-    use crate::common::setup_fs_and_enter;
+    use crate::common::setup_fs_and_enter_with_env;
     use crate::{krun_call, krun_call_u32};
     use crate::{Test, TestOutcome, TestSetup};
     use krun_sys::*;
     use std::io::Read;
+    use std::os::fd::AsRawFd;
 
     impl Test for TestVirtioFsMisc {
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            // Create a host-owned file in the rootfs before entering the VM.
+            // Inside the guest it must appear as root-owned: on Linux via user
+            // namespace mapping, on macOS via the EUID→0 mapping (PR #734).
+            let root_dir = test_setup.tmp_dir.join("rootfs");
+            std::fs::create_dir_all(&root_dir)?;
+            std::fs::write(root_dir.join(HOST_OWNED_FILE), b"host-data")?;
+
             unsafe {
                 krun_call!(krun_set_log_level(KRUN_LOG_LEVEL_TRACE))?;
                 let ctx = krun_call_u32!(krun_create_ctx())?;
                 krun_call!(krun_set_vm_config(ctx, 1, 1024))?;
-                setup_fs_and_enter(ctx, test_setup)?;
+                krun_call!(krun_add_virtio_console_default(
+                    ctx,
+                    std::io::stdin().as_raw_fd(),
+                    std::io::stdout().as_raw_fd(),
+                    std::io::stderr().as_raw_fd(),
+                ))?;
+
+                // Forward KRUN_NO_UNSHARE to the guest so UID/GID mapping
+                // subtests can skip themselves when no user namespace is active.
+                let mut guest_env: Vec<&std::ffi::CStr> = Vec::new();
+                if std::env::var_os("KRUN_NO_UNSHARE").is_some() {
+                    guest_env.push(c"KRUN_NO_UNSHARE=1");
+                }
+                setup_fs_and_enter_with_env(ctx, test_setup, &guest_env)?;
             }
             Ok(())
         }
@@ -81,6 +106,7 @@ mod guest {
 
     use nix::fcntl::{fallocate, FallocateFlags};
     use nix::libc;
+    use nix::unistd::{chown, Gid, Uid};
 
     fn run_subtests(tests: &[(&str, fn())]) {
         let mut failed = Vec::new();
@@ -525,6 +551,82 @@ mod guest {
         .expect("fchmod on open fd after rename failed - PR #700 regression!");
     }
 
+    /// Verify that pre-existing host files appear as owned by root inside the
+    /// guest.  Requires UID mapping (user namespace on Linux, always on macOS).
+    fn test_uid_gid_mapping_preexisting_files() {
+        if std::env::var_os("KRUN_NO_UNSHARE").is_some() {
+            eprintln!("SKIP: uid_gid_mapping_preexisting (no user namespace)");
+            return;
+        }
+
+        let path = format!("/{HOST_OWNED_FILE}");
+        let meta = fs::metadata(&path).unwrap_or_else(|e| panic!("stat {path}: {e}"));
+        assert_eq!(
+            meta.uid(),
+            0,
+            "{path} uid should be 0 (root), got {}",
+            meta.uid()
+        );
+        assert_eq!(
+            meta.gid(),
+            0,
+            "{path} gid should be 0 (root), got {}",
+            meta.gid()
+        );
+    }
+
+    /// Verify that a UID/GID change is reflected in subsequent stat.
+    /// Requires UID mapping (user namespace on Linux, always on macOS).
+    fn test_uid_gid_mapping_chown() {
+        if std::env::var_os("KRUN_NO_UNSHARE").is_some() {
+            eprintln!("SKIP: uid_gid_mapping_chown (no user namespace)");
+            return;
+        }
+
+        let path = "/test_uid_chown";
+        fs::write(path, b"data").expect("write");
+
+        // Newly created file starts as root-owned.
+        let meta = fs::metadata(path).expect("stat before chown");
+        assert_eq!(meta.uid(), 0, "initial uid should be 0");
+        assert_eq!(meta.gid(), 0, "initial gid should be 0");
+
+        // Change to uid=1000, gid=1000.
+        chown(path, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000)))
+            .expect("chown(1000,1000)");
+
+        let meta = fs::metadata(path).expect("stat after chown");
+        assert_eq!(
+            meta.uid(),
+            1000,
+            "uid after chown should be 1000, got {}",
+            meta.uid()
+        );
+        assert_eq!(
+            meta.gid(),
+            1000,
+            "gid after chown should be 1000, got {}",
+            meta.gid()
+        );
+
+        // Change back to root.
+        chown(path, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).expect("chown(0,0)");
+
+        let meta = fs::metadata(path).expect("stat after chown back to root");
+        assert_eq!(
+            meta.uid(),
+            0,
+            "uid after chown back should be 0, got {}",
+            meta.uid()
+        );
+        assert_eq!(
+            meta.gid(),
+            0,
+            "gid after chown back should be 0, got {}",
+            meta.gid()
+        );
+    }
+
     /// Test that creating files mid-iteration does not cause duplicates.
     ///
     /// POSIX says readdir behavior is unspecified when the directory is modified
@@ -650,6 +752,11 @@ mod guest {
                     "dirstream_no_duplicates_mid_iter",
                     test_dirstream_no_duplicates_on_mid_iteration_create,
                 ),
+                (
+                    "uid_gid_mapping_preexisting",
+                    test_uid_gid_mapping_preexisting_files,
+                ),
+                ("uid_gid_mapping_chown", test_uid_gid_mapping_chown),
             ]);
         }
     }
