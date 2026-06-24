@@ -1,6 +1,6 @@
 [package]
 name = "krun-kernel"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 edition = "2021"
 description = "Kernel loading support for libkrun"
 license = "Apache-2.0"
@@ -9,4 +9,4 @@ repository = "https://github.com/containers/libkrun"
 [dependencies]
 vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
 
-utils = { package = "krun-utils", version = "=0.1.0-1.19.1", path = "../utils" }
+utils = { package = "krun-utils", version = "=0.1.0-1.19.2", path = "../utils" }

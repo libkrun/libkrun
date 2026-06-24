@@ -1,6 +1,6 @@
 [package]
 name = "krun-smbios"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 edition = "2021"
 description = "SMBIOS table generation for libkrun"
 license = "Apache-2.0"

@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "krun-arch"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 dependencies = [
  "krun-arch-gen",
  "krun-smbios",
@@ -608,11 +608,11 @@ dependencies = [
 
 [[package]]
 name = "krun-arch-gen"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 
 [[package]]
 name = "krun-aws-nitro"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 dependencies = [
  "krun-devices",
  "libc",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "krun-cpuid"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "krun-devices"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 dependencies = [
  "bitflags 1.3.2",
  "caps",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "krun-hvf"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 dependencies = [
  "crossbeam-channel",
  "krun-arch",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "krun-init-blob"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 
 [[package]]
 name = "krun-input"
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "krun-kernel"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 dependencies = [
  "krun-utils",
  "vm-memory",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "krun-polly"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 dependencies = [
  "krun-utils",
  "libc",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "krun-rutabaga-gfx"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 dependencies = [
  "anyhow",
  "cfg-if",
@@ -736,14 +736,14 @@ dependencies = [
 
 [[package]]
 name = "krun-smbios"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 dependencies = [
  "vm-memory",
 ]
 
 [[package]]
 name = "krun-utils"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 dependencies = [
  "bitflags 1.3.2",
  "crossbeam-channel",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "krun-vmm"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 dependencies = [
  "bitfield",
  "bitflags 2.11.0",
@@ -818,7 +818,7 @@ checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
 name = "libkrun"
-version = "1.19.1"
+version = "1.19.2"
 dependencies = [
  "crossbeam-channel",
  "env_logger",

@@ -1,6 +1,6 @@
 [package]
 name = "krun-utils"
-version = "0.1.0-1.19.1"
+version = "0.1.0-1.19.2"
 authors = ["The libkrun Authors"]
 edition = "2021"
 description = "Utility helpers for libkrun"
