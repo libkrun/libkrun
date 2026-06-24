@@ -11,6 +11,7 @@ mod fs;
 mod timesync;
 
 fn main() -> anyhow::Result<()> {
+    println!("check1");
     #[cfg(target_os = "freebsd")]
     freebsd::open_console();
 
@@ -20,6 +21,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(any(feature = "amd-sev", feature = "tdx"))]
     fs::mount_tee_block_device()?;
 
+    println!("check2");
     #[cfg(target_os = "linux")]
     {
         fs::mount_filesystems()?;
@@ -27,27 +29,33 @@ fn main() -> anyhow::Result<()> {
         fs::mount_shared_root()?;
     }
 
+    println!("check3");
     let _ = nix::unistd::setsid();
     unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 1i32) };
 
+    println!("check4");
     #[cfg(target_os = "freebsd")]
     unsafe {
         libc::setlogin(c"root".as_ptr())
     };
 
+    println!("check5");
     env::setup_network(
         #[cfg(target_os = "linux")]
         "eth0",
     );
 
+    println!("check6");
     #[cfg(target_os = "linux")]
     if env::tsi_enabled() {
         env::enable_dummy_interface();
     }
 
+    println!("check7");
     #[cfg(target_os = "freebsd")]
     let iso_mounted = std::env::var("KRUN_CONFIG").is_err() && freebsd::mount_config_iso();
 
+    println!("check8");
     #[cfg(target_os = "linux")]
     let cfg = config::load(fs::is_mount_point);
     #[cfg(not(target_os = "linux"))]
@@ -62,11 +70,13 @@ fn main() -> anyhow::Result<()> {
     if let Some(ref path) = cfg.tmpfs {
         fs::mount_tmpfs(path)?;
     }
+    println!("check9");
 
     env::apply_env();
     env::apply_hostname();
     env::apply_rlimits();
 
+    println!("check10");
     if let Some(workdir) = std::env::var("KRUN_WORKDIR").ok().or(cfg.workdir)
         && let Err(e) = nix::unistd::chdir(workdir.as_str())
     {
@@ -74,6 +84,7 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(125);
     }
 
+    println!("check11");
     // The kernel places everything after `--` in the cmdline as this
     // process's argv[1..].  The C init built exec_argv by replacing argv[0]
     // with KRUN_INIT (or /bin/sh) and keeping argv[1..] in every branch.
@@ -103,9 +114,11 @@ fn main() -> anyhow::Result<()> {
     } else {
         vec!["/bin/sh".to_string()]
     };
+    println!("check12");
 
     #[cfg(feature = "timesync")]
     timesync::run();
 
+    println!("check13");
     exec::run_workload(&argv);
 }
