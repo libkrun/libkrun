@@ -1,6 +1,6 @@
 [package]
 name = "krun-hvf"
-version = "0.1.0-1.19.0"
+version = "0.1.0-1.19.1"
 authors = ["The libkrun Authors"]
 edition = "2021"
 description = "Apple Hypervisor.framework backend for libkrun"
@@ -12,4 +12,4 @@ crossbeam-channel = ">=0.5.15"
 libloading = "0.8"
 log = "0.4.0"
 
-arch = { package = "krun-arch", version = "=0.1.0-1.19.0", path = "../arch" }
+arch = { package = "krun-arch", version = "=0.1.0-1.19.1", path = "../arch" }
