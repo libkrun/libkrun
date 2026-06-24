@@ -21,6 +21,8 @@ pub mod resources;
 /// Signal handling utilities.
 #[cfg(target_os = "linux")]
 pub mod signal_handler;
+/// VM snapshot/restore seam (M0 skeleton).
+pub mod snapshot;
 /// Wrappers over structures used to configure the VMM.
 pub mod vmm_config;
 
