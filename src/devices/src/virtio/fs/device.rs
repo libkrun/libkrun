@@ -22,6 +22,7 @@ use super::virtual_entry::VirtualDirEntry;
 use super::worker::FsWorker;
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
+use crate::virtio::passthrough::PermissionSemantics;
 
 #[derive(Copy, Clone)]
 #[repr(C, packed)]
@@ -46,6 +47,7 @@ pub struct Fs {
     acked_features: u64,
     device_state: DeviceState,
     config: VirtioFsConfig,
+    allow_idmap: bool,
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: Option<passthrough::Config>,
     read_only: bool,
@@ -60,6 +62,7 @@ pub struct Fs {
 impl Fs {
     pub fn new(
         fs_id: String,
+        semantics: PermissionSemantics,
         shared_dir: Option<String>,
         exit_code: Arc<AtomicI32>,
         read_only: bool,
@@ -74,14 +77,18 @@ impl Fs {
 
         let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
             root_dir,
+            semantics,
             ..Default::default()
         });
+
+        let allow_idmap = matches!(semantics, PermissionSemantics::LinuxComplete);
 
         Ok(Fs {
             avail_features,
             acked_features: 0,
             device_state: DeviceState::Inactive,
             config,
+            allow_idmap,
             shm_region: None,
             passthrough_cfg: fs_cfg,
             read_only,
@@ -194,6 +201,7 @@ impl VirtioDevice for Fs {
             queue_evts,
             interrupt.clone(),
             mem.clone(),
+            self.allow_idmap,
             self.shm_region.clone(),
             self.passthrough_cfg.clone(),
             self.read_only,

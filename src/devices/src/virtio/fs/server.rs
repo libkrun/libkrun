@@ -86,6 +86,7 @@ impl<F: FileSystem + Sync> Server<F> {
         &self,
         mut r: Reader,
         w: Writer,
+        allow_idmap: bool,
         shm_region: &Option<VirtioShmRegion>,
         exit_code: &Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
@@ -124,7 +125,7 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::Listxattr as u32 => self.listxattr(in_header, r, w),
             x if x == Opcode::Removexattr as u32 => self.removexattr(in_header, r, w),
             x if x == Opcode::Flush as u32 => self.flush(in_header, r, w),
-            x if x == Opcode::Init as u32 => self.init(in_header, r, w),
+            x if x == Opcode::Init as u32 => self.init(in_header, r, w, allow_idmap),
             x if x == Opcode::Opendir as u32 => self.opendir(in_header, r, w),
             x if x == Opcode::Readdir as u32 => self.readdir(in_header, r, w),
             x if x == Opcode::Releasedir as u32 => self.releasedir(in_header, r, w),
@@ -842,7 +843,13 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn init(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn init(
+        &self,
+        in_header: InHeader,
+        mut r: Reader,
+        w: Writer,
+        allow_idmap: bool,
+    ) -> Result<usize> {
         let InitInCompat {
             major,
             minor,
@@ -898,8 +905,11 @@ impl<F: FileSystem + Sync> Server<F> {
             | FsOptions::MAX_PAGES
             | FsOptions::SUBMOUNTS
             | FsOptions::HANDLE_KILLPRIV_V2
-            | FsOptions::INIT_EXT
-            | FsOptions::ALLOW_IDMAP;
+            | FsOptions::INIT_EXT;
+
+        if allow_idmap {
+            supported |= FsOptions::ALLOW_IDMAP;
+        }
 
         if cfg!(target_os = "macos") {
             supported |= FsOptions::SECURITY_CTX;
