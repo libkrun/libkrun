@@ -538,7 +538,7 @@ pub enum PermissionSemantics {
     ///  - Idmaps are not supported.
     ///  - Ownership bits are ignored, always returning the uid/gid from the process
     ///    requesting the operation within the guest (obtained from `Context`).
-    ///  - Permissions bits are stored in the host, no as extended attributes.
+    ///  - Permissions bits are stored in the host, not as extended attributes.
     LinuxSimplified,
 }
 
