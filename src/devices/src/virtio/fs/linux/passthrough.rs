@@ -296,6 +296,18 @@ pub enum PermissionSemantics {
     LinuxSimplified,
 }
 
+impl TryFrom<u32> for PermissionSemantics {
+    type Error = ();
+
+    fn try_from(semantics: u32) -> Result<Self, Self::Error> {
+        match semantics {
+            0 => Ok(PermissionSemantics::LinuxComplete),
+            1 => Ok(PermissionSemantics::LinuxSimplified),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Options that configure the behavior of the file system.
 #[derive(Debug, Clone)]
 pub struct Config {

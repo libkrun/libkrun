@@ -283,6 +283,21 @@ int32_t krun_add_disk2(uint32_t ctx_id,
                        bool direct_io,
                        uint32_t sync_mode);
 
+/* Supported virtio-fs permission semantics */
+
+/**
+ * Be as close as possible to the common semantics of Linux file systems.
+ */
+#define KRUN_SEMANTICS_LINUX_COMPLETE 0
+/**
+ * As KRUN_SEMANTICS_LINUX_COMPLETE, with the following simplifications:
+ *  - Idmaps are not supported.
+ *  - Ownership bits are ignored, always returning the uid/gid from the process
+ *    requesting the operation within the guest (obtained from `Context`).
+ *  - Permissions bits are stored in the host, not as extended attributes.
+ */
+#define KRUN_SEMANTICS_LINUX_SIMPLIFIED 1
+
 /**
  * NO LONGER SUPPORTED. DO NOT USE.
  *
@@ -351,6 +366,25 @@ int32_t krun_add_virtiofs3(uint32_t ctx_id,
                            const char *c_path,
                            uint64_t shm_size,
                            bool read_only);
+
+/**
+ * Adds an independent virtio-fs device pointing to a host's directory with a
+ * tag. This variant allows specifying the permission semantics to be emulated.
+ *
+ * Arguments:
+ *  "ctx_id"         - the configuration context ID.
+ *  "c_tag"          - tag to identify the filesystem in the guest.
+ *  "c_path"         - full path to the directory in the host to be exposed to the guest.
+ *  "shm_size"       - size of the DAX SHM window in bytes.
+ *  "read_only"      - if true, the filesystem will be exposed as read-only to the guest.
+ *  "semantics"      - the permissions semantics to be emulated.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_add_virtiofs4(uint32_t ctx_id, const char *c_tag,
+                           const char *c_path, uint64_t shm_size,
+                           bool read_only, uint32_t semantics);
 
 /* Send the VFKIT magic after establishing the connection,
    as required by gvproxy in vfkit mode. */

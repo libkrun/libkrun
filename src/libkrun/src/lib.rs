@@ -4,6 +4,8 @@ extern crate log;
 use crossbeam_channel::unbounded;
 #[cfg(feature = "blk")]
 use devices::virtio::block::{ImageType, SyncMode};
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+use devices::virtio::fs::passthrough::PermissionSemantics;
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::display::DisplayInfo;
 #[cfg(feature = "net")]
@@ -619,6 +621,7 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
             cfg.vmr.add_fs_device(FsDeviceConfig {
                 fs_id,
                 shared_dir: Some(shared_dir),
+                semantics: PermissionSemantics::LinuxComplete,
                 // Default to a conservative 512 MB window.
                 shm_size: Some(1 << 29),
                 read_only: false,
@@ -647,7 +650,7 @@ pub unsafe extern "C" fn krun_add_virtiofs(
     c_tag: *const c_char,
     c_path: *const c_char,
 ) -> i32 {
-    krun_add_virtiofs3(ctx_id, c_tag, c_path, 0, false)
+    krun_add_virtiofs4(ctx_id, c_tag, c_path, 0, false, 0)
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -659,7 +662,7 @@ pub unsafe extern "C" fn krun_add_virtiofs2(
     c_path: *const c_char,
     shm_size: u64,
 ) -> i32 {
-    krun_add_virtiofs3(ctx_id, c_tag, c_path, shm_size, false)
+    krun_add_virtiofs4(ctx_id, c_tag, c_path, shm_size, false, 0)
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -672,6 +675,25 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
     shm_size: u64,
     read_only: bool,
 ) -> i32 {
+    krun_add_virtiofs4(ctx_id, c_tag, c_path, shm_size, read_only, 0)
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub unsafe extern "C" fn krun_add_virtiofs4(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+    shm_size: u64,
+    read_only: bool,
+    semantics: u32,
+) -> i32 {
+    let semantics = match PermissionSemantics::try_from(semantics) {
+        Ok(semantics) => semantics,
+        Err(_) => return -libc::EINVAL,
+    };
+
     if c_tag.is_null() {
         return -libc::EINVAL;
     }
@@ -712,6 +734,7 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
             cfg.vmr.add_fs_device(FsDeviceConfig {
                 fs_id: tag.to_string(),
                 shared_dir: path.map(|p| p.to_string()),
+                semantics,
                 shm_size: shm,
                 read_only,
                 virtual_entries,
@@ -2385,6 +2408,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
             ctx_cfg.vmr.add_fs_device(FsDeviceConfig {
                 fs_id: "/dev/root".into(),
                 shared_dir: None,
+                semantics: PermissionSemantics::LinuxComplete,
                 // Default to a conservative 512 MB window.
                 shm_size: Some(1 << 29),
                 read_only: false,
