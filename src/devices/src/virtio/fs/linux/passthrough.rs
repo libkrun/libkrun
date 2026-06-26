@@ -280,6 +280,22 @@ impl FromStr for CachePolicy {
     }
 }
 
+/// The permission semantics to be emulated by this file system personality.
+#[derive(Debug, Default, Clone, Copy)]
+pub enum PermissionSemantics {
+    /// Be as close as possible to the common semantics of Linux file systems.
+    #[default]
+    LinuxComplete,
+
+    /// As `LinuxComplete`, with the following simplifications:
+    ///  - Extended attributes are not supported.
+    ///  - Idmaps are not supported.
+    ///  - Ownership bits are ignored, always returning the uid/gid from the process
+    ///    requesting the operation within the guest (obtained from `Context`).
+    ///  - Permissions bits are stored in the host, no as extended attributes.
+    LinuxSimplified,
+}
+
 /// Options that configure the behavior of the file system.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -337,8 +353,13 @@ pub struct Config {
 
     /// ID of this filesystem to uniquely identify exports.
     pub export_fsid: u64,
+
     /// Table of exported FDs to share with other subsystems.
     pub export_table: Option<ExportTable>,
+
+    /// The permission semantics to be emulated. See the documentation for `PermissionSemantics` for
+    /// more details.
+    pub semantics: PermissionSemantics,
 }
 
 impl Default for Config {
@@ -353,6 +374,7 @@ impl Default for Config {
             proc_sfd_rawfd: None,
             export_fsid: 0,
             export_table: None,
+            semantics: PermissionSemantics::LinuxComplete,
         }
     }
 }

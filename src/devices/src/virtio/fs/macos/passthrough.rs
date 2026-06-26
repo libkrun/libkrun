@@ -10,6 +10,8 @@ use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::net::UnixListener;
+use std::path::Path;
 use std::ptr::null_mut;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -263,6 +265,7 @@ fn is_valid_owner(owner: Option<(u32, u32)>) -> bool {
 
     false
 }
+
 // We won't need this once expressions like "if let ... &&" are allowed.
 #[allow(clippy::unnecessary_unwrap)]
 fn set_xattr_stat(
@@ -272,7 +275,7 @@ fn set_xattr_stat(
     owner: Option<(u32, u32)>,
     mode: Option<u32>,
 ) -> io::Result<()> {
-    let st = st.unwrap_or(istat(ctx, file, true)?);
+    let st = st.unwrap_or(istat(ctx, PermissionSemantics::LinuxComplete, file, true)?);
     let options = if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
         libc::XATTR_NOFOLLOW
     } else {
@@ -349,9 +352,44 @@ fn set_xattr_stat(
     }
 }
 
-fn stat_common(
-    _ctx: &Context,
-    mut st: bindings::stat64,
+fn set_host_stat(
+    file: &InodeHandle,
+    _owner: Option<(u32, u32)>,
+    mode: Option<u32>,
+) -> io::Result<()> {
+    // We're only using set_host_stat for LinuxSimplified semantics, and in this
+    // mode we ignore the host's owner bits, so don't attempt to write them here.
+
+    if let Some(mode) = mode {
+        let res = match file {
+            InodeHandle::Path(path) => unsafe { libc::chmod(path.as_ptr(), mode as u16) },
+            InodeHandle::Fd(fd) => unsafe { libc::fchmod(*fd, mode as u16) },
+        };
+
+        if res < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+    }
+
+    Ok(())
+}
+
+fn set_stat(
+    ctx: &Context,
+    semantics: PermissionSemantics,
+    file: &InodeHandle,
+    st: Option<bindings::stat64>,
+    owner: Option<(u32, u32)>,
+    mode: Option<u32>,
+) -> io::Result<()> {
+    match semantics {
+        PermissionSemantics::LinuxComplete => set_xattr_stat(ctx, file, st, owner, mode),
+        PermissionSemantics::LinuxSimplified => set_host_stat(file, owner, mode),
+    }
+}
+
+fn stat_xattr_common(
+    st: &mut bindings::stat64,
     uid: Option<u32>,
     gid: Option<u32>,
     mode: Option<u32>,
@@ -370,10 +408,15 @@ fn stat_common(
         }
     }
 
-    Ok(st)
+    Ok(*st)
 }
 
-fn fstat(ctx: &Context, fd: RawFd, host: bool) -> io::Result<bindings::stat64> {
+fn fstat(
+    ctx: &Context,
+    semantics: PermissionSemantics,
+    fd: RawFd,
+    host: bool,
+) -> io::Result<bindings::stat64> {
     let mut st = MaybeUninit::<bindings::stat64>::zeroed();
 
     // Safe because the kernel will only write data in `st` and we check the return
@@ -381,10 +424,19 @@ fn fstat(ctx: &Context, fd: RawFd, host: bool) -> io::Result<bindings::stat64> {
     let res = unsafe { libc::fstat(fd, st.as_mut_ptr()) };
     if res >= 0 {
         // Safe because the kernel guarantees that the struct is now fully initialized.
-        let st = unsafe { st.assume_init() };
+        let mut st = unsafe { st.assume_init() };
         if !host {
-            let (uid, gid, mode) = get_xattr_fstat(fd, st)?;
-            stat_common(ctx, st, uid, gid, mode)
+            match semantics {
+                PermissionSemantics::LinuxComplete => {
+                    let (uid, gid, mode) = get_xattr_fstat(fd, st)?;
+                    stat_xattr_common(&mut st, uid, gid, mode)
+                }
+                PermissionSemantics::LinuxSimplified => {
+                    st.st_uid = ctx.uid;
+                    st.st_gid = ctx.gid;
+                    Ok(st)
+                }
+            }
         } else {
             Ok(st)
         }
@@ -393,7 +445,12 @@ fn fstat(ctx: &Context, fd: RawFd, host: bool) -> io::Result<bindings::stat64> {
     }
 }
 
-fn lstat(ctx: &Context, c_path: &CString, host: bool) -> io::Result<bindings::stat64> {
+fn lstat(
+    ctx: &Context,
+    semantics: PermissionSemantics,
+    c_path: &CString,
+    host: bool,
+) -> io::Result<bindings::stat64> {
     let mut st = MaybeUninit::<bindings::stat64>::zeroed();
 
     // Safe because the kernel will only write data in `st` and we check the return
@@ -401,10 +458,19 @@ fn lstat(ctx: &Context, c_path: &CString, host: bool) -> io::Result<bindings::st
     let res = unsafe { libc::lstat(c_path.as_ptr(), st.as_mut_ptr()) };
     if res >= 0 {
         // Safe because the kernel guarantees that the struct is now fully initialized.
-        let st = unsafe { st.assume_init() };
+        let mut st = unsafe { st.assume_init() };
         if !host {
-            let (uid, gid, mode) = get_xattr_lstat(c_path, st)?;
-            stat_common(ctx, st, uid, gid, mode)
+            match semantics {
+                PermissionSemantics::LinuxComplete => {
+                    let (uid, gid, mode) = get_xattr_lstat(c_path, st)?;
+                    stat_xattr_common(&mut st, uid, gid, mode)
+                }
+                PermissionSemantics::LinuxSimplified => {
+                    st.st_uid = ctx.uid;
+                    st.st_gid = ctx.gid;
+                    Ok(st)
+                }
+            }
         } else {
             Ok(st)
         }
@@ -413,10 +479,15 @@ fn lstat(ctx: &Context, c_path: &CString, host: bool) -> io::Result<bindings::st
     }
 }
 
-fn istat(ctx: &Context, ihandle: &InodeHandle, host: bool) -> io::Result<bindings::stat64> {
+fn istat(
+    ctx: &Context,
+    semantics: PermissionSemantics,
+    ihandle: &InodeHandle,
+    host: bool,
+) -> io::Result<bindings::stat64> {
     match ihandle {
-        InodeHandle::Fd(fd) => fstat(ctx, *fd, host),
-        InodeHandle::Path(c_path) => lstat(ctx, c_path, host),
+        InodeHandle::Fd(fd) => fstat(ctx, semantics, *fd, host),
+        InodeHandle::Path(c_path) => lstat(ctx, semantics, c_path, host),
     }
 }
 
@@ -453,6 +524,22 @@ impl FromStr for CachePolicy {
             _ => Err("invalid cache policy"),
         }
     }
+}
+
+/// The permission semantics to be emulated by this file system personality.
+#[derive(Debug, Default, Clone, Copy)]
+pub enum PermissionSemantics {
+    /// Be as close as possible to the common semantics of Linux file systems.
+    #[default]
+    LinuxComplete,
+
+    /// As `LinuxComplete`, with the following simplifications:
+    ///  - Extended attributes are not supported.
+    ///  - Idmaps are not supported.
+    ///  - Ownership bits are ignored, always returning the uid/gid from the process
+    ///    requesting the operation within the guest (obtained from `Context`).
+    ///  - Permissions bits are stored in the host, no as extended attributes.
+    LinuxSimplified,
 }
 
 /// Options that configure the behavior of the file system.
@@ -512,8 +599,13 @@ pub struct Config {
 
     /// ID of this filesystem to uniquely identify exports. Not supported for macos.
     pub export_fsid: u64,
+
     /// Table of exported FDs to share with other subsystems. Not supported for macos.
     pub export_table: Option<ExportTable>,
+
+    /// The permission semantics to be emulated. See the documentation for `PermissionSemantics` for
+    /// more details.
+    pub semantics: PermissionSemantics,
 }
 
 impl Default for Config {
@@ -528,6 +620,7 @@ impl Default for Config {
             proc_sfd_rawfd: None,
             export_fsid: 0,
             export_table: None,
+            semantics: PermissionSemantics::LinuxComplete,
         }
     }
 }
@@ -766,10 +859,17 @@ impl PassthroughFs {
 
             remove_security_capability(&ihandle);
 
-            if let Ok(st) = fstat(ctx, fd, false) {
+            if let Ok(st) = fstat(ctx, self.cfg.semantics, fd, false) {
                 let new_mode = clear_suid_sgid(st.st_mode as u32);
                 if new_mode != st.st_mode as u32
-                    && let Err(err) = set_xattr_stat(ctx, &ihandle, Some(st), None, Some(new_mode))
+                    && let Err(err) = set_stat(
+                        ctx,
+                        self.cfg.semantics,
+                        &ihandle,
+                        Some(st),
+                        None,
+                        Some(new_mode),
+                    )
                 {
                     error!("Couldn't clear suid/sgid for inode {inode}: {err}");
                 }
@@ -820,8 +920,8 @@ impl PassthroughFs {
     fn do_getattr(&self, ctx: &Context, inode: Inode) -> io::Result<(bindings::stat64, Duration)> {
         let ihandle = self.inode_to_handle(inode, true)?;
         let st = match ihandle {
-            InodeHandle::Path(c_path) => lstat(ctx, &c_path, false)?,
-            InodeHandle::Fd(fd) => fstat(ctx, fd, false)?,
+            InodeHandle::Path(c_path) => lstat(ctx, self.cfg.semantics, &c_path, false)?,
+            InodeHandle::Fd(fd) => fstat(ctx, self.cfg.semantics, fd, false)?,
         };
 
         Ok((st, self.cfg.attr_timeout))
@@ -837,7 +937,7 @@ impl PassthroughFs {
     }
 
     fn store_unlinked_fd(&self, ctx: &Context, unlinked_fd: RawFd) -> io::Result<bool> {
-        let st = fstat(ctx, unlinked_fd, true)?;
+        let st = fstat(ctx, self.cfg.semantics, unlinked_fd, true)?;
         let altkey = InodeAltKey {
             ino: st.st_ino,
             dev: st.st_dev,
@@ -929,6 +1029,93 @@ impl PassthroughFs {
             }
             Err(linux_error(err))
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mknod_complete(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        mode: u32,
+        _rdev: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        let c_path = self.name_to_path(parent, name)?;
+
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            Err(linux_error(io::Error::last_os_error()))
+        } else {
+            let ihandle = InodeHandle::Fd(fd);
+
+            // Set security context
+            if let Some(secctx) = extensions.secctx {
+                set_secctx(&ihandle, secctx, false)?
+            };
+
+            // For mknod, we're forced to store the mode as xattr even in
+            // simplified mode, since macOS doesn't allow unprivileged users
+            // to create special files (such as sockets or fifos) using mknod.
+            if let Err(e) = set_xattr_stat(
+                &ctx,
+                &ihandle,
+                None,
+                Some((ctx.uid, ctx.gid)),
+                Some(mode & !umask),
+            ) {
+                unsafe { libc::close(fd) };
+                return Err(e);
+            }
+
+            unsafe { libc::close(fd) };
+            self.lookup(ctx, parent, name)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mknod_simplified(
+        &self,
+        ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        mode: u32,
+        rdev: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        let c_path = self.name_to_path(parent, name)?;
+
+        // macOS doesn't allow us to create UNIX sockets using macOS, so we
+        // have to resort to actually creating the socket ourselves and
+        // dropping it.
+        if (mode as u16 & libc::S_IFMT) == libc::S_IFSOCK {
+            let path = c_path.to_str().map_err(|_| einval())?;
+            let listener = UnixListener::bind(Path::new(path)).map_err(|_| einval())?;
+            // Explicitly drop the listener to make it clear we aren't going
+            // to use it. UnixListener's Drop doesn't remove the socket it
+            // created, so we can reuse for the guest.
+            drop(listener);
+        } else {
+            let res = unsafe { libc::mknod(c_path.as_ptr(), (mode & !umask) as u16, rdev as i32) };
+            if res < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+        }
+
+        // Set security context
+        if let Some(secctx) = extensions.secctx {
+            let ihandle = InodeHandle::Path(c_path);
+            set_secctx(&ihandle, secctx, false)?
+        };
+        self.lookup(ctx, parent, name)
     }
 
     fn parse_open_flags(&self, flags: i32) -> i32 {
@@ -1100,7 +1287,7 @@ impl FileSystem for PassthroughFs {
             gid: 0,
             pid: 0,
         };
-        let st = fstat(&ctx, f.as_raw_fd(), true)?;
+        let st = fstat(&ctx, self.cfg.semantics, f.as_raw_fd(), true)?;
 
         // Safe because this doesn't modify any memory and there is no need to check the return
         // value because this system call always succeeds. We need to clear the umask here because
@@ -1171,7 +1358,7 @@ impl FileSystem for PassthroughFs {
             .ok_or_else(ebadf)?;
 
         let c_path = self.name_to_path(parent, name)?;
-        let st = lstat(&ctx, &c_path, false)?;
+        let st = lstat(&ctx, self.cfg.semantics, &c_path, false)?;
 
         debug!(
             "lookup: inode={} path={}",
@@ -1275,8 +1462,13 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<Entry> {
         let c_path = self.name_to_path(parent, name)?;
 
+        let (host_mode, complete) = match self.cfg.semantics {
+            PermissionSemantics::LinuxComplete => (0o700, true),
+            PermissionSemantics::LinuxSimplified => ((mode & !umask) as u16, false),
+        };
+
         // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe { libc::mkdir(c_path.as_ptr(), 0o700) };
+        let res = unsafe { libc::mkdir(c_path.as_ptr(), host_mode) };
         if res == 0 {
             let ihandle = InodeHandle::Path(c_path);
             // Set security context
@@ -1284,13 +1476,16 @@ impl FileSystem for PassthroughFs {
                 set_secctx(&ihandle, secctx, false)?
             };
 
-            set_xattr_stat(
-                &ctx,
-                &ihandle,
-                None,
-                Some((ctx.uid, ctx.gid)),
-                Some(mode & !umask),
-            )?;
+            if complete {
+                set_stat(
+                    &ctx,
+                    self.cfg.semantics,
+                    &ihandle,
+                    None,
+                    Some((ctx.uid, ctx.gid)),
+                    Some(mode & !umask),
+                )?;
+            }
             self.lookup(ctx, parent, name)
         } else {
             Err(linux_error(io::Error::last_os_error()))
@@ -1379,10 +1574,16 @@ impl FileSystem for PassthroughFs {
         let c_path = self.name_to_path(parent, name)?;
 
         let flags = self.parse_open_flags(flags as i32);
-        let hostmode = if (flags & libc::O_DIRECTORY) != 0 {
-            0o700
-        } else {
-            0o600
+        let (host_mode, complete) = match self.cfg.semantics {
+            PermissionSemantics::LinuxComplete => {
+                let mode = if (flags & libc::O_DIRECTORY) != 0 {
+                    0o700
+                } else {
+                    0o600
+                };
+                (mode, true)
+            }
+            PermissionSemantics::LinuxSimplified => (mode & !(umask & 0o777), false),
         };
 
         // Safe because this doesn't modify any memory and we check the return value. We don't
@@ -1392,7 +1593,7 @@ impl FileSystem for PassthroughFs {
             libc::open(
                 c_path.as_ptr(),
                 flags | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                hostmode,
+                host_mode,
             )
         };
         if fd < 0 {
@@ -1400,13 +1601,16 @@ impl FileSystem for PassthroughFs {
         }
         let ihandle = InodeHandle::Fd(fd);
 
-        if let Err(e) = set_xattr_stat(
-            &ctx,
-            &ihandle,
-            None,
-            Some((ctx.uid, ctx.gid)),
-            Some(libc::S_IFREG as u32 | (mode & !(umask & 0o777))),
-        ) {
+        if complete
+            && let Err(e) = set_stat(
+                &ctx,
+                self.cfg.semantics,
+                &ihandle,
+                None,
+                Some((ctx.uid, ctx.gid)),
+                Some(libc::S_IFREG as u32 | (mode & !(umask & 0o777))),
+            )
+        {
             unsafe { libc::close(fd) };
             return Err(e);
         }
@@ -1512,12 +1716,18 @@ impl FileSystem for PassthroughFs {
 
             remove_security_capability(&ihandle);
 
-            if let Ok(st) = fstat(&ctx, fd, false) {
+            if let Ok(st) = fstat(&ctx, self.cfg.semantics, fd, false) {
                 let new_mode = clear_suid_sgid(st.st_mode as u32);
                 if new_mode != st.st_mode as u32 {
                     // Update mode in xattr
-                    if let Err(err) = set_xattr_stat(&ctx, &ihandle, Some(st), None, Some(new_mode))
-                    {
+                    if let Err(err) = set_stat(
+                        &ctx,
+                        self.cfg.semantics,
+                        &ihandle,
+                        Some(st),
+                        None,
+                        Some(new_mode),
+                    ) {
                         error!("Couldn't clear suid/sgid for inode {inode}: {err}");
                     }
                 }
@@ -1562,7 +1772,14 @@ impl FileSystem for PassthroughFs {
         };
 
         if valid.contains(SetattrValid::MODE) {
-            set_xattr_stat(&ctx, &ihandle, None, None, Some(attr.st_mode as u32))?
+            set_stat(
+                &ctx,
+                self.cfg.semantics,
+                &ihandle,
+                None,
+                None,
+                Some(attr.st_mode as u32),
+            )?
         }
 
         if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
@@ -1580,7 +1797,7 @@ impl FileSystem for PassthroughFs {
             };
 
             remove_security_capability(&ihandle);
-            let st = istat(&ctx, &ihandle, false)?;
+            let st = istat(&ctx, self.cfg.semantics, &ihandle, false)?;
 
             // Clear suid/sgid if UID or GID is being changed
             let new_mode = clear_suid_sgid(st.st_mode as u32);
@@ -1589,7 +1806,14 @@ impl FileSystem for PassthroughFs {
             } else {
                 None
             };
-            set_xattr_stat(&ctx, &ihandle, Some(st), Some((uid, gid)), new_mode)?;
+            set_stat(
+                &ctx,
+                self.cfg.semantics,
+                &ihandle,
+                Some(st),
+                Some((uid, gid)),
+                new_mode,
+            )?;
         }
 
         if valid.contains(SetattrValid::SIZE) {
@@ -1603,10 +1827,17 @@ impl FileSystem for PassthroughFs {
 
                     // Clear security.capability on truncate unconditionally
                     remove_security_capability(&ihandle);
-                    let st = fstat(&ctx, fd, false)?;
+                    let st = fstat(&ctx, self.cfg.semantics, fd, false)?;
                     let new_mode = clear_suid_sgid(st.st_mode as u32);
                     if new_mode != st.st_mode as u32 {
-                        set_xattr_stat(&ctx, &ihandle, Some(st), None, Some(new_mode))?;
+                        set_stat(
+                            &ctx,
+                            self.cfg.semantics,
+                            &ihandle,
+                            Some(st),
+                            None,
+                            Some(new_mode),
+                        )?;
                     }
                 }
                 InodeHandle::Path(_) => {
@@ -1623,10 +1854,17 @@ impl FileSystem for PassthroughFs {
                     // reuse the FD we just opened, thus reducing the number of syscalls.
                     let ihandle = InodeHandle::Fd(f.as_raw_fd());
                     remove_security_capability(&ihandle);
-                    let st = istat(&ctx, &ihandle, false)?;
+                    let st = istat(&ctx, self.cfg.semantics, &ihandle, false)?;
                     let new_mode = clear_suid_sgid(st.st_mode as u32);
                     if new_mode != st.st_mode as u32 {
-                        set_xattr_stat(&ctx, &ihandle, Some(st), None, Some(new_mode))?;
+                        set_stat(
+                            &ctx,
+                            self.cfg.semantics,
+                            &ihandle,
+                            Some(st),
+                            None,
+                            Some(new_mode),
+                        )?;
                     }
                 }
             };
@@ -1755,24 +1993,34 @@ impl FileSystem for PassthroughFs {
             }
 
             if ((flags as i32) & bindings::LINUX_RENAME_WHITEOUT) != 0 {
+                let (host_mode, complete) = match self.cfg.semantics {
+                    PermissionSemantics::LinuxComplete => (0o600, true),
+                    PermissionSemantics::LinuxSimplified => {
+                        (((libc::S_IFCHR | 0o600) as u32), true)
+                    }
+                };
                 let fd = unsafe {
                     libc::open(
                         old_cpath.as_ptr(),
                         libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                        0o600,
+                        host_mode,
                     )
                 };
                 if fd > 0 {
-                    if let Err(e) = set_xattr_stat(
-                        &ctx,
-                        &InodeHandle::Fd(fd),
-                        None,
-                        None,
-                        Some((libc::S_IFCHR | 0o600) as u32),
-                    ) {
+                    if complete
+                        && let Err(e) = set_stat(
+                            &ctx,
+                            self.cfg.semantics,
+                            &InodeHandle::Fd(fd),
+                            None,
+                            None,
+                            Some((libc::S_IFCHR | 0o600) as u32),
+                        )
+                    {
                         unsafe { libc::close(fd) };
                         return Err(e);
                     }
+
                     unsafe { libc::close(fd) };
                 }
             }
@@ -1796,42 +2044,17 @@ impl FileSystem for PassthroughFs {
         parent: Inode,
         name: &CStr,
         mode: u32,
-        _rdev: u32,
+        rdev: u32,
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        let c_path = self.name_to_path(parent, name)?;
-
-        let fd = unsafe {
-            libc::open(
-                c_path.as_ptr(),
-                libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            Err(linux_error(io::Error::last_os_error()))
-        } else {
-            let ihandle = InodeHandle::Fd(fd);
-
-            // Set security context
-            if let Some(secctx) = extensions.secctx {
-                set_secctx(&ihandle, secctx, false)?
-            };
-
-            if let Err(e) = set_xattr_stat(
-                &ctx,
-                &ihandle,
-                None,
-                Some((ctx.uid, ctx.gid)),
-                Some(mode & !umask),
-            ) {
-                unsafe { libc::close(fd) };
-                return Err(e);
+        match self.cfg.semantics {
+            PermissionSemantics::LinuxComplete => {
+                self.mknod_complete(ctx, parent, name, mode, rdev, umask, extensions)
             }
-
-            unsafe { libc::close(fd) };
-            self.lookup(ctx, parent, name)
+            PermissionSemantics::LinuxSimplified => {
+                self.mknod_simplified(ctx, parent, name, mode, rdev, umask, extensions)
+            }
         }
     }
 
@@ -1878,17 +2101,20 @@ impl FileSystem for PassthroughFs {
             };
 
             let mut entry = self.lookup(ctx, parent, name)?;
-            let mode = libc::S_IFLNK | 0o777;
-            set_xattr_stat(
-                &ctx,
-                &ihandle,
-                None,
-                Some((ctx.uid, ctx.gid)),
-                Some(mode as u32),
-            )?;
-            entry.attr.st_uid = ctx.uid;
-            entry.attr.st_gid = ctx.gid;
-            entry.attr.st_mode = mode;
+            if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
+                let mode = libc::S_IFLNK | 0o777;
+                set_stat(
+                    &ctx,
+                    self.cfg.semantics,
+                    &ihandle,
+                    None,
+                    Some((ctx.uid, ctx.gid)),
+                    Some(mode as u32),
+                )?;
+                entry.attr.st_uid = ctx.uid;
+                entry.attr.st_gid = ctx.gid;
+                entry.attr.st_mode = mode;
+            }
             Ok(entry)
         } else {
             Err(linux_error(io::Error::last_os_error()))
@@ -1991,8 +2217,8 @@ impl FileSystem for PassthroughFs {
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
         let st = match self.inode_to_handle(inode, true)? {
-            InodeHandle::Path(c_path) => lstat(&ctx, &c_path, false)?,
-            InodeHandle::Fd(fd) => fstat(&ctx, fd, false)?,
+            InodeHandle::Path(c_path) => lstat(&ctx, self.cfg.semantics, &c_path, false)?,
+            InodeHandle::Fd(fd) => fstat(&ctx, self.cfg.semantics, fd, false)?,
         };
 
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
@@ -2298,7 +2524,7 @@ impl FileSystem for PassthroughFs {
                 // The best thing we can do here is extend the file to (offset + length).
                 // This doesn't adhere to the same semantics, but should work fine (albeit
                 // less performant) for most guest applications.
-                let st = fstat(&ctx, fd, true)?;
+                let st = fstat(&ctx, self.cfg.semantics, fd, true)?;
                 let new_length = (offset + length) as i64;
 
                 if keep_size {
