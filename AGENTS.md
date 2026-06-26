@@ -121,6 +121,7 @@ Features are additive and controlled at the `libkrun` crate level. Each device f
 - Commit messages should be concise and written in the imperative mood. Small, focused commits are preferred.
 
 ### Rust coding style
+- Code must be self-explanatory and the main source of reference. Do not write comments unless the code is counter-intuitive and cannot be clarified through better naming or structure. When a comment is necessary, it must explain *why*, never *what*.
 - No error handling for impossible scenarios.
 - Avoid checking for empty input when calling a function if the function already handles the base case well (e.g. empty input is noop).
 - Use `use` imports instead of inline full paths. One level of qualitifation is fine when it clarifies what something is (e.g., `log::trace!`, `fs::read_to_string()`), but don't use longer paths like `std::process::Command::new(...)` or `crate::foo::bar::baz()` -- import with `use` instead.
