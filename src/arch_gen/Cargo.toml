@@ -1,6 +1,6 @@
 [package]
 name = "krun-arch-gen"
-version = "0.1.0-1.19.2"
+version = "0.1.0-1.19.3"
 authors = ["The libkrun Authors"]
 edition = "2021"
 description = "Generated architecture-specific definitions for libkrun"

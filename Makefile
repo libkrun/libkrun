@@ -3,7 +3,7 @@ LIBRARY_HEADER_DISPLAY = include/libkrun_display.h
 LIBRARY_HEADER_INPUT = include/libkrun_input.h
 
 ABI_VERSION=1
-FULL_VERSION=1.19.2
+FULL_VERSION=1.19.3
 
 AWS_NITRO_INIT_SRC = \
 		init/aws-nitro/include/*        	  	\
