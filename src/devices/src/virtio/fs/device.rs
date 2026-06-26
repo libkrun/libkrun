@@ -5,6 +5,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 #[cfg(target_os = "macos")]
@@ -75,9 +76,18 @@ impl Fs {
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
         config.num_request_queues = 1;
 
+        let attr_timeout = if matches!(semantics, PermissionSemantics::LinuxSimplified) {
+            // As uid/gid are context-dependent, attributes can't be cached.
+            Duration::from_secs(0)
+        } else {
+            // The value defined as default in virtio-fs.
+            Duration::from_secs(5)
+        };
+
         let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
             root_dir,
             semantics,
+            attr_timeout,
             ..Default::default()
         });
 
