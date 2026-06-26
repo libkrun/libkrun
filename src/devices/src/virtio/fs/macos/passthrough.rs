@@ -161,16 +161,6 @@ fn einval() -> io::Error {
     linux_error(io::Error::from_raw_os_error(libc::EINVAL))
 }
 
-fn host_euid() -> u32 {
-    static EUID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *EUID.get_or_init(|| unsafe { libc::geteuid() })
-}
-
-fn host_egid() -> u32 {
-    static EGID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *EGID.get_or_init(|| unsafe { libc::getegid() })
-}
-
 fn item_to_value(item: &[u8], radix: u32) -> Option<u32> {
     match std::str::from_utf8(item) {
         Ok(val) => match u32::from_str_radix(val, radix) {
@@ -366,21 +356,11 @@ fn stat_common(
     host: bool,
 ) -> io::Result<bindings::stat64> {
     if !host {
-        match uid {
-            Some(uid) => st.st_uid = uid,
-            None => {
-                if st.st_uid == host_euid() {
-                    st.st_uid = 0;
-                }
-            }
+        if let Some(uid) = uid {
+            st.st_uid = uid;
         }
-        match gid {
-            Some(gid) => st.st_gid = gid,
-            None => {
-                if st.st_gid == host_egid() {
-                    st.st_gid = 0;
-                }
-            }
+        if let Some(gid) = gid {
+            st.st_gid = gid;
         }
         if let Some(mode) = mode {
             if mode as u16 & libc::S_IFMT == 0 {
