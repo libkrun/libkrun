@@ -45,6 +45,8 @@ use devices::legacy::{IoApic, IrqChipT};
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+use devices::virtio::passthrough::PermissionSemantics;
 use devices::virtio::{port_io, MmioTransport, PortDescription, VirtioDevice, Vsock};
 
 #[cfg(feature = "tee")]
@@ -1898,6 +1900,7 @@ fn attach_fs_devices(
         let fs = Arc::new(Mutex::new(
             devices::virtio::Fs::new(
                 config.fs_id.clone(),
+                PermissionSemantics::LinuxComplete,
                 config.shared_dir.clone(),
                 exit_code.clone(),
                 config.read_only,
