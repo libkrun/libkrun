@@ -1899,7 +1899,7 @@ fn attach_fs_devices(
         let fs = Arc::new(Mutex::new(
             devices::virtio::Fs::new(
                 config.fs_id.clone(),
-                PermissionSemantics::LinuxComplete,
+                PermissionSemantics::LinuxSimplified,
                 config.shared_dir.clone(),
                 exit_code.clone(),
                 config.read_only,
