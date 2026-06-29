@@ -333,7 +333,7 @@ pub struct HvfVcpu<'a> {
 impl HvfVcpu<'_> {
     pub fn new(mpidr: u64, nested_enabled: bool) -> Result<Self, Error> {
         let mut vcpuid: hv_vcpu_t = 0;
-        let vcpu_exit_ptr: *mut hv_vcpu_exit_t = std::ptr::null_mut();
+        let mut vcpu_exit_ptr: *mut hv_vcpu_exit_t = std::ptr::null_mut();
 
         #[cfg(target_arch = "aarch64")]
         let cntfrq = {
@@ -349,7 +349,7 @@ impl HvfVcpu<'_> {
         let ret = unsafe {
             hv_vcpu_create(
                 &mut vcpuid,
-                &vcpu_exit_ptr as *const _ as *mut *mut _,
+                &mut vcpu_exit_ptr as *mut *mut _,
                 std::ptr::null_mut(),
             )
         };
@@ -406,12 +406,12 @@ impl HvfVcpu<'_> {
             }
 
             // Enable EL2 and GICv3 in ID_AA64PFR0_EL1
-            let val: u64 = 0;
+            let mut val: u64 = 0;
             let ret = unsafe {
                 hv_vcpu_get_sys_reg(
                     self.vcpuid,
                     hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR0_EL1,
-                    &val as *const _ as *mut _,
+                    &mut val as *mut _,
                 )
             };
             if ret != HV_SUCCESS {
@@ -430,12 +430,12 @@ impl HvfVcpu<'_> {
 
             // If SME is enabled in ID_AA64PFR1_EL1 in the VM, the guest will
             // break after enabling the MMU. Mask it out.
-            let val: u64 = 0;
+            let mut val: u64 = 0;
             let ret = unsafe {
                 hv_vcpu_get_sys_reg(
                     self.vcpuid,
                     hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
-                    &val as *const _ as *mut _,
+                    &mut val as *mut _,
                 )
             };
             if ret != HV_SUCCESS {
@@ -478,8 +478,8 @@ impl HvfVcpu<'_> {
     }
 
     fn read_reg(&self, reg: u32) -> Result<u64, Error> {
-        let val: u64 = 0;
-        let ret = unsafe { hv_vcpu_get_reg(self.vcpuid, reg, &val as *const _ as *mut _) };
+        let mut val: u64 = 0;
+        let ret = unsafe { hv_vcpu_get_reg(self.vcpuid, reg, &mut val as *mut _) };
         if ret != HV_SUCCESS {
             Err(Error::VcpuReadRegister)
         } else {
@@ -497,8 +497,8 @@ impl HvfVcpu<'_> {
     }
 
     fn read_sys_reg(&self, reg: u16) -> Result<u64, Error> {
-        let val: u64 = 0;
-        let ret = unsafe { hv_vcpu_get_sys_reg(self.vcpuid, reg, &val as *const _ as *mut _) };
+        let mut val: u64 = 0;
+        let ret = unsafe { hv_vcpu_get_sys_reg(self.vcpuid, reg, &mut val as *mut _) };
         if ret != HV_SUCCESS {
             Err(Error::VcpuReadSystemRegister)
         } else {
