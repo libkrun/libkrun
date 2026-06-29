@@ -1300,6 +1300,42 @@ int32_t krun_set_root_disk_remount(uint32_t ctx_id, const char *device, const ch
  */
 int32_t krun_start_enter(uint32_t ctx_id);
 
+/**
+ * Pause a running VM: freeze every vCPU at an instruction boundary. Thread-safe
+ * and out-of-band -- call it from a thread other than the one blocked in
+ * krun_start_enter(). The freeze completes asynchronously in the VM's event
+ * loop; this returns as soon as the request is signalled. Idempotent. Device
+ * worker threads are notification-driven, so they idle on their own while the
+ * guest is frozen. Currently macOS/HVF only; returns -ENOTSUP elsewhere.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID of the running VM.
+ *
+ * Returns:
+ *  0        - the pause request was signalled.
+ *  -ENOENT  - no running VM is registered for this ctx_id.
+ *  -EIO     - failed to signal the VM.
+ *  -ENOTSUP - pause is unsupported on this platform.
+ */
+int32_t krun_vm_pause(uint32_t ctx_id);
+
+/**
+ * Resume a VM previously paused with krun_vm_pause(). The guest's virtual timer
+ * is advanced by the time spent paused so armed timers do not fire en masse on
+ * wake. Thread-safe, out-of-band, and idempotent. Currently macOS/HVF only;
+ * returns -ENOTSUP elsewhere.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID of the paused VM.
+ *
+ * Returns:
+ *  0        - the resume request was signalled.
+ *  -ENOENT  - no running VM is registered for this ctx_id.
+ *  -EIO     - failed to signal the VM.
+ *  -ENOTSUP - resume is unsupported on this platform.
+ */
+int32_t krun_vm_resume(uint32_t ctx_id);
+
 #ifdef __cplusplus
 }
 #endif

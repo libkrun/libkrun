@@ -988,6 +988,11 @@ pub fn build_microvm(
     // We use this atomic to record the exit code set by init/init.c in the VM.
     let exit_code = Arc::new(AtomicI32::new(i32::MAX));
 
+    #[cfg(target_os = "macos")]
+    let (vm_ctl_tx, vm_ctl_rx) = utils::pollable_channel::pollable_channel()
+        .map_err(Error::EventFd)
+        .map_err(StartMicrovmError::Internal)?;
+
     let mut vmm = Vmm {
         guest_memory,
         arch_memory_info,
@@ -1000,6 +1005,14 @@ pub fn build_microvm(
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
+        #[cfg(target_os = "macos")]
+        vm_ctl_tx,
+        #[cfg(target_os = "macos")]
+        vm_ctl_rx,
+        #[cfg(target_os = "macos")]
+        paused: false,
+        #[cfg(target_os = "macos")]
+        paused_at: 0,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.

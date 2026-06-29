@@ -16,6 +16,7 @@ use bindings::*;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::asm;
+use std::cell::Cell;
 
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
@@ -328,6 +329,9 @@ pub struct HvfVcpu<'a> {
     pending_advance_pc: bool,
     vtimer_masked: bool,
     nested_enabled: bool,
+    // Cached copy of the HVF vtimer offset (0 until a live pause advances it),
+    // so the WFE deadline check doesn't issue a syscall on every wait.
+    vtimer_offset: Cell<u64>,
 }
 
 impl HvfVcpu<'_> {
@@ -375,6 +379,7 @@ impl HvfVcpu<'_> {
             pending_advance_pc: false,
             vtimer_masked: false,
             nested_enabled,
+            vtimer_offset: Cell::new(0),
         })
     }
 
@@ -504,6 +509,22 @@ impl HvfVcpu<'_> {
         } else {
             Ok(val)
         }
+    }
+
+    /// Freeze the guest's CNTVCT across a live pause. The guest virtual counter
+    /// is `mach_absolute_time() - vtimer_offset`; while paused the host counter
+    /// keeps advancing, so on resume we add the ticks spent paused to the offset.
+    /// The guest's counter then resumes where it stopped and armed deadlines stay
+    /// in the near future instead of firing en masse to catch up the gap.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub fn advance_vtimer_offset(&self, paused_ticks: u64) -> Result<(), Error> {
+        let offset = self.vtimer_offset.get().wrapping_add(paused_ticks);
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, offset) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetRegister);
+        }
+        self.vtimer_offset.set(offset);
+        Ok(())
     }
 
     fn hvf_sync_vtimer(&mut self, vcpu_list: Arc<dyn Vcpus>) {
@@ -712,7 +733,15 @@ impl HvfVcpu<'_> {
 
                 // Also CNTV_CVAL & CNTV_CVAL_EL0
                 let cval = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)?;
-                let now = unsafe { mach_absolute_time() };
+                // The guest's deadline `cval` is in the CNTVCT domain, where
+                // CNTVCT = mach_absolute_time() - vtimer_offset. The offset is 0
+                // on a fresh boot but nonzero after a live pause (it keeps CNTVCT
+                // continuous across the paused interval). Compare against the
+                // corrected counter, not raw mach time — otherwise after a pause
+                // `now` runs ahead of every armed deadline and the vCPU busy-loops
+                // on WaitForEventExpired instead of parking, so the guest's virtual
+                // timer never fires and timed sleeps hang.
+                let now = unsafe { mach_absolute_time() }.saturating_sub(self.vtimer_offset.get());
                 if now > cval {
                     return Ok(VcpuExit::WaitForEventExpired);
                 }

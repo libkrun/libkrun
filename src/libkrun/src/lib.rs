@@ -39,10 +39,14 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
 use utils::eventfd::EventFd;
+#[cfg(target_os = "macos")]
+use utils::pollable_channel::PollableChannelSender;
 #[cfg(target_os = "windows")]
 use utils::windows::AsRawFd;
 #[cfg(target_os = "windows")]
 use utils::windows::SendHandle;
+#[cfg(target_os = "macos")]
+use vmm::VmCtl;
 use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
     VmResources, VsockConfig,
@@ -425,6 +429,13 @@ fn with_cfg(ctx_id: u32, f: impl FnOnce(&mut ContextConfig) -> i32) -> i32 {
 
 static CTX_MAP: Lazy<Mutex<HashMap<u32, ContextConfig>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static CTX_IDS: AtomicI32 = AtomicI32::new(0);
+
+/// Out-of-band control channel for running VMs, keyed by ctx id. Populated by
+/// `krun_start_enter` for every macOS VM so `krun_vm_pause` / `krun_vm_resume`
+/// can reach it from another thread.
+#[cfg(target_os = "macos")]
+static VM_CTL: Lazy<Mutex<HashMap<u32, PollableChannelSender<VmCtl>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn log_level_to_filter_str(level: u32) -> &'static str {
     match level {
@@ -2965,6 +2976,14 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(any(feature = "amd-sev", feature = "tdx"))]
     vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
 
+    // Register the control channel for every macOS VM so another thread can
+    // freeze/wake this guest while `krun_start_enter` blocks here.
+    #[cfg(target_os = "macos")]
+    VM_CTL
+        .lock()
+        .unwrap()
+        .insert(ctx_id, _vmm.lock().unwrap().vm_ctl_sender());
+
     loop {
         match event_manager.run() {
             Ok(_) => {}
@@ -2974,6 +2993,51 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             }
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn send_vm_ctl(ctx_id: u32, req: VmCtl) -> i32 {
+    let map = VM_CTL.lock().unwrap();
+    let Some(tx) = map.get(&ctx_id) else {
+        return -libc::ENOENT;
+    };
+    if let Err(e) = tx.send(req) {
+        error!("Failed to send vm control request: {e:?}");
+        return -libc::EIO;
+    }
+    KRUN_SUCCESS
+}
+
+/// Thread-safe out-of-band freeze of a VM running under `krun_start_enter` on
+/// another thread: every vCPU stops at an instruction boundary. Returns once the
+/// request is signalled (the freeze completes asynchronously in the VM's event
+/// loop). Idempotent. Device worker threads are notify-driven, so they idle on
+/// their own while the guest is frozen.
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_vm_pause(ctx_id: u32) -> i32 {
+    send_vm_ctl(ctx_id, VmCtl::Pause)
+}
+
+/// Thread-safe out-of-band wake of a VM previously frozen with `krun_vm_pause`.
+/// The guest's virtual timer is advanced by the time spent paused so armed
+/// timers don't fire en masse. Idempotent.
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_vm_resume(ctx_id: u32) -> i32 {
+    send_vm_ctl(ctx_id, VmCtl::Resume)
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_vm_pause(_ctx_id: u32) -> i32 {
+    -libc::ENOTSUP
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_vm_resume(_ctx_id: u32) -> i32 {
+    -libc::ENOTSUP
 }
 
 #[cfg(feature = "aws-nitro")]
