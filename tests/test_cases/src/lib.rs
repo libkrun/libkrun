@@ -1,6 +1,9 @@
 mod test_vm_config;
 use test_vm_config::TestVmConfig;
 
+mod test_vm_pause;
+use test_vm_pause::TestVmPause;
+
 #[cfg(any(feature = "host", target_os = "linux"))]
 mod test_vsock_guest_connect;
 #[cfg(any(feature = "host", target_os = "linux"))]
@@ -92,6 +95,7 @@ pub fn test_cases() -> Vec<TestCase> {
                 ram_mib: 1024,
             }),
         ),
+        TestCase::new("vm-pause", Box::new(TestVmPause)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("vsock-guest-connect", Box::new(TestVsockGuestConnect)),
         TestCase::new(
