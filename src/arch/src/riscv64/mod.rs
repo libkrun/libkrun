@@ -40,6 +40,8 @@ pub fn arch_memory_regions(
     let info = ArchMemoryInfo {
         ram_last_addr,
         shm_start_addr,
+        // To be filled later using GuestMemory.
+        guest_last_addr: 0,
         page_size,
         initrd_addr: ram_last_addr - layout::FDT_MAX_SIZE as u64 - initrd_size,
         firmware_addr: FIRMWARE_START,
