@@ -5,7 +5,7 @@
 //! on-disk layout (`manifest.json` + `memory.img` + `vmstate`).
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 #[cfg(target_arch = "aarch64")]
@@ -122,6 +122,25 @@ pub fn write_mem_image(mem: &GuestMemoryMmap, out: &mut dyn Write) -> Result<(),
     Ok(())
 }
 
+/// Load `memory.img` back into guest RAM (the inverse of [`write_mem_image`]).
+/// Regions are filled in the same address order they were dumped.
+///
+/// ponytail: copies the image into anonymous guest RAM. A `MAP_PRIVATE` mapping
+/// of `memory.img` would demand-page instead (lower idle RSS) — the upgrade path
+/// if restore RSS matters.
+pub fn load_mem_image(mem: &GuestMemoryMmap, src: &mut dyn Read) -> Result<(), SnapErr> {
+    for region in mem.iter() {
+        let host = mem
+            .get_host_address(region.start_addr())
+            .map_err(|e| SnapErr::State(format!("guest memory host address: {e:?}")))?;
+        // SAFETY: vCPUs are not started yet, so the region is exclusively ours
+        // and the mapping outlives this write.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(host, region.len() as usize) };
+        src.read_exact(bytes)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // snapshot directory: manifest.json + vmstate + memory.img
 // ---------------------------------------------------------------------------
@@ -135,8 +154,7 @@ pub const MEMORY_NAME: &str = "memory.img";
 pub const MANIFEST_VERSION: u32 = 1;
 
 /// The human-readable side of a snapshot: what's needed to rebuild the VM
-/// shape before loading `vmstate`/`memory.img`. Device descriptors are added
-/// with per-device capture.
+/// shape before loading `vmstate`/`memory.img`.
 #[derive(Serialize, Deserialize)]
 pub struct Manifest {
     pub manifest_version: u32,
@@ -146,6 +164,64 @@ pub struct Manifest {
     pub mem_size_mib: usize,
     pub vcpu_count: u8,
     pub vmstate_version: u32,
+    /// Device kinds in registration order. Restore matches saved device state to
+    /// live devices by position, so this is the topology the restore config must
+    /// reproduce exactly (device kind is not unique on its own).
+    pub devices: Vec<String>,
+}
+
+impl Manifest {
+    /// Reject a freshly-configured VM that doesn't match the snapshot it is
+    /// restoring into. Config-validate restore: the embedder rebuilt the VM
+    /// shape (with fresh fds), and this is the single gate before saved state is
+    /// hydrated onto it.
+    pub fn validate(
+        &self,
+        arch: &str,
+        backend: &str,
+        mem_size_mib: usize,
+        vcpu_count: u8,
+        device_kinds: &[&str],
+    ) -> Result<(), SnapErr> {
+        if self.manifest_version != MANIFEST_VERSION {
+            return Err(SnapErr::Version {
+                expected: MANIFEST_VERSION,
+                found: self.manifest_version,
+            });
+        }
+        let mismatch = |field: &str, want: &dyn std::fmt::Display, got: &dyn std::fmt::Display| {
+            SnapErr::State(format!(
+                "snapshot {field} mismatch: snapshot={want}, config={got}"
+            ))
+        };
+        if self.arch != arch {
+            return Err(mismatch("arch", &self.arch, &arch));
+        }
+        if self.backend != backend {
+            return Err(mismatch("backend", &self.backend, &backend));
+        }
+        if self.mem_size_mib != mem_size_mib {
+            return Err(mismatch("mem_size_mib", &self.mem_size_mib, &mem_size_mib));
+        }
+        if self.vcpu_count != vcpu_count {
+            return Err(mismatch("vcpu_count", &self.vcpu_count, &vcpu_count));
+        }
+        if self.devices.len() != device_kinds.len()
+            || self.devices.iter().zip(device_kinds).any(|(a, b)| a != b)
+        {
+            return Err(SnapErr::State(format!(
+                "snapshot device topology mismatch: snapshot={:?}, config={:?}",
+                self.devices, device_kinds
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Read and parse `manifest.json` from a snapshot directory.
+pub fn read_manifest(dir: &Path) -> Result<Manifest, SnapErr> {
+    let bytes = fs::read(dir.join(MANIFEST_NAME))?;
+    serde_json::from_slice(&bytes).map_err(|e| SnapErr::State(format!("manifest: {e}")))
 }
 
 /// Write a complete snapshot directory: `manifest.json`, the `vmstate` blob,
@@ -276,6 +352,94 @@ impl<'a> Iterator for VmstateReader<'a> {
     }
 }
 
+/// Everything the `vmstate` blob carries, decoded for restore. The memory image
+/// and manifest load separately (the caller owns the guest-RAM lifetime).
+#[cfg(target_arch = "aarch64")]
+pub struct Vmstate {
+    /// One per vCPU, in capture (vCPU index) order.
+    pub vcpus: Vec<Aarch64VcpuState>,
+    /// Opaque GIC distributor/redistributor blob.
+    pub gic: Vec<u8>,
+    /// `(device id, state)` pairs; restore binds each onto the live device of
+    /// the same id.
+    pub devices: Vec<(String, DeviceState)>,
+}
+
+/// Decode a `vmstate` blob produced by [`VmstateWriter`] back into its sections.
+#[cfg(target_arch = "aarch64")]
+pub fn load_vmstate(blob: &[u8]) -> Result<Vmstate, SnapErr> {
+    let mut vcpus = Vec::new();
+    let mut gic = Vec::new();
+    let mut devices = Vec::new();
+    for section in VmstateReader::new(blob)? {
+        let s = section?;
+        match s.id {
+            x if x == SectionId::Vcpu as u8 => vcpus.push(Aarch64VcpuState::from_bytes(s.bytes)?),
+            x if x == SectionId::Gic as u8 => gic = s.bytes.to_vec(),
+            x if x == SectionId::Device as u8 => {
+                let (id, bytes) = split_device_section(s.bytes)?;
+                devices.push((
+                    id,
+                    DeviceState {
+                        version: s.version,
+                        bytes,
+                    },
+                ));
+            }
+            other => {
+                return Err(SnapErr::State(format!(
+                    "vmstate: unknown section id {other}"
+                )));
+            }
+        }
+    }
+    Ok(Vmstate {
+        vcpus,
+        gic,
+        devices,
+    })
+}
+
+/// Split a device section's `[id_len u16][id][bytes]` framing (the inverse of
+/// the framing [`crate::Vmm::snapshot`] writes).
+#[cfg(target_arch = "aarch64")]
+fn split_device_section(bytes: &[u8]) -> Result<(String, Vec<u8>), SnapErr> {
+    let id_len = bytes
+        .get(0..2)
+        .map(|b| u16::from_le_bytes(b.try_into().unwrap()) as usize)
+        .ok_or_else(|| SnapErr::State("device section: truncated id length".into()))?;
+    let end = 2 + id_len;
+    let id = bytes
+        .get(2..end)
+        .ok_or_else(|| SnapErr::State("device section: truncated id".into()))?;
+    let id = String::from_utf8(id.to_vec())
+        .map_err(|e| SnapErr::State(format!("device id utf8: {e}")))?;
+    Ok((id, bytes[end..].to_vec()))
+}
+
+/// A snapshot loaded from disk, ready to hydrate onto a freshly-built VM. The
+/// memory image is opened lazily at apply time (it can be large).
+#[cfg(target_arch = "aarch64")]
+pub struct RestoreInput {
+    pub manifest: Manifest,
+    pub vmstate: Vmstate,
+    pub mem_path: std::path::PathBuf,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl RestoreInput {
+    /// Read `manifest.json` + `vmstate` from a snapshot directory.
+    pub fn read(dir: &Path) -> Result<Self, SnapErr> {
+        let manifest = read_manifest(dir)?;
+        let vmstate = load_vmstate(&fs::read(dir.join(VMSTATE_NAME))?)?;
+        Ok(Self {
+            manifest,
+            vmstate,
+            mem_path: dir.join(MEMORY_NAME),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +498,7 @@ mod tests {
             mem_size_mib: 1,
             vcpu_count: 2,
             vmstate_version: VMSTATE_VERSION,
+            devices: vec![],
         };
         let mut w = VmstateWriter::new();
         w.section(SectionId::Vcpu, 1, &[9, 9]);
@@ -373,6 +538,76 @@ mod tests {
         assert!(Aarch64VcpuState::from_bytes(&bytes[..bytes.len() - 1]).is_err());
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn load_vmstate_splits_sections() {
+        let vcpu = Aarch64VcpuState {
+            gp: core::array::from_fn(|i| i as u64),
+            sysregs: vec![(1, 2)],
+            simd: [0; 32],
+            icc: vec![],
+            fpcr: 0,
+            fpsr: 0,
+            vtimer: VtimerState {
+                mask: false,
+                offset: 0,
+            },
+            host_counter: 42,
+        };
+        let mut w = VmstateWriter::new();
+        w.section(SectionId::Vcpu, VCPU_SECTION_VERSION, &vcpu.to_bytes());
+        w.section(SectionId::Gic, 1, b"gicblob");
+        // Device framing: [id_len u16][id][bytes], section version = dev version.
+        let id = b"rtc0";
+        let mut payload = (id.len() as u16).to_le_bytes().to_vec();
+        payload.extend_from_slice(id);
+        payload.extend_from_slice(b"rtcstate");
+        w.section(SectionId::Device, 2, &payload);
+
+        let vm = load_vmstate(&w.finish()).unwrap();
+        assert_eq!(vm.vcpus.len(), 1);
+        assert_eq!(vm.vcpus[0], vcpu);
+        assert_eq!(vm.gic, b"gicblob");
+        assert_eq!(vm.devices.len(), 1);
+        assert_eq!(vm.devices[0].0, "rtc0");
+        assert_eq!(vm.devices[0].1.version, 2);
+        assert_eq!(vm.devices[0].1.bytes, b"rtcstate");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn manifest_validate_rejects_mismatch() {
+        let m = Manifest {
+            manifest_version: MANIFEST_VERSION,
+            libkrun_version: "x".into(),
+            arch: "aarch64".into(),
+            backend: "hvf".into(),
+            mem_size_mib: 512,
+            vcpu_count: 1,
+            vmstate_version: VMSTATE_VERSION,
+            devices: vec!["fs".into(), "console".into()],
+        };
+        let devs = ["fs", "console"];
+        assert!(m.validate("aarch64", "hvf", 512, 1, &devs).is_ok());
+        assert!(m.validate("aarch64", "hvf", 256, 1, &devs).is_err());
+        assert!(m.validate("aarch64", "hvf", 512, 2, &devs).is_err());
+        assert!(m.validate("x86_64", "hvf", 512, 1, &devs).is_err());
+        // Topology: reordered, missing, extra, and wrong-kind all fail.
+        assert!(
+            m.validate("aarch64", "hvf", 512, 1, &["console", "fs"])
+                .is_err()
+        );
+        assert!(m.validate("aarch64", "hvf", 512, 1, &["fs"]).is_err());
+        assert!(
+            m.validate("aarch64", "hvf", 512, 1, &["fs", "console", "block"])
+                .is_err()
+        );
+        assert!(
+            m.validate("aarch64", "hvf", 512, 1, &["fs", "block"])
+                .is_err()
+        );
+    }
+
     #[test]
     fn manifest_round_trips() {
         let m = Manifest {
@@ -383,11 +618,13 @@ mod tests {
             mem_size_mib: 1,
             vcpu_count: 1,
             vmstate_version: VMSTATE_VERSION,
+            devices: vec!["fs".into(), "console".into()],
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: Manifest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.libkrun_version, "1.0\"evil");
         assert_eq!(back.vcpu_count, 1);
+        assert_eq!(back.devices, ["fs", "console"]);
     }
 
     #[test]

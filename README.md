@@ -63,6 +63,16 @@ Each variant generates a dynamic library with a different name (and ```soname```
 * virtio-rng
 
 
+## Snapshot and restore (experimental)
+
+> Available on the macOS/HVF backend only, and part of the still-evolving 2.0 API.
+
+Capture a running VM (vCPU, interrupt controller, devices, and memory) to a
+directory with `krun_snapshot_request()`, then restore it onto a
+freshly-configured context and resume from the captured point with
+`krun_restore()`. See `include/libkrun.h` for the full API.
+
+
 ## Networking
 
 In ```libkrun```, networking is provided by two different, mutually exclusive techniques: **virtio-vsock + TSI** and **virtio-net + passt/gvproxy**.

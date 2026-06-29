@@ -164,6 +164,13 @@ pub trait VirtioDevice: AsAny + Send {
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         None
     }
+
+    /// Re-establish worker state after a snapshot restore, once the transport has
+    /// re-activated the device with the restored queues. Default: no-op. A fresh
+    /// boot starts these from guest control-queue messages (e.g. console port
+    /// open); a guest restored at steady state has already sent them and won't
+    /// resend, so devices that spawn per-queue I/O threads must restart them.
+    fn resume_after_restore(&mut self) {}
 }
 
 pub trait VmmExitObserver: Send {

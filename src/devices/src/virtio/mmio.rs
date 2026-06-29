@@ -17,8 +17,9 @@ use super::device_status;
 use super::*;
 use crate::bus::BusDevice;
 use crate::legacy::IrqChip;
+use crate::snapshot::{DeviceState, Snapshottable};
 use utils::{byte_order, eventfd::EventFd};
-use vm_memory::{GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 //TODO crosvm uses 0 here, but IIRC virtio specified some other vendor id that should be used
 const VENDOR_ID: u32 = 0;
@@ -78,6 +79,12 @@ pub struct MmioTransport {
     queue_config: Vec<QueueConfig>,
     shm_region_select: u32,
     interrupt: InterruptTransport,
+    // Per-instance registration id, used as the snapshot key (id()).
+    name: String,
+    // Queue addresses/sizes captured at activation. The live queues are moved
+    // into the device (and then its worker threads), so this is the only place
+    // the transport can recover their config for a snapshot.
+    activated_queues: Vec<QueueSnapshot>,
 }
 
 struct InterruptTransportInner {
@@ -168,12 +175,17 @@ impl MmioTransport {
         mem: GuestMemoryMmap,
         intc: IrqChip,
         device: Arc<Mutex<dyn VirtioDevice>>,
+        id: String,
     ) -> Result<MmioTransport, CreateMmioTransportError> {
         let locked = device
             .try_lock()
             .expect("Mutex of VirtioDevice should not be locked when calling MmioTransport::new");
 
-        let debug_log_target = format!("{}[{}]", module_path!(), locked.device_name());
+        // The per-instance registration id (e.g. the block drive id, or "fs0"),
+        // not the device kind — snapshot keys device state by it, so it must be
+        // unique across devices of the same kind.
+        let name = id;
+        let debug_log_target = format!("{}[{}]", module_path!(), name);
         let queue_config: Vec<QueueConfig> = locked.queue_config().to_vec();
         drop(locked);
 
@@ -193,6 +205,8 @@ impl MmioTransport {
             queue_evts,
             queue_config,
             shm_region_select: 0,
+            name,
+            activated_queues: Vec::new(),
         })
     }
 
@@ -302,6 +316,10 @@ impl MmioTransport {
         let Some(queues) = self.queues.take() else {
             return;
         };
+
+        // Record the negotiated queue config before ownership passes to the
+        // device's worker threads, so a later snapshot can recover it.
+        self.activated_queues = queues.iter().map(|q| q.snapshot()).collect();
 
         let mut device_queues: Vec<DeviceQueue> = queues
             .into_iter()
@@ -527,6 +545,105 @@ impl BusDevice for MmioTransport {
     }
 }
 
+/// Version of the transport snapshot encoding.
+const TRANSPORT_SNAPSHOT_VERSION: u8 = 1;
+
+/// Resume-critical virtio-mmio negotiation state. The inner device's threads,
+/// fds, and per-port state are rebuilt by re-activation on restore.
+#[derive(bincode::Encode, bincode::Decode)]
+struct TransportState {
+    device_status: u32,
+    acked_features: u64,
+    queues: Vec<Option<QueueSnapshot>>,
+}
+
+impl Snapshottable for MmioTransport {
+    fn id(&self) -> &str {
+        &self.name
+    }
+
+    fn save(&self) -> Result<DeviceState, crate::Error> {
+        // The live queues' running indices are owned by the device's worker
+        // threads, but the vCPUs are frozen and the workers quiesced at snapshot
+        // time, so every consumed buffer has been returned: next_avail ==
+        // next_used == the guest's used-ring index. Recover the addresses from
+        // the activation-time config and the index from guest memory.
+        let queues = self
+            .activated_queues
+            .iter()
+            .map(|qs| {
+                let mut qs = *qs;
+                let used_idx: u16 = self
+                    .mem
+                    .read_obj(GuestAddress(qs.used_ring.wrapping_add(2)))
+                    .unwrap_or(0);
+                qs.next_avail = used_idx;
+                qs.next_used = used_idx;
+                Some(qs)
+            })
+            .collect();
+        let state = TransportState {
+            device_status: self.device_status,
+            acked_features: self.locked_device().acked_features(),
+            queues,
+        };
+        let bytes = bincode::encode_to_vec(&state, bincode::config::standard())
+            .map_err(|e| crate::Error::Snapshot(e.to_string()))?;
+        Ok(DeviceState {
+            version: TRANSPORT_SNAPSHOT_VERSION,
+            bytes,
+        })
+    }
+
+    /// Rebuild the negotiated queues and re-activate the device. The guest wrote
+    /// DRIVER_OK before the snapshot and resumes past it, so the transport never
+    /// sees that write again — without re-activating here the device's worker
+    /// threads never start and the guest's queue notifications go unanswered.
+    fn restore(&mut self, state: &DeviceState) -> Result<(), crate::Error> {
+        if state.version != TRANSPORT_SNAPSHOT_VERSION {
+            return Err(crate::Error::Snapshot(format!(
+                "mmio transport: unsupported state version {}",
+                state.version
+            )));
+        }
+        let (ts, _): (TransportState, _) =
+            bincode::decode_from_slice(&state.bytes, bincode::config::standard())
+                .map_err(|e| crate::Error::Snapshot(format!("mmio transport: {e}")))?;
+
+        self.locked_device().set_acked_features(ts.acked_features);
+
+        // Rebuild the queues from saved state (addresses, indices, ready bits)
+        // before activation moves them into the device.
+        let mut queues = Self::create_queues(&self.queue_config);
+        for (queue, snapshot) in queues.iter_mut().zip(&ts.queues) {
+            if let Some(snapshot) = snapshot {
+                queue.restore(snapshot);
+            }
+        }
+        // The ring addresses/size come from an untrusted snapshot; the workers
+        // assume validated queues (they `unwrap()` guest-memory access), so a
+        // ready queue that fails validation must fail the restore, not panic
+        // later on the first kick.
+        for queue in queues.iter().filter(|q| q.ready) {
+            if !queue.is_valid(&self.mem) {
+                return Err(crate::Error::Snapshot(
+                    "mmio transport: restored queue failed validation".into(),
+                ));
+            }
+        }
+        self.queues = Some(queues);
+        self.device_status = ts.device_status;
+
+        if (ts.device_status & device_status::DRIVER_OK) != 0
+            && !self.locked_device().is_activated()
+        {
+            self.activate();
+            self.locked_device().resume_after_restore();
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use utils::byte_order::{read_le_u32, write_le_u32};
@@ -619,8 +736,13 @@ pub(crate) mod tests {
     fn test_new() {
         let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
         let dummy = DummyDevice::new();
-        let mut d =
-            MmioTransport::new(m, DummyIrqChip::new().into(), Arc::new(Mutex::new(dummy))).unwrap();
+        let mut d = MmioTransport::new(
+            m,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(dummy)),
+            "test".into(),
+        )
+        .unwrap();
 
         // We just make sure here that the implementation of a mmio device behaves as we expect,
         // given a known virtio device implementation (the dummy device).
@@ -650,6 +772,7 @@ pub(crate) mod tests {
             m,
             DummyIrqChip::new().into(),
             Arc::new(Mutex::new(DummyDevice::new())),
+            "test".into(),
         )
         .unwrap();
 
@@ -730,7 +853,13 @@ pub(crate) mod tests {
     fn test_bus_device_write() {
         let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
         let dummy_dev = Arc::new(Mutex::new(DummyDevice::new()));
-        let mut d = MmioTransport::new(m, DummyIrqChip::new().into(), dummy_dev.clone()).unwrap();
+        let mut d = MmioTransport::new(
+            m,
+            DummyIrqChip::new().into(),
+            dummy_dev.clone(),
+            "test".into(),
+        )
+        .unwrap();
         let mut buf = vec![0; 5];
         write_le_u32(&mut buf[..4], 1);
 
@@ -891,6 +1020,7 @@ pub(crate) mod tests {
             m,
             DummyIrqChip::new().into(),
             Arc::new(Mutex::new(DummyDevice::new())),
+            "test".into(),
         )
         .unwrap();
 
@@ -1004,6 +1134,7 @@ pub(crate) mod tests {
             m,
             DummyIrqChip::new().into(),
             Arc::new(Mutex::new(DummyDevice::new())),
+            "test".into(),
         )
         .unwrap();
         let mut buf = [0; 4];

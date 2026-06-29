@@ -120,7 +120,7 @@ impl MMIODeviceManager {
     /// Register an already created MMIO device to be used via MMIO transport.
     pub fn register_mmio_device(
         &mut self,
-        mut mmio_device: devices::virtio::MmioTransport,
+        mmio_device: Arc<Mutex<devices::virtio::MmioTransport>>,
         type_id: u32,
         device_id: String,
     ) -> Result<(u64, u32)> {
@@ -128,10 +128,10 @@ impl MMIODeviceManager {
             return Err(Error::IrqsExhausted);
         }
 
-        mmio_device.set_irq_line(self.irq);
+        mmio_device.lock().unwrap().set_irq_line(self.irq);
 
         self.bus
-            .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)
+            .insert(mmio_device, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
         let ret = (self.mmio_base, self.irq);
         self.id_to_dev_info.insert(
@@ -360,11 +360,18 @@ mod tests {
             type_id: u32,
             device_id: &str,
         ) -> Result<u64> {
-            let mmio_device =
-                devices::virtio::MmioTransport::new(guest_mem, DummyIrqChip::new().into(), device)
-                    .unwrap();
-            let (mmio_base, _irq) =
-                self.register_mmio_device(mmio_device, type_id, device_id.to_string())?;
+            let mmio_device = devices::virtio::MmioTransport::new(
+                guest_mem,
+                DummyIrqChip::new().into(),
+                device,
+                device_id.to_string(),
+            )
+            .unwrap();
+            let (mmio_base, _irq) = self.register_mmio_device(
+                Arc::new(Mutex::new(mmio_device)),
+                type_id,
+                device_id.to_string(),
+            )?;
             Ok(mmio_base)
         }
     }

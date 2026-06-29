@@ -53,7 +53,7 @@ pub struct HvfGicBindings {
     hv_gic_get_redistributor_size:
         libloading::Symbol<'static, unsafe extern "C" fn(*mut usize) -> hv_return_t>,
     hv_gic_set_spi: libloading::Symbol<'static, unsafe extern "C" fn(u32, bool) -> hv_return_t>,
-    // Snapshot save-side symbols (restore-side lands with M2).
+    // Snapshot symbols (dynamic: not in the older Hypervisor.framework SDK).
     hv_gic_state_create: libloading::Symbol<'static, unsafe extern "C" fn() -> hv_gic_state_t>,
     hv_gic_state_get_size: libloading::Symbol<
         'static,
@@ -66,6 +66,12 @@ pub struct HvfGicBindings {
     hv_gic_get_icc_reg: libloading::Symbol<
         'static,
         unsafe extern "C" fn(hv_vcpu_t, hv_gic_icc_reg_t, *mut u64) -> hv_return_t,
+    >,
+    hv_gic_set_state:
+        libloading::Symbol<'static, unsafe extern "C" fn(*const c_void, usize) -> hv_return_t>,
+    hv_gic_set_icc_reg: libloading::Symbol<
+        'static,
+        unsafe extern "C" fn(hv_vcpu_t, hv_gic_icc_reg_t, u64) -> hv_return_t,
     >,
 }
 
@@ -115,6 +121,8 @@ impl HvfGicV3 {
                     .get(b"hv_gic_state_get_data")
                     .map_err(Error::FindSymbol)?,
                 hv_gic_get_icc_reg: HVF.get(b"hv_gic_get_icc_reg").map_err(Error::FindSymbol)?,
+                hv_gic_set_state: HVF.get(b"hv_gic_set_state").map_err(Error::FindSymbol)?,
+                hv_gic_set_icc_reg: HVF.get(b"hv_gic_set_icc_reg").map_err(Error::FindSymbol)?,
             }
         };
 
@@ -236,6 +244,38 @@ impl IrqChipT for HvfGicV3 {
                 }
             })
             .collect()
+    }
+
+    /// Restore the distributor/redistributor blob from [`HvfGicV3::save_gic_state`]
+    /// into the already-created in-kernel GIC. Must run after every vCPU exists:
+    /// the per-cpu redistributor state (incl. the PPI enable that gates the
+    /// virtual-timer IRQ) is dropped silently if a redistributor is missing.
+    fn restore_gic_state(&self, blob: &[u8]) -> Result<(), DeviceError> {
+        let ret =
+            unsafe { (self.bindings.hv_gic_set_state)(blob.as_ptr() as *const c_void, blob.len()) };
+        if ret != HV_SUCCESS {
+            Err(DeviceError::Snapshot("hv_gic_set_state failed".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn restore_vcpu_icc(&self, vcpuid: u64, regs: &[(u32, u64)]) -> Result<(), DeviceError> {
+        for &(reg, val) in regs {
+            // Snapshot data is untrusted: only restore ICC registers we capture,
+            // so a malformed snapshot can't write an arbitrary GIC register.
+            if !SAVED_ICC.iter().any(|&r| r as u32 == reg) {
+                return Err(DeviceError::Snapshot(format!(
+                    "snapshot has unknown ICC reg id 0x{reg:x}"
+                )));
+            }
+            let ret =
+                unsafe { (self.bindings.hv_gic_set_icc_reg)(vcpuid, reg as hv_gic_icc_reg_t, val) };
+            if ret != HV_SUCCESS {
+                return Err(DeviceError::Snapshot("hv_gic_set_icc_reg failed".into()));
+            }
+        }
+        Ok(())
     }
 }
 

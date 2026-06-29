@@ -203,10 +203,26 @@ pub struct Vcpu {
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
 
+    /// Snapshot state to hydrate instead of a normal boot. `None` on a fresh VM.
+    restore: Option<VcpuRestore>,
+
     /// GIC handle, set before capture so this thread can read its own per-vCPU
     /// ICC registers (HVF's `hv_gic_*` per-vCPU calls are thread-affine, so the
-    /// coordinator can't read them on the vCPU's behalf).
+    /// coordinator can't read them on the vCPU's behalf). Also carries the
+    /// restore calls, which are thread-affine for the same reason.
     intc: Option<IrqChip>,
+}
+
+/// State hydrated onto a vCPU on the restore path, replacing its normal boot
+/// (`set_initial_state`). Built by the restore orchestrator in `builder.rs`.
+pub struct VcpuRestore {
+    /// Architectural register file captured at snapshot.
+    pub state: HvfVcpuState,
+    /// Per-vCPU GIC CPU-interface (ICC) registers.
+    pub icc: Vec<(u32, u64)>,
+    /// The global GIC distributor/redistributor blob — `Some` only on the vCPU
+    /// that restores it (once, after every redistributor exists).
+    pub gic: Option<Vec<u8>>,
 }
 
 impl Vcpu {
@@ -300,12 +316,18 @@ impl Vcpu {
             response_sender,
             vcpu_list,
             nested_enabled,
+            restore: None,
             intc: None,
         })
     }
 
-    /// Give this vCPU the GIC handle so it can capture its own ICC state on its
-    /// own thread during a snapshot.
+    /// Hydrate this vCPU from a snapshot instead of booting it normally.
+    pub fn set_restore(&mut self, restore: VcpuRestore) {
+        self.restore = Some(restore);
+    }
+
+    /// Give this vCPU the GIC handle so it can capture or restore its own ICC
+    /// state on its own thread.
     pub fn set_intc(&mut self, intc: IrqChip) {
         self.intc = Some(intc);
     }
@@ -464,15 +486,23 @@ impl Vcpu {
         let (wfe_sender, wfe_receiver) = unbounded();
         self.vcpu_list.register(hvf_vcpuid, wfe_sender);
 
-        let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
-            boot_receiver.recv().unwrap()
+        if let Some(restore) = self.restore.take() {
+            if let Err(e) = self.apply_restore(&hvf_vcpu, hvf_vcpuid, restore) {
+                error!("vCPU {} restore failed: {e}", self.id);
+                self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+                return;
+            }
         } else {
-            self.boot_entry_addr
-        };
+            let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
+                boot_receiver.recv().unwrap()
+            } else {
+                self.boot_entry_addr
+            };
 
-        hvf_vcpu
-            .set_initial_state(entry_addr, self.fdt_addr)
-            .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+            hvf_vcpu
+                .set_initial_state(entry_addr, self.fdt_addr)
+                .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+        }
 
         loop {
             // An out-of-band pause request breaks the vCPU out of HVF via
@@ -541,6 +571,44 @@ impl Vcpu {
     }
 
     fn wait_for_resume(&mut self) {}
+
+    /// Hydrate snapshot state onto this freshly-created vCPU instead of booting
+    /// it. The GIC blob (if present) is restored first — its redistributor state
+    /// exists now that `HvfVcpu::new` has run — then the register file, then the
+    /// per-vCPU ICC registers (which live in the now-restored CPU interface).
+    ///
+    /// ponytail: single-vCPU happy path. With >1 vCPU the GIC blob must be
+    /// restored once after ALL redistributors exist (a barrier across the vCPU
+    /// threads), and every vCPU must share one vtimer offset (CNTVCT is
+    /// system-wide). Add both when multi-vCPU restore is needed.
+    ///
+    /// Returns an error (not a panic) on malformed snapshot data — the register
+    /// and ICC ids come from an untrusted snapshot and are validated against the
+    /// capture allowlists inside `restore_state` / `restore_vcpu_icc`.
+    fn apply_restore(
+        &self,
+        hvf_vcpu: &HvfVcpu,
+        hvf_id: u64,
+        restore: VcpuRestore,
+    ) -> std::result::Result<(), String> {
+        let intc = self.intc.as_ref().expect("vcpu intc set before restore");
+        if let Some(gic) = &restore.gic {
+            intc.lock()
+                .unwrap()
+                .restore_gic_state(gic)
+                .map_err(|e| format!("GIC state restore: {e:?}"))?;
+        }
+        let offset =
+            hvf::shared_vtimer_offset(restore.state.host_counter, restore.state.vtimer_offset);
+        hvf_vcpu
+            .restore_state(&restore.state, offset)
+            .map_err(|e| format!("vCPU register restore: {e:?}"))?;
+        intc.lock()
+            .unwrap()
+            .restore_vcpu_icc(hvf_id, &restore.icc)
+            .map_err(|e| format!("vCPU ICC restore: {e:?}"))?;
+        Ok(())
+    }
 
     /// Freeze in response to `Pause`, block until `Resume`, and advance the vtimer
     /// offset by the paused ticks (computed once VM-wide) so CNTVCT stays

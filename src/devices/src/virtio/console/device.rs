@@ -1,4 +1,3 @@
-use bincode::{Decode, Encode};
 use std::cmp;
 use std::io::Write;
 use std::iter::zip;
@@ -16,7 +15,6 @@ use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
 };
 use super::{defs, defs::control_event, defs::uapi};
-use crate::snapshot::{DeviceState as SnapshotState, Snapshottable};
 use crate::virtio::console::console_control::{
     ConsoleControl, VirtioConsoleControl, VirtioConsoleResize,
 };
@@ -25,7 +23,7 @@ use crate::virtio::console::port::Port;
 use crate::virtio::console::port_queue_mapping::{
     QueueDirection, num_queues, port_id_to_queue_idx,
 };
-use crate::virtio::{InterruptTransport, PortDescription, QueueSnapshot, VmmExitObserver};
+use crate::virtio::{InterruptTransport, PortDescription, VmmExitObserver};
 
 pub(crate) const CONTROL_RXQ_INDEX: usize = 2;
 pub(crate) const CONTROL_TXQ_INDEX: usize = 3;
@@ -354,6 +352,32 @@ impl VirtioDevice for Console {
         self.device_state.is_activated()
     }
 
+    /// Restart per-port I/O threads after restore. On a fresh boot these start
+    /// from the guest's `PORT_OPEN` control message (see `process_control_tx`);
+    /// a guest restored at steady state already negotiated its ports and won't
+    /// resend, so start every port's threads here using the restored queues.
+    fn resume_after_restore(&mut self) {
+        let (mem, interrupt) = match &self.device_state {
+            DeviceState::Activated(mem, interrupt) => (mem.clone(), interrupt.clone()),
+            _ => return,
+        };
+        for port_id in 0..self.ports.len() {
+            let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+            let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+            let (Some(rx), Some(tx)) = (self.queues[rx_idx].take(), self.queues[tx_idx].take())
+            else {
+                continue;
+            };
+            self.ports[port_id].start(
+                mem.clone(),
+                rx.queue,
+                tx.queue,
+                interrupt.clone(),
+                self.control.clone(),
+            );
+        }
+    }
+
     fn reset(&mut self) -> bool {
         // Shutdown ports and clear queues.
         for port in &mut self.ports {
@@ -370,60 +394,5 @@ impl VmmExitObserver for Console {
     fn on_vmm_exit(&mut self) {
         self.reset();
         log::trace!("Console on_vmm_exit finished");
-    }
-}
-
-/// Version of the console snapshot encoding.
-const CONSOLE_SNAPSHOT_VERSION: u8 = 2;
-
-/// Resume-critical console state. Ports/threads/fds are rebuilt on restore.
-#[derive(Encode, Decode)]
-struct ConsoleState {
-    acked_features: u64,
-    activated: bool,
-    queues: Vec<Option<QueueSnapshot>>,
-}
-
-impl Snapshottable for Console {
-    fn id(&self) -> &str {
-        "console"
-    }
-
-    fn save(&self) -> std::result::Result<SnapshotState, crate::Error> {
-        let state = ConsoleState {
-            acked_features: self.acked_features,
-            activated: matches!(self.device_state, DeviceState::Activated(..)),
-            queues: self
-                .queues
-                .iter()
-                .map(|q| q.as_ref().map(|dq| dq.queue.snapshot()))
-                .collect(),
-        };
-        let bytes = bincode::encode_to_vec(&state, bincode::config::standard())
-            .map_err(|e| crate::Error::Snapshot(e.to_string()))?;
-        Ok(SnapshotState {
-            version: CONSOLE_SNAPSHOT_VERSION,
-            bytes,
-        })
-    }
-
-    fn restore(&mut self, state: &SnapshotState) -> std::result::Result<(), crate::Error> {
-        if state.version != CONSOLE_SNAPSHOT_VERSION {
-            return Err(crate::Error::Snapshot(format!(
-                "console: unsupported state version {}",
-                state.version
-            )));
-        }
-        let (cs, _): (ConsoleState, _) =
-            bincode::decode_from_slice(&state.bytes, bincode::config::standard())
-                .map_err(|e| crate::Error::Snapshot(format!("console: {e}")))?;
-        self.acked_features = cs.acked_features;
-        // cs.activated is informational until restore reactivates.
-        for (i, qs) in cs.queues.iter().enumerate() {
-            if let (Some(qs), Some(Some(dq))) = (qs, self.queues.get_mut(i)) {
-                dq.queue.restore(qs);
-            }
-        }
-        Ok(())
     }
 }

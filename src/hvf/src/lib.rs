@@ -113,6 +113,7 @@ pub enum Error {
     VcpuReadRegister,
     VcpuReadSystemRegister,
     VcpuRequestExit,
+    RestoreInvalidRegister(u32),
     VcpuRun,
     VcpuSetPendingIrq,
     VcpuSetRegister,
@@ -139,6 +140,9 @@ impl Display for Error {
             VcpuReadRegister => write!(f, "Error reading HVF vCPU register"),
             VcpuReadSystemRegister => write!(f, "Error reading HVF vCPU system register"),
             VcpuRequestExit => write!(f, "Error requesting HVF vCPU exit"),
+            RestoreInvalidRegister(r) => {
+                write!(f, "Snapshot has unknown system register id 0x{r:x}")
+            }
             VcpuRun => write!(f, "Error running HVF vCPU"),
             VcpuSetPendingIrq => write!(f, "Error setting HVF vCPU pending irq"),
             VcpuSetRegister => write!(f, "Error setting HVF vCPU register"),
@@ -193,6 +197,47 @@ pub fn vcpu_set_pending_irq(
         Err(Error::VcpuSetPendingIrq)
     } else {
         Ok(())
+    }
+}
+
+/// Vtimer offset that keeps the guest's CNTVCT continuous across a snapshot.
+/// The guest counter at capture was `host_counter - captured_offset` (CNTVCT =
+/// `mach_absolute_time() - offset`); to resume the guest at that same value the
+/// new offset is `now - host_counter + captured_offset`. Computed once from the
+/// primary vCPU's capture and shared across all vCPUs (CNTVCT is system-wide).
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub fn shared_vtimer_offset(host_counter: u64, captured_offset: u64) -> u64 {
+    vtimer_offset_for(
+        unsafe { mach_absolute_time() },
+        host_counter,
+        captured_offset,
+    )
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn vtimer_offset_for(now: u64, host_counter: u64, captured_offset: u64) -> u64 {
+    now.saturating_sub(host_counter)
+        .saturating_add(captured_offset)
+}
+
+#[cfg(all(test, target_arch = "aarch64", target_os = "macos"))]
+mod vtimer_tests {
+    use super::vtimer_offset_for;
+
+    // The guest's CNTVCT is `now - offset`. Restoring must reproduce the value
+    // the guest saw at capture (`host_counter - captured_offset`), regardless of
+    // how much host time passed in between.
+    #[test]
+    fn restore_preserves_guest_counter() {
+        for &(host_counter, captured_offset, now) in &[
+            (1_000u64, 0u64, 5_000u64), // fresh capture (offset 0)
+            (1_000, 300, 5_000),        // captured after a pause
+            (10_000, 2_500, 10_000),    // no host time elapsed
+        ] {
+            let guest_at_capture = host_counter - captured_offset;
+            let offset = vtimer_offset_for(now, host_counter, captured_offset);
+            assert_eq!(now - offset, guest_at_capture);
+        }
     }
 }
 
@@ -327,7 +372,9 @@ pub struct HvfVcpu<'a> {
     mmio_buf: [u8; 8],
     pending_mmio_read: Option<MmioRead>,
     pending_advance_pc: bool,
-    vtimer_masked: bool,
+    // `Cell` so the `&self` restore path can update this mirror of the HVF vtimer
+    // mask alongside the hardware register.
+    vtimer_masked: Cell<bool>,
     nested_enabled: bool,
     // Cached copy of the HVF vtimer offset (0 until a live pause advances it),
     // so the WFE deadline check doesn't issue a syscall on every wait.
@@ -488,7 +535,7 @@ impl HvfVcpu<'_> {
             mmio_buf: [0; 8],
             pending_mmio_read: None,
             pending_advance_pc: false,
-            vtimer_masked: false,
+            vtimer_masked: Cell::new(false),
             nested_enabled,
             vtimer_offset: Cell::new(0),
         })
@@ -685,8 +732,54 @@ impl HvfVcpu<'_> {
         })
     }
 
+    /// Restore register state from [`HvfVcpu::save_state`] onto this fresh vCPU,
+    /// on its own thread before the first `run()`. ICC state is restored
+    /// separately via `hv_gic_*`. `vtimer_offset` (`now - host_counter`, shared
+    /// across vCPUs) keeps CNTVCT continuous, so armed deadlines don't fire en
+    /// masse to catch up the snapshot gap.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub fn restore_state(&self, state: &HvfVcpuState, vtimer_offset: u64) -> Result<(), Error> {
+        for (&r, &v) in SAVED_GP.iter().zip(&state.gp) {
+            self.write_reg(r, v)?;
+        }
+        for &(r, v) in &state.sysregs {
+            // Snapshot data is untrusted: only restore registers we capture, so a
+            // malformed snapshot can't write an arbitrary system register.
+            if !SAVED_SYSREGS.iter().any(|&s| s as u32 == r) {
+                return Err(Error::RestoreInvalidRegister(r));
+            }
+            let ret = unsafe { hv_vcpu_set_sys_reg(self.vcpuid, r as u16, v) };
+            if ret != HV_SUCCESS {
+                return Err(Error::VcpuSetSystemRegister(r as u16, v));
+            }
+        }
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, vtimer_offset) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetRegister);
+        }
+        self.vtimer_offset.set(vtimer_offset);
+        let ret = unsafe { hv_vcpu_set_vtimer_mask(self.vcpuid, state.vtimer_mask) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetVtimerMask);
+        }
+        // Keep the mirror in sync so hvf_sync_vtimer re-arms a restored-masked
+        // vtimer instead of skipping it forever.
+        self.vtimer_masked.set(state.vtimer_mask);
+        self.write_reg(hv_reg_t_HV_REG_FPCR, state.fpcr)?;
+        self.write_reg(hv_reg_t_HV_REG_FPSR, state.fpsr)?;
+        for (q, &val) in state.simd.iter().enumerate() {
+            let ret = unsafe {
+                hv_vcpu_set_simd_fp_reg(self.vcpuid, q as u32, val as hv_simd_fp_uchar16_t)
+            };
+            if ret != HV_SUCCESS {
+                return Err(Error::VcpuSetRegister);
+            }
+        }
+        Ok(())
+    }
+
     fn hvf_sync_vtimer(&mut self, vcpu_list: Arc<dyn Vcpus>) {
-        if !self.vtimer_masked {
+        if !self.vtimer_masked.get() {
             return;
         }
 
@@ -698,7 +791,7 @@ impl HvfVcpu<'_> {
         vcpu_list.set_vtimer_irq(self.vcpuid);
         if !irq_state {
             vcpu_set_vtimer_mask(self.vcpuid, false).unwrap();
-            self.vtimer_masked = false;
+            self.vtimer_masked.set(false);
         }
     }
 
@@ -767,7 +860,7 @@ impl HvfVcpu<'_> {
         match self.vcpu_exit.reason {
             HV_EXIT_REASON_EXCEPTION => { /* This is the main one, handle below. */ }
             HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                self.vtimer_masked = true;
+                self.vtimer_masked.set(true);
                 return Ok(VcpuExit::VtimerActivated);
             }
             HV_EXIT_REASON_CANCELED => return Ok(VcpuExit::Canceled),
@@ -891,14 +984,10 @@ impl HvfVcpu<'_> {
 
                 // Also CNTV_CVAL & CNTV_CVAL_EL0
                 let cval = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)?;
-                // The guest's deadline `cval` is in the CNTVCT domain, where
-                // CNTVCT = mach_absolute_time() - vtimer_offset. The offset is 0
-                // on a fresh boot but nonzero after a live pause (it keeps CNTVCT
-                // continuous across the paused interval). Compare against the
-                // corrected counter, not raw mach time — otherwise after a pause
-                // `now` runs ahead of every armed deadline and the vCPU busy-loops
-                // on WaitForEventExpired instead of parking, so the guest's virtual
-                // timer never fires and timed sleeps hang.
+                // `cval` is in the CNTVCT domain (mach time - vtimer_offset), so
+                // compare against the corrected counter; using raw mach time after
+                // a pause/restore busy-loops on WaitForEventExpired and the vtimer
+                // never fires.
                 let now = unsafe { mach_absolute_time() }.saturating_sub(self.vtimer_offset.get());
                 if now > cval {
                     return Ok(VcpuExit::WaitForEventExpired);

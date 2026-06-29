@@ -2845,6 +2845,14 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(feature = "aws-nitro")]
     return krun_start_enter_nitro(ctx_id);
 
+    enter_vmm(ctx_id, None)
+}
+
+/// Build the microVM from a ctx and run its event loop (blocking). When
+/// `restore` is set, the VM is hydrated from that snapshot directory instead of
+/// booted.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+fn enter_vmm(ctx_id: u32, restore: Option<PathBuf>) -> i32 {
     let mut event_manager = match EventManager::new() {
         Ok(em) => em,
         Err(e) => {
@@ -2957,6 +2965,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         &mut event_manager,
         ctx_cfg.shutdown_efd,
         sender,
+        restore,
     ) {
         Ok(vmm) => vmm,
         Err(e) => {
@@ -3042,6 +3051,43 @@ pub extern "C" fn krun_vm_resume(_ctx_id: u32) -> i32 {
     -libc::ENOTSUP
 }
 
+/// Restore a VM from the snapshot at `c_snapshot_path` and run it. `ctx_id` must
+/// be an already-configured context whose shape (arch, memory, vCPU count)
+/// matches the snapshot's manifest; this validates that, hydrates guest RAM,
+/// device, and vCPU state onto it, then enters the guest (blocking, like
+/// `krun_start_enter`). `flags` is reserved and must be 0.
+#[cfg(all(target_os = "macos", not(any(feature = "tee", feature = "aws-nitro"))))]
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_restore(
+    ctx_id: u32,
+    c_snapshot_path: *const c_char,
+    flags: u32,
+) -> i32 {
+    if flags != 0 || c_snapshot_path.is_null() {
+        return -libc::EINVAL;
+    }
+    let path = match unsafe { CStr::from_ptr(c_snapshot_path) }.to_str() {
+        Ok(p) => PathBuf::from(p),
+        Err(e) => {
+            error!("Error parsing snapshot path: {e:?}");
+            return -libc::EINVAL;
+        }
+    };
+    enter_vmm(ctx_id, Some(path))
+}
+
+#[cfg(not(all(target_os = "macos", not(any(feature = "tee", feature = "aws-nitro")))))]
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_restore(
+    _ctx_id: u32,
+    _c_snapshot_path: *const c_char,
+    _flags: u32,
+) -> i32 {
+    -libc::ENOTSUP
+}
+
 /// Thread-safe out-of-band snapshot of a VM running under `krun_start_enter` on
 /// another thread. The VM's event loop freezes the vCPUs, writes the snapshot to
 /// `c_snapshot_path` and exits the process (`KRUN_SNAPSHOT_EXIT`).
@@ -3063,6 +3109,9 @@ pub unsafe extern "C" fn krun_snapshot_request(
             return -libc::EINVAL;
         }
     };
+    if c_snapshot_path.is_null() {
+        return -libc::EINVAL;
+    }
     let path = match unsafe { CStr::from_ptr(c_snapshot_path) }.to_str() {
         Ok(p) => PathBuf::from(p),
         Err(e) => {

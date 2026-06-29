@@ -21,7 +21,10 @@ pub mod resources;
 /// Signal handling utilities.
 #[cfg(target_os = "linux")]
 pub mod signal_handler;
-/// VM snapshot/restore seam (M0 skeleton).
+/// VM snapshot/restore seam. macOS/HVF only — the capture/restore backend and
+/// its serde manifest are HVF-specific, so the module (and serde) stay off other
+/// targets.
+#[cfg(target_os = "macos")]
 pub mod snapshot;
 /// Wrappers over structures used to configure the VMM.
 pub mod vmm_config;
@@ -433,13 +436,18 @@ impl Vmm {
             .map_err(|e| SnapErr::State(format!("gic state: {e:?}")))?;
         writer.section(SectionId::Gic, 1, &gic);
 
-        // Per-device sections: framed as [id_len u16][id][device bytes], with
-        // the device's own version as the section version.
+        // Per-device sections in registration order, framed as
+        // [id_len u16][id][device bytes] with the device's own section version.
+        // Device kind is not unique (two virtio-fs devices are both "fs"), so
+        // restore matches by position; the manifest records the ordered kinds as
+        // the topology the restore config must reproduce.
+        let mut device_kinds = Vec::new();
         for dev in self.mmio_device_manager.snapshottables() {
             let dev = dev.lock().unwrap();
             let state = dev
                 .save()
                 .map_err(|e| SnapErr::State(format!("device {}: {e:?}", dev.id())))?;
+            device_kinds.push(dev.id().to_string());
             let id = dev.id().as_bytes();
             let mut payload = Vec::with_capacity(2 + id.len() + state.bytes.len());
             payload.extend_from_slice(&(id.len() as u16).to_le_bytes());
@@ -459,6 +467,7 @@ impl Vmm {
             mem_size_mib: (mem_bytes / (1 << 20)) as usize,
             vcpu_count: self.vcpus_handles.len() as u8,
             vmstate_version: VMSTATE_VERSION,
+            devices: device_kinds,
         };
         write_snapshot(path, &manifest, &vmstate, &self.guest_memory)?;
 

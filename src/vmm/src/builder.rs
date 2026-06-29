@@ -176,6 +176,8 @@ pub enum StartMicrovmError {
     InitrdRead(io::Error),
     /// Internal error encountered while starting a microVM.
     Internal(Error),
+    /// Failed to restore the VM from a snapshot.
+    Restore(String),
     /// Cannot inject the kernel into the guest memory due to a problem with the bundle.
     InvalidKernelBundle(vm_memory::mmap::MmapRegionError),
     /// The kernel command line is invalid.
@@ -341,6 +343,7 @@ impl Display for StartMicrovmError {
             ),
             InitrdRead(ref err) => write!(f, "Cannot load initrd due to an invalid image: {err}"),
             Internal(ref err) => write!(f, "Internal error while starting microVM: {err:?}"),
+            Restore(ref msg) => write!(f, "Failed to restore VM from snapshot: {msg}"),
             InvalidKernelBundle(ref err) => {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");
@@ -585,6 +588,7 @@ pub fn build_microvm(
     event_manager: &mut EventManager,
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
+    restore_from: Option<std::path::PathBuf>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     let payload = choose_payload(vm_resources)?;
 
@@ -1180,6 +1184,28 @@ pub fn build_microvm(
         }
 
         println!("Starting TEE/microVM.");
+    }
+
+    // Restore path: hydrate guest RAM, devices, and vCPU state from the snapshot
+    // before the vCPUs run. `configure_system` above wrote a fresh FDT/cmdline;
+    // the snapshot RAM image overwrites it with the captured contents.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if let Some(dir) = restore_from {
+        // The snapshot captures only EL1 sysregs, and the restore path skips
+        // set_initial_state (which programs the EL2 registers). A nested VM would
+        // resume with EL2 config at reset defaults, so reject it outright.
+        if vm_resources.nested_enabled {
+            return Err(StartMicrovmError::Restore(
+                "restore of a nested-virtualization VM is not supported".into(),
+            ));
+        }
+        apply_restore(&vmm, &mut vcpus, &dir)?;
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    if restore_from.is_some() {
+        return Err(StartMicrovmError::Restore(
+            "snapshot restore is only supported on macOS/aarch64".into(),
+        ));
     }
 
     vmm.start_vcpus(vcpus)
@@ -2083,6 +2109,117 @@ fn create_vcpus_aarch64(
     Ok(vcpus)
 }
 
+/// Hydrate a freshly-built VM from a snapshot directory: validate the config
+/// against the manifest, overwrite guest RAM with the captured image, restore
+/// device state, and stage each vCPU's register/GIC state so its thread resumes
+/// the guest instead of booting. Runs after the devices and vCPUs are built but
+/// before `start_vcpus`.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn apply_restore(
+    vmm: &Vmm,
+    vcpus: &mut [Vcpu],
+    dir: &std::path::Path,
+) -> std::result::Result<(), StartMicrovmError> {
+    use crate::macos::vstate::VcpuRestore;
+    use crate::snapshot::{RestoreInput, SnapErr, load_mem_image};
+    use hvf::HvfVcpuState;
+    use vm_memory::{GuestMemory, GuestMemoryRegion};
+
+    let err = |e: SnapErr| StartMicrovmError::Restore(format!("{e:?}"));
+    let input = RestoreInput::read(dir).map_err(err)?;
+
+    // Config-validate: the freshly-built VM shape (incl. ordered device topology)
+    // must match the snapshot. Device kind alone isn't unique, so the ordered
+    // kinds are the contract and device state is matched to devices by position.
+    let mem_mib = vmm.guest_memory().iter().map(|r| r.len()).sum::<u64>() / (1 << 20);
+    let live_kinds: Vec<String> = vmm
+        .mmio_device_manager
+        .snapshottables()
+        .iter()
+        .map(|d| d.lock().unwrap().id().to_string())
+        .collect();
+    input
+        .manifest
+        .validate(
+            "aarch64",
+            "hvf",
+            mem_mib as usize,
+            vcpus.len() as u8,
+            &live_kinds.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .map_err(err)?;
+
+    // Multi-vCPU restore is not implemented: the global GIC blob must be restored
+    // once after every redistributor exists (a barrier across the vCPU threads),
+    // and all vCPUs must share one vtimer offset (CNTVCT is system-wide). Reject
+    // it rather than silently dropping secondary GIC state.
+    if input.vmstate.vcpus.len() > 1 {
+        return Err(StartMicrovmError::Restore(format!(
+            "multi-vCPU restore is not supported yet (snapshot has {} vcpus)",
+            input.vmstate.vcpus.len()
+        )));
+    }
+
+    // Overwrite guest RAM with the captured image.
+    let mut img = File::open(&input.mem_path)
+        .map_err(|e| StartMicrovmError::Restore(format!("open memory.img: {e}")))?;
+    load_mem_image(vmm.guest_memory(), &mut img).map_err(err)?;
+
+    // Restore device state by position: validate() already confirmed the ordered
+    // device topology matches, so saved section i belongs to live device i.
+    if input.vmstate.devices.len() != live_kinds.len() {
+        return Err(StartMicrovmError::Restore(format!(
+            "snapshot has {} device sections, config has {}",
+            input.vmstate.devices.len(),
+            live_kinds.len()
+        )));
+    }
+    for (dev, (kind, state)) in vmm
+        .mmio_device_manager
+        .snapshottables()
+        .iter()
+        .zip(&input.vmstate.devices)
+    {
+        let mut dev = dev.lock().unwrap();
+        if dev.id() != kind {
+            return Err(StartMicrovmError::Restore(format!(
+                "device section kind mismatch: snapshot={kind}, config={}",
+                dev.id()
+            )));
+        }
+        dev.restore(state)
+            .map_err(|e| StartMicrovmError::Restore(format!("device {}: {e:?}", dev.id())))?;
+    }
+
+    // Attach per-vCPU restore; vCPU 0 also restores the global GIC blob.
+    if input.vmstate.vcpus.len() != vcpus.len() {
+        return Err(StartMicrovmError::Restore(format!(
+            "snapshot has {} vcpus, config has {}",
+            input.vmstate.vcpus.len(),
+            vcpus.len()
+        )));
+    }
+    for (i, (vcpu, state)) in vcpus.iter_mut().zip(input.vmstate.vcpus).enumerate() {
+        let hvf_state = HvfVcpuState {
+            gp: state.gp.to_vec(),
+            sysregs: state.sysregs,
+            simd: state.simd.to_vec(),
+            fpcr: state.fpcr,
+            fpsr: state.fpsr,
+            vtimer_mask: state.vtimer.mask,
+            vtimer_offset: state.vtimer.offset,
+            host_counter: state.host_counter,
+        };
+        let gic = (i == 0).then(|| input.vmstate.gic.clone());
+        vcpu.set_restore(VcpuRestore {
+            state: hvf_state,
+            icc: state.icc,
+            gic,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(all(target_arch = "riscv64", target_os = "linux"))]
 fn create_vcpus_riscv64(
     vm: &Vm,
@@ -2108,32 +2245,49 @@ fn create_vcpus_riscv64(
     Ok(vcpus)
 }
 
-/// Attaches an virtio mmio device to the device manager.
+/// Attaches an virtio mmio device to the device manager. Returns the transport
+/// so the caller can register it as a snapshot participant.
 fn attach_mmio_device(
     vmm: &mut Vmm,
     id: String,
     intc: IrqChip,
     device: Arc<Mutex<dyn VirtioDevice>>,
-) -> std::result::Result<(), device_manager::mmio::Error> {
-    let mmio_device = MmioTransport::new(vmm.guest_memory().clone(), intc, device)?;
+) -> std::result::Result<Arc<Mutex<MmioTransport>>, device_manager::mmio::Error> {
+    let mmio_device = Arc::new(Mutex::new(MmioTransport::new(
+        vmm.guest_memory().clone(),
+        intc,
+        device,
+        id.clone(),
+    )?));
 
-    let type_id = mmio_device.locked_device().device_type();
+    let type_id = mmio_device.lock().unwrap().locked_device().device_type();
     let _cmdline = &mut vmm.kernel_cmdline;
 
     #[cfg(target_os = "linux")]
-    let (_mmio_base, _irq) =
-        vmm.mmio_device_manager
-            .register_mmio_device(vmm.vm.fd(), mmio_device, type_id, id)?;
+    let (_mmio_base, _irq) = vmm.mmio_device_manager.register_mmio_device(
+        vmm.vm.fd(),
+        mmio_device.clone(),
+        type_id,
+        id,
+    )?;
     #[cfg(target_os = "macos")]
     let (_mmio_base, _irq) =
         vmm.mmio_device_manager
-            .register_mmio_device(mmio_device, type_id, id)?;
+            .register_mmio_device(mmio_device.clone(), type_id, id)?;
 
     #[cfg(target_arch = "x86_64")]
     vmm.mmio_device_manager
         .add_device_to_cmdline(_cmdline, _mmio_base, _irq)?;
 
-    Ok(())
+    // Every virtio device participates in the snapshot via its transport: the
+    // guest expects them all live after a restore, and reboot/shutdown touches
+    // each (e.g. a filesystem sync on virtiofs), so leaving any unrestored hangs
+    // the resumed guest.
+    #[cfg(target_os = "macos")]
+    vmm.mmio_device_manager
+        .add_snapshottable(mmio_device.clone());
+
+    Ok(mmio_device)
 }
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -2564,9 +2718,6 @@ fn attach_console_devices(
 
     vmm.exit_observers.push(console.clone());
 
-    #[cfg(target_os = "macos")]
-    vmm.mmio_device_manager.add_snapshottable(console.clone());
-
     event_manager
         .add_subscriber(console.clone())
         .map_err(RegisterEvent)?;
@@ -2576,6 +2727,7 @@ fn attach_console_devices(
         .map_err(RegisterFsSigwinch)?;
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
+    // attach_mmio_device registers the transport as a snapshot participant.
     attach_mmio_device(vmm, format!("hvc{id_number}"), intc, console)
         .map_err(RegisterConsoleDevice)?;
 

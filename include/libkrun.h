@@ -1365,6 +1365,32 @@ int32_t krun_vm_resume(uint32_t ctx_id);
 int32_t krun_snapshot_request(uint32_t ctx_id, const char *snapshot_path,
                               uint32_t flags);
 
+/**
+ * Restore a VM from a snapshot and run it. "ctx_id" must be an already-
+ * configured context whose shape (architecture, memory size, vCPU count)
+ * matches the snapshot's "manifest.json"; krun_restore() validates that, then
+ * hydrates guest RAM, device, and vCPU state onto it and enters the guest.
+ * Currently macOS/HVF only; returns -ENOTSUP elsewhere and on TEE builds.
+ *
+ * Devices are reconfigured fresh by the caller (with new host fds); the saved
+ * transport state binds onto them, so open file descriptors need not survive.
+ *
+ * Arguments:
+ *  "ctx_id"        - the configuration context ID.
+ *  "snapshot_path" - the snapshot directory written by krun_snapshot_request().
+ *  "flags"         - reserved, must be 0.
+ *
+ * Notes:
+ *  Like krun_start_enter(), on success this assumes control of the process and
+ *  does not return until the restored guest exits.
+ *
+ * Returns:
+ *  -EINVAL  - bad path, non-zero flags, or a config that doesn't match the
+ *             snapshot manifest.
+ *  -ENOTSUP - restore is unsupported on this platform/build.
+ */
+int32_t krun_restore(uint32_t ctx_id, const char *snapshot_path, uint32_t flags);
+
 #ifdef __cplusplus
 }
 #endif
