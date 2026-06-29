@@ -1,6 +1,6 @@
 [package]
 name = "krun-aws-nitro"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 edition = "2024"
 description = "AWS Nitro Enclaves support for libkrun"
 license = "Apache-2.0"
@@ -15,7 +15,7 @@ nix = { version = "0.30", features = ["poll"] }
 tar = "0.4"
 vsock = "0.5"
 
-devices = { package = "krun-devices", version = "=0.1.0-1.18.0", path = "../devices" }
+devices = { package = "krun-devices", version = "=0.1.0-2.0.0-dev", path = "../devices" }
 log = "0.4"
 signal-hook = "0.3"
 

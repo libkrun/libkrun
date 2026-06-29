@@ -30,8 +30,6 @@ pub fn update_feature_info_entry(
         entry.ecx &= 1 << 21;
     }
 
-    entry.ecx.write_bit(ecx::TSC_DEADLINE_TIMER_BITINDEX, true);
-
     Ok(())
 }
 

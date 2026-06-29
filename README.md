@@ -10,6 +10,14 @@
 
 It integrates a VMM (Virtual Machine Monitor, the userspace side of an Hypervisor) with the minimum amount of emulated devices required to its purpose, abstracting most of the complexity that comes from Virtual Machine management, offering users a simple C API.
 
+> [!NOTE]
+> The `main` branch is now **libkrun 2.0**, which will not be backwards
+> compatible with the 1.x API/ABI. The 2.0 API is also still under active
+> development and may change further before the first stable release. If
+> you are building from source for production use, please use the newest
+> [`stable-*` release branch](https://github.com/libkrun/libkrun/branches)
+> instead.
+
 ## Use cases
 
 * [crun](https://github.com/containers/crun/blob/main/krun.1.md): Adding Virtualization-based isolation to container and confidential workloads.

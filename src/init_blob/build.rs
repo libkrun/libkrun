@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn musl_target_for_host() -> &'static str {
-    let host = env::var("HOST").unwrap_or_default();
+    let host = env::var("TARGET").unwrap_or_default();
     if host.starts_with("aarch64") {
         "aarch64-unknown-linux-musl"
     } else {
@@ -116,6 +116,13 @@ fn build_rust_init() -> PathBuf {
 
     if use_musl {
         cmd.arg("--target").arg(musl_target);
+
+        // The parent cargo sets CARGO_ENCODED_RUSTFLAGS="" for build scripts.
+        // The child cargo we spawn inherits it, and since that env var has
+        // higher precedence than CARGO_TARGET_*_RUSTFLAGS, the cross-linker
+        // flags from the Makefile would be silently ignored. Remove it so
+        // the per-target env vars take effect.
+        cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
     }
 
     let mut features: Vec<&str> = Vec::new();

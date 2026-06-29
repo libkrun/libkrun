@@ -1,6 +1,6 @@
 [package]
 name = "krun-init-blob"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 edition = "2024"
 description = "Default init binary blob for libkrun guests"
 license = "Apache-2.0"

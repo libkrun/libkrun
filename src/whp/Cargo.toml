@@ -1,6 +1,6 @@
 [package]
 name = "krun-whp"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 authors = ["The libkrun Authors"]
 edition = "2024"
 description = "Windows Hypervisor Platform backend for libkrun"

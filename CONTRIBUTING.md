@@ -62,6 +62,21 @@ You can add this automatically by committing with `git commit -s`.
 An automated DCO check runs on every pull request. PRs with commits
 that are missing the `Signed-off-by` trailer will not be merged.
 
+## Branches and Stable Releases
+
+The `main` branch tracks **libkrun 2.0** development. Stable releases
+are maintained on `stable-*` branches (e.g. `stable-1.19`).
+
+When submitting a bug fix, target the right branch:
+
+- **Fix applies to both 2.0 and stable:** open your PR against `main`.
+  Tag it with the appropriate cherry-pick label (e.g.
+  `cherry-pick-1.19.x`) so that maintainers know it should be
+  back-ported.
+- **Fix only applies to the legacy 1.x release** (the bug doesn't
+  exist in 2.0, or that part of the code was completely rewritten):
+  open your PR directly against the relevant `stable-*` branch.
+
 ## Code Review and Merging
 
 We use **rebase merging** — PRs are not squash-merged. This means

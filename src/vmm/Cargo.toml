@@ -1,6 +1,6 @@
 [package]
 name = "krun-vmm"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 authors = ["The libkrun Authors"]
 edition = "2024"
 build = "build.rs"
@@ -30,12 +30,12 @@ vmm-sys-util = "0.14"
 krun_display = { package = "krun-display", version = "0.1.0", path = "../display", optional = true, features = ["bindgen_clang_runtime"] }
 krun_input = { package = "krun-input", version = "0.1.0", path = "../input", optional = true, features = ["bindgen_clang_runtime"] }
 
-arch = { package = "krun-arch", version = "=0.1.0-1.18.0", path = "../arch" }
-arch_gen = { package = "krun-arch-gen", version = "=0.1.0-1.18.0", path = "../arch_gen" }
-devices = { package = "krun-devices", version = "=0.1.0-1.18.0", path = "../devices" }
-kernel = { package = "krun-kernel", version = "=0.1.0-1.18.0", path = "../kernel" }
-utils = { package = "krun-utils", version = "=0.1.0-1.18.0", path = "../utils" }
-polly = { package = "krun-polly", version = "=0.1.0-1.18.0", path = "../polly" }
+arch = { package = "krun-arch", version = "=0.1.0-2.0.0-dev", path = "../arch" }
+arch_gen = { package = "krun-arch-gen", version = "=0.1.0-2.0.0-dev", path = "../arch_gen" }
+devices = { package = "krun-devices", version = "=0.1.0-2.0.0-dev", path = "../devices" }
+kernel = { package = "krun-kernel", version = "=0.1.0-2.0.0-dev", path = "../kernel" }
+utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }
+polly = { package = "krun-polly", version = "=0.1.0-2.0.0-dev", path = "../polly" }
 
 # Dependencies for amd-sev
 kbs-types = { version = "0.13.0", optional = true }
@@ -47,7 +47,7 @@ bitflags = { version = "2.10.0", optional = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 bzip2 = "0.5"
-cpuid = { package = "krun-cpuid", version = "=0.1.0-1.18.0", path = "../cpuid" }
+cpuid = { package = "krun-cpuid", version = "=0.1.0-2.0.0-dev", path = "../cpuid" }
 zstd = "0.13"
 
 [target.'cfg(unix)'.dependencies]
@@ -59,7 +59,7 @@ kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
 kvm-ioctls = "0.24"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-hvf = { package = "krun-hvf", version = "=0.1.0-1.18.0", path = "../hvf" }
+hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = [
@@ -68,4 +68,4 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [dev-dependencies]
-devices = { package = "krun-devices", version = "=0.1.0-1.18.0", path = "../devices", features = ["test_utils"] }
+devices = { package = "krun-devices", version = "=0.1.0-2.0.0-dev", path = "../devices", features = ["test_utils"] }

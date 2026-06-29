@@ -214,6 +214,9 @@ pub fn enosys() -> io::Error {
 pub fn enodata() -> io::Error {
     io::Error::from_raw_os_error(LINUX_ENODATA)
 }
+pub fn erofs() -> io::Error {
+    io::Error::from_raw_os_error(LINUX_EROFS)
+}
 pub fn enxio() -> io::Error {
     io::Error::from_raw_os_error(LINUX_ENXIO)
 }

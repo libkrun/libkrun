@@ -164,17 +164,19 @@ fn run_single_test(
             eprintln!("WARNING: buildah not available, running without namespace isolation.");
             eprintln!("Tests may fail if the required network ports are already in use.");
         }
-        Command::new(&executable)
-            .arg("start-vm")
+        let mut cmd = Command::new(&executable);
+        cmd.arg("start-vm")
             .arg("--test-case")
             .arg(test_case.name)
             .arg("--tmp-dir")
             .arg(&test_dir)
             .stdin(Stdio::piped())
             .stdout(stdout_file)
-            .stderr(log_file)
-            .spawn()
-            .context("Failed to start subprocess for test")?
+            .stderr(log_file);
+        if cfg!(target_os = "linux") {
+            cmd.env("KRUN_NO_UNSHARE", "1");
+        }
+        cmd.spawn().context("Failed to start subprocess for test")?
     };
 
     // Enforce a per-test timeout. If the child doesn't exit within the

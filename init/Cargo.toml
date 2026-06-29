@@ -1,6 +1,6 @@
 [package]
 name = "krun-init"
-version = "0.1.0-1.18.1"
+version = "0.1.0-2.0.0-dev"
 edition = "2024"
 description = "PID-1 init binary for libkrun guest VMs"
 license = "Apache-2.0"
