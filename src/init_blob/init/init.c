@@ -29,6 +29,8 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#include <grp.h>
+
 #if __linux__
 #include <linux/reboot.h>
 #include <linux/vm_sockets.h>
@@ -157,6 +159,36 @@ int unmount_config_iso()
     return unmount("/mnt", 0);
 }
 #endif
+
+static void setgid_wrapper(const char *gid)
+{
+    char *endptr;
+    errno = 0;
+    unsigned long val = strtoul(gid, &endptr, 10);
+    if (errno != 0 || *endptr != '\0' || val > (gid_t)-1) {
+        printf("Can't parse GID\n");
+        exit(125);
+    }
+    if (setgroups(0, NULL) != 0 || setgid((gid_t)val) != 0) {
+        printf("Can't set GID\n");
+        exit(125);
+    }
+}
+
+static void setuid_wrapper(const char *uid)
+{
+    char *endptr;
+    errno = 0;
+    unsigned long val = strtoul(uid, &endptr, 10);
+    if (errno != 0 || *endptr != '\0' || val > (uid_t)-1) {
+        printf("Can't parse UID\n");
+        exit(125);
+    }
+    if (setuid((uid_t)val) != 0) {
+        printf("Can't set UID\n");
+        exit(125);
+    }
+}
 
 static void set_rlimits(const char *rlimits)
 {
@@ -860,8 +892,8 @@ char **concat_entrypoint_argv(char **entrypoint, char **config_argv)
     return argv;
 }
 
-static int config_parse_file(char ***argv, char **workdir,
-                             const char *config_file)
+static int config_parse_file(char ***argv, char **workdir, char **uid,
+                             char **gid, const char *config_file)
 {
     jsmn_parser parser;
     jsmntok_t *tokens;
@@ -870,7 +902,8 @@ static int config_parse_file(char ***argv, char **workdir,
     off_t data_len;
     char **config_argv;
     char **entrypoint;
-    int parsed_env, parsed_workdir, parsed_args, parsed_entrypoint;
+    int parsed_env, parsed_workdir, parsed_args, parsed_entrypoint, parsed_uid,
+        parsed_gid;
     int num_tokens;
     int ret = -1;
     int fd;
@@ -918,10 +951,12 @@ static int config_parse_file(char ***argv, char **workdir,
 
     config_argv = NULL;
     entrypoint = NULL;
-    parsed_env = parsed_workdir = parsed_args = parsed_entrypoint = 0;
+    parsed_env = parsed_workdir = parsed_args = parsed_entrypoint = parsed_uid =
+        parsed_gid = 0;
 
-    for (i = 1; i < num_tokens && (!parsed_env || !parsed_args ||
-                                   !parsed_workdir || !parsed_entrypoint);
+    for (i = 1;
+         i < num_tokens && (!parsed_env || !parsed_args || !parsed_workdir ||
+                            !parsed_entrypoint || !parsed_uid || !parsed_gid);
          i++) {
         if (!parsed_env && jsoneq(data, &tokens[i], "Env") == 0 &&
             (i + 1) < num_tokens && tokens[i + 1].type == JSMN_ARRAY) {
@@ -957,6 +992,18 @@ static int config_parse_file(char ***argv, char **workdir,
             (i + 1) < num_tokens) {
             entrypoint = config_parse_args(data, &tokens[i + 1]);
             parsed_entrypoint = 1;
+        }
+
+        if (!parsed_gid && jsoneq(data, &tokens[i], "gid") == 0 &&
+            (i + 1) < num_tokens) {
+            *gid = config_parse_string(data, &tokens[i + 1]);
+            parsed_gid = 1;
+        }
+
+        if (!parsed_uid && jsoneq(data, &tokens[i], "uid") == 0 &&
+            (i + 1) < num_tokens) {
+            *uid = config_parse_string(data, &tokens[i + 1]);
+            parsed_uid = 1;
         }
     }
 
@@ -1322,6 +1369,7 @@ int main(int argc, char **argv)
     char *env_init_pid1;
     char *config_workdir, *env_workdir;
     char *rlimits;
+    char *config_uid, *config_gid;
     char **config_argv, **exec_argv;
     const char *config_file;
 #if __FreeBSD__
@@ -1449,6 +1497,8 @@ int main(int argc, char **argv)
 
     config_argv = NULL;
     config_workdir = NULL;
+    config_uid = NULL;
+    config_gid = NULL;
 
     config_file = getenv("KRUN_CONFIG");
 
@@ -1462,7 +1512,8 @@ int main(int argc, char **argv)
         config_file = CONFIG_FILE_PATH;
     }
 
-    config_parse_file(&config_argv, &config_workdir, config_file);
+    config_parse_file(&config_argv, &config_workdir, &config_uid, &config_gid,
+                      config_file);
 
 #if __FreeBSD__
     if (config_file_mounted) {
@@ -1542,6 +1593,14 @@ int main(int argc, char **argv)
             exit(125);
         }
 #endif
+        // Set group first as otherwise we don't have permission to set user
+        if (config_gid) {
+            setgid_wrapper(config_gid);
+        }
+        if (config_uid) {
+            setuid_wrapper(config_uid);
+        }
+
         if (execvp(exec_argv[0], exec_argv) < 0) {
             saved_errno = errno;
             printf("Couldn't execute '%s' inside the vm: %s\n", exec_argv[0],
