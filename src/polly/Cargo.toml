@@ -1,6 +1,6 @@
 [package]
 name = "krun-polly"
-version = "0.1.0-1.19.3"
+version = "0.1.0-1.19.4"
 authors = ["The libkrun Authors"]
 edition = "2021"
 description = "Event-driven I/O polling for libkrun"
@@ -9,4 +9,4 @@ repository = "https://github.com/containers/libkrun"
 
 [dependencies]
 libc = ">=0.2.39"
-utils = { package = "krun-utils", version = "=0.1.0-1.19.3", path="../utils" }
+utils = { package = "krun-utils", version = "=0.1.0-1.19.4", path="../utils" }
