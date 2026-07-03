@@ -1152,8 +1152,7 @@ impl PassthroughFs {
     }
 }
 
-fn set_secctx(file: &InodeHandle, secctx: SecContext, symlink: bool) -> io::Result<()> {
-    let options = if symlink { libc::XATTR_NOFOLLOW } else { 0 };
+fn do_set_secctx(file: &InodeHandle, secctx: &SecContext, options: i32) -> io::Result<()> {
     let ret = match file {
         InodeHandle::Path(path) => unsafe {
             libc::setxattr(
@@ -1181,6 +1180,61 @@ fn set_secctx(file: &InodeHandle, secctx: SecContext, symlink: bool) -> io::Resu
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+fn set_secctx(file: &InodeHandle, secctx: SecContext, symlink: bool) -> io::Result<()> {
+    let options = if symlink { libc::XATTR_NOFOLLOW } else { 0 };
+
+    match do_set_secctx(file, &secctx, options) {
+        Ok(()) => return Ok(()),
+        Err(err) => {
+            let err_os = err.raw_os_error();
+            if err_os != Some(libc::EACCES) && err_os != Some(libc::EPERM) {
+                return Err(linux_error(err));
+            }
+        }
+    }
+
+    // The file mode doesn't allow setting xattrs. Temporarily grant the owner
+    // write permission, set the attribute, then restore the original mode.
+    let mut st = MaybeUninit::<bindings::stat64>::zeroed();
+    let ret = match file {
+        InodeHandle::Path(path) => unsafe { libc::lstat(path.as_ptr(), st.as_mut_ptr()) },
+        InodeHandle::Fd(fd) => unsafe { libc::fstat(*fd, st.as_mut_ptr()) },
+    };
+    if ret < 0 {
+        return Err(linux_error(io::Error::last_os_error()));
+    }
+    let st = unsafe { st.assume_init() };
+
+    let tmp_mode = st.st_mode | libc::S_IWUSR;
+    let ret = match file {
+        InodeHandle::Path(path) => unsafe { libc::chmod(path.as_ptr(), tmp_mode) },
+        InodeHandle::Fd(fd) => unsafe { libc::fchmod(*fd, tmp_mode) },
+    };
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        error!("set_secctx: chmod failed: {}", err);
+        return Err(linux_error(err));
+    }
+
+    let secctx_ret = do_set_secctx(file, &secctx, options);
+
+    let ret = match file {
+        InodeHandle::Path(path) => unsafe { libc::chmod(path.as_ptr(), st.st_mode) },
+        InodeHandle::Fd(fd) => unsafe { libc::fchmod(*fd, st.st_mode) },
+    };
+    if ret < 0 {
+        error!(
+            "set_secctx: chmod restore failed: {}",
+            io::Error::last_os_error()
+        );
+    }
+
+    match secctx_ret {
+        Ok(()) => Ok(()),
+        Err(err) => Err(linux_error(err)),
     }
 }
 
