@@ -58,6 +58,8 @@ pub struct TsiStreamProxy {
     push_cnt: Wrapping<u32>,
     pending_accepts: u64,
     unixsock_path: Option<PathBuf>,
+    // Unsent guest->host bytes, flushed on EventSet::OUT — never dropped (see drain_tx).
+    tx_buf: Vec<u8>,
 }
 
 impl TsiStreamProxy {
@@ -138,6 +140,7 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
+            tx_buf: Vec::new(),
         })
     }
 
@@ -176,6 +179,7 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
+            tx_buf: Vec::new(),
         }
     }
 
@@ -457,6 +461,59 @@ impl TsiStreamProxy {
     }
 }
 
+impl TsiStreamProxy {
+    /// Re-arm epoll interest: the caller's RX interest plus EventSet::OUT while guest->host bytes
+    /// remain buffered, so the muxer wakes us (process_event OUT) to finish flushing them.
+    fn rearm(&self, rx: EventSet) -> Option<(u64, RawFd, EventSet)> {
+        let ev = if self.tx_buf.is_empty() {
+            rx
+        } else {
+            rx | EventSet::OUT
+        };
+        Some((self.id, self.fd.as_raw_fd(), ev))
+    }
+
+    /// Flush buffered guest->host bytes to the host socket WITHOUT ever dropping them. Previously a single
+    /// non-blocking send() logged "couldn't set everything" on a short/EAGAIN write and discarded the
+    /// remainder, corrupting the stream. Buffer the tail, advance tx_cnt only for bytes actually written,
+    /// and emit credit updates (same threshold as before) as they drain. Returns whether to signal the queue.
+    fn drain_tx(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        let flags = MsgFlags::empty();
+        #[cfg(target_os = "linux")]
+        let flags = MsgFlags::MSG_NOSIGNAL;
+
+        let mut signal = false;
+        while !self.tx_buf.is_empty() {
+            match send(self.fd.as_raw_fd(), &self.tx_buf, flags) {
+                Ok(0) => break,
+                Ok(sent) => {
+                    self.tx_buf.drain(..sent);
+                    self.tx_cnt += Wrapping(sent as u32);
+                    if (self.tx_cnt - self.last_tx_cnt_sent).0 >= self.peer_buf_alloc / 2 {
+                        self.last_tx_cnt_sent = self.tx_cnt;
+                        let rx = MuxerRx::CreditUpdate {
+                            local_port: self.local_port,
+                            peer_port: self.peer_port,
+                            fwd_cnt: self.tx_cnt.0,
+                        };
+                        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+                        signal = true;
+                    }
+                }
+                Err(Errno::EINTR) => continue,
+                Err(Errno::EAGAIN) => break, // socket full; EventSet::OUT will wake us to finish
+                Err(e) => {
+                    error!("sendmsg: dropping connection after send error: id={}, err={e}", self.id);
+                    self.tx_buf.clear();
+                    break;
+                }
+            }
+        }
+        signal
+    }
+}
+
 impl Proxy for TsiStreamProxy {
     fn id(&self) -> u64 {
         self.id
@@ -498,7 +555,7 @@ impl Proxy for TsiStreamProxy {
             ));
         } else {
             if self.status == ProxyStatus::Connected {
-                update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN));
+                update.polling = self.rearm(EventSet::IN);
             }
             self.push_connect_rsp(result);
         }
@@ -531,7 +588,7 @@ impl Proxy for TsiStreamProxy {
         // Now that the vsock transport is fully established, start listening
         // for events in the TCP socket again.
         Some(ProxyUpdate {
-            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::IN)),
+            polling: self.rearm(EventSet::IN),
             ..Default::default()
         })
     }
@@ -587,49 +644,20 @@ impl Proxy for TsiStreamProxy {
 
         let mut update = ProxyUpdate::default();
 
-        let ret = if let Some(buf) = pkt.buf() {
-            #[cfg(target_os = "macos")]
-            let flags = MsgFlags::empty();
-            #[cfg(target_os = "linux")]
-            let flags = MsgFlags::MSG_NOSIGNAL;
-
-            match send(self.fd.as_raw_fd(), buf, flags) {
-                Ok(sent) => {
-                    if sent != buf.len() {
-                        error!("couldn't set everything: buf={}, sent={}", buf.len(), sent);
-                    }
-                    self.tx_cnt += Wrapping(sent as u32);
-                    sent as i32
-                }
-                Err(err) => {
-                    #[cfg(target_os = "macos")]
-                    let errno = -linux_errno_raw(err as i32);
-                    #[cfg(target_os = "linux")]
-                    let errno = -(err as i32);
-                    errno
-                }
-            }
-        } else {
-            -libc::EINVAL
-        };
-
-        if ret > 0 && (self.tx_cnt - self.last_tx_cnt_sent).0 >= self.peer_buf_alloc / 2 {
-            debug!(
-                "sending credit update: id={}, tx_cnt={}, last_tx_cnt={}",
-                self.id, self.tx_cnt, self.last_tx_cnt_sent
-            );
-            self.last_tx_cnt_sent = self.tx_cnt;
-            // This packet goes to the connection.
-            let rx = MuxerRx::CreditUpdate {
-                local_port: pkt.dst_port(),
-                peer_port: pkt.src_port(),
-                fwd_cnt: self.tx_cnt.0,
-            };
-            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        if let Some(buf) = pkt.buf() {
+            self.tx_buf.extend_from_slice(buf); // queue first — never drop on a short write
+        }
+        if self.drain_tx() {
             update.signal_queue = true;
         }
+        // Keep RX interest as the status implies; rearm() adds OUT while bytes remain buffered.
+        let rx = if self.status == ProxyStatus::Connected {
+            EventSet::IN
+        } else {
+            EventSet::empty()
+        };
+        update.polling = self.rearm(rx);
 
-        debug!("sendmsg ret={ret}");
         update
     }
 
@@ -662,7 +690,7 @@ impl Proxy for TsiStreamProxy {
         if result == 0 {
             self.peer_port = req.vm_port;
             self.status = ProxyStatus::Listening;
-            update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN));
+            update.polling = self.rearm(EventSet::IN);
         }
 
         update
@@ -700,7 +728,7 @@ impl Proxy for TsiStreamProxy {
         self.status = ProxyStatus::Connected;
 
         ProxyUpdate {
-            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::IN)),
+            polling: self.rearm(EventSet::IN),
             ..Default::default()
         }
     }
@@ -733,7 +761,7 @@ impl Proxy for TsiStreamProxy {
         self.switch_to_connected();
 
         ProxyUpdate {
-            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::IN)),
+            polling: self.rearm(EventSet::IN),
             push_accept: Some((self.id, self.parent_id)),
             ..Default::default()
         }
@@ -847,7 +875,7 @@ impl Proxy for TsiStreamProxy {
                     return update;
                 } else if self.status == ProxyStatus::WaitingCreditUpdate {
                     debug!("process_event: WaitingCreditUpdate");
-                    update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
+                    update.polling = self.rearm(EventSet::empty());
                 }
             } else if self.status == ProxyStatus::Listening
                 || self.status == ProxyStatus::WaitingOnAccept
@@ -877,6 +905,17 @@ impl Proxy for TsiStreamProxy {
                 // Stop listening for events in the TCP socket until we receive
                 // OP_REQUEST and the vsock transport is fully established.
                 update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
+            } else if !self.tx_buf.is_empty() {
+                // Host socket writable again: finish flushing the buffered guest->host tail.
+                if self.drain_tx() {
+                    update.signal_queue = true;
+                }
+                let rx = if self.status == ProxyStatus::Connected {
+                    EventSet::IN
+                } else {
+                    EventSet::empty()
+                };
+                update.polling = self.rearm(rx);
             } else {
                 debug!("EventSet::OUT while not connecting");
             }

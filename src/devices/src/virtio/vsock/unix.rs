@@ -45,6 +45,8 @@ pub struct UnixProxy {
     last_tx_cnt_sent: Wrapping<u32>,
     push_cnt: Wrapping<u32>,
     rx_cnt: Wrapping<u32>,
+    // Unsent guest->host bytes, flushed on EventSet::OUT — never dropped (see drain_tx).
+    tx_buf: Vec<u8>,
 }
 
 fn proxy_fd_create(id: u64) -> Result<OwnedFd, ProxyError> {
@@ -119,6 +121,7 @@ impl UnixProxy {
             last_tx_cnt_sent: Wrapping(0),
             push_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
+            tx_buf: Vec::new(),
         })
     }
 
@@ -152,6 +155,7 @@ impl UnixProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             path: Default::default(),
+            tx_buf: Vec::new(),
         }
     }
 
@@ -311,6 +315,54 @@ impl UnixProxy {
     }
 }
 
+impl UnixProxy {
+    fn rearm(&self, rx: EventSet) -> Option<(u64, RawFd, EventSet)> {
+        let ev = if self.tx_buf.is_empty() {
+            rx
+        } else {
+            rx | EventSet::OUT
+        };
+        Some((self.id, self.fd.as_raw_fd(), ev))
+    }
+
+    /// Flush buffered guest->host bytes without ever dropping them (see the TSI proxy for the rationale).
+    fn drain_tx(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        let flags = MsgFlags::empty();
+        #[cfg(target_os = "linux")]
+        let flags = MsgFlags::MSG_NOSIGNAL;
+
+        let mut signal = false;
+        while !self.tx_buf.is_empty() {
+            match send(self.fd.as_raw_fd(), &self.tx_buf, flags) {
+                Ok(0) => break,
+                Ok(sent) => {
+                    self.tx_buf.drain(..sent);
+                    self.tx_cnt += Wrapping(sent as u32);
+                    if (self.tx_cnt - self.last_tx_cnt_sent).0 >= self.peer_buf_alloc / 2 {
+                        self.last_tx_cnt_sent = self.tx_cnt;
+                        let rx = MuxerRx::CreditUpdate {
+                            local_port: self.local_port,
+                            peer_port: self.peer_port,
+                            fwd_cnt: self.tx_cnt.0,
+                        };
+                        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+                        signal = true;
+                    }
+                }
+                Err(Errno::EINTR) => continue,
+                Err(Errno::EAGAIN) => break,
+                Err(e) => {
+                    error!("sendmsg: dropping connection after send error: id={}, err={e}", self.id);
+                    self.tx_buf.clear();
+                    break;
+                }
+            }
+        }
+        signal
+    }
+}
+
 impl Proxy for UnixProxy {
     fn id(&self) -> u64 {
         self.id
@@ -350,7 +402,7 @@ impl Proxy for UnixProxy {
             update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN | EventSet::OUT));
         } else {
             if self.status == ProxyStatus::Connected {
-                update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN));
+                update.polling = self.rearm(EventSet::IN);
             }
             self.push_connect_rsp(result);
         }
@@ -390,52 +442,18 @@ impl Proxy for UnixProxy {
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
-        let ret = if let Some(buf) = pkt.buf() {
-            #[cfg(target_os = "macos")]
-            let flags = MsgFlags::empty();
-
-            #[cfg(target_os = "linux")]
-            let flags = MsgFlags::MSG_NOSIGNAL;
-
-            match send(self.fd.as_raw_fd(), buf, flags) {
-                Ok(sent) => {
-                    if sent != buf.len() {
-                        error!("couldn't set everything: buf={}, sent={}", buf.len(), sent);
-                    }
-                    self.tx_cnt += Wrapping(sent as u32);
-                    sent as i32
-                }
-                Err(err) => {
-                    #[cfg(target_os = "macos")]
-                    let errno = -linux_errno_raw(err as i32);
-
-                    #[cfg(target_os = "linux")]
-                    let errno = -(err as i32);
-                    errno
-                }
-            }
-        } else {
-            -libc::EINVAL
-        };
-
-        if ret > 0 && (self.tx_cnt - self.last_tx_cnt_sent).0 >= self.peer_buf_alloc / 2 {
-            debug!(
-                "sending credit update: id={}, tx_cnt={}, last_tx_cnt={}",
-                self.id, self.tx_cnt, self.last_tx_cnt_sent
-            );
-            self.last_tx_cnt_sent = self.tx_cnt;
-
-            let rx = MuxerRx::CreditUpdate {
-                local_port: pkt.dst_port(),
-                peer_port: pkt.src_port(),
-                fwd_cnt: self.tx_cnt.0,
-            };
-
-            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        if let Some(buf) = pkt.buf() {
+            self.tx_buf.extend_from_slice(buf); // queue first — never drop on a short write
+        }
+        if self.drain_tx() {
             update.signal_queue = true;
         }
-
-        debug!("sendmsg ret={ret}");
+        let rx = if self.status == ProxyStatus::Connected {
+            EventSet::IN
+        } else {
+            EventSet::empty()
+        };
+        update.polling = self.rearm(rx);
 
         update
     }
@@ -470,7 +488,7 @@ impl Proxy for UnixProxy {
         self.status = ProxyStatus::Connected;
 
         ProxyUpdate {
-            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::IN)),
+            polling: self.rearm(EventSet::IN),
             ..Default::default()
         }
     }
@@ -503,7 +521,7 @@ impl Proxy for UnixProxy {
         self.switch_to_connected();
 
         ProxyUpdate {
-            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::IN)),
+            polling: self.rearm(EventSet::IN),
             ..Default::default()
         }
     }
@@ -590,7 +608,7 @@ impl Proxy for UnixProxy {
                     return update;
                 } else if self.status == ProxyStatus::WaitingCreditUpdate {
                     debug!("process_event: WaitingCreditUpdate");
-                    update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
+                    update.polling = self.rearm(EventSet::empty());
                 }
             } else {
                 debug!("EventSet::IN while not connected: {:?}", self.status);
@@ -603,7 +621,17 @@ impl Proxy for UnixProxy {
                 self.switch_to_connected();
                 self.push_connect_rsp(0);
                 update.signal_queue = true;
-                update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::IN));
+                update.polling = self.rearm(EventSet::IN);
+            } else if !self.tx_buf.is_empty() {
+                if self.drain_tx() {
+                    update.signal_queue = true;
+                }
+                let rx = if self.status == ProxyStatus::Connected {
+                    EventSet::IN
+                } else {
+                    EventSet::empty()
+                };
+                update.polling = self.rearm(rx);
             } else {
                 error!("EventSet::OUT while not connecting");
             }
