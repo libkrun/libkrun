@@ -145,20 +145,30 @@ impl DiskProperties {
         Ok(device_id)
     }
 
-    fn build_disk_image_id(disk_file: &File) -> Vec<u8> {
+    fn build_disk_image_id(disk_file: &File, block_id: &str) -> Vec<u8> {
         let mut default_id = vec![0; VIRTIO_BLK_ID_BYTES as usize];
-        match Self::build_device_id(disk_file) {
-            Err(_) => {
-                warn!("Could not generate device id. We'll use a default.");
+
+        // The public libkrun disk API accepts a caller-provided block_id. Make
+        // that the virtio-blk GET_ID value so Linux can expose it as
+        // /sys/block/<dev>/serial. Fall back to the historical backing-file
+        // derived id only for callers that pass an empty block_id.
+        let disk_id = if block_id.is_empty() {
+            match Self::build_device_id(disk_file) {
+                Err(_) => {
+                    warn!("Could not generate device id. We'll use a default.");
+                    return default_id;
+                }
+                Ok(m) => m,
             }
-            Ok(m) => {
-                // The kernel only knows to read a maximum of VIRTIO_BLK_ID_BYTES.
-                // This will also zero out any leftover bytes.
-                let disk_id = m.as_bytes();
-                let bytes_to_copy = cmp::min(disk_id.len(), VIRTIO_BLK_ID_BYTES as usize);
-                default_id[..bytes_to_copy].clone_from_slice(&disk_id[..bytes_to_copy])
-            }
-        }
+        } else {
+            block_id.to_string()
+        };
+
+        // The kernel only knows to read a maximum of VIRTIO_BLK_ID_BYTES.
+        // This will also zero out any leftover bytes.
+        let disk_id = disk_id.as_bytes();
+        let bytes_to_copy = cmp::min(disk_id.len(), VIRTIO_BLK_ID_BYTES as usize);
+        default_id[..bytes_to_copy].clone_from_slice(&disk_id[..bytes_to_copy]);
         default_id
     }
 
@@ -270,7 +280,7 @@ impl Block {
             .write(!is_disk_read_only)
             .open(PathBuf::from(&disk_image_path))?;
 
-        let disk_image_id = DiskProperties::build_disk_image_id(&disk_image);
+        let disk_image_id = DiskProperties::build_disk_image_id(&disk_image, &id);
 
         let file_opts = StorageOpenOptions::new()
             .write(!is_disk_read_only)
@@ -467,5 +477,62 @@ impl VirtioDevice for Block {
         }
         self.device_state = DeviceState::Inactive;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use utils::tempfile::TempFile;
+
+    #[test]
+    fn disk_image_id_prefers_supplied_block_id() {
+        let backing = TempFile::new().expect("create backing file");
+        backing
+            .as_file()
+            .set_len(SECTOR_SIZE)
+            .expect("size backing file");
+
+        let image_id = DiskProperties::build_disk_image_id(backing.as_file(), "workload-rootfs");
+
+        assert_eq!(image_id.len(), VIRTIO_BLK_ID_BYTES as usize);
+        assert_eq!(&image_id[..b"workload-rootfs".len()], b"workload-rootfs");
+        assert!(
+            image_id[b"workload-rootfs".len()..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+    }
+
+    #[test]
+    fn disk_image_id_truncates_supplied_block_id_to_virtio_limit() {
+        let backing = TempFile::new().expect("create backing file");
+        backing
+            .as_file()
+            .set_len(SECTOR_SIZE)
+            .expect("size backing file");
+        let long_id = "volume-name-that-is-longer-than-virtio-limit";
+
+        let image_id = DiskProperties::build_disk_image_id(backing.as_file(), long_id);
+
+        assert_eq!(image_id.len(), VIRTIO_BLK_ID_BYTES as usize);
+        assert_eq!(
+            &image_id,
+            &long_id.as_bytes()[..VIRTIO_BLK_ID_BYTES as usize]
+        );
+    }
+
+    #[test]
+    fn disk_image_id_accepts_empty_block_id() {
+        let backing = TempFile::new().expect("create backing file");
+        backing
+            .as_file()
+            .set_len(SECTOR_SIZE)
+            .expect("size backing file");
+
+        let image_id = DiskProperties::build_disk_image_id(backing.as_file(), "");
+
+        assert_eq!(image_id.len(), VIRTIO_BLK_ID_BYTES as usize);
     }
 }
