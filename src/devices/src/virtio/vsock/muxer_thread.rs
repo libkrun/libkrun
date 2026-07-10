@@ -12,7 +12,7 @@ use super::tsi_stream::TsiStreamProxy;
 
 use crate::virtio::InterruptTransport;
 use crate::virtio::vsock::defs;
-use crate::virtio::vsock::unix::{UnixAcceptorProxy, UnixProxy};
+use crate::virtio::vsock::unix_proxy::{UnixAcceptorProxy, UnixProxy};
 use crossbeam_channel::Sender;
 use rand::{RngExt, rng, rngs::ThreadRng};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};

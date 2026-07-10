@@ -19,10 +19,10 @@ pub enum RecvPkt {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum ProxyError {
-    CreatingSocket(nix::errno::Errno),
+    CreatingSocket(std::io::Error),
     InvalidFamily,
-    SettingReuseAddr(nix::errno::Errno),
-    SettingReusePort(nix::errno::Errno),
+    SettingReuseAddr(std::io::Error),
+    SettingReusePort(std::io::Error),
 }
 
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
@@ -69,6 +69,7 @@ impl fmt::Display for ProxyError {
 }
 
 pub trait Proxy: Send + AsRawFd {
+    #[allow(dead_code)]
     fn id(&self) -> u64;
     #[allow(dead_code)]
     fn status(&self) -> ProxyStatus;

@@ -17,7 +17,7 @@ use super::reaper::ReaperThread;
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
-use super::unix::UnixProxy;
+use super::unix_proxy::UnixProxy;
 use crossbeam_channel::{Sender, unbounded};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;

@@ -18,7 +18,7 @@ mod reaper;
 mod timesync;
 mod tsi_dgram;
 mod tsi_stream;
-mod unix;
+mod unix_proxy;
 
 pub use self::defs::TsiFlags;
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
