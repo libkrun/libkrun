@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+#[cfg(windows)]
+use utils::windows::RawFd;
 
 use super::super::Queue as VirtQueue;
 use super::muxer::{MuxerRx, ProxyMap, push_packet};
@@ -70,13 +73,28 @@ impl MuxerThread {
 
     pub fn update_polling(&self, id: u64, fd: RawFd, evset: EventSet) {
         debug!("update_polling id={id} fd={fd:?} evset={evset:?}");
-        let _ = self
-            .epoll
-            .ctl(ControlOperation::Delete, fd, &EpollEvent::default());
-        if !evset.is_empty() {
+        #[cfg(unix)]
+        {
             let _ = self
                 .epoll
-                .ctl(ControlOperation::Add, fd, &EpollEvent::new(evset, id));
+                .ctl(ControlOperation::Delete, fd, &EpollEvent::default());
+            if !evset.is_empty() {
+                let _ = self
+                    .epoll
+                    .ctl(ControlOperation::Add, fd, &EpollEvent::new(evset, id));
+            }
+        }
+        #[cfg(windows)]
+        {
+            let sock = fd as windows_sys::Win32::Networking::WinSock::SOCKET;
+            let _ = self
+                .epoll
+                .ctl_socket(ControlOperation::Delete, sock, &EpollEvent::default());
+            if !evset.is_empty() {
+                let _ =
+                    self.epoll
+                        .ctl_socket(ControlOperation::Add, sock, &EpollEvent::new(evset, id));
+            }
         }
     }
 
@@ -149,7 +167,7 @@ impl MuxerThread {
         }
     }
 
-    fn create_lisening_ipc_sockets(&self) {
+    fn create_listening_ipc_sockets(&self) {
         for (port, (path, do_listen)) in &self.unix_ipc_port_map {
             if !do_listen {
                 continue;
@@ -174,7 +192,7 @@ impl MuxerThread {
 
     fn work(mut self) {
         let mut thread_rng = rng();
-        self.create_lisening_ipc_sockets();
+        self.create_listening_ipc_sockets();
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
             match self

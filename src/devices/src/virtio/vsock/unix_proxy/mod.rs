@@ -25,6 +25,11 @@ mod unix;
 #[cfg(unix)]
 use unix as sys;
 
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows as sys;
+
 // Fields are marked pub(crate) so the OS submodules can access them
 pub struct UnixProxy {
     pub(crate) id: u64,
