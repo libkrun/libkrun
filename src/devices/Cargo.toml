@@ -23,6 +23,7 @@ timesync = []
 vhost-user = ["vhost", "vmm-sys-util"]
 
 [dependencies]
+bincode = { version = "2.0.1", default-features = false, features = ["std", "derive"] }
 bitflags = "1.2.0"
 crossbeam-channel = ">=0.5.15"
 libc = ">=0.2.39"

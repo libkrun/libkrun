@@ -11,7 +11,7 @@ use std::{fmt, io};
 
 use devices::fdt::DeviceInfoForFDT;
 use devices::legacy::IrqChip;
-use devices::{BusDevice, DeviceType};
+use devices::{BusDevice, DeviceType, Snapshottable};
 use kernel::cmdline as kernel_cmdline;
 use polly::event_manager::EventManager;
 #[cfg(target_arch = "aarch64")]
@@ -84,6 +84,9 @@ pub struct MMIODeviceManager {
     irq: u32,
     last_irq: u32,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
+    /// Devices that participate in snapshot, collected as they are registered
+    /// so the VMM can capture their state without downcasting bus entries.
+    snapshottables: Vec<Arc<Mutex<dyn Snapshottable>>>,
 }
 
 impl MMIODeviceManager {
@@ -99,7 +102,19 @@ impl MMIODeviceManager {
             last_irq: irq_interval.1,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
+            snapshottables: Vec::new(),
         }
+    }
+
+    /// Devices to capture in a snapshot, in registration order.
+    pub fn snapshottables(&self) -> &[Arc<Mutex<dyn Snapshottable>>] {
+        &self.snapshottables
+    }
+
+    /// Register a snapshottable device created outside this manager (e.g. a
+    /// virtio device built in the VMM builder).
+    pub fn add_snapshottable(&mut self, dev: Arc<Mutex<dyn Snapshottable>>) {
+        self.snapshottables.push(dev);
     }
 
     /// Register an already created MMIO device to be used via MMIO transport.
@@ -190,8 +205,10 @@ impl MMIODeviceManager {
         let rtc_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
         let device = devices::legacy::RTC::new(rtc_evt.try_clone().map_err(Error::EventFd)?);
 
+        let device = Arc::new(Mutex::new(device));
+        self.snapshottables.push(device.clone());
         self.bus
-            .insert(Arc::new(Mutex::new(device)), self.mmio_base, MMIO_LEN)
+            .insert(device, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
 
         let ret = self.mmio_base;

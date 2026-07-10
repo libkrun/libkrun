@@ -9,12 +9,36 @@ use crate::bus::BusDevice;
 use crate::legacy::gic::GICDevice;
 use crate::legacy::irqchip::IrqChipT;
 
+use std::os::raw::c_void;
+
 use hvf::Error;
-use hvf::bindings::{HV_SUCCESS, hv_gic_config_t, hv_ipa_t, hv_return_t};
+use hvf::bindings::{
+    HV_SUCCESS, hv_gic_config_t, hv_gic_icc_reg_t, hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1, hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR0_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR1_EL1, hv_gic_icc_reg_t_HV_GIC_ICC_REG_CTLR_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_IGRPEN0_EL1, hv_gic_icc_reg_t_HV_GIC_ICC_REG_IGRPEN1_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_PMR_EL1, hv_gic_icc_reg_t_HV_GIC_ICC_REG_SRE_EL1,
+    hv_gic_state_t, hv_ipa_t, hv_return_t, hv_vcpu_t, os_release,
+};
 use utils::eventfd::EventFd;
 
 // Device trees specific constants
 const ARCH_GIC_V3_MAINT_IRQ: u32 = 9;
+
+/// Per-vCPU GIC CPU-interface (ICC) registers captured for snapshot. These are
+/// the writable interface controls (group enables, priority mask, binary point,
+/// active-priority); RPR is read-only and the nested EL2 SRE is excluded.
+const SAVED_ICC: &[hv_gic_icc_reg_t] = &[
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_SRE_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_CTLR_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_PMR_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR0_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR1_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_IGRPEN0_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_IGRPEN1_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1,
+];
 
 pub struct HvfGicBindings {
     hv_gic_create:
@@ -29,6 +53,20 @@ pub struct HvfGicBindings {
     hv_gic_get_redistributor_size:
         libloading::Symbol<'static, unsafe extern "C" fn(*mut usize) -> hv_return_t>,
     hv_gic_set_spi: libloading::Symbol<'static, unsafe extern "C" fn(u32, bool) -> hv_return_t>,
+    // Snapshot save-side symbols (restore-side lands with M2).
+    hv_gic_state_create: libloading::Symbol<'static, unsafe extern "C" fn() -> hv_gic_state_t>,
+    hv_gic_state_get_size: libloading::Symbol<
+        'static,
+        unsafe extern "C" fn(hv_gic_state_t, *mut usize) -> hv_return_t,
+    >,
+    hv_gic_state_get_data: libloading::Symbol<
+        'static,
+        unsafe extern "C" fn(hv_gic_state_t, *mut c_void) -> hv_return_t,
+    >,
+    hv_gic_get_icc_reg: libloading::Symbol<
+        'static,
+        unsafe extern "C" fn(hv_vcpu_t, hv_gic_icc_reg_t, *mut u64) -> hv_return_t,
+    >,
 }
 
 pub struct HvfGicV3 {
@@ -69,6 +107,14 @@ impl HvfGicV3 {
                     .get(b"hv_gic_get_redistributor_size")
                     .map_err(Error::FindSymbol)?,
                 hv_gic_set_spi: HVF.get(b"hv_gic_set_spi").map_err(Error::FindSymbol)?,
+                hv_gic_state_create: HVF.get(b"hv_gic_state_create").map_err(Error::FindSymbol)?,
+                hv_gic_state_get_size: HVF
+                    .get(b"hv_gic_state_get_size")
+                    .map_err(Error::FindSymbol)?,
+                hv_gic_state_get_data: HVF
+                    .get(b"hv_gic_state_get_data")
+                    .map_err(Error::FindSymbol)?,
+                hv_gic_get_icc_reg: HVF.get(b"hv_gic_get_icc_reg").map_err(Error::FindSymbol)?,
             }
         };
 
@@ -147,6 +193,49 @@ impl IrqChipT for HvfGicV3 {
                 "IRQ not line configured",
             )))
         }
+    }
+
+    fn save_gic_state(&self) -> Result<Vec<u8>, DeviceError> {
+        // Mirrors ignition's gic.rs: create state, query size, copy out,
+        // os_release on every path. The state object is the only thing freed
+        // here; os_release is a libSystem symbol, always present.
+        let gic_err = || DeviceError::Snapshot("hv_gic_state save failed".into());
+        unsafe {
+            let state = (self.bindings.hv_gic_state_create)();
+            if state.is_null() {
+                return Err(gic_err());
+            }
+            let result = (|| {
+                let mut size: usize = 0;
+                if (self.bindings.hv_gic_state_get_size)(state, &mut size) != HV_SUCCESS {
+                    return Err(gic_err());
+                }
+                let mut buf = vec![0u8; size];
+                if (self.bindings.hv_gic_state_get_data)(state, buf.as_mut_ptr() as *mut c_void)
+                    != HV_SUCCESS
+                {
+                    return Err(gic_err());
+                }
+                Ok(buf)
+            })();
+            os_release(state as *mut c_void);
+            result
+        }
+    }
+
+    fn save_vcpu_icc(&self, vcpuid: u64) -> Result<Vec<(u32, u64)>, DeviceError> {
+        SAVED_ICC
+            .iter()
+            .map(|&reg| {
+                let mut val: u64 = 0;
+                let ret = unsafe { (self.bindings.hv_gic_get_icc_reg)(vcpuid, reg, &mut val) };
+                if ret != HV_SUCCESS {
+                    Err(DeviceError::Snapshot("hv_gic_get_icc_reg failed".into()))
+                } else {
+                    Ok((reg as u32, val))
+                }
+            })
+            .collect()
     }
 }
 

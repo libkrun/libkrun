@@ -1,3 +1,4 @@
+use bincode::{Decode, Encode};
 use std::cmp;
 use std::io::Write;
 use std::iter::zip;
@@ -15,6 +16,7 @@ use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
 };
 use super::{defs, defs::control_event, defs::uapi};
+use crate::snapshot::{DeviceState as SnapshotState, Snapshottable};
 use crate::virtio::console::console_control::{
     ConsoleControl, VirtioConsoleControl, VirtioConsoleResize,
 };
@@ -23,7 +25,7 @@ use crate::virtio::console::port::Port;
 use crate::virtio::console::port_queue_mapping::{
     QueueDirection, num_queues, port_id_to_queue_idx,
 };
-use crate::virtio::{InterruptTransport, PortDescription, VmmExitObserver};
+use crate::virtio::{InterruptTransport, PortDescription, QueueSnapshot, VmmExitObserver};
 
 pub(crate) const CONTROL_RXQ_INDEX: usize = 2;
 pub(crate) const CONTROL_TXQ_INDEX: usize = 3;
@@ -368,5 +370,60 @@ impl VmmExitObserver for Console {
     fn on_vmm_exit(&mut self) {
         self.reset();
         log::trace!("Console on_vmm_exit finished");
+    }
+}
+
+/// Version of the console snapshot encoding.
+const CONSOLE_SNAPSHOT_VERSION: u8 = 2;
+
+/// Resume-critical console state. Ports/threads/fds are rebuilt on restore.
+#[derive(Encode, Decode)]
+struct ConsoleState {
+    acked_features: u64,
+    activated: bool,
+    queues: Vec<Option<QueueSnapshot>>,
+}
+
+impl Snapshottable for Console {
+    fn id(&self) -> &str {
+        "console"
+    }
+
+    fn save(&self) -> std::result::Result<SnapshotState, crate::Error> {
+        let state = ConsoleState {
+            acked_features: self.acked_features,
+            activated: matches!(self.device_state, DeviceState::Activated(..)),
+            queues: self
+                .queues
+                .iter()
+                .map(|q| q.as_ref().map(|dq| dq.queue.snapshot()))
+                .collect(),
+        };
+        let bytes = bincode::encode_to_vec(&state, bincode::config::standard())
+            .map_err(|e| crate::Error::Snapshot(e.to_string()))?;
+        Ok(SnapshotState {
+            version: CONSOLE_SNAPSHOT_VERSION,
+            bytes,
+        })
+    }
+
+    fn restore(&mut self, state: &SnapshotState) -> std::result::Result<(), crate::Error> {
+        if state.version != CONSOLE_SNAPSHOT_VERSION {
+            return Err(crate::Error::Snapshot(format!(
+                "console: unsupported state version {}",
+                state.version
+            )));
+        }
+        let (cs, _): (ConsoleState, _) =
+            bincode::decode_from_slice(&state.bytes, bincode::config::standard())
+                .map_err(|e| crate::Error::Snapshot(format!("console: {e}")))?;
+        self.acked_features = cs.acked_features;
+        // cs.activated is informational until restore reactivates.
+        for (i, qs) in cs.queues.iter().enumerate() {
+            if let (Some(qs), Some(Some(dq))) = (qs, self.queues.get_mut(i)) {
+                dq.queue.restore(qs);
+            }
+        }
+        Ok(())
     }
 }

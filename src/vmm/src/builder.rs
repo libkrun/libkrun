@@ -838,7 +838,8 @@ pub fn build_microvm(
         Arc::new(VcpuList::new(cpu_count as u64))
     };
 
-    let vcpus;
+    #[allow(unused_mut)]
+    let mut vcpus;
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
@@ -950,6 +951,11 @@ pub fn build_microvm(
         )
         .map_err(StartMicrovmError::Internal)?;
 
+        // Each vCPU captures its own thread-affine GIC (ICC) state at snapshot.
+        for vcpu in &mut vcpus {
+            vcpu.set_intc(intc.clone());
+        }
+
         attach_legacy_devices(
             &vm,
             &mut mmio_device_manager,
@@ -1005,6 +1011,8 @@ pub fn build_microvm(
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
+        #[cfg(target_os = "macos")]
+        intc: intc.clone(),
         #[cfg(target_os = "macos")]
         vm_ctl_tx,
         #[cfg(target_os = "macos")]
@@ -2555,6 +2563,9 @@ fn attach_console_devices(
     let console = Arc::new(Mutex::new(devices::virtio::Console::new(ports).unwrap()));
 
     vmm.exit_observers.push(console.clone());
+
+    #[cfg(target_os = "macos")]
+    vmm.mmio_device_manager.add_snapshottable(console.clone());
 
     event_manager
         .add_subscriber(console.clone())

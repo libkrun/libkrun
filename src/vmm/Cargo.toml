@@ -10,8 +10,8 @@ repository = "https://github.com/containers/libkrun"
 
 [features]
 tee = ["devices/tee", "arch/tee"]
-amd-sev = ["blk", "bitfield", "bitflags", "iocuddle", "tee", "kbs-types", "serde", "serde_json", "devices/amd-sev", "arch/amd-sev"]
-tdx = ["blk", "tee", "kbs-types", "serde", "serde_json", "dep:tdx", "devices/tdx", "arch/tdx", "cpuid/tdx"]
+amd-sev = ["blk", "bitfield", "bitflags", "iocuddle", "tee", "kbs-types", "devices/amd-sev", "arch/amd-sev"]
+tdx = ["blk", "tee", "kbs-types", "dep:tdx", "devices/tdx", "arch/tdx", "cpuid/tdx"]
 net = ["devices/net"]
 blk = ["devices/blk"]
 gpu = ["devices/gpu", "krun_display"]
@@ -20,6 +20,7 @@ aws-nitro = []
 vhost-user = ["devices/vhost-user"]
 
 [dependencies]
+bincode = { version = "2.0.1", default-features = false, features = ["std", "derive"] }
 crossbeam-channel = ">=0.5.15"
 flate2 = "1.0.35"
 libc = ">=0.2.39"
@@ -39,8 +40,8 @@ polly = { package = "krun-polly", version = "=0.1.0-2.0.0-dev", path = "../polly
 
 # Dependencies for amd-sev
 kbs-types = { version = "0.13.0", optional = true }
-serde = { version = "1.0.125", optional = true }
-serde_json = { version = "1.0.64", optional = true }
+serde = { version = "1.0.125", features = ["derive"] }
+serde_json = { version = "1.0.64" }
 iocuddle = { version = "0.1.1", optional = true }
 bitfield = { version = "0.19.4", optional = true }
 bitflags = { version = "2.10.0", optional = true }

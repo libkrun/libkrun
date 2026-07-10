@@ -51,6 +51,8 @@ use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
     VmResources, VsockConfig,
 };
+#[cfg(all(target_os = "macos", not(any(feature = "tee", feature = "aws-nitro"))))]
+use vmm::snapshot::SnapshotFlags;
 #[cfg(feature = "blk")]
 use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
 #[cfg(not(feature = "tee"))]
@@ -431,8 +433,8 @@ static CTX_MAP: Lazy<Mutex<HashMap<u32, ContextConfig>>> = Lazy::new(|| Mutex::n
 static CTX_IDS: AtomicI32 = AtomicI32::new(0);
 
 /// Out-of-band control channel for running VMs, keyed by ctx id. Populated by
-/// `krun_start_enter` for every macOS VM so `krun_vm_pause` / `krun_vm_resume`
-/// can reach it from another thread.
+/// `krun_start_enter` for every macOS VM so `krun_vm_pause`, `krun_vm_resume`
+/// and `krun_snapshot_request` can reach it from another thread.
 #[cfg(target_os = "macos")]
 static VM_CTL: Lazy<Mutex<HashMap<u32, PollableChannelSender<VmCtl>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -2977,7 +2979,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
 
     // Register the control channel for every macOS VM so another thread can
-    // freeze/wake this guest while `krun_start_enter` blocks here.
+    // freeze, wake or snapshot this guest while `krun_start_enter` blocks here.
     #[cfg(target_os = "macos")]
     VM_CTL
         .lock()
@@ -3037,6 +3039,48 @@ pub extern "C" fn krun_vm_pause(_ctx_id: u32) -> i32 {
 #[cfg(not(target_os = "macos"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_vm_resume(_ctx_id: u32) -> i32 {
+    -libc::ENOTSUP
+}
+
+/// Thread-safe out-of-band snapshot of a VM running under `krun_start_enter` on
+/// another thread. The VM's event loop freezes the vCPUs, writes the snapshot to
+/// `c_snapshot_path` and exits the process (`KRUN_SNAPSHOT_EXIT`).
+#[cfg(all(target_os = "macos", not(any(feature = "tee", feature = "aws-nitro"))))]
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_snapshot_request(
+    ctx_id: u32,
+    c_snapshot_path: *const c_char,
+    flags: u32,
+) -> i32 {
+    // M1 supports `Exit` only; `Resume` is accepted by the ABI but not yet
+    // implemented.
+    let flags = match SnapshotFlags::from_bits(flags) {
+        Some(SnapshotFlags::Exit) => SnapshotFlags::Exit,
+        Some(SnapshotFlags::Resume) => return -libc::ENOTSUP,
+        None => {
+            error!("Unknown snapshot flags: {flags}");
+            return -libc::EINVAL;
+        }
+    };
+    let path = match unsafe { CStr::from_ptr(c_snapshot_path) }.to_str() {
+        Ok(p) => PathBuf::from(p),
+        Err(e) => {
+            error!("Error parsing snapshot path: {e:?}");
+            return -libc::EINVAL;
+        }
+    };
+    send_vm_ctl(ctx_id, VmCtl::Snapshot(path, flags))
+}
+
+#[cfg(not(all(target_os = "macos", not(any(feature = "tee", feature = "aws-nitro")))))]
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_snapshot_request(
+    _ctx_id: u32,
+    _c_snapshot_path: *const c_char,
+    _flags: u32,
+) -> i32 {
     -libc::ENOTSUP
 }
 

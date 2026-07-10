@@ -109,6 +109,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
 dependencies = [
  "bincode_derive",
+ "serde",
  "unty",
 ]
 
@@ -662,6 +663,7 @@ dependencies = [
 name = "krun-devices"
 version = "0.1.0-2.0.0-dev"
 dependencies = [
+ "bincode",
  "bitflags 1.3.2",
  "caps",
  "crossbeam-channel",
@@ -798,6 +800,7 @@ dependencies = [
 name = "krun-vmm"
 version = "0.1.0-2.0.0-dev"
 dependencies = [
+ "bincode",
  "bitfield",
  "bitflags 2.11.0",
  "bzip2",

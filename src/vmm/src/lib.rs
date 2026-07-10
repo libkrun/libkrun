@@ -21,6 +21,8 @@ pub mod resources;
 /// Signal handling utilities.
 #[cfg(target_os = "linux")]
 pub mod signal_handler;
+/// VM snapshot/restore seam (M0 skeleton).
+pub mod snapshot;
 /// Wrappers over structures used to configure the VMM.
 pub mod vmm_config;
 
@@ -212,11 +214,15 @@ pub struct Vmm {
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
 
-    // Out-of-band live pause/resume requests: the C API sends `VmCtl` from
-    // another thread; the event loop freezes or wakes the vCPUs. A single
-    // channel rather than one eventfd per operation, so the event loop observes
-    // the requests in the order they were made. Device worker threads are
-    // notify-driven, so a frozen guest leaves them idle without explicit
+    // Interrupt controller handle, retained for snapshot capture of GIC state.
+    #[cfg(target_os = "macos")]
+    intc: IrqChip,
+
+    // Out-of-band live pause/resume/snapshot requests: the C API sends `VmCtl`
+    // from another thread; the event loop freezes, wakes or serializes the VM.
+    // A single channel rather than one eventfd per operation, so the event loop
+    // observes the requests in the order they were made. Device worker threads
+    // are notify-driven, so a frozen guest leaves them idle without explicit
     // handling.
     #[cfg(target_os = "macos")]
     vm_ctl_tx: PollableChannelSender<VmCtl>,
@@ -234,6 +240,8 @@ pub struct Vmm {
 pub enum VmCtl {
     Pause,
     Resume,
+    /// Serialize the VM into this directory, then act on the flags.
+    Snapshot(std::path::PathBuf, crate::snapshot::SnapshotFlags),
 }
 
 impl Vmm {
@@ -292,8 +300,8 @@ impl Vmm {
         Ok(())
     }
 
-    /// Sender for live [`VmCtl`] requests. The event loop runs [`Vmm::pause`] /
-    /// [`Vmm::resume`] in response.
+    /// Sender for live [`VmCtl`] requests. The event loop runs [`Vmm::pause`],
+    /// [`Vmm::resume`] or [`Vmm::snapshot`] in response.
     #[cfg(target_os = "macos")]
     pub fn vm_ctl_sender(&self) -> PollableChannelSender<VmCtl> {
         self.vm_ctl_tx.clone()
@@ -348,6 +356,120 @@ impl Vmm {
         }
         self.paused = false;
         Ok(())
+    }
+
+    /// Snapshot the running VM into the directory `path`: vCPU registers, GIC
+    /// state, devices, and guest RAM. The vCPUs are frozen for the duration so
+    /// the captured pieces are mutually consistent. This is the equivalent of
+    /// the proposed 2.0 `RunningVmm::snapshot(path, flags)`.
+    ///
+    /// `flags` selects the post-capture action: `Exit` returns `Ok` (the caller
+    /// terminates the process); `Resume` is not yet implemented.
+    ///
+    /// M1 assumes every configured vCPU is running; a never-powered-on
+    /// secondary would block waiting for its `Snapshotted` response.
+    #[cfg(target_os = "macos")]
+    pub fn snapshot(
+        &mut self,
+        path: &std::path::Path,
+        flags: crate::snapshot::SnapshotFlags,
+    ) -> std::result::Result<(), crate::snapshot::SnapErr> {
+        use crate::snapshot::SnapshotFlags;
+        use crate::snapshot::{
+            Aarch64VcpuState, MANIFEST_VERSION, Manifest, SectionId, SnapErr, VCPU_SECTION_VERSION,
+            VMSTATE_VERSION, VmstateWriter, VtimerState, write_snapshot,
+        };
+        use crate::vstate::{VcpuEvent, VcpuResponse};
+        use vm_memory::{GuestMemory, GuestMemoryRegion};
+
+        // Freeze every vCPU, then ask each parked thread to report its own
+        // registers and ICC state: HVF's per-vCPU `hv_gic_*` calls are
+        // thread-affine, so the coordinator can't read ICC on their behalf.
+        self.pause().map_err(SnapErr::State)?;
+        for h in &self.vcpus_handles {
+            h.send_event(VcpuEvent::Snapshot)
+                .map_err(|e| SnapErr::State(format!("vcpu snapshot event: {e:?}")))?;
+        }
+
+        // Don't hold the GIC lock here: each vCPU thread takes it to read its own
+        // (thread-affine) ICC state while producing the response we await below.
+        let mut writer = VmstateWriter::new();
+        for h in &self.vcpus_handles {
+            let (hvf_state, icc) = match h.response_receiver().recv() {
+                Ok(VcpuResponse::Snapshotted(s, icc)) => (*s, icc),
+                Ok(other) => {
+                    return Err(SnapErr::State(format!(
+                        "unexpected vcpu response: {other:?}"
+                    )));
+                }
+                Err(e) => return Err(SnapErr::State(format!("vcpu response: {e:?}"))),
+            };
+            let state = Aarch64VcpuState {
+                gp: hvf_state
+                    .gp
+                    .try_into()
+                    .map_err(|_| SnapErr::State("gp register count".into()))?,
+                sysregs: hvf_state.sysregs,
+                simd: hvf_state
+                    .simd
+                    .try_into()
+                    .map_err(|_| SnapErr::State("simd register count".into()))?,
+                icc,
+                fpcr: hvf_state.fpcr,
+                fpsr: hvf_state.fpsr,
+                vtimer: VtimerState {
+                    mask: hvf_state.vtimer_mask,
+                    offset: hvf_state.vtimer_offset,
+                },
+                host_counter: hvf_state.host_counter,
+            };
+            writer.section(SectionId::Vcpu, VCPU_SECTION_VERSION, &state.to_bytes());
+        }
+        let gic = self
+            .intc
+            .lock()
+            .unwrap()
+            .save_gic_state()
+            .map_err(|e| SnapErr::State(format!("gic state: {e:?}")))?;
+        writer.section(SectionId::Gic, 1, &gic);
+
+        // Per-device sections: framed as [id_len u16][id][device bytes], with
+        // the device's own version as the section version.
+        for dev in self.mmio_device_manager.snapshottables() {
+            let dev = dev.lock().unwrap();
+            let state = dev
+                .save()
+                .map_err(|e| SnapErr::State(format!("device {}: {e:?}", dev.id())))?;
+            let id = dev.id().as_bytes();
+            let mut payload = Vec::with_capacity(2 + id.len() + state.bytes.len());
+            payload.extend_from_slice(&(id.len() as u16).to_le_bytes());
+            payload.extend_from_slice(id);
+            payload.extend_from_slice(&state.bytes);
+            writer.section(SectionId::Device, state.version, &payload);
+        }
+        let vmstate = writer.finish();
+
+        // Manifest + on-disk layout (guest RAM dumped by write_snapshot).
+        let mem_bytes: u64 = self.guest_memory.iter().map(|r| r.len()).sum();
+        let manifest = Manifest {
+            manifest_version: MANIFEST_VERSION,
+            libkrun_version: env!("CARGO_PKG_VERSION").to_string(),
+            arch: "aarch64".to_string(),
+            backend: "hvf".to_string(),
+            mem_size_mib: (mem_bytes / (1 << 20)) as usize,
+            vcpu_count: self.vcpus_handles.len() as u8,
+            vmstate_version: VMSTATE_VERSION,
+        };
+        write_snapshot(path, &manifest, &vmstate, &self.guest_memory)?;
+
+        match flags {
+            // The vCPUs are frozen; the caller terminates the process.
+            SnapshotFlags::Exit => Ok(()),
+            // Resuming frozen vCPUs (unpark + restore vtimer) is a later step.
+            SnapshotFlags::Resume => Err(SnapErr::State(
+                "snapshot resume is not yet implemented".into(),
+            )),
+        }
     }
 
     /// Configures the system for boot.
@@ -490,12 +612,32 @@ impl Subscriber for Vmm {
         #[cfg(target_os = "macos")]
         if source == self.vm_ctl_rx.as_raw_fd() && event_set == EventSet::IN {
             while let Ok(Some(req)) = self.vm_ctl_rx.try_recv() {
-                let res = match req {
-                    VmCtl::Pause => self.pause(),
-                    VmCtl::Resume => self.resume(),
-                };
-                if let Err(e) = res {
-                    error!("vm {req:?} failed: {e}");
+                match &req {
+                    VmCtl::Pause => {
+                        if let Err(e) = self.pause() {
+                            error!("vm pause failed: {e}");
+                        }
+                    }
+                    VmCtl::Resume => {
+                        if let Err(e) = self.resume() {
+                            error!("vm resume failed: {e}");
+                        }
+                    }
+                    // A snapshot leaves the vCPUs frozen either way, so the
+                    // process ends here whether or not it was written.
+                    VmCtl::Snapshot(path, flags) => {
+                        match self.snapshot(path, *flags) {
+                            Ok(()) => {
+                                info!("snapshot written to {}", path.display());
+                                self.stop(FC_EXIT_CODE_OK as i32);
+                            }
+                            Err(e) => {
+                                error!("snapshot failed: {e:?}");
+                                self.stop(FC_EXIT_CODE_GENERIC_ERROR as i32);
+                            }
+                        }
+                        return;
+                    }
                 }
             }
             return;

@@ -1336,6 +1336,35 @@ int32_t krun_vm_pause(uint32_t ctx_id);
  */
 int32_t krun_vm_resume(uint32_t ctx_id);
 
+/* Snapshot flags. */
+#define KRUN_SNAPSHOT_EXIT 0   /* capture, then exit */
+#define KRUN_SNAPSHOT_RESUME 1 /* capture, then resume (unimplemented) */
+
+/**
+ * Thread-safe, out-of-band snapshot trigger for a VM already running under
+ * krun_start_enter() on another thread. The VM's event loop freezes the vCPUs,
+ * serializes the VM into "snapshot_path", and exits the process.
+ *
+ * The snapshot is written as a directory containing "manifest.json", "vmstate",
+ * and "memory.img".
+ *
+ * Currently macOS/HVF only; returns -ENOTSUP elsewhere and on TEE builds.
+ *
+ * Arguments:
+ *  "ctx_id"        - the configuration context ID of the running VM.
+ *  "snapshot_path" - destination directory for the snapshot.
+ *  "flags"         - KRUN_SNAPSHOT_EXIT.
+ *
+ * Returns:
+ *  0        - the snapshot request was signalled.
+ *  -EINVAL  - bad path or unsupported flags.
+ *  -ENOENT  - no running VM is registered for this ctx_id.
+ *  -EIO     - failed to signal the VM.
+ *  -ENOTSUP - snapshots are unsupported on this platform/build.
+ */
+int32_t krun_snapshot_request(uint32_t ctx_id, const char *snapshot_path,
+                              uint32_t flags);
+
 #ifdef __cplusplus
 }
 #endif

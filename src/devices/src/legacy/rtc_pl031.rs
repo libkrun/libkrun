@@ -8,11 +8,13 @@
 //! a real-time clock input.
 //!
 
+use bincode::{Decode, Encode};
 use std::fmt;
 use std::time::Instant;
 use std::{io, result};
 
 use crate::BusDevice;
+use crate::snapshot::{DeviceState, Snapshottable};
 use utils::byte_order;
 use utils::eventfd::EventFd;
 //use bus::Error;
@@ -180,6 +182,62 @@ impl BusDevice for RTC {
     }
 }
 
+/// Version of the RTC snapshot encoding.
+const RTC_SNAPSHOT_VERSION: u8 = 2;
+
+/// Resume-critical RTC state. `now_ns` is the absolute tick value so restore can
+/// re-anchor against a fresh `Instant::now()`.
+#[derive(Encode, Decode)]
+struct RtcState {
+    now_ns: i64,
+    match_value: u32,
+    load: u32,
+    imsc: u32,
+    ris: u32,
+}
+
+impl Snapshottable for RTC {
+    fn id(&self) -> &str {
+        "rtc"
+    }
+
+    fn save(&self) -> std::result::Result<DeviceState, crate::Error> {
+        let state = RtcState {
+            now_ns: self.tick_offset
+                + Instant::now().duration_since(self.previous_now).as_nanos() as i64,
+            match_value: self.match_value,
+            load: self.load,
+            imsc: self.imsc,
+            ris: self.ris,
+        };
+        let bytes = bincode::encode_to_vec(&state, bincode::config::standard())
+            .map_err(|e| crate::Error::Snapshot(e.to_string()))?;
+        Ok(DeviceState {
+            version: RTC_SNAPSHOT_VERSION,
+            bytes,
+        })
+    }
+
+    fn restore(&mut self, state: &DeviceState) -> std::result::Result<(), crate::Error> {
+        if state.version != RTC_SNAPSHOT_VERSION {
+            return Err(crate::Error::Snapshot(format!(
+                "rtc: unsupported state version {}",
+                state.version
+            )));
+        }
+        let (s, _): (RtcState, _) =
+            bincode::decode_from_slice(&state.bytes, bincode::config::standard())
+                .map_err(|e| crate::Error::Snapshot(format!("rtc: {e}")))?;
+        self.tick_offset = s.now_ns;
+        self.previous_now = Instant::now();
+        self.match_value = s.match_value;
+        self.load = s.load;
+        self.imsc = s.imsc;
+        self.ris = s.ris;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +295,46 @@ mod tests {
         rtc.read(0, AMBA_ID_LOW, &mut data);
         let index = AMBA_ID_LOW + 3;
         assert_eq!(data[0], PL031_ID[((index - AMBA_ID_LOW) >> 2) as usize]);
+    }
+
+    #[test]
+    fn test_rtc_snapshot_round_trip() {
+        let mut rtc = RTC::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
+        let mut data = [0; 4];
+        byte_order::write_le_u32(&mut data, 42);
+        rtc.write(0, RTCMR, &data); // match_value = 42
+        byte_order::write_le_u32(&mut data, 1);
+        rtc.write(0, RTCIMSC, &data); // imsc = 1
+        let _ = rtc.interrupt_evt.read();
+
+        let state = rtc.save().unwrap();
+
+        let mut restored = RTC::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
+        restored.restore(&state).unwrap();
+        assert_eq!(restored.match_value, 42);
+        assert_eq!(restored.imsc, 1);
+        // The captured absolute tick is re-anchored, so the clock reads back
+        // within a second of the original.
+        assert!(restored.get_time().abs_diff(rtc.get_time()) <= 1);
+
+        // A truncated or wrong-version blob is rejected, not half-applied.
+        let mut bad = state.bytes.clone();
+        bad.truncate(10);
+        assert!(
+            restored
+                .restore(&DeviceState {
+                    version: RTC_SNAPSHOT_VERSION,
+                    bytes: bad,
+                })
+                .is_err()
+        );
+        assert!(
+            restored
+                .restore(&DeviceState {
+                    version: RTC_SNAPSHOT_VERSION + 1,
+                    bytes: state.bytes.clone(),
+                })
+                .is_err()
+        );
     }
 }

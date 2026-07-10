@@ -334,6 +334,117 @@ pub struct HvfVcpu<'a> {
     vtimer_offset: Cell<u64>,
 }
 
+/// GP registers captured for snapshot, in order: X0..X30, PC, CPSR (33 entries).
+/// SP_EL0/EL1 are captured as sysregs; X29=FP, X30=LR.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const SAVED_GP: &[hv_reg_t] = &[
+    hv_reg_t_HV_REG_X0,
+    hv_reg_t_HV_REG_X1,
+    hv_reg_t_HV_REG_X2,
+    hv_reg_t_HV_REG_X3,
+    hv_reg_t_HV_REG_X4,
+    hv_reg_t_HV_REG_X5,
+    hv_reg_t_HV_REG_X6,
+    hv_reg_t_HV_REG_X7,
+    hv_reg_t_HV_REG_X8,
+    hv_reg_t_HV_REG_X9,
+    hv_reg_t_HV_REG_X10,
+    hv_reg_t_HV_REG_X11,
+    hv_reg_t_HV_REG_X12,
+    hv_reg_t_HV_REG_X13,
+    hv_reg_t_HV_REG_X14,
+    hv_reg_t_HV_REG_X15,
+    hv_reg_t_HV_REG_X16,
+    hv_reg_t_HV_REG_X17,
+    hv_reg_t_HV_REG_X18,
+    hv_reg_t_HV_REG_X19,
+    hv_reg_t_HV_REG_X20,
+    hv_reg_t_HV_REG_X21,
+    hv_reg_t_HV_REG_X22,
+    hv_reg_t_HV_REG_X23,
+    hv_reg_t_HV_REG_X24,
+    hv_reg_t_HV_REG_X25,
+    hv_reg_t_HV_REG_X26,
+    hv_reg_t_HV_REG_X27,
+    hv_reg_t_HV_REG_X28,
+    hv_reg_t_HV_REG_X29,
+    hv_reg_t_HV_REG_X30,
+    hv_reg_t_HV_REG_PC,
+    hv_reg_t_HV_REG_CPSR,
+];
+
+/// EL1 guest-resume sysreg set + generic timer. MPIDR_EL1 is set at vCPU
+/// create, not here. The pointer-auth keys (AP*KEY*) MUST be captured: the
+/// kernel signs return addresses with them, and a restored vCPU with different
+/// keys faults on `autiasp`.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const SAVED_SYSREGS: &[hv_sys_reg_t] = &[
+    hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TTBR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TCR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_MAIR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AMAIR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_SP_EL0,
+    hv_sys_reg_t_HV_SYS_REG_SP_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ELR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ESR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_FAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CONTEXTIDR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL0,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TPIDRRO_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CPACR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CSSELR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AFSR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AFSR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_PAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTKCTL_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CNTP_CTL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTP_CVAL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_APIAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIAKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIBKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIBKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDAKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDBKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDBKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APGAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APGAKEYHI_EL1,
+];
+
+/// Captured HVF vCPU register state, hypervisor-side. The VMM maps this into
+/// its arch-neutral snapshot type; HVF register ids never leave this crate.
+///
+/// Per-vCPU GIC CPU-interface (ICC) registers are captured separately alongside
+/// the GIC distributor/redistributor blob, because those use the dynamically
+/// loaded `hv_gic_*` symbols rather than the statically linked `hv_vcpu_*` set.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[derive(Debug, Clone)]
+pub struct HvfVcpuState {
+    /// One value per `SAVED_GP` entry, in order.
+    pub gp: Vec<u64>,
+    /// (sys_reg id, value) per `SAVED_SYSREGS` entry.
+    pub sysregs: Vec<(u32, u64)>,
+    /// Q0..Q31 NEON/FP registers.
+    pub simd: Vec<u128>,
+    /// FP control / status registers.
+    pub fpcr: u64,
+    pub fpsr: u64,
+    /// Virtual timer mask + offset at capture.
+    pub vtimer_mask: bool,
+    pub vtimer_offset: u64,
+    /// `mach_absolute_time()` at capture — the anchor used to recompute the
+    /// vtimer offset on restore so the guest's CNTVCT stays continuous.
+    pub host_counter: u64,
+}
+
 impl HvfVcpu<'_> {
     pub fn new(mpidr: u64, nested_enabled: bool) -> Result<Self, Error> {
         let mut vcpuid: hv_vcpu_t = 0;
@@ -525,6 +636,53 @@ impl HvfVcpu<'_> {
         }
         self.vtimer_offset.set(offset);
         Ok(())
+    }
+
+    /// Capture this vCPU's architectural register state for snapshot. Uses only
+    /// the statically linked `hv_vcpu_*` symbols; per-vCPU GIC (ICC) state goes
+    /// through the dynamically loaded `hv_gic_*` path instead. Must be called
+    /// from the vCPU's own thread while it is parked between guest runs.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub fn save_state(&self) -> Result<HvfVcpuState, Error> {
+        let gp = SAVED_GP
+            .iter()
+            .map(|&r| self.read_reg(r))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sysregs = SAVED_SYSREGS
+            .iter()
+            .map(|&r| Ok((r as u32, self.read_sys_reg(r)?)))
+            .collect::<Result<Vec<_>, Error>>()?;
+        let simd = (0u32..32)
+            .map(|q| {
+                let mut val: hv_simd_fp_uchar16_t = 0;
+                let ret = unsafe { hv_vcpu_get_simd_fp_reg(self.vcpuid, q, &mut val) };
+                if ret != HV_SUCCESS {
+                    Err(Error::VcpuReadRegister)
+                } else {
+                    Ok(val)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let fpcr = self.read_reg(hv_reg_t_HV_REG_FPCR)?;
+        let fpsr = self.read_reg(hv_reg_t_HV_REG_FPSR)?;
+
+        let mut vtimer_mask = false;
+        let ret = unsafe { hv_vcpu_get_vtimer_mask(self.vcpuid, &mut vtimer_mask) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadRegister);
+        }
+        let host_counter = unsafe { mach_absolute_time() };
+
+        Ok(HvfVcpuState {
+            gp,
+            sysregs,
+            simd,
+            fpcr,
+            fpsr,
+            vtimer_mask,
+            vtimer_offset: self.vtimer_offset.get(),
+            host_counter,
+        })
     }
 
     fn hvf_sync_vtimer(&mut self, vcpu_list: Arc<dyn Vcpus>) {

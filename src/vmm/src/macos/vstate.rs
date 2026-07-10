@@ -19,8 +19,8 @@ use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
 use crossbeam_channel::{Receiver, Sender, after, select, unbounded};
-use devices::legacy::VcpuList;
-use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
+use devices::legacy::{IrqChip, VcpuList};
+use hvf::{HvfVcpu, HvfVcpuState, HvfVm, VcpuExit, Vcpus};
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
@@ -202,6 +202,11 @@ pub struct Vcpu {
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+
+    /// GIC handle, set before capture so this thread can read its own per-vCPU
+    /// ICC registers (HVF's `hv_gic_*` per-vCPU calls are thread-affine, so the
+    /// coordinator can't read them on the vCPU's behalf).
+    intc: Option<IrqChip>,
 }
 
 impl Vcpu {
@@ -295,7 +300,14 @@ impl Vcpu {
             response_sender,
             vcpu_list,
             nested_enabled,
+            intc: None,
         })
+    }
+
+    /// Give this vCPU the GIC handle so it can capture its own ICC state on its
+    /// own thread during a snapshot.
+    pub fn set_intc(&mut self, intc: IrqChip) {
+        self.intc = Some(intc);
     }
 
     /// Returns the cpu index as seen by the guest OS.
@@ -530,11 +542,10 @@ impl Vcpu {
 
     fn wait_for_resume(&mut self) {}
 
-    /// Freeze this vCPU in response to a `Pause` event and block until `Resume`,
-    /// which carries the paused tick count. Advancing the vtimer offset by it
-    /// keeps the guest's CNTVCT continuous so armed timers don't fire en masse
-    /// to catch up the gap. The coordinator computes the tick count once for the
-    /// whole VM, so multi-vCPU offsets stay in lockstep.
+    /// Freeze in response to `Pause`, block until `Resume`, and advance the vtimer
+    /// offset by the paused ticks (computed once VM-wide) so CNTVCT stays
+    /// continuous. A `Snapshot` event is served while parked — the registers and
+    /// per-vCPU ICC must be read on this thread (HVF's `hv_gic_*` are thread-affine).
     fn pause_and_park(&mut self, hvf_vcpu: &HvfVcpu) {
         self.response_sender
             .send(VcpuResponse::Paused)
@@ -552,7 +563,23 @@ impl Vcpu {
                         .expect("failed to send Resumed status");
                     return;
                 }
-                Ok(_) => {}
+                Ok(VcpuEvent::Snapshot) => {
+                    let state = hvf_vcpu
+                        .save_state()
+                        .unwrap_or_else(|e| panic!("vCPU {} snapshot failed: {e:?}", self.id));
+                    let icc = self
+                        .intc
+                        .as_ref()
+                        .expect("vcpu intc set before snapshot")
+                        .lock()
+                        .unwrap()
+                        .save_vcpu_icc(hvf_vcpu.id())
+                        .unwrap_or_else(|e| panic!("vCPU {} ICC snapshot failed: {e:?}", self.id));
+                    self.response_sender
+                        .send(VcpuResponse::Snapshotted(Box::new(state), icc))
+                        .expect("failed to send snapshot state");
+                }
+                Ok(VcpuEvent::Pause) => {}
                 Err(_) => return,
             }
         }
@@ -584,9 +611,11 @@ pub enum VcpuEvent {
     /// (the wall-clock time the VM spent paused). The coordinator sends the
     /// same value to every vCPU so their counters stay synchronized.
     Resume(u64),
+    /// Report this (already paused) vCPU's register and ICC state.
+    Snapshot,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 /// List of responses that the Vcpu reports.
 pub enum VcpuResponse {
     /// Vcpu is paused.
@@ -595,6 +624,9 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// Vcpu reported its register state and per-vCPU ICC registers in response
+    /// to a `Snapshot` event.
+    Snapshotted(Box<HvfVcpuState>, Vec<(u32, u64)>),
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.

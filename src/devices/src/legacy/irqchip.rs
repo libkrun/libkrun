@@ -35,6 +35,18 @@ impl IrqChipDevice {
     ) -> Result<(), DeviceError> {
         self.inner.set_irq(irq_line, interrupt_evt)
     }
+
+    /// Capture the in-kernel GIC distributor/redistributor state (snapshot).
+    #[cfg(target_arch = "aarch64")]
+    pub fn save_gic_state(&self) -> Result<Vec<u8>, DeviceError> {
+        self.inner.save_gic_state()
+    }
+
+    /// Capture one vCPU's GIC CPU-interface (ICC) registers (snapshot).
+    #[cfg(target_arch = "aarch64")]
+    pub fn save_vcpu_icc(&self, vcpuid: u64) -> Result<Vec<(u32, u64)>, DeviceError> {
+        self.inner.save_vcpu_icc(vcpuid)
+    }
 }
 
 impl BusDevice for IrqChipDevice {
@@ -132,6 +144,23 @@ pub trait IrqChipT: BusDevice + GICDevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    /// Capture the in-kernel GIC distributor/redistributor state as an opaque
+    /// blob (snapshot). Default: unsupported — only the HVF GIC overrides it.
+    fn save_gic_state(&self) -> Result<Vec<u8>, DeviceError> {
+        Err(DeviceError::Snapshot(
+            "GIC state snapshot not supported by this irqchip".into(),
+        ))
+    }
+
+    /// Capture one vCPU's GIC CPU-interface (ICC) registers (snapshot). These
+    /// live in the vCPU interface, not the global blob above. Default:
+    /// unsupported.
+    fn save_vcpu_icc(&self, _vcpuid: u64) -> Result<Vec<(u32, u64)>, DeviceError> {
+        Err(DeviceError::Snapshot(
+            "vCPU ICC snapshot not supported by this irqchip".into(),
+        ))
+    }
 }
 
 #[cfg(target_arch = "riscv64")]
