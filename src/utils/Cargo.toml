@@ -26,6 +26,7 @@ nix = { version = "0.30.1", features = ["fs"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_System_IO",
     "Win32_System_Performance",
