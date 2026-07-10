@@ -26,6 +26,11 @@ mod unix;
 #[cfg(unix)]
 use unix as sys;
 
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows as sys;
+
 pub struct TsiStreamProxy {
     pub(crate) id: u64,
     pub(crate) cid: u64,
