@@ -240,7 +240,7 @@ impl InputWorker {
             let mut buffer: [u8; size_of::<virtio_input::virtio_input_event>()] =
                 [0; size_of::<virtio_input::virtio_input_event>()];
             reader.read_exact(&mut buffer)?;
-            debug!("Not implemented status queue request: {:?}", &buffer);
+            debug!("Not implemented status queue request: {buffer:?}");
             // For now, we don't send events back to the input source
             // This would be used for things like setting LEDs on keyboards, haptic feedback, etc.
         }
