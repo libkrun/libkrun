@@ -21,26 +21,26 @@ use crate::rutabaga_utils::*;
  * used by guest userspace (i.e, DRM_FORMAT_RGB332) are left out for simplicity.
  */
 
-pub const DRM_FORMAT_R8: [u8; 4] = [b'R', b'8', b' ', b' '];
+pub const DRM_FORMAT_R8: [u8; 4] = *b"R8  ";
 
-pub const DRM_FORMAT_RGB565: [u8; 4] = [b'R', b'G', b'1', b'6'];
-pub const DRM_FORMAT_BGR888: [u8; 4] = [b'B', b'G', b'2', b'4'];
+pub const DRM_FORMAT_RGB565: [u8; 4] = *b"RG16";
+pub const DRM_FORMAT_BGR888: [u8; 4] = *b"BG24";
 
-pub const DRM_FORMAT_XRGB8888: [u8; 4] = [b'X', b'R', b'2', b'4'];
-pub const DRM_FORMAT_XBGR8888: [u8; 4] = [b'X', b'B', b'2', b'4'];
+pub const DRM_FORMAT_XRGB8888: [u8; 4] = *b"XR24";
+pub const DRM_FORMAT_XBGR8888: [u8; 4] = *b"XB24";
 
-pub const DRM_FORMAT_ARGB8888: [u8; 4] = [b'A', b'R', b'2', b'4'];
-pub const DRM_FORMAT_ABGR8888: [u8; 4] = [b'A', b'B', b'2', b'4'];
+pub const DRM_FORMAT_ARGB8888: [u8; 4] = *b"AR24";
+pub const DRM_FORMAT_ABGR8888: [u8; 4] = *b"AB24";
 
-pub const DRM_FORMAT_XRGB2101010: [u8; 4] = [b'X', b'R', b'3', b'0'];
-pub const DRM_FORMAT_XBGR2101010: [u8; 4] = [b'X', b'B', b'3', b'0'];
-pub const DRM_FORMAT_ARGB2101010: [u8; 4] = [b'A', b'R', b'3', b'0'];
-pub const DRM_FORMAT_ABGR2101010: [u8; 4] = [b'A', b'B', b'3', b'0'];
+pub const DRM_FORMAT_XRGB2101010: [u8; 4] = *b"XR30";
+pub const DRM_FORMAT_XBGR2101010: [u8; 4] = *b"XB30";
+pub const DRM_FORMAT_ARGB2101010: [u8; 4] = *b"AR30";
+pub const DRM_FORMAT_ABGR2101010: [u8; 4] = *b"AB30";
 
-pub const DRM_FORMAT_ABGR16161616F: [u8; 4] = [b'A', b'B', b'4', b'H'];
+pub const DRM_FORMAT_ABGR16161616F: [u8; 4] = *b"AB4H";
 
-pub const DRM_FORMAT_NV12: [u8; 4] = [b'N', b'V', b'1', b'2'];
-pub const DRM_FORMAT_YVU420: [u8; 4] = [b'Y', b'V', b'1', b'2'];
+pub const DRM_FORMAT_NV12: [u8; 4] = *b"NV12";
+pub const DRM_FORMAT_YVU420: [u8; 4] = *b"YV12";
 
 /// A [fourcc](https://en.wikipedia.org/wiki/FourCC) format identifier.
 #[derive(Copy, Clone, Eq, PartialEq, Default)]
