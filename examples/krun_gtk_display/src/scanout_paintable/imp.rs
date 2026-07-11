@@ -1,4 +1,5 @@
 use gtk::{
+    cairo::Region,
     gdk::{Paintable, PaintableFlags, RGBA, Snapshot, Texture},
     glib,
     graphene::Rect,
@@ -18,7 +19,7 @@ pub struct ScanoutPaintable {
     pub default_width: Cell<i32>,
     #[property(get, set)]
     pub default_height: Cell<i32>,
-    pub rect: Rect,
+    pub update_region: RefCell<Option<Region>>,
 }
 
 #[glib::object_subclass]
@@ -39,6 +40,7 @@ impl PaintableImpl for ScanoutPaintable {
     fn snapshot(&self, snapshot: &Snapshot, width: f64, height: f64) {
         if let Some(texture) = self.texture.borrow().as_ref() {
             snapshot.append_texture(texture, &Rect::new(0.0, 0.0, width as f32, height as f32));
+            self.update_region.replace(None);
         } else {
             snapshot.append_color(
                 &RGBA::new(0.0, 0.0, 0.0, 1.0),

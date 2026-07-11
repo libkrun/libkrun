@@ -32,6 +32,27 @@ impl ScanoutPaintable {
     ) {
         assert_eq!(buffer.len(), width as usize * height as usize * 4);
         let imp = self.imp();
+
+        if let Some(rect) = rect {
+            let damage = RectangleInt::new(
+                rect.x as i32,
+                rect.y as i32,
+                rect.width as i32,
+                rect.height as i32,
+            );
+            let mut region_ref = imp.update_region.borrow_mut();
+            match *region_ref {
+                Some(ref region) => {
+                    let _ = region.union_rectangle(&damage);
+                }
+                None => {
+                    *region_ref = Some(Region::create_rectangle(&damage));
+                }
+            }
+        } else {
+            imp.update_region.replace(None);
+        }
+
         let builder = MemoryTextureBuilder::new()
             .set_width(width)
             .set_height(height)
@@ -39,20 +60,18 @@ impl ScanoutPaintable {
             .set_stride(width as usize * ResourceFormat::BYTES_PER_PIXEL)
             .set_bytes(Some(&buffer));
 
-        let builder = if let Some(rect) = rect {
+        let region_ref = imp.update_region.borrow();
+        let builder = if let Some(ref region) = *region_ref {
             builder
-                .set_update_region(Some(&Region::create_rectangle(&RectangleInt::new(
-                    rect.x as i32,
-                    rect.y as i32,
-                    rect.width as i32,
-                    rect.height as i32,
-                ))))
+                .set_update_region(Some(region))
                 .set_update_texture(imp.texture.borrow().as_ref())
         } else {
             builder
         };
 
-        let old_texture = imp.texture.replace(Some(builder.build()));
+        let new_texture = builder.build();
+        drop(region_ref);
+        let old_texture = imp.texture.replace(Some(new_texture));
 
         self.invalidate_contents();
         if let Some(old_texture) = old_texture
