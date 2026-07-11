@@ -187,7 +187,12 @@ impl InputQueryConfig for GtkTouchscreenConfig {
                 let bitmap_len2 = if self.options.emit_mt {
                     write_bitmap(
                         bitmap_buf,
-                        &[ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y],
+                        &[
+                            ABS_MT_SLOT,
+                            ABS_MT_TRACKING_ID,
+                            ABS_MT_POSITION_X,
+                            ABS_MT_POSITION_Y,
+                        ],
                     )
                 } else {
                     0
