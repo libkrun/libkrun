@@ -389,7 +389,7 @@ impl ScanoutWindow {
         let overlay = build_overlay(window.as_ref());
         overlay.set_child(Some(&picture));
         window.set_child(Some(&overlay));
-        window.set_visible(true);
+        window.present();
 
         if let Some(keyboard_event_tx) = keyboard_event_tx {
             picture.set_focusable(true);
@@ -421,7 +421,7 @@ impl ScanoutWindow {
 
 impl Drop for ScanoutWindow {
     fn drop(&mut self) {
-        self.window.destroy();
+        self.window.close();
     }
 }
 
