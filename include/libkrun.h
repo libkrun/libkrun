@@ -510,6 +510,23 @@ int32_t krun_add_display(uint32_t ctx_id, uint32_t width, uint32_t height);
 int32_t krun_display_set_edid(uint32_t ctx_id, uint32_t display_id, const uint8_t* edid_blob, size_t blob_size);
 
 /**
+ * Set the EDID manufacturer and display name for a display.
+ *
+ * These values are used to generate the EDID reported to the guest.
+ * Either parameter may be NULL to leave that field unchanged.
+ *
+ * Arguments:
+ *  "ctx_id"        - the configuration context ID.
+ *  "display_id"    - the ID of the display (range: 0 to KRUN_MAX_DISPLAYS - 1)
+ *  "manufacturer"  - 3-character PNP manufacturer ID (e.g. "GGL"), or NULL
+ *  "display_name"  - display product name (max 13 characters), or NULL
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_display_set_edid_name(uint32_t ctx_id, uint32_t display_id, const char* manufacturer, const char* display_name);
+
+/**
  * Configure DPI of the display reported to the guest
  *
  * This overrides the DPI set by krun_set_display_dpi()

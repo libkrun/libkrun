@@ -1667,6 +1667,60 @@ pub unsafe extern "C" fn krun_display_set_edid(
 
 #[cfg(any(feature = "gpu", feature = "vhost-user"))]
 #[unsafe(no_mangle)]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn krun_display_set_edid_name(
+    ctx_id: u32,
+    display_id: u32,
+    manufacturer: *const c_char,
+    display_name: *const c_char,
+) -> i32 {
+    with_cfg(ctx_id, |cfg| {
+        let Some(display_info) = cfg.vmr.displays.get_mut(display_id as usize) else {
+            return -libc::EINVAL;
+        };
+
+        let DisplayInfoEdid::Generated(ref mut edid_params) = display_info.edid else {
+            return -libc::EALREADY;
+        };
+
+        if !manufacturer.is_null() {
+            let mfr = unsafe { CStr::from_ptr(manufacturer) }.to_bytes();
+            if mfr.len() != 3 || !mfr.iter().all(|&c| c.is_ascii_uppercase()) {
+                return -libc::EINVAL;
+            }
+            edid_params.manufacturer = [mfr[0], mfr[1], mfr[2]];
+        }
+
+        if !display_name.is_null() {
+            let name = unsafe { CStr::from_ptr(display_name) };
+            let name_str = match name.to_str() {
+                Ok(s) => s,
+                Err(_) => return -libc::EINVAL,
+            };
+            if name_str.is_empty() || name_str.len() > 13 {
+                return -libc::EINVAL;
+            }
+            edid_params.display_name = name_str.to_string();
+        }
+
+        KRUN_SUCCESS
+    })
+}
+
+#[cfg(not(any(feature = "gpu", feature = "vhost-user")))]
+#[unsafe(no_mangle)]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn krun_display_set_edid_name(
+    _ctx_id: u32,
+    _display_id: u32,
+    _manufacturer: *const c_char,
+    _display_name: *const c_char,
+) -> i32 {
+    -libc::ENOTSUP
+}
+
+#[cfg(any(feature = "gpu", feature = "vhost-user"))]
+#[unsafe(no_mangle)]
 pub extern "C" fn krun_display_set_physical_size(
     ctx_id: u32,
     display_id: u32,

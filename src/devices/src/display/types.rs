@@ -9,10 +9,12 @@ pub const MAX_DISPLAYS: usize = VIRTIO_GPU_MAX_SCANOUTS as usize;
 
 use super::edid::EdidInfo;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct EdidParams {
     pub refresh_rate: u32,
     pub physical_size: PhysicalSize,
+    pub manufacturer: [u8; 3],
+    pub display_name: String,
 }
 
 impl Default for EdidParams {
@@ -20,6 +22,8 @@ impl Default for EdidParams {
         EdidParams {
             refresh_rate: 60,
             physical_size: PhysicalSize::Dpi(300),
+            manufacturer: *b"RHT",
+            display_name: "krun-display".to_string(),
         }
     }
 }

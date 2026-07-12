@@ -27,7 +27,7 @@ const DEFAULT_HORIZONTAL_SYNC_PULSE: u16 = 192;
 const DEFAULT_VERTICAL_SYNC_PULSE: u16 = 3;
 const MILLIMETERS_PER_INCH: f32 = 25.4;
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub struct EdidInfo {
     width: u32,
     height: u32,
@@ -40,6 +40,8 @@ pub struct EdidInfo {
     vertical_sync: u16,
     width_millimeters: u16,
     height_millimeters: u16,
+    manufacturer: [u8; 3],
+    display_name: String,
 }
 
 impl EdidInfo {
@@ -67,6 +69,8 @@ impl EdidInfo {
             vertical_sync: DEFAULT_VERTICAL_SYNC_PULSE,
             width_millimeters,
             height_millimeters,
+            manufacturer: params.manufacturer,
+            display_name: params.display_name.clone(),
         }
     }
 
@@ -82,7 +86,7 @@ impl EdidInfo {
         let mut edid_box: Box<[u8]> = vec![0; EDID_DATA_LENGTH].into_boxed_slice();
         let edid = &mut edid_box[..];
 
-        populate_header(edid);
+        populate_header(edid, &self.manufacturer);
         populate_edid_version(edid);
         populate_size(edid, &self);
         populate_standard_timings(edid, &self);
@@ -92,7 +96,7 @@ impl EdidInfo {
         populate_detailed_timing(block0, &self);
 
         let block1 = &mut edid[72..90];
-        populate_display_name(block1);
+        populate_display_name(block1, &self.display_name);
 
         calculate_checksum(edid);
 
@@ -100,12 +104,16 @@ impl EdidInfo {
     }
 }
 
-fn populate_display_name(edid_block: &mut [u8]) {
-    // Display Product Name String Descriptor Tag
+fn populate_display_name(edid_block: &mut [u8], name: &str) {
     edid_block[0..5].clone_from_slice(&[0x00, 0x00, 0x00, 0xFC, 0x00]);
-    // This should to be padded to 13 bytes, see Section 3.10.3.4
-    let product_name: &[u8; 13] = b"krun-display\n";
-    edid_block[5..].clone_from_slice(product_name);
+    // Section 3.10.3.4: 13-byte field, newline-terminated if shorter than 13 chars
+    let mut product_name = [b' '; 13];
+    let len = name.len().min(13);
+    product_name[..len].copy_from_slice(&name.as_bytes()[..len]);
+    if len < 13 {
+        product_name[len] = b'\n';
+    }
+    edid_block[5..].clone_from_slice(&product_name);
 }
 
 fn populate_detailed_timing(edid_block: &mut [u8], info: &EdidInfo) {
@@ -210,7 +218,7 @@ fn populate_detailed_timing(edid_block: &mut [u8], info: &EdidInfo) {
 }
 
 // The EDID header. This is defined by the EDID spec.
-fn populate_header(edid: &mut [u8]) {
+fn populate_header(edid: &mut [u8], manufacturer_name: &[u8; 3]) {
     edid[0] = 0x00;
     edid[1] = 0xFF;
     edid[2] = 0xFF;
@@ -220,8 +228,6 @@ fn populate_header(edid: &mut [u8]) {
     edid[6] = 0xFF;
     edid[7] = 0x00;
 
-    // Red Hat 'RHT' is also used in QEMU, though it is not technically officially assigned
-    let manufacturer_name = b"RHT";
     // 00001 -> A, 00010 -> B, etc
     let manufacturer_id: u16 = manufacturer_name
         .iter()
@@ -318,5 +324,86 @@ const fn gcd(x: u32, y: u32) -> u32 {
     match y {
         0 => x,
         _ => gcd(y, x % y),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_edid(manufacturer: [u8; 3], display_name: &str) -> Box<[u8]> {
+        let params = EdidParams {
+            manufacturer,
+            display_name: display_name.to_string(),
+            ..EdidParams::default()
+        };
+        EdidInfo::new(1920, 1080, &params).bytes()
+    }
+
+    fn decode_manufacturer(edid: &[u8]) -> [u8; 3] {
+        let id = u16::from_be_bytes([edid[8], edid[9]]);
+        [
+            b'A' + ((id >> 10) & 0x1F) as u8 - 1,
+            b'A' + ((id >> 5) & 0x1F) as u8 - 1,
+            b'A' + (id & 0x1F) as u8 - 1,
+        ]
+    }
+
+    #[test]
+    fn manufacturer_encoding() {
+        assert_eq!(decode_manufacturer(&make_edid(*b"RHT", "x")), *b"RHT");
+        assert_eq!(decode_manufacturer(&make_edid(*b"GGL", "x")), *b"GGL");
+    }
+
+    #[test]
+    fn display_name_short_is_newline_terminated() {
+        let name = &make_edid(*b"RHT", "Hello")[77..90];
+        assert_eq!(&name[..5], b"Hello");
+        assert_eq!(name[5], b'\n');
+    }
+
+    #[test]
+    fn display_name_max_13_chars() {
+        let name = &make_edid(*b"RHT", "1234567890123")[77..90];
+        assert_eq!(name, b"1234567890123");
+    }
+
+    #[test]
+    fn valid_checksum() {
+        let edid = make_edid(*b"RHT", "test");
+        let sum: u8 = edid.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn header_and_version() {
+        let edid = make_edid(*b"RHT", "test");
+        assert_eq!(
+            &edid[0..8],
+            &[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]
+        );
+        assert_eq!((edid[18], edid[19]), (1, 4));
+        assert_eq!(&edid[72..77], &[0x00, 0x00, 0x00, 0xFC, 0x00]);
+    }
+
+    // Android's PhysicalDisplayId is derived from the EDID manufacturer ID
+    // (bytes 8-9) and a CityHash of the display name (descriptor 0xFC).
+    // The Cuttlefish APEX IDC files hardcode hashes for manufacturer "GGL"
+    // and display name "CrosvmDisplay". This test verifies our EDID produces
+    // the exact bytes Android expects, so touch routing works without
+    // modifying any Android code.
+    #[test]
+    fn crosvm_display_android_id_compatibility() {
+        let edid = make_edid(*b"GGL", "CrosvmDisplay");
+
+        // Android reads manufacturer ID as big-endian u16 from bytes 8-9.
+        // GGL: G=7, G=7, L=12 → (7 << 10) | (7 << 5) | 12 = 0x1CEC
+        let manufacturer_id = u16::from_be_bytes([edid[8], edid[9]]);
+        assert_eq!(manufacturer_id, 0x1CEC);
+
+        // Android extracts the display name from the 0xFC descriptor (bytes 77-90),
+        // strips the newline terminator, and hashes via CityHash64. Verify the name
+        // is stored verbatim so the hash will match.
+        assert_eq!(&edid[77..90], b"CrosvmDisplay");
     }
 }
