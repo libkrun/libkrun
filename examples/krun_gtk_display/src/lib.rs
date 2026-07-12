@@ -112,6 +112,8 @@ pub struct TouchScreenOptions {
     pub emit_non_mt: bool,
     /// Translate mouse click & drag into touch events
     pub triggered_by_mouse: bool,
+    /// Custom device name reported to the guest (defaults to "libkrun Touchscreen")
+    pub device_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]

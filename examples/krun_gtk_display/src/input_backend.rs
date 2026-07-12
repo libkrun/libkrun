@@ -145,8 +145,13 @@ impl ObjectNew<TouchScreenOptions> for GtkTouchscreenConfig {
 
 impl InputQueryConfig for GtkTouchscreenConfig {
     fn query_device_name(&self, name_buf: &mut [u8]) -> Result<u8, InputBackendError> {
-        let copy_len = std::cmp::min(TOUCHSCREEN_DEVICE_NAME.len(), name_buf.len());
-        name_buf[..copy_len].copy_from_slice(&TOUCHSCREEN_DEVICE_NAME[..copy_len]);
+        let name = self
+            .options
+            .device_name
+            .as_deref()
+            .unwrap_or(std::str::from_utf8(TOUCHSCREEN_DEVICE_NAME).unwrap());
+        let copy_len = std::cmp::min(name.len(), name_buf.len());
+        name_buf[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
         Ok(copy_len as u8)
     }
 

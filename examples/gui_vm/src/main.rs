@@ -264,6 +264,7 @@ fn main() -> anyhow::Result<()> {
                 emit_mt: true,
                 emit_non_mt: false,
                 triggered_by_mouse: true,
+                device_name: None,
             }));
         }
     }
