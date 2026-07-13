@@ -1,4 +1,7 @@
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "windows")]
+use utils::windows::AsRawFd;
 
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
