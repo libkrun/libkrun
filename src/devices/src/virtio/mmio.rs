@@ -19,7 +19,7 @@ use crate::bus::BusDevice;
 use crate::legacy::IrqChip;
 use crate::snapshot::{DeviceState, Snapshottable};
 use utils::{byte_order, eventfd::EventFd};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 //TODO crosvm uses 0 here, but IIRC virtio specified some other vendor id that should be used
 const VENDOR_ID: u32 = 0;
@@ -81,10 +81,10 @@ pub struct MmioTransport {
     interrupt: InterruptTransport,
     // Per-instance registration id, used as the snapshot key (id()).
     name: String,
-    // Queue addresses/sizes captured at activation. The live queues are moved
-    // into the device (and then its worker threads), so this is the only place
-    // the transport can recover their config for a snapshot.
+    // Queue config captured at activation; the live queues move into the device.
     activated_queues: Vec<QueueSnapshot>,
+    // Live queues a paused device handed back — the authoritative snapshot state.
+    paused_queues: Option<Vec<DeviceQueue>>,
 }
 
 struct InterruptTransportInner {
@@ -207,6 +207,7 @@ impl MmioTransport {
             shm_region_select: 0,
             name,
             activated_queues: Vec::new(),
+            paused_queues: None,
         })
     }
 
@@ -546,7 +547,7 @@ impl BusDevice for MmioTransport {
 }
 
 /// Version of the transport snapshot encoding.
-const TRANSPORT_SNAPSHOT_VERSION: u8 = 1;
+const TRANSPORT_SNAPSHOT_VERSION: u8 = 3;
 
 /// Resume-critical virtio-mmio negotiation state. The inner device's threads,
 /// fds, and per-port state are rebuilt by re-activation on restore.
@@ -554,7 +555,12 @@ const TRANSPORT_SNAPSHOT_VERSION: u8 = 1;
 struct TransportState {
     device_status: u32,
     acked_features: u64,
+    // virtio-mmio InterruptStatus: an unacked used-buffer IRQ must survive, or
+    // the restored handler reads 0 and never reaps the ring.
+    interrupt_status: u32,
     queues: Vec<Option<QueueSnapshot>>,
+    // Opaque device-specific state (see `VirtioDevice::save_state`).
+    device: Vec<u8>,
 }
 
 impl Snapshottable for MmioTransport {
@@ -562,30 +568,41 @@ impl Snapshottable for MmioTransport {
         &self.name
     }
 
-    fn save(&self) -> Result<DeviceState, crate::Error> {
-        // The live queues' running indices are owned by the device's worker
-        // threads, but the vCPUs are frozen and the workers quiesced at snapshot
-        // time, so every consumed buffer has been returned: next_avail ==
-        // next_used == the guest's used-ring index. Recover the addresses from
-        // the activation-time config and the index from guest memory.
+    fn pause(&mut self) -> Result<(), crate::Error> {
+        if !self.locked_device().is_activated() {
+            return Ok(());
+        }
         let queues = self
-            .activated_queues
-            .iter()
-            .map(|qs| {
-                let mut qs = *qs;
-                let used_idx: u16 = self
-                    .mem
-                    .read_obj(GuestAddress(qs.used_ring.wrapping_add(2)))
-                    .unwrap_or(0);
-                qs.next_avail = used_idx;
-                qs.next_used = used_idx;
-                Some(qs)
-            })
-            .collect();
+            .locked_device()
+            .pause()
+            .map_err(|e| crate::Error::Snapshot(format!("{}: {e}", self.name)))?;
+        self.paused_queues = Some(queues);
+        Ok(())
+    }
+
+    fn save(&self) -> Result<DeviceState, crate::Error> {
+        // Snapshot the indices off the paused queues, not the running device.
+        let queues: Vec<Option<QueueSnapshot>> = if self.locked_device().is_activated() {
+            let Some(paused) = &self.paused_queues else {
+                return Err(crate::Error::Snapshot(format!(
+                    "{}: save before pause; the device's workers still own the queues",
+                    self.name
+                )));
+            };
+            paused.iter().map(|dq| Some(dq.queue.snapshot())).collect()
+        } else {
+            Vec::new()
+        };
+        // Separate lets: two `locked_device()` temporaries in one struct literal
+        // would both be live and self-deadlock on the device mutex.
+        let acked_features = self.locked_device().acked_features();
+        let device = self.locked_device().save_state();
         let state = TransportState {
             device_status: self.device_status,
-            acked_features: self.locked_device().acked_features(),
+            acked_features,
+            interrupt_status: self.interrupt.status().load(Ordering::SeqCst) as u32,
             queues,
+            device,
         };
         let bytes = bincode::encode_to_vec(&state, bincode::config::standard())
             .map_err(|e| crate::Error::Snapshot(e.to_string()))?;
@@ -595,10 +612,6 @@ impl Snapshottable for MmioTransport {
         })
     }
 
-    /// Rebuild the negotiated queues and re-activate the device. The guest wrote
-    /// DRIVER_OK before the snapshot and resumes past it, so the transport never
-    /// sees that write again — without re-activating here the device's worker
-    /// threads never start and the guest's queue notifications go unanswered.
     fn restore(&mut self, state: &DeviceState) -> Result<(), crate::Error> {
         if state.version != TRANSPORT_SNAPSHOT_VERSION {
             return Err(crate::Error::Snapshot(format!(
@@ -611,19 +624,31 @@ impl Snapshottable for MmioTransport {
                 .map_err(|e| crate::Error::Snapshot(format!("mmio transport: {e}")))?;
 
         self.locked_device().set_acked_features(ts.acked_features);
+        self.interrupt
+            .status()
+            .store(ts.interrupt_status as usize, Ordering::SeqCst);
 
-        // Rebuild the queues from saved state (addresses, indices, ready bits)
-        // before activation moves them into the device.
+        // Reject a short queue list: the zip below would leave the missing queues
+        // zeroed (and not `ready`, so is_valid skips them) and the device would
+        // silently answer nothing.
+        if (ts.device_status & device_status::DRIVER_OK) != 0
+            && ts.queues.len() != self.queue_config.len()
+        {
+            return Err(crate::Error::Snapshot(format!(
+                "mmio transport: snapshot has {} queues, device has {}",
+                ts.queues.len(),
+                self.queue_config.len()
+            )));
+        }
+
         let mut queues = Self::create_queues(&self.queue_config);
         for (queue, snapshot) in queues.iter_mut().zip(&ts.queues) {
             if let Some(snapshot) = snapshot {
                 queue.restore(snapshot);
             }
         }
-        // The ring addresses/size come from an untrusted snapshot; the workers
-        // assume validated queues (they `unwrap()` guest-memory access), so a
-        // ready queue that fails validation must fail the restore, not panic
-        // later on the first kick.
+        // Ring addresses come from an untrusted snapshot; workers `unwrap()`
+        // guest-memory access, so validate before use, don't panic on first kick.
         for queue in queues.iter().filter(|q| q.ready) {
             if !queue.is_valid(&self.mem) {
                 return Err(crate::Error::Snapshot(
@@ -631,14 +656,46 @@ impl Snapshottable for MmioTransport {
                 ));
             }
         }
-        self.queues = Some(queues);
         self.device_status = ts.device_status;
+        self.locked_device().restore_state(&ts.device)?;
 
         if (ts.device_status & device_status::DRIVER_OK) != 0
             && !self.locked_device().is_activated()
         {
-            self.activate();
-            self.locked_device().resume_after_restore();
+            // Hold the queues for `resume`, which runs after the vCPUs restore
+            // the GIC — a worker started now would raise IRQs the GIC blob wipes.
+            self.activated_queues = queues.iter().map(|q| q.snapshot()).collect();
+            let event_idx_enabled = (ts.acked_features & (1 << VIRTIO_RING_F_EVENT_IDX)) != 0;
+            self.paused_queues = Some(
+                queues
+                    .into_iter()
+                    .zip(self.queue_evts.iter().cloned())
+                    .map(|(mut queue, event)| {
+                        queue.set_event_idx(event_idx_enabled);
+                        DeviceQueue::new(queue, event)
+                    })
+                    .collect(),
+            );
+        } else {
+            self.queues = Some(queues);
+        }
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<(), crate::Error> {
+        let Some(queues) = self.paused_queues.take() else {
+            return Ok(());
+        };
+        let (mem, interrupt) = (self.mem.clone(), self.interrupt.clone());
+        self.locked_device()
+            .resume(mem, interrupt, queues)
+            .map_err(|e| crate::Error::Snapshot(format!("{}: device resume: {e:?}", self.name)))?;
+
+        // Kick every queue: the restored eventfds start at 0, and a descriptor
+        // the guest made available but the worker hadn't consumed left no
+        // notification behind (and won't be re-kicked under suppression).
+        for event in &self.queue_evts {
+            let _ = event.write(1);
         }
         Ok(())
     }

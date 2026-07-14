@@ -16,7 +16,7 @@ use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
 
-use super::super::{FsError, Queue};
+use super::super::{DeviceQueue, FsError, Queue};
 use super::augment_fs::AugmentFs;
 use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
@@ -145,14 +145,15 @@ impl FsWorker {
         })
     }
 
-    pub fn run(self) -> thread::JoinHandle<()> {
+    /// Returns its queues on stop, so the transport can snapshot the live indices.
+    pub fn run(self) -> thread::JoinHandle<Vec<DeviceQueue>> {
         thread::Builder::new()
             .name("fs worker".into())
             .spawn(|| self.work())
             .unwrap()
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> Vec<DeviceQueue> {
         let virtq_hpq_ev_fd = self.queue_evts[HPQ_INDEX].as_raw_fd();
         let virtq_req_ev_fd = self.queue_evts[REQ_INDEX].as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
@@ -192,7 +193,12 @@ impl FsWorker {
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
-                                return;
+                                return self
+                                    .queues
+                                    .into_iter()
+                                    .zip(self.queue_evts)
+                                    .map(|(queue, event)| DeviceQueue { queue, event })
+                                    .collect();
                             }
                             _ => {
                                 log::warn!(

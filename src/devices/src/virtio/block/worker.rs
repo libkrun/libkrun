@@ -83,14 +83,15 @@ impl BlockWorker {
         }
     }
 
-    pub fn run(self) -> thread::JoinHandle<()> {
+    /// Returns its queue on stop, so the transport can snapshot the live indices.
+    pub fn run(self) -> thread::JoinHandle<DeviceQueue> {
         thread::Builder::new()
             .name("block worker".into())
             .spawn(|| self.work())
             .unwrap()
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> DeviceQueue {
         let virtq_ev_fd = self.device_queue.event.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
 
@@ -122,7 +123,7 @@ impl BlockWorker {
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
-                                return;
+                                return self.device_queue;
                             }
                             _ => {
                                 log::warn!(

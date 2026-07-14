@@ -82,6 +82,8 @@ use crate::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
 use crate::vstate::KvmContext;
 #[cfg(all(target_os = "linux", feature = "tee"))]
 use crate::vstate::MeasuredRegion;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+use crate::vstate::VcpuResponse;
 use crate::vstate::{Error as VstateError, Vcpu, VcpuConfig, Vm};
 use arch::{ArchMemoryInfo, InitrdConfig};
 use device_manager::shm::ShmManager;
@@ -1190,7 +1192,7 @@ pub fn build_microvm(
     // before the vCPUs run. `configure_system` above wrote a fresh FDT/cmdline;
     // the snapshot RAM image overwrites it with the captured contents.
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    if let Some(dir) = restore_from {
+    if let Some(dir) = restore_from.as_ref() {
         // The snapshot captures only EL1 sysregs, and the restore path skips
         // set_initial_state (which programs the EL2 registers). A nested VM would
         // resume with EL2 config at reset defaults, so reject it outright.
@@ -1199,7 +1201,7 @@ pub fn build_microvm(
                 "restore of a nested-virtualization VM is not supported".into(),
             ));
         }
-        apply_restore(&vmm, &mut vcpus, &dir)?;
+        apply_restore(&vmm, &mut vcpus, dir)?;
     }
     #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
     if restore_from.is_some() {
@@ -1210,6 +1212,33 @@ pub fn build_microvm(
 
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
+
+    // Resume device workers only after the vCPUs restore the GIC (on their own
+    // threads): a worker raises IRQs at once, and the GIC blob would wipe them.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if restore_from.is_some() {
+        for handle in vmm.vcpus_handles.iter() {
+            match handle.response_receiver().recv() {
+                Ok(VcpuResponse::Restored) => {}
+                Ok(other) => {
+                    return Err(StartMicrovmError::Restore(format!(
+                        "unexpected vcpu response while restoring: {other:?}"
+                    )));
+                }
+                Err(e) => {
+                    return Err(StartMicrovmError::Restore(format!(
+                        "vcpu restore response: {e:?}"
+                    )));
+                }
+            }
+        }
+        for dev in vmm.mmio_device_manager.snapshottables() {
+            dev.lock()
+                .unwrap()
+                .resume()
+                .map_err(|e| StartMicrovmError::Restore(format!("device resume: {e:?}")))?;
+        }
+    }
 
     // Clippy thinks we don't need Arc<Mutex<...
     // but we don't want to change the event_manager interface

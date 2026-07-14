@@ -141,10 +141,11 @@ impl PortOutput for PortOutputHandle {
         }
     }
 
-    fn wait_until_writable(&self) {
+    fn wait_until_writable(&self, _stopfd: Option<&EventFd>) -> bool {
         // Because WriteFile is blocking, `write_volatile` will natively pause the
         // thread until space is available. It will never return io::ErrorKind::WouldBlock.
         // Therefore, `process_tx` will never invoke this function on Windows.
+        false
     }
 }
 

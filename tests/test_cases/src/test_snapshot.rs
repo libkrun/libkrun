@@ -6,6 +6,11 @@
 //!   onto a fresh, identically-shaped VM and checks the resumed guest keeps
 //!   running: it resumes mid heartbeat-loop, so its stdout carries the tail of
 //!   the loop but never restarts at `HEARTBEAT 0` the way a fresh boot would.
+//! - `snapshot-fs-capture` snapshots while the guest is hammering virtio-fs, so
+//!   the fs worker is genuinely busy when it is quiesced — the join-at-a-
+//!   descriptor-boundary path the idle tests never exercise. It checks capture
+//!   only: virtio-fs internal fid state is not yet restored, so resuming a guest
+//!   that did fs I/O is a known gap (see the README limitations).
 
 use macros::{guest, host};
 
@@ -17,6 +22,14 @@ pub struct TestSnapshot {
 
 #[cfg_attr(not(feature = "host"), allow(dead_code))]
 pub struct TestSnapshotResume {
+    pub(crate) ram_mib: u32,
+}
+
+/// Snapshots while the guest hammers virtio-fs, so the fs worker is genuinely
+/// busy when it is quiesced. Capture only — restoring a guest that did fs I/O
+/// needs virtio-fs fid state that is not captured yet.
+#[cfg_attr(not(feature = "host"), allow(dead_code))]
+pub struct TestSnapshotFsCapture {
     pub(crate) ram_mib: u32,
 }
 
@@ -158,6 +171,80 @@ mod host {
         }
     }
 
+    /// Capture in a child process, then restore onto a fresh, identically-shaped
+    /// VM and run it. Shared by the plain and I/O resume tests, which differ only
+    /// in the guest workload (dispatched by `test_case`).
+    ///
+    /// A child re-exec captures the snapshot first — HVF allows one VM per
+    /// process, so the child fully exits before the restore VM is built. Its
+    /// console goes to a separate file so the runner's captured stdout is exactly
+    /// the restored guest's output.
+    fn resume_flow(test_setup: &TestSetup, ram_mib: u32) -> anyhow::Result<()> {
+        let root_dir = setup_rootfs(test_setup)?;
+        let snapshot_dir = test_setup.tmp_dir.join("snapshot");
+
+        if std::env::var_os("KRUN_TEST_SNAPSHOT_CREATE").is_some() {
+            let ctx = unsafe { krun_call_u32!(krun_create_ctx())? };
+            return unsafe {
+                capture(
+                    ctx,
+                    ram_mib,
+                    &root_dir,
+                    &test_setup.test_case,
+                    &snapshot_dir,
+                )
+            };
+        }
+
+        let child_stdout = std::fs::File::create(test_setup.tmp_dir.join("create_stdout.txt"))?;
+        let status = Command::new(std::env::current_exe()?)
+            .arg("start-vm")
+            .arg("--test-case")
+            .arg(&test_setup.test_case)
+            .arg("--tmp-dir")
+            .arg(&test_setup.tmp_dir)
+            .env("KRUN_TEST_SNAPSHOT_CREATE", "1")
+            .stdin(Stdio::null())
+            .stdout(child_stdout)
+            .stderr(Stdio::inherit())
+            .status()?;
+        if !snapshot_dir.join("vmstate").exists() {
+            anyhow::bail!("child did not create a snapshot (exit {status:?})");
+        }
+
+        let ctx = unsafe { krun_call_u32!(krun_create_ctx())? };
+        unsafe { configure_vm(ctx, ram_mib, &root_dir, &test_setup.test_case)? };
+        let snapshot_cstr = CString::new(snapshot_dir.as_os_str().as_bytes())?;
+        let rc = unsafe { krun_restore(ctx, snapshot_cstr.as_ptr(), 0) };
+        if rc < 0 {
+            anyhow::bail!("krun_restore failed: {rc}");
+        }
+        Ok(())
+    }
+
+    /// The restored guest must have resumed mid-loop (not rebooted) and run to
+    /// completion. Every workload prints `HEARTBEAT 0..80`, so a fresh reboot
+    /// would show `HEARTBEAT 0` and a hang would never reach `HEARTBEAT 79`.
+    fn check_resumed(stdout: &[u8]) -> TestOutcome {
+        let out = String::from_utf8_lossy(stdout);
+        if !out.contains("HEARTBEAT") {
+            return TestOutcome::Fail(format!(
+                "restored guest produced no heartbeat; stdout: {out:?}"
+            ));
+        }
+        if out.lines().any(|l| l.trim() == "HEARTBEAT 0") {
+            return TestOutcome::Fail(format!(
+                "restored guest restarted the loop (HEARTBEAT 0 present) instead of resuming; stdout: {out:?}"
+            ));
+        }
+        if !out.contains("HEARTBEAT 79") {
+            return TestOutcome::Fail(format!(
+                "restored guest did not finish the heartbeat loop; stdout: {out:?}"
+            ));
+        }
+        TestOutcome::Pass
+    }
+
     impl Test for TestSnapshotResume {
         fn should_run(&self) -> ShouldRun {
             if cfg!(target_os = "macos") {
@@ -172,78 +259,46 @@ mod host {
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            let root_dir = setup_rootfs(&test_setup)?;
-            let snapshot_dir = test_setup.tmp_dir.join("snapshot");
-
-            // A child process (re-exec of this binary with the same test case)
-            // captures the snapshot first; HVF allows one VM per process, so the
-            // child fully exits before we build the restore VM here. Its guest
-            // console goes to a separate file so the stdout the runner captures
-            // is exactly the restored guest's output.
-            if std::env::var_os("KRUN_TEST_SNAPSHOT_CREATE").is_some() {
-                let ctx = unsafe { krun_call_u32!(krun_create_ctx())? };
-                return unsafe {
-                    capture(
-                        ctx,
-                        self.ram_mib,
-                        &root_dir,
-                        &test_setup.test_case,
-                        &snapshot_dir,
-                    )
-                };
-            }
-
-            let child_stdout = std::fs::File::create(test_setup.tmp_dir.join("create_stdout.txt"))?;
-            let status = Command::new(std::env::current_exe()?)
-                .arg("start-vm")
-                .arg("--test-case")
-                .arg(&test_setup.test_case)
-                .arg("--tmp-dir")
-                .arg(&test_setup.tmp_dir)
-                .env("KRUN_TEST_SNAPSHOT_CREATE", "1")
-                .stdin(Stdio::null())
-                .stdout(child_stdout)
-                .stderr(Stdio::inherit())
-                .status()?;
-            if !snapshot_dir.join("vmstate").exists() {
-                anyhow::bail!("child did not create a snapshot (exit {status:?})");
-            }
-
-            // Restore onto a fresh, identically-shaped VM and run it. The guest
-            // resumes mid heartbeat-loop, prints the rest to stdout (which the
-            // runner captures for check()), runs to completion, and powers off —
-            // krun_restore returns like krun_start_enter.
-            let ctx = unsafe { krun_call_u32!(krun_create_ctx())? };
-            unsafe { configure_vm(ctx, self.ram_mib, &root_dir, &test_setup.test_case)? };
-            let snapshot_cstr = CString::new(snapshot_dir.as_os_str().as_bytes())?;
-            let rc = unsafe { krun_restore(ctx, snapshot_cstr.as_ptr(), 0) };
-            if rc < 0 {
-                anyhow::bail!("krun_restore failed: {rc}");
-            }
-            Ok(())
+            resume_flow(&test_setup, self.ram_mib)
         }
 
         fn check(self: Box<Self>, stdout: Vec<u8>, _test_setup: TestSetup) -> TestOutcome {
-            let out = String::from_utf8_lossy(&stdout);
-            if !out.contains("HEARTBEAT") {
-                return TestOutcome::Fail(format!(
-                    "restored guest produced no heartbeat; stdout: {out:?}"
-                ));
+            check_resumed(&stdout)
+        }
+    }
+
+    impl Test for TestSnapshotFsCapture {
+        fn should_run(&self) -> ShouldRun {
+            if cfg!(target_os = "macos") {
+                ShouldRun::Yes
+            } else {
+                ShouldRun::No("snapshot is macOS/HVF only")
             }
-            // A real resume picks up mid-loop; a regression that reboots the guest
-            // fresh would re-run the loop from the start and print "HEARTBEAT 0".
-            if out.lines().any(|l| l.trim() == "HEARTBEAT 0") {
-                return TestOutcome::Fail(format!(
-                    "restored guest restarted the loop (HEARTBEAT 0 present) instead of resuming; stdout: {out:?}"
-                ));
+        }
+
+        fn timeout_secs(&self) -> u64 {
+            30
+        }
+
+        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            let root_dir = setup_rootfs(&test_setup)?;
+            let snapshot_dir = test_setup.tmp_dir.join("snapshot");
+            let ctx = unsafe { krun_call_u32!(krun_create_ctx())? };
+            unsafe {
+                capture(
+                    ctx,
+                    self.ram_mib,
+                    &root_dir,
+                    &test_setup.test_case,
+                    &snapshot_dir,
+                )
             }
-            // ...and it must run the loop to completion, then power off.
-            if !out.contains("HEARTBEAT 79") {
-                return TestOutcome::Fail(format!(
-                    "restored guest did not finish the heartbeat loop; stdout: {out:?}"
-                ));
-            }
-            TestOutcome::Pass
+        }
+
+        fn check(self: Box<Self>, _stdout: Vec<u8>, test_setup: TestSetup) -> TestOutcome {
+            // The snapshot completing (and the process exiting cleanly) is the
+            // test: it means the fs worker was quiesced mid-I/O without hanging.
+            check_snapshot_dir(&test_setup.tmp_dir.join("snapshot"))
         }
     }
 }
@@ -273,6 +328,25 @@ mod guest {
                 println!("HEARTBEAT {i}");
                 let _ = std::io::stdout().flush();
                 std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+    }
+
+    impl Test for TestSnapshotFsCapture {
+        fn in_guest(self: Box<Self>) {
+            // Keep the virtio-fs worker busy so the snapshot quiesces it mid-I/O:
+            // a tight write / fsync / read / verify loop with no pause, for longer
+            // than the host waits before capturing. The host snapshots and exits
+            // the process (KRUN_SNAPSHOT_EXIT) well before this returns.
+            let path = "/snapshot_io_probe";
+            for i in 0..1_000_000u64 {
+                let payload = format!("iter {i}\n");
+                std::fs::write(path, &payload).expect("virtio-fs write failed");
+                let f = std::fs::File::open(path).expect("virtio-fs open failed");
+                f.sync_all().expect("virtio-fs fsync failed");
+                drop(f);
+                let got = std::fs::read_to_string(path).expect("virtio-fs read failed");
+                assert_eq!(got, payload, "virtio-fs read-back mismatch at {i}");
             }
         }
     }

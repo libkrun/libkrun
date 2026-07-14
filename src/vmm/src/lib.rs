@@ -428,6 +428,17 @@ impl Vmm {
             };
             writer.section(SectionId::Vcpu, VCPU_SECTION_VERSION, &state.to_bytes());
         }
+        // Quiesce every device first: the vCPUs are frozen but device workers
+        // aren't, and they own the live queue indices. Also stops anything from
+        // writing guest RAM before it's dumped.
+        for dev in self.mmio_device_manager.snapshottables() {
+            let mut dev = dev.lock().unwrap();
+            dev.pause()
+                .map_err(|e| SnapErr::State(format!("device {}: {e:?}", dev.id())))?;
+        }
+
+        // GIC after pause: a worker completing during `pause` raises an IRQ the
+        // blob would otherwise miss, hanging the restored guest.
         let gic = self
             .intc
             .lock()

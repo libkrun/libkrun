@@ -492,6 +492,10 @@ impl Vcpu {
                 self.exit(FC_EXIT_CODE_GENERIC_ERROR);
                 return;
             }
+            // GIC is loaded; the coordinator can now start the device workers.
+            self.response_sender
+                .send(VcpuResponse::Restored)
+                .expect("failed to send Restored status");
         } else {
             let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
                 boot_receiver.recv().unwrap()
@@ -695,6 +699,9 @@ pub enum VcpuResponse {
     /// Vcpu reported its register state and per-vCPU ICC registers in response
     /// to a `Snapshot` event.
     Snapshotted(Box<HvfVcpuState>, Vec<(u32, u64)>),
+    /// Vcpu finished hydrating snapshot state (GIC included); the coordinator
+    /// waits for this before starting the device workers.
+    Restored,
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.

@@ -99,23 +99,23 @@ that cannot be cleanly restored.
   vtimer offset.
 - **No nested virtualization.** EL2 registers are not captured, so restoring a
   nested VM is rejected.
-- **Device worker threads are not stopped at capture.** Freezing the vCPUs stops
-  the guest, but a device's workers keep running, so their queue indices are
-  reconstructed rather than read. This holds for an idle guest, which is why the
-  snapshot must be taken at a steady state; a capture taken under active device
-  I/O can restore inconsistently.
-- **Per-device internal state is not captured** beyond the virtio queues. A
-  device holding host-side state across a snapshot (in-flight block requests,
-  vsock connections, virtio-fs open fids) will not have it restored.
+- **Devices**: block, virtio-fs, console, rng and balloon can be snapshotted.
+  The rest (net, vsock, gpu, input) cannot be quiesced yet and refuse the
+  snapshot rather than being captured mid-flight.
+- **Per-device internal state is not captured** beyond the virtio queues and the
+  console's open ports. A device holding host-side state across a snapshot
+  (in-flight block requests, vsock connections, virtio-fs open fids) will not
+  have it restored.
+- **A partially consumed descriptor is not serialized.** Devices are quiesced at
+  a descriptor boundary, so a request the guest had submitted but the device had
+  not finished is not preserved.
 - **`KRUN_SNAPSHOT_RESUME` is not implemented**; capture always exits the
   process (`KRUN_SNAPSHOT_EXIT`).
 - Restore copies `memory.img` into guest RAM, so RSS is the full VM size.
 
 ### Planned
 
-- Quiescing the devices at capture, so their workers stop and hand back the live
-  queues instead of the indices being reconstructed. That is what makes a
-  snapshot under active I/O sound.
+- Quiesce support for the remaining devices (net, vsock, gpu, input).
 - Multi-vCPU restore (a GIC barrier across the vCPU threads, one shared vtimer
   offset).
 - Per-device internal state, and serializing a partially consumed descriptor.

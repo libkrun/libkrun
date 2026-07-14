@@ -22,8 +22,8 @@ use super::passthrough;
 use super::virtual_entry::VirtualDirEntry;
 use super::worker::FsWorker;
 use super::{defs, defs::uapi};
-use crate::virtio::InterruptTransport;
 use crate::virtio::passthrough::PermissionSemantics;
+use crate::virtio::{InterruptTransport, PauseError};
 
 #[derive(Copy, Clone)]
 #[repr(C, packed)]
@@ -53,7 +53,7 @@ pub struct Fs {
     passthrough_cfg: Option<passthrough::Config>,
     read_only: bool,
     virtual_entries: Vec<VirtualDirEntry>,
-    worker_thread: Option<JoinHandle<()>>,
+    worker_thread: Option<JoinHandle<Vec<DeviceQueue>>>,
     worker_stopfd: EventFd,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
@@ -248,5 +248,25 @@ impl VirtioDevice for Fs {
         }
         self.device_state = DeviceState::Inactive;
         true
+    }
+
+    /// Stop the worker and take its queues back; it parks in `epoll` at a
+    /// descriptor boundary, so nothing is in flight.
+    fn pause(&mut self) -> std::result::Result<Vec<DeviceQueue>, PauseError> {
+        // A DAX worker can park mid-`setupmapping` on a reply from the vmm worker
+        // thread, which needs the Vmm lock the snapshot holds — joining would
+        // deadlock. Refuse DAX until that path can be interrupted.
+        if self.shm_region.is_some() {
+            return Err(PauseError::Unsupported("virtio-fs with DAX".into()));
+        }
+        let Some(worker) = self.worker_thread.take() else {
+            return Ok(Vec::new());
+        };
+        self.worker_stopfd
+            .write(1)
+            .map_err(|e| PauseError::Failed(format!("virtio_fs stop: {e}")))?;
+        worker
+            .join()
+            .map_err(|_| PauseError::Failed("virtio_fs worker panicked".into()))
     }
 }
