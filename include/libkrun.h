@@ -399,8 +399,8 @@ int32_t krun_add_net_unixgram(uint32_t ctx_id,
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_add_net_tap(uint32_t ctx_id,
-                         char *c_tap_name,
-                         uint8_t *const c_mac,
+                         const char *c_tap_name,
+                         const uint8_t *c_mac,
                          uint32_t features,
                          uint32_t flags);
 
