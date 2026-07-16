@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 gtk_display = { path = "../krun_gtk_display" }
+gtk = { version = "0.10", package = "gtk4" }
 krun = { package = "libkrun-via-libc", path = "../../bindings/libkrun-via-libc", features = ["ffier-strong", "gpu", "input", "vhost-user"] }
 krun-init = { package = "krun-init-blob-via-cdylib", path = "../../bindings/init-blob-via-cdylib", features = ["ffier-strong"] }
 krun_input = { path = "../../src/input", package = "krun-input" }

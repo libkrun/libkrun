@@ -22,8 +22,7 @@ use gtk::{
     EventControllerLegacy, EventControllerMotion, HeaderBar, Overlay, Picture, Revealer,
     RevealerTransitionType, Widget, Window,
     gdk::{self, EventSequence, EventType, MemoryFormat, ModifierType, TouchEvent},
-    gio::ActionEntry,
-    gio::Cancellable,
+    gio::{ActionEntry, Cancellable},
     glib::{
         self, Bytes, ControlFlow, IOCondition, Propagation, clone::Downgrade,
         timeout_add_local_once, unix_fd_add_local,
@@ -307,15 +306,15 @@ impl TouchEventSequencedSender {
     }
 }
 
-struct ScanoutWindow {
-    window: ApplicationWindow,
+struct Scanout {
+    window: Option<ApplicationWindow>,
     width: i32,
     height: i32,
     format: MemoryFormat,
     scanout_paintable: ScanoutPaintable,
 }
 
-struct ScanoutWindowParams<'a> {
+struct ScanoutParams<'a> {
     app: &'a Application,
     title: &'a str,
     display_width: i32,
@@ -327,9 +326,24 @@ struct ScanoutWindowParams<'a> {
     per_display_inputs: Vec<(EventSender, DisplayInputOptions)>,
 }
 
-impl ScanoutWindow {
-    pub fn new(params: ScanoutWindowParams) -> Self {
-        let ScanoutWindowParams {
+impl Scanout {
+    fn from_paintable(
+        scanout_paintable: ScanoutPaintable,
+        width: i32,
+        height: i32,
+        format: MemoryFormat,
+    ) -> Self {
+        Self {
+            window: None,
+            scanout_paintable,
+            width,
+            height,
+            format,
+        }
+    }
+
+    fn new(params: ScanoutParams) -> Self {
+        let ScanoutParams {
             app,
             title,
             display_width,
@@ -407,10 +421,10 @@ impl ScanoutWindow {
             picture.grab_focus();
             attach_keyboard(keyboard_event_tx, &picture);
         }
-        attach_per_display_inputs(&picture, &overlay, per_display_inputs);
+        attach_per_display_inputs(&picture, per_display_inputs);
 
         Self {
-            window,
+            window: Some(window),
             width,
             height,
             format,
@@ -418,25 +432,27 @@ impl ScanoutWindow {
         }
     }
 
-    pub fn reconfigure(&mut self, width: i32, height: i32, format: gdk::MemoryFormat) {
+    fn reconfigure(&mut self, width: i32, height: i32, format: gdk::MemoryFormat) {
         self.width = width;
         self.height = height;
         self.format = format;
     }
 
-    pub fn update(&self, buffer: Bytes, rect: Option<Rect>) {
+    fn update(&self, buffer: Bytes, rect: Option<Rect>) {
         self.scanout_paintable
             .update(buffer, self.width, self.height, self.format, rect);
     }
 }
 
-impl Drop for ScanoutWindow {
+impl Drop for Scanout {
     fn drop(&mut self) {
-        self.window.close();
+        if let Some(window) = &self.window {
+            window.close();
+        }
     }
 }
 
-fn attach_keyboard(keyboard_tx: EventSender, widget: &impl IsA<Widget>) {
+pub fn attach_keyboard(keyboard_tx: EventSender, widget: &impl IsA<Widget>) {
     let key_controller = EventControllerKey::new();
 
     // Handle key press events
@@ -500,12 +516,11 @@ fn attach_keyboard(keyboard_tx: EventSender, widget: &impl IsA<Widget>) {
 /// The returned coordinates are normalized where (0..1) corresponds to coords within the paintable
 fn compute_point_inside_paintable(
     picture: &Picture,
-    container: &Overlay,
     (x, y): (f64, f64), // window coords
 ) -> Option<(f64, f64)> {
     let paintable = picture.paintable()?;
 
-    let native = container.native().unwrap();
+    let native = picture.native()?;
     let (x_offset, y_offset) = native.surface_transform();
     let p = native.compute_point(
         picture,
@@ -534,9 +549,8 @@ fn compute_point_inside_paintable(
     Some((x_rel.clamp(0.0, 1.0), y_rel.clamp(0.0, 1.0)))
 }
 
-fn attach_per_display_inputs(
+pub fn attach_per_display_inputs(
     picture: &Picture,
-    overlay: &Overlay,
     per_display_inputs: Vec<(EventSender, DisplayInputOptions)>,
 ) {
     for (tx, options) in per_display_inputs {
@@ -548,11 +562,9 @@ fn attach_per_display_inputs(
                     Rc::new(RefCell::new(TouchEventSequencedSender::new(tx, options)));
 
                 let picture_weak = Downgrade::downgrade(picture);
-                let overlay_weak = Downgrade::downgrade(overlay);
 
                 input_controller.connect_event(move |_, event| {
                     let picture = picture_weak.upgrade().unwrap();
-                    let overlay = overlay_weak.upgrade().unwrap();
 
                     let (x, y);
                     let state;
@@ -589,8 +601,7 @@ fn attach_per_display_inputs(
                         return Propagation::Proceed;
                     }
 
-                    let Some((x, y)) = compute_point_inside_paintable(&picture, &overlay, (x, y))
-                    else {
+                    let Some((x, y)) = compute_point_inside_paintable(&picture, (x, y)) else {
                         return Propagation::Proceed;
                     };
 
@@ -606,7 +617,7 @@ fn attach_per_display_inputs(
 
                     Propagation::Stop
                 });
-                overlay.add_controller(input_controller);
+                picture.add_controller(input_controller);
             }
         }
     }
@@ -665,33 +676,21 @@ fn build_overlay(window: &Window) -> Overlay {
     overlay
 }
 
-pub struct DisplayWorker {
+struct DefaultWindows {
     app: Application,
     app_name: String,
+    keyboard_tx: Option<EventSender>,
+    per_display_inputs: Vec<Vec<(EventSender, DisplayInputOptions)>>,
+}
+
+pub struct DisplayWorker {
     rx: PollableChannelReciever<DisplayEvent>,
-    keyboard_event_tx: Option<EventSender>,
-    per_display_inputs: Vec<Vec<(PollableChannelSender<InputEvent>, DisplayInputOptions)>>,
-    scanouts: RefCell<[Option<ScanoutWindow>; MAX_DISPLAYS]>,
+    paintables: [Option<ScanoutPaintable>; MAX_DISPLAYS],
+    scanouts: RefCell<[Option<Scanout>; MAX_DISPLAYS]>,
+    default_windows: Option<DefaultWindows>,
 }
 
 impl DisplayWorker {
-    pub fn new(
-        app: Application,
-        app_name: String,
-        rx: PollableChannelReciever<DisplayEvent>,
-        keyboard_event_tx: Option<EventSender>,
-        per_display_inputs: Vec<Vec<(PollableChannelSender<InputEvent>, DisplayInputOptions)>>,
-    ) -> Self {
-        Self {
-            app,
-            app_name,
-            rx,
-            keyboard_event_tx,
-            per_display_inputs,
-            scanouts: Default::default(),
-        }
-    }
-
     fn handle_event(&self) {
         let mut scanouts = self.scanouts.borrow_mut();
         while let Some(msg) = self.rx.try_recv().unwrap() {
@@ -704,7 +703,8 @@ impl DisplayWorker {
                     height,
                     format,
                 } => {
-                    if let Some(ref mut scanout) = scanouts[scanout_id as usize] {
+                    let idx = scanout_id as usize;
+                    if let Some(ref mut scanout) = scanouts[idx] {
                         trace!(
                             "Update params of scanout {scanout_id}: width={width} height={height} format={format:?}"
                         );
@@ -713,25 +713,36 @@ impl DisplayWorker {
                         debug!(
                             "Enable scanout {scanout_id} width={width} height={height} format={format:?}"
                         );
-                        scanouts[scanout_id as usize] =
-                            Some(ScanoutWindow::new(ScanoutWindowParams {
-                                app: &self.app,
+                        scanouts[idx] = if let Some(paintable) = &self.paintables[idx] {
+                            Some(Scanout::from_paintable(
+                                paintable.clone(),
+                                width as i32,
+                                height as i32,
+                                format,
+                            ))
+                        } else if let Some(default) = &self.default_windows {
+                            Some(Scanout::new(ScanoutParams {
+                                app: &default.app,
                                 title: &format!(
                                     "{name} - display {scanout_id} ({width}x{height})",
-                                    name = self.app_name
+                                    name = default.app_name
                                 ),
                                 display_width: display_width as i32,
                                 display_height: display_height as i32,
                                 width: width as i32,
                                 height: height as i32,
                                 format,
-                                keyboard_event_tx: self.keyboard_event_tx.clone(),
-                                per_display_inputs: self
+                                keyboard_event_tx: default.keyboard_tx.clone(),
+                                per_display_inputs: default
                                     .per_display_inputs
-                                    .get(scanout_id as usize)
+                                    .get(idx)
                                     .cloned()
                                     .unwrap_or_default(),
-                            }));
+                            }))
+                        } else {
+                            warn!("No paintable for scanout {scanout_id}");
+                            None
+                        };
                     }
                 }
                 DisplayEvent::DisableScanout { scanout_id } => {
@@ -743,7 +754,7 @@ impl DisplayWorker {
                     buffer,
                     rect,
                 } => {
-                    if let Some(scanout) = &mut scanouts[scanout_id as usize] {
+                    if let Some(scanout) = &scanouts[scanout_id as usize] {
                         trace!("Update scanout {scanout_id}");
                         scanout.update(buffer, rect);
                     } else {
@@ -754,36 +765,62 @@ impl DisplayWorker {
         }
     }
 
-    /// Run a GTK application in the current thread handling the krun_gtk_display events send over the channel.
-    /// The events are produces by the `DisplayBackend` which is hooked up into libkrun.
-    pub fn run(
-        app_name: String,
-        rx: PollableChannelReciever<DisplayEvent>,
-        keyboard_tx: Option<EventSender>,
-        per_display_inputs: Vec<Vec<(PollableChannelSender<InputEvent>, DisplayInputOptions)>>,
-    ) {
-        let app = Application::builder().build();
-
-        // Hold the application so it doesn't close when we don't have any windows open. We hold the
-        // app forever, because currently libkrun just exits the process on VM shutdown so there is
-        // no way for us to do anything better here for now.
-        let _app_hold = app.hold();
-        let rx_fd = rx.as_raw_fd();
-
-        let display_worker = Rc::new(DisplayWorker::new(
-            app.clone(),
-            app_name,
-            rx,
+    pub fn attach_default(worker: crate::DisplayBackendWorker, app: &Application, app_name: &str) {
+        let crate::DisplayBackendWorker {
+            display_rx,
             keyboard_tx,
             per_display_inputs,
-        ));
-        app.connect_activate(move |_app| {
-            let display_worker = display_worker.clone();
-            unix_fd_add_local(rx_fd, IOCondition::IN, move |_, _| {
-                display_worker.handle_event();
-                ControlFlow::Continue
-            });
+            ..
+        } = worker;
+
+        DisplayWorker::setup(
+            display_rx,
+            Default::default(),
+            Some(DefaultWindows {
+                app: app.clone(),
+                app_name: app_name.to_string(),
+                keyboard_tx,
+                per_display_inputs,
+            }),
+        );
+    }
+
+    pub fn attach_with<F: FnOnce(&mut crate::DisplayBackendWorker) + 'static>(
+        mut worker: crate::DisplayBackendWorker,
+        on_setup: F,
+    ) {
+        on_setup(&mut worker);
+
+        let crate::DisplayBackendWorker {
+            display_rx,
+            paintables,
+            ..
+        } = worker;
+
+        let mut scanout_paintables: [Option<ScanoutPaintable>; MAX_DISPLAYS] = Default::default();
+        for (i, paintable) in paintables.into_iter().enumerate() {
+            scanout_paintables[i] = paintable;
+        }
+
+        DisplayWorker::setup(display_rx, scanout_paintables, None);
+    }
+
+    fn setup(
+        rx: PollableChannelReciever<DisplayEvent>,
+        paintables: [Option<ScanoutPaintable>; MAX_DISPLAYS],
+        default_windows: Option<DefaultWindows>,
+    ) {
+        let rx_fd = rx.as_raw_fd();
+        let display_worker = Rc::new(DisplayWorker {
+            rx,
+            paintables,
+            scanouts: RefCell::new(Default::default()),
+            default_windows,
         });
-        app.run_with_args::<&str>(&[]);
+        let display_worker_clone = display_worker.clone();
+        unix_fd_add_local(rx_fd, IOCondition::IN, move |_, _| {
+            display_worker_clone.handle_event();
+            ControlFlow::Continue
+        });
     }
 }
