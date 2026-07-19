@@ -97,8 +97,14 @@ impl Balloon {
                 );
                 #[cfg(target_os = "linux")]
                 let advice = libc::MADV_DONTNEED;
+                // MADV_FREE_REUSABLE (not plain MADV_FREE) drops the pages from the
+                // process's phys_footprint immediately and lets the kernel reclaim
+                // them eagerly; MADV_FREE only reclaims under memory pressure, so
+                // idle VMs never shrink. Reported pages are unused by the guest
+                // until acked and come back zero-filled, matching reporting
+                // semantics.
                 #[cfg(target_os = "macos")]
-                let advice = libc::MADV_FREE;
+                let advice = libc::MADV_FREE_REUSABLE;
                 #[cfg(unix)]
                 unsafe {
                     libc::madvise(
