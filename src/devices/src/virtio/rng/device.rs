@@ -1,4 +1,4 @@
-use rand::{TryRngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use utils::eventfd::EventFd;
 use vm_memory::{Bytes, GuestMemoryMmap};
 
@@ -60,7 +60,7 @@ impl Rng {
             let mut written = 0;
             for desc in head.into_iter() {
                 let mut rand_bytes = vec![0u8; desc.len as usize];
-                if let Err(e) = OsRng.try_fill_bytes(&mut rand_bytes) {
+                if let Err(e) = SysRng.try_fill_bytes(&mut rand_bytes) {
                     error!("Failed to fill buffer with random data: {e:?}");
                     queues[REQ_INDEX].queue.go_to_previous_position();
                     break;

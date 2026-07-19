@@ -14,7 +14,7 @@ use crate::virtio::InterruptTransport;
 use crate::virtio::vsock::defs;
 use crate::virtio::vsock::unix::{UnixAcceptorProxy, UnixProxy};
 use crossbeam_channel::Sender;
-use rand::{Rng, rng, rngs::ThreadRng};
+use rand::{RngExt, rng, rngs::ThreadRng};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 
