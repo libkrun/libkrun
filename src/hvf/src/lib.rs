@@ -18,9 +18,10 @@ use bindings::*;
 use std::arch::asm;
 use std::cell::Cell;
 
+use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -298,6 +299,9 @@ impl HvfVm {
 
 #[derive(Debug)]
 pub enum VcpuExit<'a> {
+    /// A fault hit a balloon-reclaimed RAM range; it has been remapped and the
+    /// faulting instruction must be retried (PC not advanced).
+    BalloonRefault,
     Breakpoint,
     Canceled,
     CpuOn(u64, u64, u64),
@@ -312,6 +316,113 @@ pub enum VcpuExit<'a> {
     WaitForEvent,
     WaitForEventExpired,
     WaitForEventTimeout(Duration),
+}
+
+// ---- balloon free-page reclaim ------------------------------------------
+//
+// hv_vm_map'd guest RAM is hypervisor-pinned; no madvise releases it while the
+// stage-2 mapping exists. To honor virtio-balloon free-page reports we unmap
+// the reported range from stage-2, madvise the host mapping, and remap it on
+// the next guest fault. This is protocol-conformant: the guest must not touch
+// a reported range until the report is acked, and makes no assumption about
+// its contents afterward. Opt-in via KRUN_BALLOON_RECLAIM=1.
+
+struct ReclaimEntry {
+    host: u64,
+    len: u64,
+}
+
+static RECLAIMED: OnceLock<Mutex<BTreeMap<u64, ReclaimEntry>>> = OnceLock::new();
+
+fn reclaimed_map() -> &'static Mutex<BTreeMap<u64, ReclaimEntry>> {
+    RECLAIMED.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Whether balloon free-page reclaim is enabled (opt-in via
+/// KRUN_BALLOON_RECLAIM=1).
+pub fn balloon_reclaim_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("KRUN_BALLOON_RECLAIM").is_some_and(|v| v == "1"))
+}
+
+fn host_page_size() -> u64 {
+    static PS: OnceLock<u64> = OnceLock::new();
+    *PS.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 })
+}
+
+/// Release a balloon-reported guest range: drop its stage-2 mapping (so the
+/// host pages are no longer hypervisor-pinned) and let the host purge them.
+/// Called from the balloon device thread before the report is acked. Ranges
+/// are shrunk inward to host-page alignment; the guest reports in >=4 MiB
+/// multiples, so edge loss is negligible.
+pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64) {
+    let ps = host_page_size();
+    let start = (gpa + ps - 1) & !(ps - 1);
+    let end = (gpa + len) & !(ps - 1);
+    if end <= start {
+        return;
+    }
+    let host = host_addr + (start - gpa);
+    let alen = end - start;
+
+    // The lock is held across unmap/insert so a concurrent vCPU refault of a
+    // neighboring entry serializes with us.
+    let mut map = reclaimed_map().lock().unwrap();
+    // Entries are disjoint; refuse a report overlapping an outstanding entry
+    // (double hv_vm_unmap would fail and split bookkeeping).
+    if map
+        .range(..end)
+        .next_back()
+        .is_some_and(|(&prev_start, prev)| prev_start + prev.len > start)
+    {
+        return;
+    }
+    let ret = unsafe { hv_vm_unmap(start, alen as usize) };
+    if ret != HV_SUCCESS {
+        error!("balloon reclaim: hv_vm_unmap(0x{start:x}, {alen}) failed: {ret:x}");
+        return;
+    }
+    // With the stage-2 mapping gone nothing pins the pages; MADV_FREE_REUSABLE
+    // drops them from phys_footprint immediately.
+    #[cfg(target_os = "macos")]
+    let advice = libc::MADV_FREE_REUSABLE;
+    #[cfg(not(target_os = "macos"))]
+    let advice = libc::MADV_DONTNEED;
+    unsafe { libc::madvise(host as *mut libc::c_void, alen as usize, advice) };
+    map.insert(start, ReclaimEntry { host, len: alen });
+}
+
+/// If `pa` falls inside a reclaimed range, remap the whole range and return
+/// true so the vCPU retries the faulting instruction. Also covers stage-1
+/// page-table walks that land in reclaimed memory (s1ptw aborts report the
+/// walked PA the same way).
+fn balloon_remap_if_reclaimed(pa: u64) -> bool {
+    let mut map = reclaimed_map().lock().unwrap();
+    let (&gpa, entry) = match map.range(..=pa).next_back() {
+        Some(e) => e,
+        None => return false,
+    };
+    if pa >= gpa + entry.len {
+        return false;
+    }
+    let ret = unsafe {
+        hv_vm_map(
+            entry.host as *mut core::ffi::c_void,
+            gpa,
+            entry.len as usize,
+            (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
+        )
+    };
+    if ret != HV_SUCCESS {
+        // Falling through to MMIO dispatch would corrupt the guest; this is
+        // unrecoverable state, surface it loudly.
+        panic!(
+            "balloon refault: hv_vm_map(0x{gpa:x}, {}) failed: {ret:x}",
+            entry.len
+        );
+    }
+    map.remove(&gpa);
+    true
 }
 
 struct MmioRead {
@@ -648,6 +759,13 @@ impl HvfVcpu<'_> {
                 );
 
                 let pa = self.vcpu_exit.exception.physical_address;
+
+                // A fault in a balloon-reclaimed RAM range is not MMIO: remap and
+                // retry (PC not advanced). Must precede MMIO classification.
+                if balloon_reclaim_enabled() && balloon_remap_if_reclaimed(pa) {
+                    return Ok(VcpuExit::BalloonRefault);
+                }
+
                 self.pending_advance_pc = true;
 
                 if iswrite {

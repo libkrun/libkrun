@@ -95,14 +95,18 @@ impl Balloon {
                     "balloon: should release guest_addr={:?} host_addr={:p} len={}",
                     desc.addr, host_addr, desc.len
                 );
+                // macOS guest pages are hypervisor-pinned, so reclaim unmaps the
+                // range from stage-2 before the report is acked; it remaps lazily
+                // on the next guest fault (see hvf::balloon_reclaim_range).
+                #[cfg(target_os = "macos")]
+                if hvf::balloon_reclaim_enabled() {
+                    hvf::balloon_reclaim_range(desc.addr.0, host_addr as u64, desc.len as u64);
+                    continue;
+                }
+                // Linux MADV_DONTNEED decommits immediately; on macOS this path
+                // runs only when reclaim is disabled.
                 #[cfg(target_os = "linux")]
                 let advice = libc::MADV_DONTNEED;
-                // MADV_FREE_REUSABLE (not plain MADV_FREE) drops the pages from the
-                // process's phys_footprint immediately and lets the kernel reclaim
-                // them eagerly; MADV_FREE only reclaims under memory pressure, so
-                // idle VMs never shrink. Reported pages are unused by the guest
-                // until acked and come back zero-filled, matching reporting
-                // semantics.
                 #[cfg(target_os = "macos")]
                 let advice = libc::MADV_FREE_REUSABLE;
                 #[cfg(unix)]
