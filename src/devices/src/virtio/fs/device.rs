@@ -134,6 +134,18 @@ impl Fs {
         cfg.export_fsid
     }
 
+    pub fn add_virtual_entry(&mut self, entry: VirtualDirEntry) {
+        self.virtual_entries.push(entry);
+    }
+
+    pub fn virtual_entries_mut(&mut self) -> &mut Vec<VirtualDirEntry> {
+        &mut self.virtual_entries
+    }
+
+    pub fn set_exit_code(&mut self, exit_code: Arc<AtomicI32>) {
+        self.exit_code = exit_code;
+    }
+
     #[cfg(target_os = "macos")]
     pub fn set_map_sender(&mut self, map_sender: Sender<WorkerMessage>) {
         self.map_sender = Some(map_sender);

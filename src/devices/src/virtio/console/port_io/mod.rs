@@ -35,7 +35,11 @@ pub fn term_fixed_size(width: u16, height: u16) -> Box<dyn PortTerminalPropertie
 }
 
 pub fn output_to_log_as_err() -> Box<dyn PortOutput + Send> {
-    Box::new(PortOutputLog::new())
+    Box::new(PortOutputLog::new(Level::Error))
+}
+
+pub fn output_to_log(level: Level) -> Box<dyn PortOutput + Send> {
+    Box::new(PortOutputLog::new(level))
 }
 
 struct PortTerminalPropertiesFixed((u16, u16));
@@ -46,21 +50,24 @@ impl PortTerminalProperties for PortTerminalPropertiesFixed {
     }
 }
 
-#[derive(Default)]
 pub struct PortOutputLog {
     buf: Vec<u8>,
+    level: Level,
 }
 
 impl PortOutputLog {
     const FORCE_FLUSH_TRESHOLD: usize = 512;
     const LOG_TARGET: &'static str = "init_or_kernel";
 
-    fn new() -> Self {
-        Self::default()
+    fn new(level: Level) -> Self {
+        Self {
+            buf: Vec::new(),
+            level,
+        }
     }
 
     fn force_flush(&mut self) {
-        log::log!(target: PortOutputLog::LOG_TARGET, Level::Error, "[missing newline]{}", String::from_utf8_lossy(&self.buf));
+        log::log!(target: PortOutputLog::LOG_TARGET, self.level, "[missing newline]{}", String::from_utf8_lossy(&self.buf));
         self.buf.clear();
     }
 }
@@ -72,12 +79,11 @@ impl PortOutput for PortOutputLog {
         let mut start = 0;
         for (i, ch) in self.buf.iter().cloned().enumerate() {
             if ch == b'\n' {
-                log::log!(target: PortOutputLog::LOG_TARGET, Level::Error, "{}", String::from_utf8_lossy(&self.buf[start..i]));
+                log::log!(target: PortOutputLog::LOG_TARGET, self.level, "{}", String::from_utf8_lossy(&self.buf[start..i]));
                 start = i + 1;
             }
         }
         self.buf.drain(0..start);
-        // Make sure to not grow the internal buffer forever!
         if self.buf.len() > PortOutputLog::FORCE_FLUSH_TRESHOLD {
             self.force_flush()
         }
@@ -99,4 +105,24 @@ impl Default for PortInputEmpty {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Open a virtio console port by name.
+///
+/// Scans `/dev/hvc*` devices for one whose `name` sysfs attribute matches
+/// the given name. Returns the opened file if found.
+pub fn open_virtio_port(name: &str) -> Option<std::fs::File> {
+    use std::fs;
+    use std::path::Path;
+
+    for entry in fs::read_dir("/sys/class/virtio-ports").ok()? {
+        let entry = entry.ok()?;
+        let port_name = fs::read_to_string(entry.path().join("name")).ok()?;
+        if port_name.trim() == name {
+            let dev_name = entry.file_name();
+            let dev_path = Path::new("/dev").join(dev_name);
+            return fs::File::open(dev_path).ok();
+        }
+    }
+    None
 }

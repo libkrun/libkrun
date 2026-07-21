@@ -153,6 +153,8 @@ pub enum StartMicrovmError {
     PeGzInvalid,
     /// Cannot open the file containing the kernel code.
     RawOpenKernel(io::Error),
+    /// Cannot attach a device via the device manager.
+    AttachDevice(String),
     /// Cannot initialize a MMIO Balloon device or add a device to the MMIO Bus.
     RegisterBalloonDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Block Device or add a device to the MMIO Bus.
@@ -342,6 +344,7 @@ impl Display for StartMicrovmError {
             RawOpenKernel(ref err) => {
                 write!(f, "Cannot open the file containing the kernel code: {err}")
             }
+            AttachDevice(ref err) => write!(f, "Cannot attach device: {err}"),
             RegisterBalloonDevice(ref err) => {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");
