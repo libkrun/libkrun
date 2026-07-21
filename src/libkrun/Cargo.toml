@@ -9,9 +9,9 @@ license = "Apache-2.0"
 repository = "https://github.com/containers/libkrun"
 
 [features]
-tee = ["vmm/tee", "devices/tee"]
-amd-sev = ["blk", "tee", "vmm/amd-sev", "devices/amd-sev"]
-tdx = ["blk", "tee", "vmm/tdx", "devices/tdx"]
+tee = ["vmm/tee", "devices/tee", "arch/tee"]
+amd-sev = ["blk", "tee", "vmm/amd-sev", "devices/amd-sev", "arch/amd-sev", "dep:kbs-types"]
+tdx = ["blk", "tee", "vmm/tdx", "devices/tdx", "arch/tdx", "dep:kbs-types"]
 net = ["devices/net", "vmm/net"]
 blk = ["devices/blk", "vmm/blk"]
 gpu = ["vmm/gpu", "devices/gpu", "krun_display"]
@@ -22,8 +22,11 @@ vhost-user = ["vmm/vhost-user", "devices/vhost-user"]
 timesync = ["devices/timesync"]
 
 [dependencies]
+arch = { package = "krun-arch", version = "=0.1.0-2.0.0-dev", path = "../arch" }
 crossbeam-channel = ">=0.5.15"
 env_logger = "0.11"
+kernel = { package = "krun-kernel", version = "=0.1.0-2.0.0-dev", path = "../kernel" }
+kbs-types = { version = "0.13.0", optional = true }
 libc = ">=0.2.39"
 libloading = "0.8"
 log = "0.4.0"
@@ -34,7 +37,11 @@ krun_input = { package = "krun-input", version = "0.1.0", path = "../input", opt
 devices = { package = "krun-devices", version = "=0.1.0-2.0.0-dev", path = "../devices" }
 polly = { package = "krun-polly", version = "=0.1.0-2.0.0-dev", path = "../polly" }
 utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }
+vm-memory = { version = "0.17.0", default-features = false }
 vmm = { package = "krun-vmm", version = "=0.1.0-2.0.0-dev", path = "../vmm" }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30.1", features = ["fs", "term"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }
@@ -44,10 +51,10 @@ kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
 kvm-ioctls = "0.24"
 aws-nitro = { package = "krun-aws-nitro", version = "=0.1.0-2.0.0-dev", path = "../aws_nitro", optional = true }
 nitro-enclaves = { version = "0.5.0", optional = true }
-vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
     "Win32_System_Console",
 ] }
 

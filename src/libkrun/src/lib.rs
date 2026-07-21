@@ -1,6 +1,8 @@
 #[macro_use]
 extern crate log;
 
+mod builder;
+
 use crossbeam_channel::unbounded;
 #[cfg(any(feature = "gpu", feature = "vhost-user"))]
 use devices::display::DisplayInfo;
@@ -3002,7 +3004,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     let (sender, _receiver) = unbounded();
 
-    let _vmm = match vmm::builder::build_microvm(
+    let _vmm = match crate::builder::build_microvm(
         &ctx_cfg.vmr,
         &mut event_manager,
         ctx_cfg.shutdown_efd,
