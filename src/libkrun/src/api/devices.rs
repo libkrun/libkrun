@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use devices::legacy::IrqChip;
 #[cfg(feature = "gpu")]
 use devices::virtio::display::{DisplayInfo, DisplayInfoEdid, PhysicalSize};
+#[cfg(feature = "input")]
+use krun_input;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -1276,6 +1278,93 @@ impl<'a> AttachDevice<'a> for GpuDevice {
             inner.lock().unwrap().set_shm_region(region.into());
         }
 
+        let id = inner.lock().unwrap().id().to_string();
+        ctx.register(&id, inner)
+    }
+}
+
+/// A virtio input device forwarding host input events to the guest.
+#[cfg(feature = "input")]
+pub struct InputDevice {
+    config_backend: krun_input::InputConfigBackend<'static>,
+    events_backend: krun_input::InputEventProviderBackend<'static>,
+}
+
+#[cfg(feature = "input")]
+impl InputDevice {
+    /// Create from opaque config/events backend vtables.
+    ///
+    /// # Safety
+    ///
+    /// `config_backend` must point to a valid `InputConfigBackend` struct of at
+    /// least `config_backend_size` bytes, and `event_provider_backend` must
+    /// point to a valid `InputEventProviderBackend` struct of at least
+    /// `event_provider_backend_size` bytes. Both structs are copied — the
+    /// caller retains ownership of the originals.
+    pub unsafe fn new(
+        config_backend: *const std::ffi::c_void,
+        config_backend_size: usize,
+        event_provider_backend: *const std::ffi::c_void,
+        event_provider_backend_size: usize,
+    ) -> Result<Self, Error> {
+        if config_backend_size < std::mem::size_of::<krun_input::InputConfigBackend<'_>>() {
+            return Err(Error::InvalidParam());
+        }
+        if event_provider_backend_size
+            < std::mem::size_of::<krun_input::InputEventProviderBackend<'_>>()
+        {
+            return Err(Error::InvalidParam());
+        }
+        let config_backend: krun_input::InputConfigBackend<'static> =
+            unsafe { std::ptr::read_unaligned(config_backend as *const _) };
+        if !config_backend.verify() {
+            return Err(Error::InvalidParam());
+        }
+        let events_backend: krun_input::InputEventProviderBackend<'static> =
+            unsafe { std::ptr::read_unaligned(event_provider_backend as *const _) };
+        if !events_backend.verify() {
+            return Err(Error::InvalidParam());
+        }
+        Ok(Self {
+            config_backend,
+            events_backend,
+        })
+    }
+
+    /// Create a passthrough input device from an evdev fd.
+    ///
+    /// The fd must refer to a Linux `/dev/input/eventN` device. It is
+    /// duplicated internally; the caller retains ownership.
+    /// Create a passthrough input device from an evdev fd.
+    ///
+    /// The fd must refer to a Linux `/dev/input/eventN` device. It is
+    /// duplicated internally; the caller retains ownership.
+    #[cfg(target_os = "linux")]
+    pub fn new_from_fd(input_fd: i32) -> Result<Self, Error> {
+        use devices::virtio::input::passthrough::PassthroughInputBackend;
+        use krun_input::{IntoInputConfig, IntoInputEvents};
+
+        let borrowed: std::os::fd::BorrowedFd<'static> =
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(input_fd) };
+        let leaked: &'static std::os::fd::BorrowedFd<'static> = Box::leak(Box::new(borrowed));
+
+        let config_backend = PassthroughInputBackend::into_input_config(Some(leaked));
+        let events_backend = PassthroughInputBackend::into_input_events(Some(leaked));
+
+        Ok(Self {
+            config_backend,
+            events_backend,
+        })
+    }
+}
+
+#[cfg(feature = "input")]
+impl<'a> AttachDevice<'a> for InputDevice {
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), DetailedError> {
+        use devices::virtio::input::Input;
+        let input = Input::new(self.config_backend, self.events_backend)
+            .map_err(|e| DetailedError::new(Error::Internal(), format!("input: {e:?}")))?;
+        let inner = Arc::new(Mutex::new(input));
         let id = inner.lock().unwrap().id().to_string();
         ctx.register(&id, inner)
     }

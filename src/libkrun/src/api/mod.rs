@@ -18,6 +18,8 @@ pub use devices::BlockDevice;
 pub use devices::NetDevice;
 #[cfg(feature = "gpu")]
 pub use devices::{DisplayBackend, DisplayInfoBuilder, GpuDevice};
+#[cfg(feature = "input")]
+pub use devices::InputDevice;
 pub use devices::{
     AttachContext, AttachDevice, ConsoleBuilder, ConsoleDevice, DeviceManager, DeviceRequirements,
     MmioDeviceManager, ResolvedShmRegion, VsockDevice,
