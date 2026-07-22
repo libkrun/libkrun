@@ -20,36 +20,67 @@ impl TestTsiTcpGuestConnect {
 mod host {
     use super::*;
 
-    use crate::common::setup_fs_and_enter;
-    use crate::{Test, TestSetup};
-    use crate::{krun_call, krun_call_u32};
-    use krun_sys::*;
-    use std::os::fd::AsRawFd;
     use std::thread;
 
+    use krun_via_cdylib_weak as krun;
+
+    use crate::common::{self, init_krun, setup_standard_devices};
+    use crate::{ShouldRun, Test, TestSetup};
+
+    const TSI_HIJACK_INET: u32 = 1;
+
     impl Test for TestTsiTcpGuestConnect {
+        fn should_run(&self) -> ShouldRun {
+            if common::require_vm_symbols().is_err() {
+                return ShouldRun::No("core VM symbols not available");
+            }
+            if krun::require(
+                None,
+                &[
+                    krun::Symbol::KrunVsockDeviceNew,
+                    krun::Symbol::KrunVsockDeviceDestroy,
+                ],
+            )
+            .is_err()
+            {
+                return ShouldRun::No("vsock symbols not available");
+            }
+            ShouldRun::Yes
+        }
+
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             let listener = self.tcp_tester.create_server_socket();
             thread::spawn(move || self.tcp_tester.run_server(listener));
-            unsafe {
-                krun_call!(krun_init_log(
-                    KRUN_LOG_TARGET_DEFAULT,
-                    KRUN_LOG_LEVEL_TRACE,
-                    KRUN_LOG_STYLE_AUTO,
-                    0
-                ))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_add_vsock(ctx, KRUN_TSI_HIJACK_INET))?;
-                krun_call!(krun_set_vm_config(ctx, 1, 512))?;
-                krun_call!(krun_add_virtio_console_default(
-                    ctx,
-                    std::io::stdin().as_raw_fd(),
-                    std::io::stdout().as_raw_fd(),
-                    std::io::stderr().as_raw_fd(),
-                ))?;
-                setup_fs_and_enter(ctx, test_setup)?;
-            }
-            Ok(())
+
+            init_krun()?;
+            // TODO: duplicated with should_run — see require-in-should-run-broken.md
+            krun::require(
+                None,
+                &[
+                    krun::Symbol::KrunVsockDeviceNew,
+                    krun::Symbol::KrunVsockDeviceDestroy,
+                ],
+            )
+            .map_err(|e| anyhow::anyhow!("vsock symbols: {e}"))?;
+
+            let (mut devices, payload) = setup_standard_devices(&test_setup, &[])?;
+            devices.add(
+                krun::VsockDevice::new(3, TSI_HIJACK_INET)
+                    .map_err(|e| anyhow::anyhow!("VsockDevice: {e:?}"))?,
+            );
+
+            let mut vmm = krun::VmmBuilder::new()
+                .vcpus(1)
+                .map_err(|e| anyhow::anyhow!("vcpus: {e:?}"))?
+                .ram_mib(512)
+                .map_err(|e| anyhow::anyhow!("ram_mib: {e:?}"))?
+                .payload(payload)
+                .devices(devices)
+                .build()
+                .map_err(|e| anyhow::anyhow!("build: {e:?}"))?;
+
+            vmm.run();
+            unreachable!()
         }
     }
 }

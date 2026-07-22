@@ -126,24 +126,61 @@ pub fn setup_and_run_with_env(
     guest_env: &[&str],
 ) -> anyhow::Result<()> {
     init_krun()?;
+    let (devices, payload) = setup_standard_devices(&test_setup, guest_env)?;
 
-    let root_dir = setup_rootfs(&test_setup)?;
+    let mut vmm = krun::VmmBuilder::new()
+        .vcpus(num_cpus)
+        .map_err(|e| anyhow::anyhow!("vcpus: {e:?}"))?
+        .ram_mib(ram_mib)
+        .map_err(|e| anyhow::anyhow!("ram_mib: {e:?}"))?
+        .payload(payload)
+        .devices(devices)
+        .build()
+        .map_err(|e| anyhow::anyhow!("VmmBuilder::build: {e:?}"))?;
 
+    vmm.run();
+    unreachable!()
+}
+
+/// Set up the standard test VM: rootfs + init config + console + balloon + rng.
+/// Returns a device manager and payload ready for the test to add extra devices
+/// (vsock, block, net, etc.) before passing to `build_and_run()`.
+pub fn setup_standard_devices(
+    test_setup: &TestSetup,
+    guest_env: &[&str],
+) -> anyhow::Result<(krun::MmioDeviceManager<'static>, krun::Payload)> {
+    let root_dir = setup_rootfs(test_setup)?;
     let init_config = build_init_config(&test_setup.test_case, guest_env);
 
     let mut rootfs = krun::FsDevice::new("/dev/root", root_dir.to_str().unwrap())
         .map_err(|e| anyhow::anyhow!("FsDevice::new: {e:?}"))?;
-
     let mut payload =
-        krun::Payload::load_krunfw().map_err(|e| anyhow::anyhow!("Payload::load_krunfw: {e:?}"))?;
-
+        krun::Payload::load_krunfw().map_err(|e| anyhow::anyhow!("load_krunfw: {e:?}"))?;
     let mut overlay = krun::FsOverlay::new();
     init_config
         .apply(ptr::null_mut(), &mut overlay, &mut payload)
         .map_err(|e| anyhow::anyhow!("Config::apply: {e}"))?;
     rootfs.set_overlay(overlay);
 
-    build_and_run(num_cpus, ram_mib, rootfs, payload)
+    let mut console_builder = krun::ConsoleDevice::builder();
+    console_builder
+        .add_default_console(
+            io::stdin().as_raw_fd(),
+            io::stdout().as_raw_fd(),
+            io::stderr().as_raw_fd(),
+        )
+        .map_err(|e| anyhow::anyhow!("add_default_console: {e:?}"))?;
+    let console = console_builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("ConsoleDevice::build: {e:?}"))?;
+
+    let mut devices = krun::MmioDeviceManager::new();
+    devices.add(rootfs);
+    devices.add(console);
+    devices.add(krun::BalloonDevice::new().map_err(|e| anyhow::anyhow!("BalloonDevice: {e:?}"))?);
+    devices.add(krun::RngDevice::new().map_err(|e| anyhow::anyhow!("RngDevice: {e:?}"))?);
+
+    Ok((devices, payload))
 }
 
 /// Build a VM with the given rootfs device and payload, add a default console,

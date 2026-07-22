@@ -15,7 +15,7 @@ mod host {
 
     use krun_via_cdylib_weak as krun;
 
-    use crate::common::{self, build_and_run, build_init_config, init_krun, setup_rootfs};
+    use crate::common::{self, build_init_config, init_krun, setup_rootfs};
     use crate::{ShouldRun, Test, TestSetup};
 
     fn spawn_ping_pong_responder(stream: UnixStream) {

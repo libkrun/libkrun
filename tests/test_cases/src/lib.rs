@@ -4,16 +4,16 @@ extern crate krun_init_blob_via_cdylib as krun_init;
 mod test_vm_config;
 use test_vm_config::TestVmConfig;
 
-// #[cfg(any(feature = "host", target_os = "linux"))]
-// mod test_vsock_guest_connect;
-// #[cfg(any(feature = "host", target_os = "linux"))]
-// use test_vsock_guest_connect::TestVsockGuestConnect;
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_vsock_guest_connect;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_vsock_guest_connect::TestVsockGuestConnect;
 
-// mod test_tsi_tcp_guest_connect;
-// use test_tsi_tcp_guest_connect::TestTsiTcpGuestConnect;
+mod test_tsi_tcp_guest_connect;
+use test_tsi_tcp_guest_connect::TestTsiTcpGuestConnect;
 
-// mod test_tsi_tcp_guest_listen;
-// use test_tsi_tcp_guest_listen::TestTsiTcpGuestListen;
+mod test_tsi_tcp_guest_listen;
+use test_tsi_tcp_guest_listen::TestTsiTcpGuestListen;
 
 // pub(crate) mod test_net;
 // use test_net::TestNet;
@@ -94,16 +94,16 @@ pub fn test_cases() -> Vec<TestCase> {
                 ram_mib: 1024,
             }),
         ),
-        // #[cfg(any(feature = "host", target_os = "linux"))]
-        // TestCase::new("vsock-guest-connect", Box::new(TestVsockGuestConnect)),
-        // TestCase::new(
-        //     "tsi-tcp-guest-connect",
-        //     Box::new(TestTsiTcpGuestConnect::new()),
-        // ),
-        // TestCase::new(
-        //     "tsi-tcp-guest-listen",
-        //     Box::new(TestTsiTcpGuestListen::new()),
-        // ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("vsock-guest-connect", Box::new(TestVsockGuestConnect)),
+        TestCase::new(
+            "tsi-tcp-guest-connect",
+            Box::new(TestTsiTcpGuestConnect::new()),
+        ),
+        TestCase::new(
+            "tsi-tcp-guest-listen",
+            Box::new(TestTsiTcpGuestListen::new()),
+        ),
         // TestCase::new("net-passt", Box::new(TestNet::new_passt())),
         // TestCase::new("net-tap", Box::new(TestNet::new_tap())),
         // TestCase::new("net-gvproxy", Box::new(TestNet::new_gvproxy())),
