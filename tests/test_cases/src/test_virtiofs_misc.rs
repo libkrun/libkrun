@@ -12,11 +12,18 @@ const HOST_OWNED_FILE: &str = "host_owned_file";
 mod host {
     use super::*;
 
-    use crate::common::setup_and_run_with_env;
-    use crate::{Test, TestOutcome, TestSetup};
+    use crate::common::{self, setup_and_run_with_env};
+    use crate::{ShouldRun, Test, TestOutcome, TestSetup};
     use std::io::Read;
 
     impl Test for TestVirtioFsMisc {
+        fn should_run(&self) -> ShouldRun {
+            if common::require_vm_symbols().is_err() {
+                return ShouldRun::No("core VM symbols not available");
+            }
+            ShouldRun::Yes
+        }
+
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             // Create a host-owned file in the rootfs before entering the VM.
             let root_dir = test_setup.tmp_dir.join("rootfs");

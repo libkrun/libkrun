@@ -17,139 +17,62 @@ fn make_test_payload() -> Vec<u8> {
 mod host {
     use super::*;
 
-    use crate::krun_init;
-    use crate::{Test, TestSetup};
-    use crate::{krun_call, krun_call_u32};
-    use krun_sys::*;
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    use std::ptr::null_mut;
+    use crate::common::{self, build_and_run, build_init_config, init_krun};
+    use crate::{ShouldRun, Test, TestSetup};
+    use std::ptr;
+
+    use krun_via_cdylib_weak as krun;
 
     impl Test for TestAugmentFs {
-        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            let test_case = CString::new(test_setup.test_case)?;
+        fn should_run(&self) -> ShouldRun {
+            if common::require_vm_symbols().is_err() {
+                return ShouldRun::No("core VM symbols not available");
+            }
+            ShouldRun::Yes
+        }
 
-            // Read the guest-agent binary into memory. Leaked because
-            // krun_start_enter never returns.
+        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            init_krun()?;
+
             let guest_agent_path = std::env::var("KRUN_TEST_GUEST_AGENT_PATH")
                 .expect("KRUN_TEST_GUEST_AGENT_PATH not set");
-            let guest_agent_bytes: &'static [u8] =
+            let guest_agent_bytes: &[u8] =
                 Vec::leak(std::fs::read(&guest_agent_path).expect("Failed to read guest-agent"));
 
-            // Build init config via libkrun-init.
-            let init_config = krun_init::Config::builder()
-                .args(&["/guest-agent", test_case.to_str().unwrap()])
-                .workdir("/")
-                .build();
+            let init_config = build_init_config(&test_setup.test_case, &[]);
+            let test_payload: &[u8] = Vec::leak(make_test_payload());
+            let marker: &[u8] = b"virtual-file-marker-content-12345";
+            let nested_content: &[u8] = b"deep-nested-content";
 
-            // Deterministic test payload for range-read tests.
-            let payload: &'static [u8] = Vec::leak(make_test_payload());
+            let mut rootfs = krun::FsDevice::new_null("/dev/root")
+                .map_err(|e| anyhow::anyhow!("FsDevice::new_null: {e:?}"))?;
 
-            // A small marker file to test persistent reads.
-            let marker: &'static [u8] = b"virtual-file-marker-content-12345";
-
-            unsafe {
-                krun_call!(krun_init_log(
-                    KRUN_LOG_TARGET_DEFAULT,
-                    KRUN_LOG_LEVEL_TRACE,
-                    KRUN_LOG_STYLE_AUTO,
-                    0
-                ))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_set_vm_config(ctx, 1, 512))?;
-                krun_call!(krun_add_virtio_console_default(
-                    ctx,
-                    std::io::stdin().as_raw_fd(),
-                    std::io::stdout().as_raw_fd(),
-                    std::io::stderr().as_raw_fd(),
-                ))?;
-
-                // Set up root with NO host directory (NullFs).
-                krun_call!(krun_add_virtiofs3(
-                    ctx,
-                    c"/dev/root".as_ptr(),
-                    std::ptr::null(), // NULL path → NullFs
-                    0,                // no SHM window
-                    false,            // not read-only
-                ))?;
-
-                // Virtual directories needed by init as mount points.
-                for dir in [c"dev", c"proc", c"sys"] {
-                    krun_call!(krun_fs_add_overlay_dir(
-                        ctx,
-                        c"/dev/root".as_ptr(),
-                        dir.as_ptr(),
-                        0o040_755,
-                    ))?;
-                }
-
-                // Inject init binary + config via libkrun-init.
-                init_config
-                    .apply(null_mut(), ctx, "/dev/root")
-                    .expect("apply init config");
-
-                // Overlay guest-agent (one-shot, executable). After init
-                // execs it, the file should no longer be visible.
-                krun_call!(krun_fs_add_overlay_file(
-                    ctx,
-                    c"/dev/root".as_ptr(),
-                    c"guest-agent".as_ptr(),
-                    guest_agent_bytes.as_ptr(),
-                    guest_agent_bytes.len(),
-                    0o100_755,
-                    true,
-                ))?;
-
-                // Overlay a persistent marker file.
-                krun_call!(krun_fs_add_overlay_file(
-                    ctx,
-                    c"/dev/root".as_ptr(),
-                    c"marker.txt".as_ptr(),
-                    marker.as_ptr(),
-                    marker.len(),
-                    0o100_644,
-                    false,
-                ))?;
-
-                // Overlay a deterministic 8 KiB payload for range-read tests.
-                krun_call!(krun_fs_add_overlay_file(
-                    ctx,
-                    c"/dev/root".as_ptr(),
-                    c"testdata.bin".as_ptr(),
-                    payload.as_ptr(),
-                    payload.len(),
-                    0o100_444,
-                    false,
-                ))?;
-
-                // --- Nested path test (2-level) ---
-                // etc/ -> etc/nested/ -> etc/nested/deep.txt
-                krun_call!(krun_fs_add_overlay_dir(
-                    ctx,
-                    c"/dev/root".as_ptr(),
-                    c"etc".as_ptr(),
-                    0o040_755,
-                ))?;
-                krun_call!(krun_fs_add_overlay_dir(
-                    ctx,
-                    c"/dev/root".as_ptr(),
-                    c"etc/nested".as_ptr(),
-                    0o040_755,
-                ))?;
-                let nested_content: &'static [u8] = b"deep-nested-content";
-                krun_call!(krun_fs_add_overlay_file(
-                    ctx,
-                    c"/dev/root".as_ptr(),
-                    c"etc/nested/deep.txt".as_ptr(),
-                    nested_content.as_ptr(),
-                    nested_content.len(),
-                    0o100_644,
-                    false,
-                ))?;
-
-                krun_call!(krun_start_enter(ctx))?;
+            let mut overlay = krun::FsOverlay::new();
+            // Mount point dirs needed by init.
+            for dir in ["dev", "proc", "sys"] {
+                overlay.add_dir(dir, 0o040_755);
             }
-            Ok(())
+
+            let mut payload =
+                krun::Payload::load_krunfw().map_err(|e| anyhow::anyhow!("load_krunfw: {e:?}"))?;
+            init_config
+                .apply(ptr::null_mut(), &mut overlay, &mut payload)
+                .map_err(|e| anyhow::anyhow!("Config::apply: {e}"))?;
+
+            // Guest-agent (one-shot, executable).
+            overlay.add_file("guest-agent", guest_agent_bytes, 0o100_755, true);
+            // Persistent marker file.
+            overlay.add_file("marker.txt", marker, 0o100_644, false);
+            // Deterministic 8 KiB payload for range-read tests.
+            overlay.add_file("testdata.bin", test_payload, 0o100_444, false);
+            // Nested path test: etc/nested/deep.txt
+            overlay.add_dir("etc", 0o040_755);
+            overlay.add_dir("etc/nested", 0o040_755);
+            overlay.add_file("etc/nested/deep.txt", nested_content, 0o100_644, false);
+
+            rootfs.set_overlay(overlay);
+
+            build_and_run(1, 512, rootfs, payload)
         }
     }
 }

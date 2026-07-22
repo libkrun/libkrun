@@ -51,41 +51,27 @@ use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
 
 static LIBKRUN: OnceLock<Library> = OnceLock::new();
 
-/// Load libkrun into the global namespace and initialize logging.
-pub fn init_krun() -> anyhow::Result<()> {
+/// Load libkrun and core VM symbols. Safe to call multiple times.
+/// Call from `should_run()` to verify availability before `start_vm()`.
+pub fn require_vm_symbols() -> Result<(), libloading::Error> {
     LIBKRUN.get_or_init(|| {
         unsafe { Library::open(Some("libkrun.so"), RTLD_NOW | RTLD_GLOBAL) }
             .expect("failed to dlopen libkrun.so")
     });
-
-    krun::require(None, &[krun::Symbol::KrunInitLog]).context("failed to load krun_init_log")?;
-    krun::init_log(
-        krun::LogTarget::Default,
-        krun::LogLevel::Trace,
-        krun::LogStyle::Auto,
-    )
-    .map_err(|e| anyhow::anyhow!("init_log: {e:?}"))?;
-    Ok(())
-}
-
-pub fn setup_and_run_with_env(
-    num_cpus: u8,
-    ram_mib: u32,
-    test_setup: TestSetup,
-    guest_env: &[&str],
-) -> anyhow::Result<()> {
-    init_krun()?;
-
     use krun::Symbol::*;
     krun::require(
         None,
         &[
+            KrunInitLog,
             KrunFsDeviceNew,
+            KrunFsDeviceNewReadOnly,
+            KrunFsDeviceNewNull,
             KrunFsDeviceDestroy,
             KrunFsDeviceSetOverlay,
             KrunFsOverlayNew,
             KrunFsOverlayDestroy,
             KrunFsOverlayAddFile,
+            KrunFsOverlayAddDir,
             KrunPayloadLoadKrunfw,
             KrunPayloadDestroy,
             KrunPayloadAppendCmdline,
@@ -110,7 +96,32 @@ pub fn setup_and_run_with_env(
             KrunErrorDestroy,
         ],
     )
-    .context("failed to load libkrun symbols")?;
+}
+
+/// Load libkrun into the global namespace, load core VM symbols, and init logging.
+pub fn init_krun() -> anyhow::Result<()> {
+    LIBKRUN.get_or_init(|| {
+        unsafe { Library::open(Some("libkrun.so"), RTLD_NOW | RTLD_GLOBAL) }
+            .expect("failed to dlopen libkrun.so")
+    });
+
+    require_vm_symbols().context("failed to load core VM symbols")?;
+    krun::init_log(
+        krun::LogTarget::Default,
+        krun::LogLevel::Trace,
+        krun::LogStyle::Auto,
+    )
+    .map_err(|e| anyhow::anyhow!("init_log: {e:?}"))?;
+    Ok(())
+}
+
+pub fn setup_and_run_with_env(
+    num_cpus: u8,
+    ram_mib: u32,
+    test_setup: TestSetup,
+    guest_env: &[&str],
+) -> anyhow::Result<()> {
+    init_krun()?;
 
     let root_dir = setup_rootfs(&test_setup)?;
 
@@ -128,6 +139,20 @@ pub fn setup_and_run_with_env(
         .map_err(|e| anyhow::anyhow!("Config::apply: {e}"))?;
     rootfs.set_overlay(overlay);
 
+    build_and_run(num_cpus, ram_mib, rootfs, payload)
+}
+
+/// Build a VM with the given rootfs device and payload, add a default console,
+/// and run it. Does not return.
+///
+/// Callers must have loaded the required symbols via `require_vm_symbols()`
+/// (typically in `should_run()`).
+pub fn build_and_run(
+    num_cpus: u8,
+    ram_mib: u32,
+    rootfs: krun::FsDevice<'static>,
+    payload: krun::Payload,
+) -> anyhow::Result<()> {
     let mut console_builder = krun::ConsoleDevice::builder();
     console_builder
         .add_default_console(

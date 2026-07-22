@@ -24,19 +24,19 @@ use test_vm_config::TestVmConfig;
 // mod test_multiport_console;
 // use test_multiport_console::TestMultiportConsole;
 
-// #[cfg(any(feature = "host", target_os = "linux"))]
-// mod test_virtiofs_root_ro;
-// #[cfg(any(feature = "host", target_os = "linux"))]
-// use test_virtiofs_root_ro::TestVirtiofsRootRo;
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_virtiofs_root_ro;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_virtiofs_root_ro::TestVirtiofsRootRo;
 
-// mod test_augmentfs;
-// use test_augmentfs::TestAugmentFs;
+mod test_augmentfs;
+use test_augmentfs::TestAugmentFs;
 
 // mod test_root_disk_remount;
 // use test_root_disk_remount::TestRootDiskRemount;
 
-// mod test_pjdfstest;
-// use test_pjdfstest::TestPjdfstest;
+mod test_pjdfstest;
+use test_pjdfstest::TestPjdfstest;
 
 #[cfg(any(feature = "host", target_os = "linux"))]
 mod test_virtiofs_misc;
@@ -113,13 +113,13 @@ pub fn test_cases() -> Vec<TestCase> {
         // ),
         // TestCase::new("net-vmnet-helper", Box::new(TestNet::new_vmnet_helper())),
         // TestCase::new("multiport-console", Box::new(TestMultiportConsole)),
-        // #[cfg(any(feature = "host", target_os = "linux"))]
-        // TestCase::new("virtiofs-root-ro", Box::new(TestVirtiofsRootRo)),
-        // TestCase::new("augmentfs", Box::new(TestAugmentFs)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("virtiofs-root-ro", Box::new(TestVirtiofsRootRo)),
+        TestCase::new("augmentfs", Box::new(TestAugmentFs)),
         // TestCase::new("root-disk-remount", Box::new(TestRootDiskRemount)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-misc", Box::new(TestVirtioFsMisc)),
-        // TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
+        TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
         // TestCase::new("perf-net-passt-tx", Box::new(TestNetPerf::new_passt_tx())),
         // TestCase::new("perf-net-passt-rx", Box::new(TestNetPerf::new_passt_rx())),
         // TestCase::new("perf-net-tap-tx", Box::new(TestNetPerf::new_tap_tx())),
