@@ -15,11 +15,11 @@ use test_tsi_tcp_guest_connect::TestTsiTcpGuestConnect;
 mod test_tsi_tcp_guest_listen;
 use test_tsi_tcp_guest_listen::TestTsiTcpGuestListen;
 
-// pub(crate) mod test_net;
-// use test_net::TestNet;
+pub(crate) mod test_net;
+use test_net::TestNet;
 
-// mod test_net_perf;
-// use test_net_perf::TestNetPerf;
+mod test_net_perf;
+use test_net_perf::TestNetPerf;
 
 mod test_multiport_console;
 use test_multiport_console::TestMultiportConsole;
@@ -104,14 +104,14 @@ pub fn test_cases() -> Vec<TestCase> {
             "tsi-tcp-guest-listen",
             Box::new(TestTsiTcpGuestListen::new()),
         ),
-        // TestCase::new("net-passt", Box::new(TestNet::new_passt())),
-        // TestCase::new("net-tap", Box::new(TestNet::new_tap())),
-        // TestCase::new("net-gvproxy", Box::new(TestNet::new_gvproxy())),
-        // TestCase::new(
-        //     "net-gvproxy-long-path",
-        //     Box::new(TestNet::new_gvproxy_long_path()),
-        // ),
-        // TestCase::new("net-vmnet-helper", Box::new(TestNet::new_vmnet_helper())),
+        TestCase::new("net-passt", Box::new(TestNet::new_passt())),
+        TestCase::new("net-tap", Box::new(TestNet::new_tap())),
+        TestCase::new("net-gvproxy", Box::new(TestNet::new_gvproxy())),
+        TestCase::new(
+            "net-gvproxy-long-path",
+            Box::new(TestNet::new_gvproxy_long_path()),
+        ),
+        TestCase::new("net-vmnet-helper", Box::new(TestNet::new_vmnet_helper())),
         TestCase::new("multiport-console", Box::new(TestMultiportConsole)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-root-ro", Box::new(TestVirtiofsRootRo)),
@@ -120,26 +120,26 @@ pub fn test_cases() -> Vec<TestCase> {
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-misc", Box::new(TestVirtioFsMisc)),
         TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
-        // TestCase::new("perf-net-passt-tx", Box::new(TestNetPerf::new_passt_tx())),
-        // TestCase::new("perf-net-passt-rx", Box::new(TestNetPerf::new_passt_rx())),
-        // TestCase::new("perf-net-tap-tx", Box::new(TestNetPerf::new_tap_tx())),
-        // TestCase::new("perf-net-tap-rx", Box::new(TestNetPerf::new_tap_rx())),
-        // TestCase::new(
-        //     "perf-net-gvproxy-tx",
-        //     Box::new(TestNetPerf::new_gvproxy_tx()),
-        // ),
-        // TestCase::new(
-        //     "perf-net-gvproxy-rx",
-        //     Box::new(TestNetPerf::new_gvproxy_rx()),
-        // ),
-        // TestCase::new(
-        //     "perf-net-vmnet-helper-tx",
-        //     Box::new(TestNetPerf::new_vmnet_helper_tx()),
-        // ),
-        // TestCase::new(
-        //     "perf-net-vmnet-helper-rx",
-        //     Box::new(TestNetPerf::new_vmnet_helper_rx()),
-        // ),
+        TestCase::new("perf-net-passt-tx", Box::new(TestNetPerf::new_passt_tx())),
+        TestCase::new("perf-net-passt-rx", Box::new(TestNetPerf::new_passt_rx())),
+        TestCase::new("perf-net-tap-tx", Box::new(TestNetPerf::new_tap_tx())),
+        TestCase::new("perf-net-tap-rx", Box::new(TestNetPerf::new_tap_rx())),
+        TestCase::new(
+            "perf-net-gvproxy-tx",
+            Box::new(TestNetPerf::new_gvproxy_tx()),
+        ),
+        TestCase::new(
+            "perf-net-gvproxy-rx",
+            Box::new(TestNetPerf::new_gvproxy_rx()),
+        ),
+        TestCase::new(
+            "perf-net-vmnet-helper-tx",
+            Box::new(TestNetPerf::new_vmnet_helper_tx()),
+        ),
+        TestCase::new(
+            "perf-net-vmnet-helper-rx",
+            Box::new(TestNetPerf::new_vmnet_helper_rx()),
+        ),
         // TestCase::new("freebsd-boot", Box::new(TestFreeBsdBoot)),
         // TestCase::new(
         //     "freebsd-gvproxy-tcp-guest-connect",

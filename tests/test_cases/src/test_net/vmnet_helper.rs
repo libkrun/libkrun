@@ -1,14 +1,12 @@
 //! vmnet-helper backend for virtio-net test (macOS only)
 
-use crate::test_net::get_krun_add_net_unixgram;
-use crate::{ShouldRun, TestSetup, krun_call};
-use krun_sys::{
-    NET_FEATURE_CSUM, NET_FEATURE_GUEST_CSUM, NET_FEATURE_GUEST_TSO4, NET_FEATURE_HOST_TSO4,
-    NET_FLAG_DHCP_CLIENT,
-};
 use nix::libc;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
+
+use krun_via_cdylib_weak as krun;
+
+use crate::{ShouldRun, TestSetup};
 
 const VMNET_HELPER_PATH: &str = match option_env!("VMNET_HELPER_PATH") {
     Some(path) => path,
@@ -143,28 +141,21 @@ pub(crate) fn should_run() -> ShouldRun {
     }
 }
 
-pub(crate) fn setup_backend(ctx: u32, test_setup: &TestSetup) -> anyhow::Result<()> {
+const VMNET_NET_FEATURES: u32 = (1 << 0)   // CSUM
+    | (1 << 1)   // GUEST_CSUM
+    | (1 << 7)   // GUEST_TSO4
+    | (1 << 11); // HOST_TSO4
+
+pub(crate) fn setup_backend(test_setup: &TestSetup) -> anyhow::Result<krun::NetDevice> {
     let tmp_dir = test_setup
         .tmp_dir
         .canonicalize()
         .unwrap_or_else(|_| test_setup.tmp_dir.clone());
     let vmnet_log = tmp_dir.join("vmnet-helper.log");
 
-    let mut config = start_vmnet_helper(&vmnet_log)?;
+    let config = start_vmnet_helper(&vmnet_log)?;
     test_setup.register_cleanup_pid(config.pid);
 
-    unsafe {
-        krun_call!(get_krun_add_net_unixgram()(
-            ctx,
-            std::ptr::null(),
-            config.fd,
-            config.mac.as_mut_ptr(),
-            NET_FEATURE_CSUM
-                | NET_FEATURE_GUEST_CSUM
-                | NET_FEATURE_GUEST_TSO4
-                | NET_FEATURE_HOST_TSO4,
-            NET_FLAG_DHCP_CLIENT,
-        ))?;
-    }
-    Ok(())
+    krun::NetDevice::new_unixgram_fd("net0", config.fd, &config.mac, VMNET_NET_FEATURES)
+        .map_err(|e| anyhow::anyhow!("NetDevice: {e:?}"))
 }

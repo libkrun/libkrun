@@ -8,13 +8,16 @@ use crate::tcp_tester::TcpTester;
 use macros::{guest, host};
 
 #[host]
-use nix::libc;
-
-#[host]
-use std::ffi::CString;
-
-#[host]
 use crate::{ShouldRun, TestSetup};
+
+// TODO: export this via ffier from libkrun and use the generated constant instead
+#[cfg(feature = "host")]
+pub(crate) const COMPAT_NET_FEATURES: u32 = (1 << 0)  // CSUM
+    | (1 << 1)  // GUEST_CSUM
+    | (1 << 7)  // GUEST_TSO4
+    | (1 << 10) // GUEST_UFO
+    | (1 << 11) // HOST_TSO4
+    | (1 << 14); // HOST_UFO
 
 #[cfg(feature = "host")]
 pub(crate) mod gvproxy;
@@ -31,7 +34,7 @@ pub struct TestNet {
     #[cfg(feature = "host")]
     should_run: fn() -> ShouldRun,
     #[cfg(feature = "host")]
-    setup_backend: fn(u32, &TestSetup) -> anyhow::Result<()>,
+    setup_backend: fn(&TestSetup) -> anyhow::Result<krun_via_cdylib_weak::NetDevice>,
     #[cfg(feature = "host")]
     cleanup: Option<fn()>,
 }
@@ -103,15 +106,24 @@ impl TestNet {
 #[host]
 mod host {
     use super::*;
-    use crate::common::setup_fs_and_enter;
-    use crate::{Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
-    use krun_sys::*;
-    use std::os::fd::AsRawFd;
+    use crate::common::{self, init_config_builder, init_krun, setup_standard_devices_from};
+    use crate::{Test, TestOutcome, TestSetup};
+    use krun_via_cdylib_weak as krun;
     use std::thread;
 
     impl Test for TestNet {
         fn should_run(&self) -> ShouldRun {
-            if unsafe { krun_call_u32!(krun_has_feature(KRUN_FEATURE_NET.into())) }.ok() != Some(1)
+            if common::require_vm_symbols().is_err() {
+                return ShouldRun::No("core VM symbols not available");
+            }
+            if krun::require(
+                None,
+                &[
+                    krun::Symbol::KrunNetDeviceNewUnixgramPath,
+                    krun::Symbol::KrunNetDeviceDestroy,
+                ],
+            )
+            .is_err()
             {
                 return ShouldRun::No("libkrun compiled without NET");
             }
@@ -131,33 +143,43 @@ mod host {
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            // Start TCP server
             let tcp_tester = self.tcp_tester;
             let listener = tcp_tester.create_server_socket();
             thread::spawn(move || tcp_tester.run_server(listener));
 
-            unsafe {
-                krun_call!(krun_init_log(
-                    KRUN_LOG_TARGET_DEFAULT,
-                    KRUN_LOG_LEVEL_TRACE,
-                    KRUN_LOG_STYLE_AUTO,
-                    0
-                ))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_set_vm_config(ctx, 1, 512))?;
+            init_krun()?;
+            // TODO: duplicated with should_run — see require-in-should-run-broken.md
+            krun::require(
+                None,
+                &[
+                    krun::Symbol::KrunNetDeviceNewUnixgramPath,
+                    krun::Symbol::KrunNetDeviceNewUnixgramFd,
+                    krun::Symbol::KrunNetDeviceNewUnixstreamPath,
+                    krun::Symbol::KrunNetDeviceNewUnixstreamFd,
+                    krun::Symbol::KrunNetDeviceNewTap,
+                    krun::Symbol::KrunNetDeviceDestroy,
+                ],
+            )
+            .map_err(|e| anyhow::anyhow!("net symbols: {e}"))?;
 
-                // Backend-specific setup
-                (self.setup_backend)(ctx, &test_setup)?;
+            let builder = init_config_builder(&test_setup, &[]).dhcp(true);
+            let (mut devices, payload) = setup_standard_devices_from(&test_setup, builder)?;
 
-                krun_call!(krun_add_virtio_console_default(
-                    ctx,
-                    std::io::stdin().as_raw_fd(),
-                    std::io::stdout().as_raw_fd(),
-                    std::io::stderr().as_raw_fd(),
-                ))?;
-                setup_fs_and_enter(ctx, test_setup)?;
-            }
-            Ok(())
+            let net_device = (self.setup_backend)(&test_setup)?;
+            devices.add(net_device);
+
+            let mut vmm = krun::VmmBuilder::new()
+                .vcpus(1)
+                .map_err(|e| anyhow::anyhow!("vcpus: {e:?}"))?
+                .ram_mib(512)
+                .map_err(|e| anyhow::anyhow!("ram_mib: {e:?}"))?
+                .payload(payload)
+                .devices(devices)
+                .build()
+                .map_err(|e| anyhow::anyhow!("build: {e:?}"))?;
+
+            vmm.run();
+            unreachable!()
         }
     }
 }
@@ -174,22 +196,4 @@ mod guest {
             println!("OK");
         }
     }
-}
-
-#[cfg(feature = "host")]
-type KrunAddNetUnixgramFn = unsafe extern "C" fn(
-    ctx_id: u32,
-    c_path: *const std::ffi::c_char,
-    fd: i32,
-    c_mac: *mut u8,
-    features: u32,
-    flags: u32,
-) -> i32;
-
-#[cfg(feature = "host")]
-pub(crate) fn get_krun_add_net_unixgram() -> KrunAddNetUnixgramFn {
-    let symbol = CString::new("krun_add_net_unixgram").unwrap();
-    let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr()) };
-    assert!(!ptr.is_null(), "krun_add_net_unixgram not found");
-    unsafe { std::mem::transmute(ptr) }
 }

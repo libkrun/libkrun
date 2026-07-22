@@ -22,7 +22,7 @@ pub struct TestNetPerf {
     #[cfg(feature = "host")]
     should_run: fn() -> ShouldRun,
     #[cfg(feature = "host")]
-    setup_backend: fn(u32, &TestSetup) -> anyhow::Result<()>,
+    setup_backend: fn(&TestSetup) -> anyhow::Result<krun_via_cdylib_weak::NetDevice>,
     #[cfg(feature = "host")]
     cleanup: Option<fn()>,
 }
@@ -152,10 +152,9 @@ impl TestNetPerf {
 #[host]
 mod host {
     use super::*;
-    use crate::common::setup_fs_and_enter;
-    use crate::{Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
-    use krun_sys::*;
-    use std::os::fd::AsRawFd;
+    use crate::common::{self, init_config_builder, init_krun, setup_standard_devices_from};
+    use crate::{Test, TestOutcome, TestSetup};
+    use krun_via_cdylib_weak as krun;
     use std::process::{Child, Command, Stdio};
 
     const CONTAINERFILE: &str = "\
@@ -314,7 +313,17 @@ RUN dnf install -y iperf3 && dnf clean all
             if option_env!("IPERF_DURATION").is_none() {
                 return ShouldRun::No("IPERF_DURATION not set");
             }
-            if unsafe { krun_call_u32!(krun_has_feature(KRUN_FEATURE_NET.into())) }.ok() != Some(1)
+            if common::require_vm_symbols().is_err() {
+                return ShouldRun::No("core VM symbols not available");
+            }
+            if krun::require(
+                None,
+                &[
+                    krun::Symbol::KrunNetDeviceNewUnixgramPath,
+                    krun::Symbol::KrunNetDeviceDestroy,
+                ],
+            )
+            .is_err()
             {
                 return ShouldRun::No("libkrun compiled without NET");
             }
@@ -341,35 +350,47 @@ RUN dnf install -y iperf3 && dnf clean all
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            // Start iperf3 server on host (one-off, exits after first client)
             let iperf_server = start_iperf_server(self.port)?;
             test_setup.register_cleanup_pid(iperf_server.id());
 
-            // Give iperf3 server a moment to start
             std::thread::sleep(std::time::Duration::from_millis(200));
 
-            // Check it's still running
             let mut iperf_server = iperf_server;
             if let Some(status) = iperf_server.try_wait()? {
                 anyhow::bail!("iperf3 server exited early: {status}");
             }
 
-            unsafe {
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_set_vm_config(ctx, 1, 512))?;
+            init_krun()?;
+            // TODO: duplicated with should_run — see require-in-should-run-broken.md
+            krun::require(
+                None,
+                &[
+                    krun::Symbol::KrunNetDeviceNewUnixgramPath,
+                    krun::Symbol::KrunNetDeviceNewUnixgramFd,
+                    krun::Symbol::KrunNetDeviceNewTap,
+                    krun::Symbol::KrunNetDeviceDestroy,
+                ],
+            )
+            .map_err(|e| anyhow::anyhow!("net symbols: {e}"))?;
 
-                // Backend-specific setup
-                (self.setup_backend)(ctx, &test_setup)?;
+            let builder = init_config_builder(&test_setup, &[]).dhcp(true);
+            let (mut devices, payload) = setup_standard_devices_from(&test_setup, builder)?;
 
-                krun_call!(krun_add_virtio_console_default(
-                    ctx,
-                    std::io::stdin().as_raw_fd(),
-                    std::io::stdout().as_raw_fd(),
-                    std::io::stderr().as_raw_fd(),
-                ))?;
-                setup_fs_and_enter(ctx, test_setup)?;
-            }
-            Ok(())
+            let net_device = (self.setup_backend)(&test_setup)?;
+            devices.add(net_device);
+
+            let mut vmm = krun::VmmBuilder::new()
+                .vcpus(1)
+                .map_err(|e| anyhow::anyhow!("vcpus: {e:?}"))?
+                .ram_mib(512)
+                .map_err(|e| anyhow::anyhow!("ram_mib: {e:?}"))?
+                .payload(payload)
+                .devices(devices)
+                .build()
+                .map_err(|e| anyhow::anyhow!("build: {e:?}"))?;
+
+            vmm.run();
+            unreachable!()
         }
 
         fn check(self: Box<Self>, stdout: Vec<u8>, _test_setup: TestSetup) -> TestOutcome {

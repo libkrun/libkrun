@@ -145,12 +145,29 @@ pub fn setup_and_run_with_env(
 /// Set up the standard test VM: rootfs + init config + console + balloon + rng.
 /// Returns a device manager and payload ready for the test to add extra devices
 /// (vsock, block, net, etc.) before passing to `build_and_run()`.
+/// Create a base init config builder for the given test case.
+pub fn init_config_builder(test_setup: &TestSetup, guest_env: &[&str]) -> krun_init::Builder {
+    krun_init::Config::builder()
+        .args(&["/guest-agent", &test_setup.test_case])
+        .workdir("/")
+        .env(guest_env)
+}
+
 pub fn setup_standard_devices(
     test_setup: &TestSetup,
     guest_env: &[&str],
 ) -> anyhow::Result<(krun::MmioDeviceManager<'static>, krun::Payload)> {
+    setup_standard_devices_from(test_setup, init_config_builder(test_setup, guest_env))
+}
+
+/// Build standard devices from a pre-configured init config builder.
+/// Caller can customize the builder (e.g. `.dhcp(true)`) before passing it.
+pub fn setup_standard_devices_from(
+    test_setup: &TestSetup,
+    builder: krun_init::Builder,
+) -> anyhow::Result<(krun::MmioDeviceManager<'static>, krun::Payload)> {
     let root_dir = setup_rootfs(test_setup)?;
-    let init_config = build_init_config(&test_setup.test_case, guest_env);
+    let init_config = builder.build();
 
     let mut rootfs = krun::FsDevice::new("/dev/root", root_dir.to_str().unwrap())
         .map_err(|e| anyhow::anyhow!("FsDevice::new: {e:?}"))?;

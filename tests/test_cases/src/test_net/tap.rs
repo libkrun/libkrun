@@ -1,33 +1,19 @@
 //! TAP backend for virtio-net test
 
-use crate::{ShouldRun, TestSetup, krun_call};
-use krun_sys::{COMPAT_NET_FEATURES, NET_FLAG_DHCP_CLIENT};
 use nix::libc;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
-use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
 
+use krun_via_cdylib_weak as krun;
+
+use crate::{ShouldRun, TestSetup};
+
 const DEFAULT_TAP_NAME: &str = "tap0";
 const HOST_IP: [u8; 4] = [10, 0, 0, 1];
 const NETMASK: [u8; 4] = [255, 255, 255, 0];
-
-type KrunAddNetTapFn = unsafe extern "C" fn(
-    ctx_id: u32,
-    c_tap_name: *const std::ffi::c_char,
-    c_mac: *mut u8,
-    features: u32,
-    flags: u32,
-) -> i32;
-
-fn get_krun_add_net_tap() -> KrunAddNetTapFn {
-    let symbol = CString::new("krun_add_net_tap").unwrap();
-    let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr()) };
-    assert!(!ptr.is_null(), "krun_add_net_tap not found");
-    unsafe { std::mem::transmute(ptr) }
-}
 
 fn interface_exists(name: &str) -> bool {
     std::path::Path::new(&format!("/sys/class/net/{}", name)).exists()
@@ -190,7 +176,7 @@ fn start_dhcp_server(tap_name: &str, test_setup: &TestSetup) -> anyhow::Result<(
     anyhow::bail!("dnsmasq did not start in time");
 }
 
-pub(crate) fn setup_backend(ctx: u32, test_setup: &TestSetup) -> anyhow::Result<()> {
+pub(crate) fn setup_backend(test_setup: &TestSetup) -> anyhow::Result<krun::NetDevice> {
     let tap_name = if let Ok(name) = std::env::var("LIBKRUN_TAP_NAME") {
         name
     } else {
@@ -201,17 +187,13 @@ pub(crate) fn setup_backend(ctx: u32, test_setup: &TestSetup) -> anyhow::Result<
         DEFAULT_TAP_NAME.to_string()
     };
 
-    let mut mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
-    let tap_name_c = CString::new(tap_name).unwrap();
+    let mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
 
-    unsafe {
-        krun_call!(get_krun_add_net_tap()(
-            ctx,
-            tap_name_c.as_ptr(),
-            mac.as_mut_ptr(),
-            COMPAT_NET_FEATURES,
-            NET_FLAG_DHCP_CLIENT,
-        ))?;
-    }
-    Ok(())
+    krun::NetDevice::new_tap(
+        "net0",
+        &tap_name,
+        &mac,
+        crate::test_net::COMPAT_NET_FEATURES,
+    )
+    .map_err(|e| anyhow::anyhow!("NetDevice: {e:?}"))
 }

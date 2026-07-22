@@ -1,27 +1,11 @@
 //! Passt backend for virtio-net test
 
-use crate::{ShouldRun, TestSetup, krun_call};
-use krun_sys::{COMPAT_NET_FEATURES, NET_FLAG_DHCP_CLIENT};
+use crate::{ShouldRun, TestSetup};
 use nix::libc;
-use std::ffi::CString;
 use std::os::unix::io::RawFd;
 use std::process::{Command, Stdio};
 
-type KrunAddNetUnixstreamFn = unsafe extern "C" fn(
-    ctx_id: u32,
-    c_path: *const std::ffi::c_char,
-    fd: std::ffi::c_int,
-    c_mac: *mut u8,
-    features: u32,
-    flags: u32,
-) -> i32;
-
-fn get_krun_add_net_unixstream() -> KrunAddNetUnixstreamFn {
-    let symbol = CString::new("krun_add_net_unixstream").unwrap();
-    let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr()) };
-    assert!(!ptr.is_null(), "krun_add_net_unixstream not found");
-    unsafe { std::mem::transmute(ptr) }
-}
+use krun_via_cdylib_weak as krun;
 
 fn passt_available() -> bool {
     Command::new("which")
@@ -87,19 +71,10 @@ pub(crate) fn should_run() -> ShouldRun {
     ShouldRun::Yes
 }
 
-pub(crate) fn setup_backend(ctx: u32, _test_setup: &TestSetup) -> anyhow::Result<()> {
+pub(crate) fn setup_backend(_test_setup: &TestSetup) -> anyhow::Result<krun::NetDevice> {
     let passt_fd = start_passt()?;
-    let mut mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
+    let mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
 
-    unsafe {
-        krun_call!(get_krun_add_net_unixstream()(
-            ctx,
-            std::ptr::null(),
-            passt_fd,
-            mac.as_mut_ptr(),
-            COMPAT_NET_FEATURES,
-            NET_FLAG_DHCP_CLIENT,
-        ))?;
-    }
-    Ok(())
+    krun::NetDevice::new_unixstream_fd("net0", passt_fd, &mac, crate::test_net::COMPAT_NET_FEATURES)
+        .map_err(|e| anyhow::anyhow!("NetDevice: {e:?}"))
 }
