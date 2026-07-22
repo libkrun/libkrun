@@ -61,6 +61,21 @@ jobs:
         env:
           KRUN_INIT_BINARY_PATH: ${{ github.workspace }}/init/init
 
+  verify-init-blob-bindings:
+    name: init-blob bindings
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build-env
+
+      - name: Install ffier-gen-c-header
+        run: cargo install --git https://github.com/mtjhrc/ffier.git --rev 9ee67e2 ffier-gen-c-header
+
+      - name: Verify bindings are up to date
+        run: make verify-init-blob-bindings
+
   code-quality-examples:
     name: ${{ matrix.name }}
     strategy:
