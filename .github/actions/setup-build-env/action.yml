@@ -13,6 +13,16 @@ runs:
         rustup toolchain install nightly
         rustup component add rust-src --toolchain nightly
 
+    - name: Add musl target
+      shell: bash
+      run: |
+        case $(uname -m) in
+          x86_64)  TARGET="x86_64-unknown-linux-musl"  ;;
+          aarch64|arm64) TARGET="aarch64-unknown-linux-musl" ;;
+          *)       echo "unknown arch: $(uname -m)"; exit 1 ;;
+        esac
+        rustup target add "$TARGET"
+
     - name: Cache Cargo dependencies
       uses: actions/cache@v4
       with:
