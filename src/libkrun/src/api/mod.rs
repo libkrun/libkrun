@@ -17,7 +17,7 @@ pub use devices::BlockDevice;
 #[cfg(feature = "net")]
 pub use devices::NetDevice;
 #[cfg(feature = "gpu")]
-pub use devices::{DisplayBackend, DisplayInfoBuilder};
+pub use devices::{DisplayBackend, DisplayInfoBuilder, GpuDevice};
 pub use devices::{
     AttachContext, AttachDevice, ConsoleBuilder, ConsoleDevice, DeviceManager, DeviceRequirements,
     MmioDeviceManager, ResolvedShmRegion, VsockDevice,

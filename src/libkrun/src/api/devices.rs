@@ -1223,6 +1223,64 @@ impl DisplayBackend {
     }
 }
 
+/// A virtio GPU device with virgl 3D acceleration.
+#[cfg(feature = "gpu")]
+pub struct GpuDevice {
+    virgl_flags: u32,
+    backend: DisplayBackend,
+    shm_size: usize,
+}
+
+#[cfg(feature = "gpu")]
+impl GpuDevice {
+    const DEFAULT_SHM_SIZE: usize = 1 << 33;
+
+    pub fn new(virgl_flags: u32, backend: DisplayBackend) -> Self {
+        Self {
+            virgl_flags,
+            backend,
+            shm_size: Self::DEFAULT_SHM_SIZE,
+        }
+    }
+
+    pub fn shm_size(mut self, size: usize) -> Self {
+        self.shm_size = size;
+        self
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl<'a> AttachDevice<'a> for GpuDevice {
+    fn requirements(&self) -> DeviceRequirements {
+        DeviceRequirements {
+            gpu_shm: Some(self.shm_size),
+            ..Default::default()
+        }
+    }
+
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), DetailedError> {
+        let displays: Box<[DisplayInfo]> = self.backend.displays.into_boxed_slice();
+
+        let gpu = devices::virtio::Gpu::new(
+            self.virgl_flags,
+            displays,
+            self.backend.inner,
+            #[cfg(target_os = "macos")]
+            ctx.map_sender().expect("macOS requires map_sender for GPU"),
+        )
+        .map_err(|e| DetailedError::new(Error::Internal(), format!("gpu: {e:?}")))?;
+
+        let inner = Arc::new(Mutex::new(gpu));
+
+        if let Some(region) = ctx.resolved_gpu_shm_region() {
+            inner.lock().unwrap().set_shm_region(region.into());
+        }
+
+        let id = inner.lock().unwrap().id().to_string();
+        ctx.register(&id, inner)
+    }
+}
+
 /// Walk parent directory components in a virtual entry tree, returning the
 /// children vec of the deepest parent.
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
