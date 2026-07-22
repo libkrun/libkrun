@@ -21,6 +21,8 @@ pub struct VmmBuilder<'a> {
     #[cfg(unix)]
     serial_input_fd: Option<RawFd>,
     kernel_console: Option<String>,
+    #[cfg(feature = "tee")]
+    tee_config_path: Option<std::path::PathBuf>,
 }
 
 impl Default for VmmBuilder<'_> {
@@ -40,6 +42,8 @@ impl<'a> VmmBuilder<'a> {
             #[cfg(unix)]
             serial_input_fd: None,
             kernel_console: None,
+            #[cfg(feature = "tee")]
+            tee_config_path: None,
         }
     }
 
@@ -86,6 +90,17 @@ impl<'a> VmmBuilder<'a> {
     #[cfg(unix)]
     pub fn serial_input_fd(mut self, fd: RawFd) -> Self {
         self.serial_input_fd = Some(fd);
+        self
+    }
+
+    /// Load TEE configuration from a JSON file.
+    ///
+    /// The file is parsed to obtain the TEE type (SNP/TDX), vCPU count,
+    /// and RAM size — overriding values set by [`vcpus`](Self::vcpus) and
+    /// [`ram_mib`](Self::ram_mib) if already set.
+    #[cfg(feature = "tee")]
+    pub fn set_tee_config_file(mut self, path: &str) -> Self {
+        self.tee_config_path = Some(std::path::PathBuf::from(path));
         self
     }
 }
@@ -143,10 +158,31 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, DetailedError> {
         vm_resources.external_kernel = Some(ek.clone());
     }
 
+    #[cfg(feature = "tee")]
+    if let Some(qboot) = loaded_kernel.qboot_bundle {
+        vm_resources
+            .set_qboot_bundle(qboot)
+            .map_err(|e| DetailedError::new(Error::InvalidParam(), format!("{e}")))?;
+    }
+
+    #[cfg(feature = "tee")]
+    if let Some(initrd) = loaded_kernel.initrd_bundle {
+        vm_resources
+            .set_initrd_bundle(initrd)
+            .map_err(|e| DetailedError::new(Error::InvalidParam(), format!("{e}")))?;
+    }
+
     vm_resources.kernel_cmdline.prolog = Some(loaded_kernel.cmdline);
 
     if let Some(console) = builder_cfg.kernel_console {
         vm_resources.kernel_console = Some(console);
+    }
+
+    #[cfg(feature = "tee")]
+    if let Some(tee_path) = builder_cfg.tee_config_path {
+        vm_resources
+            .set_tee_config(tee_path)
+            .map_err(|e| DetailedError::new(Error::InvalidParam(), format!("{e:?}")))?;
     }
 
     #[cfg(unix)]

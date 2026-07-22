@@ -7,6 +7,10 @@ pub struct Payload {
     pub(crate) bundle: Option<vmm::vmm_config::kernel_bundle::KernelBundle>,
     pub(crate) payload: vmm::builder::Payload,
     pub(crate) cmdline: String,
+    #[cfg(feature = "tee")]
+    pub(crate) qboot_bundle: Option<vmm::vmm_config::kernel_bundle::QbootBundle>,
+    #[cfg(feature = "tee")]
+    pub(crate) initrd_bundle: Option<vmm::vmm_config::kernel_bundle::InitrdBundle>,
 }
 
 #[ffier::export]
@@ -40,12 +44,15 @@ impl Payload {
             size,
         };
 
+        #[cfg(feature = "tee")]
+        let (qboot_bundle, initrd_bundle) = load_tee_bundles(lib)?;
+
         let payload_type = vmm::builder::choose_payload(
             Some(&bundle),
             #[cfg(feature = "tee")]
-            None,
+            qboot_bundle.as_ref(),
             #[cfg(feature = "tee")]
-            None,
+            initrd_bundle.as_ref(),
             None,
             None,
         )
@@ -60,6 +67,10 @@ impl Payload {
             bundle: Some(bundle),
             payload: payload_type,
             cmdline,
+            #[cfg(feature = "tee")]
+            qboot_bundle,
+            #[cfg(feature = "tee")]
+            initrd_bundle,
         })
     }
 
@@ -97,6 +108,10 @@ impl Payload {
             bundle: None,
             payload: payload_type,
             cmdline: cmdline.to_string(),
+            #[cfg(feature = "tee")]
+            qboot_bundle: None,
+            #[cfg(feature = "tee")]
+            initrd_bundle: None,
         })
     }
 
@@ -110,6 +125,62 @@ impl Payload {
             self.cmdline.push_str(extra);
         }
     }
+}
+
+/// Load qboot and initrd bundles from the TEE-specific krunfw library.
+#[cfg(feature = "tee")]
+fn load_tee_bundles(
+    lib: &libloading::Library,
+) -> Result<
+    (
+        Option<vmm::vmm_config::kernel_bundle::QbootBundle>,
+        Option<vmm::vmm_config::kernel_bundle::InitrdBundle>,
+    ),
+    Error,
+> {
+    use vmm::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle};
+
+    let get_qboot: libloading::Symbol<
+        unsafe extern "C" fn(*mut usize) -> *mut libc::c_char,
+    > = unsafe {
+        lib.get(b"krunfw_get_qboot").map_err(|e| {
+            log::error!("krunfw symbol krunfw_get_qboot: {e}");
+            Error::Internal()
+        })?
+    };
+
+    let get_initrd: libloading::Symbol<
+        unsafe extern "C" fn(*mut usize) -> *mut libc::c_char,
+    > = unsafe {
+        lib.get(b"krunfw_get_initrd").map_err(|e| {
+            log::error!("krunfw symbol krunfw_get_initrd: {e}");
+            Error::Internal()
+        })?
+    };
+
+    let mut qboot_size: usize = 0;
+    let qboot_host_addr = unsafe { get_qboot(&mut qboot_size) };
+    if qboot_host_addr.is_null() {
+        log::error!("krunfw_get_qboot returned null");
+        return Err(Error::BootError());
+    }
+    let qboot_bundle = QbootBundle {
+        host_addr: qboot_host_addr as u64,
+        size: qboot_size,
+    };
+
+    let mut initrd_size: usize = 0;
+    let initrd_host_addr = unsafe { get_initrd(&mut initrd_size) };
+    if initrd_host_addr.is_null() {
+        log::error!("krunfw_get_initrd returned null");
+        return Err(Error::BootError());
+    }
+    let initrd_bundle = InitrdBundle {
+        host_addr: initrd_host_addr as u64,
+        size: initrd_size,
+    };
+
+    Ok((Some(qboot_bundle), Some(initrd_bundle)))
 }
 
 #[ffier::export]
