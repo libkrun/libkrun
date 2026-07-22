@@ -9,6 +9,8 @@ use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 
 use devices::legacy::IrqChip;
+#[cfg(feature = "gpu")]
+use devices::virtio::display::{DisplayInfo, DisplayInfoEdid, PhysicalSize};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -1130,6 +1132,94 @@ impl<'a> AttachDevice<'a> for NetDevice {
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), DetailedError> {
         let id = self.inner.lock().unwrap().id().to_string();
         ctx.register(&id, self.inner)
+    }
+}
+
+/// Builder for display configuration.
+#[cfg(feature = "gpu")]
+pub struct DisplayInfoBuilder {
+    pub(crate) inner: DisplayInfo,
+}
+
+#[cfg(feature = "gpu")]
+#[ffier::export]
+impl DisplayInfoBuilder {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            inner: DisplayInfo::new(width, height),
+        }
+    }
+
+    pub fn edid(mut self, edid: &[u8]) -> Self {
+        self.inner.edid = DisplayInfoEdid::Provided(edid.to_vec().into_boxed_slice());
+        self
+    }
+
+    pub fn dpi(mut self, dpi: u32) -> Self {
+        match &mut self.inner.edid {
+            DisplayInfoEdid::Generated(params) => {
+                params.physical_size = PhysicalSize::Dpi(dpi);
+            }
+            DisplayInfoEdid::Provided(_) => {}
+        }
+        self
+    }
+
+    pub fn physical_size(mut self, width_mm: u16, height_mm: u16) -> Self {
+        match &mut self.inner.edid {
+            DisplayInfoEdid::Generated(params) => {
+                params.physical_size = PhysicalSize::DimensionsMillimeters(width_mm, height_mm);
+            }
+            DisplayInfoEdid::Provided(_) => {}
+        }
+        self
+    }
+
+    pub fn refresh_rate(mut self, rate: u32) -> Self {
+        match &mut self.inner.edid {
+            DisplayInfoEdid::Generated(params) => {
+                params.refresh_rate = rate;
+            }
+            DisplayInfoEdid::Provided(_) => {}
+        }
+        self
+    }
+}
+
+/// Wraps the pre-ffier display backend and owns the list of displays.
+#[cfg(feature = "gpu")]
+#[allow(dead_code)]
+pub struct DisplayBackend {
+    pub(crate) inner: krun_display::DisplayBackend<'static>,
+    pub(crate) displays: Vec<DisplayInfo>,
+}
+
+#[cfg(feature = "gpu")]
+impl DisplayBackend {
+    /// Create from the opaque pre-ffier `krun_display_backend` vtable pointer.
+    ///
+    /// # Safety
+    ///
+    /// `vtable` must point to a valid `krun_display_backend` struct of at least
+    /// `vtable_size` bytes. The struct is copied — the caller retains ownership
+    /// of the original.
+    pub unsafe fn new(vtable: *const std::ffi::c_void, vtable_size: usize) -> Result<Self, Error> {
+        if vtable_size < std::mem::size_of::<krun_display::DisplayBackend>() {
+            return Err(Error::InvalidParam());
+        }
+        let backend: krun_display::DisplayBackend =
+            unsafe { std::ptr::read_unaligned(vtable as *const krun_display::DisplayBackend) };
+        if !backend.verify() {
+            return Err(Error::InvalidParam());
+        }
+        Ok(Self {
+            inner: backend,
+            displays: Vec::new(),
+        })
+    }
+
+    pub fn add_display(&mut self, display: DisplayInfoBuilder) {
+        self.displays.push(display.inner);
     }
 }
 

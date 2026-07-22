@@ -16,10 +16,7 @@ fn gen_c_header() {
     });
     let lib: ffier_schema::Library = serde_json::from_str(&json)
         .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
-    let opts = ffier_gen_c_header::Options {
-        fn_typedefs: true,
-        ..Default::default()
-    };
+    let opts = ffier_gen_c_header::Options { fn_typedefs: true };
     print!("{}", ffier_gen_c_header::generate(&lib, "LIBKRUN_H", &opts));
 }
 

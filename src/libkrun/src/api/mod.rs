@@ -16,6 +16,8 @@ pub use devices::FsOverlay;
 pub use devices::BlockDevice;
 #[cfg(feature = "net")]
 pub use devices::NetDevice;
+#[cfg(feature = "gpu")]
+pub use devices::{DisplayBackend, DisplayInfoBuilder};
 pub use devices::{
     AttachContext, AttachDevice, ConsoleBuilder, ConsoleDevice, DeviceManager, DeviceRequirements,
     MmioDeviceManager, ResolvedShmRegion, VsockDevice,
@@ -61,6 +63,8 @@ ffier::library_definition!("krun", library_tag = 1,
     crate::api::devices::NetDevice = 18,
     #[cfg(feature = "net")]
     crate::api::devices::AttachDevice for crate::api::devices::NetDevice,
+    #[cfg(feature = "gpu")]
+    crate::api::devices::DisplayInfoBuilder = 19,
     #[cfg(not(feature = "tee"))]
     crate::api::devices::AttachDevice for crate::api::devices::BalloonDevice,
     #[cfg(not(feature = "tee"))]
