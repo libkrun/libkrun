@@ -1283,6 +1283,87 @@ impl<'a> AttachDevice<'a> for GpuDevice {
     }
 }
 
+/// A vhost-user device that connects to an external backend via a Unix socket.
+///
+/// The backend process handles device I/O on behalf of the guest. Because the
+/// backend must access guest memory directly, this device requires
+/// process-shareable (file-backed) guest memory — the requirement is declared
+/// via [`AttachDevice::requirements`] and flows into
+/// `create_guest_memory`'s `use_vhost_user` argument automatically.
+#[cfg(all(feature = "vhost-user", target_os = "linux"))]
+pub struct VhostUserDevice {
+    device_type: u32,
+    socket_path: String,
+    name: String,
+    num_queues: u16,
+    queue_sizes: Vec<u16>,
+}
+
+#[cfg(all(feature = "vhost-user", target_os = "linux"))]
+#[ffier::export]
+impl VhostUserDevice {
+    /// Create a new vhost-user device.
+    ///
+    /// # Arguments
+    ///
+    /// - `device_type`: virtio device type ID (e.g. 4 for RNG, 32 for Sound).
+    /// - `socket_path`: path to the vhost-user Unix domain socket.
+    /// - `name`: human-readable name for logging. If empty, defaults to
+    ///   `"vhost-user-{device_type}"`.
+    /// - `num_queues`: number of queues (0 = query backend via MQ protocol).
+    /// - `queue_sizes`: size for each queue (empty slice = use default of 256).
+    pub fn new(
+        device_type: u32,
+        socket_path: &str,
+        name: &str,
+        num_queues: u16,
+        queue_sizes: &[u16],
+    ) -> Result<Self, Error> {
+        let name = if name.is_empty() {
+            format!("vhost-user-{device_type}")
+        } else {
+            name.to_string()
+        };
+        Ok(Self {
+            device_type,
+            socket_path: socket_path.to_string(),
+            name,
+            num_queues,
+            queue_sizes: queue_sizes.to_vec(),
+        })
+    }
+}
+
+#[cfg(all(feature = "vhost-user", target_os = "linux"))]
+#[ffier::export]
+impl<'a> AttachDevice<'a> for VhostUserDevice {
+    #[ffier(skip)]
+    fn requirements(&self) -> DeviceRequirements {
+        DeviceRequirements {
+            process_shareable_memory: true,
+            ..Default::default()
+        }
+    }
+
+    #[ffier(skip)]
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), DetailedError> {
+        let device = devices::virtio::VhostUserDevice::new(
+            &self.socket_path,
+            self.device_type,
+            self.name.clone(),
+            self.num_queues,
+            &self.queue_sizes,
+        )
+        .map_err(|e| {
+            DetailedError::new(Error::Internal(), format!("vhost-user: {e}"))
+        })?;
+        let inner = Arc::new(Mutex::new(device));
+        ctx.subscribe_events(inner.clone())?;
+        ctx.register(&self.name, inner)
+    }
+}
+
+
 /// A virtio input device forwarding host input events to the guest.
 #[cfg(feature = "input")]
 pub struct InputDevice {

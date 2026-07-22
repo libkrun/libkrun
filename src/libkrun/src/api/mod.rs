@@ -20,6 +20,8 @@ pub use devices::NetDevice;
 pub use devices::{DisplayBackend, DisplayInfoBuilder, GpuDevice};
 #[cfg(feature = "input")]
 pub use devices::InputDevice;
+#[cfg(all(feature = "vhost-user", target_os = "linux"))]
+pub use devices::VhostUserDevice;
 pub use devices::{
     AttachContext, AttachDevice, ConsoleBuilder, ConsoleDevice, DeviceManager, DeviceRequirements,
     MmioDeviceManager, ResolvedShmRegion, VsockDevice,
@@ -67,6 +69,10 @@ ffier::library_definition!("krun", library_tag = 1,
     crate::api::devices::AttachDevice for crate::api::devices::NetDevice,
     #[cfg(feature = "gpu")]
     crate::api::devices::DisplayInfoBuilder = 19,
+    #[cfg(all(feature = "vhost-user", target_os = "linux"))]
+    crate::api::devices::VhostUserDevice = 20,
+    #[cfg(all(feature = "vhost-user", target_os = "linux"))]
+    crate::api::devices::AttachDevice for crate::api::devices::VhostUserDevice,
     #[cfg(not(feature = "tee"))]
     crate::api::devices::AttachDevice for crate::api::devices::BalloonDevice,
     #[cfg(not(feature = "tee"))]
