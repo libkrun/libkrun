@@ -1,8 +1,8 @@
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use std::ffi::CString;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+use std::io::IsTerminal;
 use std::marker::PhantomData;
-use std::os::fd::{BorrowedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 
@@ -11,7 +11,7 @@ use devices::legacy::IrqChip;
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::passthrough::PermissionSemantics;
-use devices::virtio::{VirtioDevice, VirtioShmRegion, VmmExitObserver};
+use devices::virtio::{PortDescription, VirtioDevice, VirtioShmRegion, VmmExitObserver, port_io};
 use polly::event_manager::{EventManager, Subscriber};
 use vm_memory::GuestMemoryMmap;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -578,6 +578,285 @@ impl<'a> AttachDevice<'a> for FsDevice<'a> {
         }
 
         ctx.register(&format!("virtiofs{}", ctx.device_index()), self.inner)
+    }
+}
+
+/// A virtio multiport console device.
+///
+/// The console provides one or more serial ports to the guest, each
+/// backed by a host file descriptor (typically a TTY). The guest kernel
+/// sees these as `/dev/hvcN` devices.
+///
+/// Use [`ConsoleDevice::builder`] to configure ports, then
+/// [`ConsoleBuilder::build`] to finalize.
+pub struct ConsoleDevice<'a> {
+    pub(crate) ports: Vec<PortDescription>,
+    #[allow(dead_code)]
+    pub(crate) kernel_console_port: Option<u32>,
+    /// Raw fds of TTY ports that need raw mode set after Vmm is constructed.
+    pub(crate) tty_fds: Vec<i32>,
+    _lifetime: PhantomData<&'a ()>,
+}
+
+/// Builder for configuring a [`ConsoleDevice`].
+///
+/// Add one or more ports with [`add_tty_port`](ConsoleBuilder::add_tty_port),
+/// then call [`build`](ConsoleBuilder::build) to create the device.
+pub struct ConsoleBuilder<'a> {
+    ports: Vec<PortDescription>,
+    kernel_console_port: Option<u32>,
+    tty_fds: Vec<i32>,
+    _lifetime: PhantomData<&'a ()>,
+}
+
+#[ffier::export]
+impl<'a> ConsoleDevice<'a> {
+    /// Create a new console builder.
+    pub fn builder() -> ConsoleBuilder<'a> {
+        ConsoleBuilder {
+            ports: Vec::new(),
+            kernel_console_port: None,
+            tty_fds: Vec::new(),
+            _lifetime: PhantomData,
+        }
+    }
+}
+
+#[ffier::export]
+impl<'a> ConsoleBuilder<'a> {
+    /// Add a TTY-backed port to the console.
+    ///
+    /// If the fd refers to a real terminal, raw mode will be enabled on it
+    /// when the VM starts, and restored on shutdown.
+    ///
+    /// # Arguments
+    ///
+    /// - `name`: the port name visible to the guest (e.g. `"tty0"`).
+    /// - `tty_fd`: borrowed fd for the host TTY; duplicated internally, caller retains ownership.
+    ///
+    /// # Returns
+    ///
+    /// The zero-based port index, usable with [`set_kernel_console`](ConsoleBuilder::set_kernel_console).
+    pub fn add_tty_port(&mut self, name: &str, tty_fd: BorrowedFd<'a>) -> Result<u32, Error> {
+        let index = self.ports.len() as u32;
+        self.add_tty_port_inner(name, tty_fd)?;
+        Ok(index)
+    }
+
+    /// Designate a port as the kernel console (`console=hvcN`).
+    ///
+    /// # Arguments
+    ///
+    /// - `port_index`: a value returned by [`add_tty_port`](ConsoleBuilder::add_tty_port).
+    pub fn set_kernel_console(&mut self, port_index: u32) -> Result<(), Error> {
+        if port_index as usize >= self.ports.len() {
+            return Err(Error::OutOfRange());
+        }
+        self.kernel_console_port = Some(port_index);
+        Ok(())
+    }
+
+    /// Build the console device. At least one port must have been added.
+    pub fn build(self) -> Result<ConsoleDevice<'a>, Error> {
+        if self.ports.is_empty() {
+            return Err(Error::MissingConfig());
+        }
+        Ok(ConsoleDevice {
+            ports: self.ports,
+            kernel_console_port: self.kernel_console_port,
+            tty_fds: self.tty_fds,
+            _lifetime: PhantomData,
+        })
+    }
+
+    /// Set up the default console: port 0 (hvc0) plus named redirect ports.
+    ///
+    /// Replicates the v1 `krun_add_virtio_console_default` behaviour:
+    ///
+    /// - If any fd is a terminal, port 0 becomes a full TTY console
+    ///   (raw mode enabled), and that fd is NOT added as a redirect port.
+    /// - Otherwise, port 0 gets log output and named redirect ports
+    ///   (`krun-stdin`, `krun-stdout`, `krun-stderr`) are added.
+    ///
+    /// Pass -1 to skip a stream.
+    pub fn add_default_console(
+        &mut self,
+        stdin: RawFd,
+        stdout: RawFd,
+        stderr: RawFd,
+    ) -> Result<(), Error> {
+        let stdin_fd = (stdin >= 0).then(|| unsafe { BorrowedFd::borrow_raw(stdin) });
+        let stdout_fd = (stdout >= 0).then(|| unsafe { BorrowedFd::borrow_raw(stdout) });
+        let stderr_fd = (stderr >= 0).then(|| unsafe { BorrowedFd::borrow_raw(stderr) });
+
+        let stdin_is_tty = stdin_fd.as_ref().is_some_and(|fd| fd.is_terminal());
+        let stdout_is_tty = stdout_fd.as_ref().is_some_and(|fd| fd.is_terminal());
+        let stderr_is_tty = stderr_fd.as_ref().is_some_and(|fd| fd.is_terminal());
+
+        let term_fd = if stdin_is_tty {
+            stdin_fd.as_ref()
+        } else if stdout_is_tty {
+            stdout_fd.as_ref()
+        } else if stderr_is_tty {
+            stderr_fd.as_ref()
+        } else {
+            None
+        };
+
+        // Port 0: default console (hvc0)
+        if let Some(tfd) = term_fd {
+            self.add_tty_port_inner("", *tfd)?;
+        } else {
+            // Non-TTY: port 0 = log output, fixed terminal size
+            self.ports.push(PortDescription {
+                name: "".into(),
+                input: None,
+                output: Some(port_io::output_to_log_as_err()),
+                terminal: Some(port_io::term_fixed_size(0, 0)),
+            });
+        }
+
+        // Named redirect ports for non-terminal fds
+        if stdin >= 0 && !stdin_is_tty {
+            self.add_io_port("krun-stdin", Some(stdin), None)?;
+        }
+        if stdout >= 0 && !stdout_is_tty {
+            self.add_io_port("krun-stdout", None, Some(stdout))?;
+        }
+        if stderr >= 0 && !stderr_is_tty {
+            self.add_io_port("krun-stderr", None, Some(stderr))?;
+        }
+
+        Ok(())
+    }
+}
+
+#[allow(dead_code)]
+impl ConsoleBuilder<'_> {
+    /// Add an output-only port (no input, no terminal).
+    pub(crate) fn add_output_port(
+        &mut self,
+        name: &str,
+        output: Box<dyn devices::virtio::port_io::PortOutput + Send>,
+    ) -> u32 {
+        let index = self.ports.len() as u32;
+        self.ports.push(PortDescription {
+            name: name.to_string().into(),
+            input: None,
+            output: Some(output),
+            terminal: None,
+        });
+        index
+    }
+
+    /// Add an output-only console port with fake terminal properties.
+    pub fn add_console_port(
+        &mut self,
+        name: &str,
+        output: Box<dyn devices::virtio::port_io::PortOutput + Send>,
+    ) -> u32 {
+        let index = self.ports.len() as u32;
+        self.ports.push(PortDescription {
+            name: name.to_string().into(),
+            input: None,
+            output: Some(output),
+            terminal: Some(port_io::term_fixed_size(80, 24)),
+        });
+        index
+    }
+
+    /// Add a port with separate input and output fds (no terminal properties).
+    pub fn add_io_port(
+        &mut self,
+        name: &str,
+        input_fd: Option<i32>,
+        output_fd: Option<i32>,
+    ) -> Result<u32, Error> {
+        let index = self.ports.len() as u32;
+        let input = match input_fd {
+            Some(fd) if fd >= 0 => Some(port_io::input_to_raw_fd_dup(fd).map_err(|e| {
+                log::error!("dup input fd: {e}");
+                Error::BadFd()
+            })?),
+            _ => None,
+        };
+        let output = match output_fd {
+            Some(fd) if fd >= 0 => Some(port_io::output_to_raw_fd_dup(fd).map_err(|e| {
+                log::error!("dup output fd: {e}");
+                Error::BadFd()
+            })?),
+            _ => None,
+        };
+        self.ports.push(PortDescription {
+            name: name.to_string().into(),
+            input,
+            output,
+            terminal: None,
+        });
+        Ok(index)
+    }
+
+    fn add_tty_port_inner(&mut self, name: &str, tty_fd: BorrowedFd<'_>) -> Result<(), Error> {
+        let raw_fd = tty_fd.as_raw_fd();
+
+        let input = Some(port_io::input_to_raw_fd_dup(raw_fd).map_err(|e| {
+            log::error!("dup input fd: {e}");
+            Error::BadFd()
+        })?);
+        let output = Some(port_io::output_to_raw_fd_dup(raw_fd).map_err(|e| {
+            log::error!("dup output fd: {e}");
+            Error::BadFd()
+        })?);
+
+        let is_term = tty_fd.is_terminal();
+        let terminal: Option<Box<dyn devices::virtio::port_io::PortTerminalProperties>> = if is_term
+        {
+            Some(port_io::term_fd(raw_fd).map_err(|e| {
+                log::error!("term fd: {e}");
+                Error::BadFd()
+            })?)
+        } else {
+            None
+        };
+
+        if is_term {
+            self.tty_fds.push(raw_fd);
+        }
+
+        self.ports.push(PortDescription {
+            name: name.to_string().into(),
+            input,
+            output,
+            terminal,
+        });
+        Ok(())
+    }
+}
+
+#[ffier::export]
+impl<'a> AttachDevice<'a> for ConsoleDevice<'a> {
+    #[ffier(skip)]
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), DetailedError> {
+        let tty_fds = self.tty_fds.clone();
+
+        let console_dev = Arc::new(Mutex::new(
+            devices::virtio::Console::new(self.ports)
+                .map_err(|e| DetailedError::new(Error::Internal(), format!("console: {e:?}")))?,
+        ));
+
+        ctx.push_exit_observer(console_dev.clone());
+        ctx.subscribe_events(console_dev.clone())?;
+
+        #[cfg(target_os = "linux")]
+        ctx.register_sigwinch(console_dev.lock().unwrap().get_sigwinch_fd())?;
+
+        ctx.register(&format!("hvc{}", ctx.device_index()), console_dev)?;
+
+        for fd in &tty_fds {
+            let borrowed = unsafe { BorrowedFd::borrow_raw(*fd) };
+            ctx.setup_terminal_raw_mode(borrowed);
+        }
+        Ok(())
     }
 }
 
