@@ -891,6 +891,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "krun-via-cdylib-weak"
+version = "0.1.0"
+
+[[package]]
 name = "krun-vmm"
 version = "0.1.0-2.0.0-dev"
 dependencies = [

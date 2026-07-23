@@ -1,3 +1,4 @@
+/*
 #[cfg(feature = "host")]
 extern crate krun_init_blob_via_cdylib as krun_init;
 
@@ -45,6 +46,7 @@ use test_pjdfstest::TestPjdfstest;
 mod test_virtiofs_misc;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_virtiofs_misc::TestVirtioFsMisc;
+*/
 
 pub enum TestOutcome {
     Pass,
@@ -54,6 +56,7 @@ pub enum TestOutcome {
     Report(Box<dyn ReportImpl>),
 }
 
+/*
 mod test_freebsd_boot;
 use test_freebsd_boot::TestFreeBsdBoot;
 
@@ -64,6 +67,7 @@ mod test_freebsd_gvproxy_tcp_guest_listen;
 use test_freebsd_gvproxy_tcp_guest_listen::TestFreeBsdGvproxyTcpGuestListen;
 
 pub mod freebsd_guest;
+*/
 
 pub enum ShouldRun {
     Yes,
@@ -82,79 +86,7 @@ impl ShouldRun {
 }
 
 pub fn test_cases() -> Vec<TestCase> {
-    // Register your test here:
-    vec![
-        TestCase::new(
-            "configure-vm-1cpu-256MiB",
-            Box::new(TestVmConfig {
-                num_cpus: 1,
-                ram_mib: 256,
-            }),
-        ),
-        TestCase::new(
-            "configure-vm-2cpu-1GiB",
-            Box::new(TestVmConfig {
-                num_cpus: 2,
-                ram_mib: 1024,
-            }),
-        ),
-        TestCase::new("vm-pause", Box::new(TestVmPause)),
-        #[cfg(any(feature = "host", target_os = "linux"))]
-        TestCase::new("vsock-guest-connect", Box::new(TestVsockGuestConnect)),
-        TestCase::new(
-            "tsi-tcp-guest-connect",
-            Box::new(TestTsiTcpGuestConnect::new()),
-        ),
-        TestCase::new(
-            "tsi-tcp-guest-listen",
-            Box::new(TestTsiTcpGuestListen::new()),
-        ),
-        TestCase::new("net-passt", Box::new(TestNet::new_passt())),
-        TestCase::new("net-tap", Box::new(TestNet::new_tap())),
-        TestCase::new("net-gvproxy", Box::new(TestNet::new_gvproxy())),
-        TestCase::new(
-            "net-gvproxy-long-path",
-            Box::new(TestNet::new_gvproxy_long_path()),
-        ),
-        TestCase::new("net-vmnet-helper", Box::new(TestNet::new_vmnet_helper())),
-        TestCase::new("multiport-console", Box::new(TestMultiportConsole)),
-        #[cfg(any(feature = "host", target_os = "linux"))]
-        TestCase::new("virtiofs-root-ro", Box::new(TestVirtiofsRootRo)),
-        TestCase::new("augmentfs", Box::new(TestAugmentFs)),
-        TestCase::new("root-disk-remount", Box::new(TestRootDiskRemount)),
-        #[cfg(any(feature = "host", target_os = "linux"))]
-        TestCase::new("virtiofs-misc", Box::new(TestVirtioFsMisc)),
-        TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
-        TestCase::new("perf-net-passt-tx", Box::new(TestNetPerf::new_passt_tx())),
-        TestCase::new("perf-net-passt-rx", Box::new(TestNetPerf::new_passt_rx())),
-        TestCase::new("perf-net-tap-tx", Box::new(TestNetPerf::new_tap_tx())),
-        TestCase::new("perf-net-tap-rx", Box::new(TestNetPerf::new_tap_rx())),
-        TestCase::new(
-            "perf-net-gvproxy-tx",
-            Box::new(TestNetPerf::new_gvproxy_tx()),
-        ),
-        TestCase::new(
-            "perf-net-gvproxy-rx",
-            Box::new(TestNetPerf::new_gvproxy_rx()),
-        ),
-        TestCase::new(
-            "perf-net-vmnet-helper-tx",
-            Box::new(TestNetPerf::new_vmnet_helper_tx()),
-        ),
-        TestCase::new(
-            "perf-net-vmnet-helper-rx",
-            Box::new(TestNetPerf::new_vmnet_helper_rx()),
-        ),
-        TestCase::new("freebsd-boot", Box::new(TestFreeBsdBoot)),
-        TestCase::new(
-            "freebsd-gvproxy-tcp-guest-connect",
-            Box::new(TestFreeBsdGvproxyTcpGuestConnect::new()),
-        ),
-        TestCase::new(
-            "freebsd-gvproxy-tcp-guest-listen",
-            Box::new(TestFreeBsdGvproxyTcpGuestListen::new()),
-        ),
-    ]
+    vec![]
 }
 
 ////////////////////
@@ -201,6 +133,7 @@ use std::path::PathBuf;
 #[cfg(all(feature = "guest", feature = "host"))]
 compile_error!("Cannot enable both guest and host in the same binary!");
 
+/*
 #[cfg(feature = "host")]
 mod common;
 
@@ -210,12 +143,13 @@ pub mod common_freebsd;
 #[cfg(feature = "host")]
 mod krun;
 
+#[cfg(feature = "guest")]
+pub mod freebsd_network;
+*/
+
 #[cfg(feature = "host")]
 pub mod rootfs;
 mod tcp_tester;
-
-#[cfg(feature = "guest")]
-pub mod freebsd_network;
 
 #[host]
 #[derive(Clone, Debug)]

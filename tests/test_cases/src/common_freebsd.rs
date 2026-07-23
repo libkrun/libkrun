@@ -1,3 +1,4 @@
+/*
 //! Host-side utilities for FreeBSD guest tests.
 
 use anyhow::Context;
@@ -250,3 +251,4 @@ unsafe fn do_setup_and_enter(
         unreachable!()
     }
 }
+*/

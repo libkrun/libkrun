@@ -43,19 +43,6 @@ endif
 ifeq ($(VIRGL_RESOURCE_MAP2),1)
 	FEATURE_FLAGS += --features virgl_resource_map2
 endif
-# Test targets require the block device (BLK) feature for FreeBSD disk tests
-# and the NET feature for gvproxy-based network tests.
-# Enable automatically unless the user explicitly set them to a value.
-ifeq ($(BLK),)
-    ifneq ($(filter test test-prefix,$(MAKECMDGOALS)),)
-        BLK := 1
-    endif
-endif
-ifeq ($(NET),)
-    ifneq ($(filter test test-prefix,$(MAKECMDGOALS)),)
-        NET := 1
-    endif
-endif
 ifeq ($(INIT_BLOB),0)
     FEATURE_FLAGS += --no-default-features
 endif
@@ -269,9 +256,6 @@ install: libkrun.pc libkrun_init.pc
 	install -d $(DESTDIR)$(PREFIX)/$(LIBDIR_$(OS))/
 	install -d $(DESTDIR)$(PREFIX)/$(LIBDIR_$(OS))/pkgconfig
 	install -d $(DESTDIR)$(PREFIX)/include
-	install -m 644 $(LIBRARY_HEADER) $(DESTDIR)$(PREFIX)/include
-	install -m 644 $(LIBRARY_HEADER_DISPLAY) $(DESTDIR)$(PREFIX)/include
-	install -m 644 $(LIBRARY_HEADER_INPUT) $(DESTDIR)$(PREFIX)/include
 	install -m 644 $(LIBRARY_HEADER_INIT) $(DESTDIR)$(PREFIX)/include
 	install -m 644 libkrun.pc $(DESTDIR)$(PREFIX)/$(LIBDIR_$(OS))/pkgconfig
 	install -m 644 libkrun_init.pc $(DESTDIR)$(PREFIX)/$(LIBDIR_$(OS))/pkgconfig

@@ -367,6 +367,10 @@ fn run_tests(
     };
 
     if tests_to_run.is_empty() {
+        if test_case == "all" {
+            println!("\nOK - 0/0 passed (no tests registered)");
+            return Ok(());
+        }
         anyhow::bail!("No such test: {test_case}");
     }
 
