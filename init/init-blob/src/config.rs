@@ -17,10 +17,10 @@
 //! ```
 
 use std::borrow::Cow;
-use std::ffi::{CString, c_char, c_void};
-use std::mem::ManuallyDrop;
+use std::ffi::c_void;
+use std::ptr::NonNull;
 
-use libloading::os::unix::Library;
+use krun_via_cdylib_weak::{self as krun, FsOverlay, Payload, Symbol};
 
 use crate::init_schema::{ConfigSchema, Mount};
 use crate::oci_schema::OciSchema;
@@ -43,20 +43,10 @@ pub enum ConfigError {
 #[cfg_attr(feature = "ffi", derive(ffier::FfiError))]
 #[non_exhaustive]
 pub enum ApplyError {
-    /// A required libkrun symbol could not be found via dlsym.
+    /// A required libkrun symbol could not be loaded.
     #[error("{0}")]
     #[cfg_attr(feature = "ffi", ffier(code = 1))]
     SymbolNotFound(Box<str>),
-
-    /// `krun_fs_add_overlay_file` failed.
-    #[error("overlay file: {}", std::io::Error::from_raw_os_error(*.0))]
-    #[cfg_attr(feature = "ffi", ffier(code = 2))]
-    OverlayFile(i32),
-
-    /// `krun_append_kernel_cmdline` failed.
-    #[error("kernel cmdline: {}", std::io::Error::from_raw_os_error(*.0))]
-    #[cfg_attr(feature = "ffi", ffier(code = 3))]
-    KernelCmdline(i32),
 }
 
 /// Guest-side path of the init binary (e.g. for `init=` kernel arg).
@@ -76,9 +66,6 @@ pub(crate) struct GuestFile {
 /// Built init configuration. Immutable after construction.
 ///
 /// Holds the init binary and serialized config JSON as guest files.
-/// [`apply`](Self::apply) passes pointers to this data into libkrun — the
-/// caller **must keep this value alive for the entire lifetime of the VM**.
-/// Dropping it while the VM is running causes dangling pointers.
 pub struct Config {
     files: Vec<GuestFile>,
 }
@@ -90,84 +77,35 @@ impl Config {
         Builder::default()
     }
 
-    /// Apply this init configuration to a libkrun VM context.
+    /// Apply this init configuration to a libkrun VM.
     ///
-    /// Adds the init binary and associated configuration file(s) as
-    /// overlay files on the specified virtiofs device, and appends
-    /// the appropriate kernel command line argument to specify the
-    /// init binary.
+    /// Populates `overlay` with the init binary and config files,
+    /// and appends the init kernel cmdline arg to `payload`.
     ///
-    /// `lib_handle` is the result of `dlopen("libkrun.so")`. Pass NULL to
-    /// search the global symbol namespace (requires libkrun was linked or
-    /// opened with `RTLD_GLOBAL`).
-    ///
-    /// # Safety
-    ///
-    /// - If `lib_handle` is non-null it must be a valid handle returned by
-    ///   `dlopen` (or equivalent) that remains open for the duration of
-    ///   this call.
-    /// - The caller must keep this `Config` alive for the entire lifetime
-    ///   of the VM. `apply` passes data pointers to libkrun that remain
-    ///   borrowed until the VM exits.
-    pub unsafe fn apply(
+    /// `lib_handle` is a `dlopen` handle for libkrun.so (or null for
+    /// the global namespace). Used to load the symbols needed for
+    /// FsOverlay and Payload operations.
+    pub fn apply(
         &self,
         lib_handle: *mut c_void,
-        ctx_id: u32,
-        fs_tag: &str,
+        #[cfg_attr(feature = "ffi", ffier(foreign = krun_via_cdylib_weak, c_name = "KrunFsOverlay"))]
+        overlay: &mut FsOverlay,
+        #[cfg_attr(feature = "ffi", ffier(foreign = krun_via_cdylib_weak, c_name = "KrunPayload"))]
+        payload: &mut Payload,
     ) -> Result<(), ApplyError> {
-        type AddOverlayFileFn = unsafe extern "C" fn(
-            u32,
-            *const c_char,
-            *const c_char,
-            *const u8,
-            usize,
-            u32,
-            bool,
-        ) -> i32;
-        type AppendKernelCmdlineFn = unsafe extern "C" fn(u32, *const c_char) -> i32;
-
-        fn load_sym<T: Copy>(lib_handle: *mut c_void, name: &[u8]) -> Result<T, ApplyError> {
-            if lib_handle.is_null() {
-                let lib = Library::this();
-                unsafe { lib.get(name) }.map(|s| *s)
-            } else {
-                let lib = ManuallyDrop::new(unsafe { Library::from_raw(lib_handle) });
-                unsafe { lib.get(name) }.map(|s| *s)
-            }
-            .map_err(|e| ApplyError::SymbolNotFound(e.to_string().into()))
-        }
-
-        let add_overlay_file: AddOverlayFileFn =
-            load_sym(lib_handle, b"krun_fs_add_overlay_file\0")?;
-        let append_kernel_cmdline: AppendKernelCmdlineFn =
-            load_sym(lib_handle, b"krun_append_kernel_cmdline\0")?;
-
-        let c_fs_tag = CString::new(fs_tag).expect("fs_tag must not contain NUL bytes");
+        krun::require(
+            NonNull::new(lib_handle),
+            &[
+                Symbol::KrunFsOverlayAddFile,
+                Symbol::KrunPayloadAppendCmdline,
+            ],
+        )
+        .map_err(|e| ApplyError::SymbolNotFound(e.to_string().into()))?;
 
         for file in &self.files {
-            let c_path = CString::new(file.path).expect("path must not contain NUL bytes");
-            let ret = unsafe {
-                add_overlay_file(
-                    ctx_id,
-                    c_fs_tag.as_ptr(),
-                    c_path.as_ptr(),
-                    file.data.as_ptr(),
-                    file.data.len(),
-                    file.mode,
-                    file.one_shot,
-                )
-            };
-            if ret != 0 {
-                return Err(ApplyError::OverlayFile(-ret));
-            }
+            overlay.add_file(file.path, &file.data, file.mode, file.one_shot);
         }
-
-        let c_init_arg = CString::new(KERNEL_INIT_ARG).unwrap();
-        let ret = unsafe { append_kernel_cmdline(ctx_id, c_init_arg.as_ptr()) };
-        if ret != 0 {
-            return Err(ApplyError::KernelCmdline(-ret));
-        }
-
+        payload.append_cmdline(KERNEL_INIT_ARG);
         Ok(())
     }
 }
@@ -250,6 +188,45 @@ impl Builder {
     /// Append multiple resource limits.
     pub fn rlimits(mut self, limits: &[&str]) -> Self {
         self.rlimits.extend(limits.iter().map(|s| s.to_string()));
+        self
+    }
+
+    /// Enable DHCP client in the guest.
+    pub fn dhcp(mut self, enable: bool) -> Self {
+        if enable {
+            self.inner
+                .process
+                .env
+                .retain(|e| !e.starts_with("KRUN_DHCP="));
+            self.inner.process.env.push("KRUN_DHCP=1".to_string());
+        }
+        self
+    }
+
+    /// Set the root disk to remount on boot.
+    pub fn set_root_disk_remount(
+        mut self,
+        device: &str,
+        fstype: Option<&str>,
+        options: Option<&str>,
+    ) -> Self {
+        self.inner
+            .process
+            .env
+            .retain(|e| !e.starts_with("KRUN_BLOCK_ROOT="));
+        let mut val = device.to_string();
+        if let Some(fs) = fstype {
+            val.push(':');
+            val.push_str(fs);
+        }
+        if let Some(opts) = options {
+            val.push(':');
+            val.push_str(opts);
+        }
+        self.inner
+            .process
+            .env
+            .push(format!("KRUN_BLOCK_ROOT={val}"));
         self
     }
 
