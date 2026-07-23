@@ -19,22 +19,9 @@ static bool push_to_stderr(void *userdata, KrunStr s)
 }
 
 static KrunVtableHandle stderr_writer = KRUN_VTABLE_HANDLE(
-    KRUN_INIT_PUSH_STR_TYPE_TAG,
-    ((KrunInitPushStrVtable){ .drop = NULL, .push = push_to_stderr }),
+    KRUN_PUSH_STR_TYPE_TAG,
+    ((KrunPushStrVtable){ .drop = NULL, .push = push_to_stderr }),
     NULL);
-
-#define TRY(call)                                                              \
-    err = NULL;                                                                \
-    call;                                                                      \
-    if (err) {                                                                 \
-        flockfile(stderr);                                                     \
-        fprintf(stderr, "%s failed: ", #call);                                 \
-        krun_init_error_message(err, &stderr_writer);                          \
-        fputc('\n', stderr);                                                   \
-        funlockfile(stderr);                                                   \
-        krun_init_error_destroy(err);                                          \
-        return -1;                                                             \
-    }
 
 static int cmd_output(char *output, size_t output_size, const char *prog, ...)
 {
@@ -89,7 +76,7 @@ static int create_tmux_tty(const char *session_name)
 {
     char tty_path[256];
     char wait_cmd[128];
-    
+
     snprintf(wait_cmd, sizeof(wait_cmd), "waitpid %d", (int)getpid());
     if (cmd("tmux", "new-session", "-d", "-s", session_name, "sh", "-c", wait_cmd, NULL) != 0)
         return -1;
@@ -143,33 +130,60 @@ int main(int argc, char *const argv[])
     const char *root_dir = argv[1];
     const char *command = argv[2];
     const char *const *command_args = (argc > 3) ? (const char *const *)&argv[3] : NULL;
-    const char *const envp[] = { 0 };
+    int ret = 1;
+    KrunError err = NULL;
 
-    krun_init_log(KRUN_LOG_TARGET_DEFAULT, KRUN_LOG_LEVEL_WARN, KRUN_LOG_STYLE_AUTO, 0);
+    KrunMmioDeviceManager devices = NULL;
+    KrunFsDevice rootfs = NULL;
+    KrunConsoleBuilder console_builder = NULL;
+    KrunConsoleDevice console = NULL;
+    KrunPayload payload = NULL;
+    KrunVmmBuilder vmm_builder = NULL;
+    KrunVmm vmm = NULL;
+    KrunFsOverlay overlay = NULL;
 
-    int err;
-    int ctx_id = krun_create_ctx();
-    if (ctx_id < 0) { errno = -ctx_id; perror("krun_create_ctx"); return 1; }
+    krun_init_log(KRUN_LOG_TARGET_DEFAULT, KRUN_LOG_LEVEL_WARN, KRUN_LOG_STYLE_AUTO, NULL);
 
-    int console_id = krun_add_virtio_console_multiport(ctx_id);
-    if (console_id < 0) {
-        errno = -console_id;
-        perror("krun_add_virtio_console_multiport");
-        return 1;
+    // Load kernel
+    payload = krun_payload_load_krunfw(&err);
+    if (!payload) {
+        fprintf(stderr, "krun_payload_load_krunfw failed\n");
+        goto cleanup;
     }
+
+    // Create rootfs
+    rootfs = krun_fs_device_new(KRUN_STR("/dev/root"), KRUN_STR(root_dir), &err);
+    if (!rootfs) {
+        fprintf(stderr, "krun_fs_device_new failed\n");
+        goto cleanup;
+    }
+
+    // Build init config
+    {
+        KrunInitError init_err = NULL;
+        KrunInitBuilder builder = krun_init_config_builder();
+        krun_init_builder_arg(&builder, KRUN_STR(command));
+        if (command_args) {
+            for (int i = 0; command_args[i]; i++)
+                krun_init_builder_arg(&builder, KRUN_STR(command_args[i]));
+        }
+        KrunInitConfig config = krun_init_builder_build(&builder);
+        overlay = krun_fs_overlay_new();
+        krun_init_config_apply(config, NULL, overlay, payload, &init_err);
+        if (init_err) {
+            fprintf(stderr, "krun_init_config_apply failed\n");
+            krun_init_error_destroy(init_err);
+            goto cleanup;
+        }
+        krun_fs_device_set_overlay(rootfs, overlay);
+        overlay = NULL;
+    }
+
+    // Build multiport console
+    console_builder = krun_console_device_builder();
 
     /* Configure console ports - edit this section to add/remove ports */
     {
-        
-        // You could also use the controlling terminal of this process in the guest: 
-        /* 
-        if ((err = krun_add_console_port_tty(ctx_id, console_id, "host_tty", open("/dev/tty", O_RDWR)))) {
-            errno = -err; 
-            perror("port host_tty"); 
-            return 1;
-        }
-        */
-
         int num_consoles = 3;
         for (int i = 0; i < num_consoles; i++) {
             char session_name[64];
@@ -180,24 +194,24 @@ int main(int argc, char *const argv[])
             int tmux_fd = create_tmux_tty(session_name);
             if (tmux_fd < 0) {
                 perror("create_tmux_tty");
-                return 1;
+                goto cleanup;
             }
-            if ((err = krun_add_console_port_tty(ctx_id, console_id, port_name, tmux_fd))) {
-                errno = -err;
-                perror("krun_add_console_port_tty");
-                return 1;
+            uint32_t port_idx;
+            if (krun_console_builder_add_tty_port(console_builder, KRUN_STR(port_name), tmux_fd, &port_idx, &err) != KRUN_RESULT_SUCCESS) {
+                fprintf(stderr, "krun_console_builder_add_tty_port failed\n");
+                goto cleanup;
             }
         }
 
         int in_fd, out_fd;
         if (create_fifo_inout("/tmp/consoles_example_in", "/tmp/consoles_example_out", &in_fd, &out_fd) < 0) {
             perror("create_fifo_inout");
-            return 1;
+            goto cleanup;
         }
-        if ((err = krun_add_console_port_inout(ctx_id, console_id, "fifo_inout", in_fd, out_fd))) {
-            errno = -err;
-            perror("krun_add_console_port_inout");
-            return 1;
+        uint32_t port_idx;
+        if (krun_console_builder_add_inout_port(console_builder, KRUN_STR("fifo_inout"), in_fd, out_fd, &port_idx, &err) != KRUN_RESULT_SUCCESS) {
+            fprintf(stderr, "krun_console_builder_add_inout_port failed\n");
+            goto cleanup;
         }
 
         fprintf(stderr, "\n=== Console ports configured ===\n");
@@ -209,40 +223,55 @@ int main(int argc, char *const argv[])
         fprintf(stderr, "================================\n\n");
     }
 
-    if ((err = krun_set_vm_config(ctx_id, 4, 4096))) {
-        errno = -err;
-        perror("krun_set_vm_config");
-        return 1;
+    console = krun_console_builder_build(console_builder, &err);
+    if (!console) {
+        fprintf(stderr, "krun_console_builder_build failed\n");
+        goto cleanup;
+    }
+    krun_console_builder_destroy(console_builder);
+    console_builder = NULL;
+
+    // Device manager
+    devices = krun_mmio_device_manager_new();
+    krun_mmio_device_manager_add(devices, (KrunAttachDevice)rootfs);
+    rootfs = NULL;
+    krun_mmio_device_manager_add(devices, (KrunAttachDevice)console);
+    console = NULL;
+
+    // Build and run VM
+    vmm_builder = krun_vmm_builder_new();
+    if (krun_vmm_builder_vcpus(&vmm_builder, 4, &err) != KRUN_RESULT_SUCCESS) goto cleanup;
+    if (krun_vmm_builder_ram_mib(&vmm_builder, 4096, &err) != KRUN_RESULT_SUCCESS) goto cleanup;
+    krun_vmm_builder_payload(&vmm_builder, payload);
+    payload = NULL;
+    krun_vmm_builder_devices(&vmm_builder, devices);
+    devices = NULL;
+
+    vmm = krun_vmm_builder_build(&vmm_builder, &err);
+    if (!vmm) {
+        fprintf(stderr, "krun_vmm_builder_build failed\n");
+        goto cleanup;
     }
 
-    if ((err = krun_add_virtiofs3(ctx_id, KRUN_FS_ROOT_TAG, root_dir, 0, false))) {
-        errno = -err;
-        perror("krun_add_virtiofs3");
-        return 1;
+    krun_vmm_run(vmm);
+    ret = 0;
+
+cleanup:
+    if (err) {
+        flockfile(stderr);
+        fprintf(stderr, "Error: ");
+        krun_error_message(err, (KrunPushStr)&stderr_writer);
+        fputc('\n', stderr);
+        funlockfile(stderr);
+        krun_error_destroy(err);
     }
-
-    // Build init configuration.
-    {
-        KrunInitError err;
-        KrunInitBuilder builder = krun_init_config_builder();
-
-        krun_init_builder_arg(&builder, KRUN_STR(command));
-        if (command_args) {
-            for (int i = 0; command_args[i]; i++)
-                krun_init_builder_arg(&builder, KRUN_STR(command_args[i]));
-        }
-
-        KrunInitConfig config = krun_init_builder_build(&builder);
-        TRY(krun_init_config_apply(config, NULL, ctx_id,
-                                   KRUN_STR("/dev/root"), &err));
-    }
-
-    if ((err = krun_start_enter(ctx_id))) {
-        errno = -err;
-        perror("krun_start_enter");
-        return 1;
-    }
-    return 0;
+    if (vmm) krun_vmm_destroy(vmm);
+    if (vmm_builder) krun_vmm_builder_destroy(vmm_builder);
+    if (devices) krun_mmio_device_manager_destroy(devices);
+    if (console_builder) krun_console_builder_destroy(console_builder);
+    if (console) krun_console_device_destroy(console);
+    if (rootfs) krun_fs_device_destroy(rootfs);
+    if (payload) krun_payload_destroy(payload);
+    if (overlay) krun_fs_overlay_destroy(overlay);
+    return ret;
 }
-
-
