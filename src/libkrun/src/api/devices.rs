@@ -1028,6 +1028,111 @@ impl<'a> AttachDevice<'a> for BlockDevice {
     }
 }
 
+/// A virtio network device.
+#[cfg(feature = "net")]
+pub struct NetDevice {
+    pub(crate) inner: Arc<Mutex<devices::virtio::Net>>,
+}
+
+#[cfg(feature = "net")]
+#[ffier::export]
+impl NetDevice {
+    /// Create a net device backed by a Unix datagram socket path.
+    pub fn new_unixgram_path(
+        id: &str,
+        path: &str,
+        mac: &[u8],
+        features: u32,
+        vfkit_magic: bool,
+    ) -> Result<Self, Error> {
+        use devices::virtio::net::device::VirtioNetBackend;
+        Self::new_inner(
+            id,
+            VirtioNetBackend::UnixgramPath(PathBuf::from(path), vfkit_magic),
+            mac,
+            features,
+        )
+    }
+
+    /// Create a net device backed by a Unix datagram socket fd.
+    pub fn new_unixgram_fd(id: &str, fd: i32, mac: &[u8], features: u32) -> Result<Self, Error> {
+        use devices::virtio::net::device::VirtioNetBackend;
+        Self::new_inner(id, VirtioNetBackend::UnixgramFd(fd), mac, features)
+    }
+
+    /// Create a net device backed by a Unix stream socket path.
+    pub fn new_unixstream_path(
+        id: &str,
+        path: &str,
+        mac: &[u8],
+        features: u32,
+    ) -> Result<Self, Error> {
+        use devices::virtio::net::device::VirtioNetBackend;
+        Self::new_inner(
+            id,
+            VirtioNetBackend::UnixstreamPath(PathBuf::from(path)),
+            mac,
+            features,
+        )
+    }
+
+    /// Create a net device backed by a Unix stream socket fd.
+    pub fn new_unixstream_fd(id: &str, fd: i32, mac: &[u8], features: u32) -> Result<Self, Error> {
+        use devices::virtio::net::device::VirtioNetBackend;
+        Self::new_inner(id, VirtioNetBackend::UnixstreamFd(fd), mac, features)
+    }
+
+    // FIXME: use #[cfg(target_os = "linux")] on the method once ffier supports
+    // per-method cfg inside #[ffier::export] impl blocks.
+    pub fn new_tap(id: &str, tap_name: &str, mac: &[u8], features: u32) -> Result<Self, Error> {
+        #[cfg(target_os = "linux")]
+        {
+            use devices::virtio::net::device::VirtioNetBackend;
+            Self::new_inner(
+                id,
+                VirtioNetBackend::Tap(tap_name.to_string()),
+                mac,
+                features,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (id, tap_name, mac, features);
+            Err(Error::FeatureDisabled())
+        }
+    }
+}
+
+#[cfg(feature = "net")]
+impl NetDevice {
+    fn new_inner(
+        id: &str,
+        backend: devices::virtio::net::device::VirtioNetBackend,
+        mac: &[u8],
+        features: u32,
+    ) -> Result<Self, Error> {
+        let mac: [u8; 6] = mac.try_into().map_err(|_| Error::InvalidParam())?;
+        let net =
+            devices::virtio::Net::new(id.to_string(), backend, mac, features).map_err(|e| {
+                log::error!("net: {e:?}");
+                Error::Internal()
+            })?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(net)),
+        })
+    }
+}
+
+#[cfg(feature = "net")]
+#[ffier::export]
+impl<'a> AttachDevice<'a> for NetDevice {
+    #[ffier(skip)]
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), DetailedError> {
+        let id = self.inner.lock().unwrap().id().to_string();
+        ctx.register(&id, self.inner)
+    }
+}
+
 /// Walk parent directory components in a virtual entry tree, returning the
 /// children vec of the deepest parent.
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]

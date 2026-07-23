@@ -160,6 +160,14 @@
         "a"
       ]
     },
+    "NetDevice": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunNetDevice"
+        }
+      },
+      "type_tag": 16777234
+    },
     "Payload": {
       "kind": {
         "handle": {
@@ -1193,6 +1201,221 @@
           "ffi_name": "krun_block_device_new"
         }
       ]
+    },
+    {
+      "name": "NetDevice",
+      "destroy_ffi_name": "krun_net_device_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "new_unixgram_path",
+          "doc": [
+            " Create a net device backed by a Unix datagram socket path."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "id",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "mac",
+              "param_kind": "regular",
+              "type": "[u8]",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "features",
+              "param_kind": "regular",
+              "type": "u32"
+            },
+            {
+              "name": "vfkit_magic",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "NetDevice"
+            },
+            "err_type": "Error",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_net_device_new_unixgram_path"
+        },
+        {
+          "name": "new_unixgram_fd",
+          "doc": [
+            " Create a net device backed by a Unix datagram socket fd."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "id",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "fd",
+              "param_kind": "regular",
+              "type": "i32"
+            },
+            {
+              "name": "mac",
+              "param_kind": "regular",
+              "type": "[u8]",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "features",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "NetDevice"
+            },
+            "err_type": "Error",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_net_device_new_unixgram_fd"
+        },
+        {
+          "name": "new_unixstream_path",
+          "doc": [
+            " Create a net device backed by a Unix stream socket path."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "id",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "mac",
+              "param_kind": "regular",
+              "type": "[u8]",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "features",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "NetDevice"
+            },
+            "err_type": "Error",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_net_device_new_unixstream_path"
+        },
+        {
+          "name": "new_unixstream_fd",
+          "doc": [
+            " Create a net device backed by a Unix stream socket fd."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "id",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "fd",
+              "param_kind": "regular",
+              "type": "i32"
+            },
+            {
+              "name": "mac",
+              "param_kind": "regular",
+              "type": "[u8]",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "features",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "NetDevice"
+            },
+            "err_type": "Error",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_net_device_new_unixstream_fd"
+        },
+        {
+          "name": "new_tap",
+          "doc": [
+            " Create a net device backed by a TAP interface."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "id",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "tap_name",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "mac",
+              "param_kind": "regular",
+              "type": "[u8]",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "features",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "NetDevice"
+            },
+            "err_type": "Error",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_net_device_new_tap"
+        }
+      ]
     }
   ],
   "errors": [
@@ -1559,6 +1782,17 @@
     {
       "trait_name": "AttachDevice",
       "struct_name": "BlockDevice",
+      "lifetimes": [
+        "a"
+      ],
+      "trait_lifetime_args": [
+        "a"
+      ],
+      "methods": []
+    },
+    {
+      "trait_name": "AttachDevice",
+      "struct_name": "NetDevice",
       "lifetimes": [
         "a"
       ],

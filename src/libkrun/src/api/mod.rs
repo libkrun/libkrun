@@ -14,6 +14,8 @@ pub use devices::RngDevice;
 pub use devices::FsOverlay;
 #[cfg(feature = "blk")]
 pub use devices::BlockDevice;
+#[cfg(feature = "net")]
+pub use devices::NetDevice;
 pub use devices::{
     AttachContext, AttachDevice, ConsoleBuilder, ConsoleDevice, DeviceManager, DeviceRequirements,
     MmioDeviceManager, ResolvedShmRegion, VsockDevice,
@@ -55,6 +57,10 @@ ffier::library_definition!("krun", library_tag = 1,
     crate::api::devices::BlockDevice = 17,
     #[cfg(feature = "blk")]
     crate::api::devices::AttachDevice for crate::api::devices::BlockDevice,
+    #[cfg(feature = "net")]
+    crate::api::devices::NetDevice = 18,
+    #[cfg(feature = "net")]
+    crate::api::devices::AttachDevice for crate::api::devices::NetDevice,
     #[cfg(not(feature = "tee"))]
     crate::api::devices::AttachDevice for crate::api::devices::BalloonDevice,
     #[cfg(not(feature = "tee"))]

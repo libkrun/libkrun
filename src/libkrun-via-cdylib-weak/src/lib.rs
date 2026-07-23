@@ -2390,6 +2390,327 @@ impl Drop for BlockDevice {
     }
 }
 
+static KRUN_NET_DEVICE_DESTROY: std::sync::OnceLock<unsafe extern "C" fn(*mut core::ffi::c_void)> =
+    std::sync::OnceLock::new();
+#[allow(non_snake_case)]
+pub unsafe fn krun_net_device_destroy(handle: *mut core::ffi::c_void) {
+    unsafe {
+        (KRUN_NET_DEVICE_DESTROY
+            .get()
+            .expect("symbol `krun_net_device_destroy` not loaded; call require() first"))(
+            handle
+        )
+    }
+}
+
+static KRUN_NET_DEVICE_NEW_UNIXGRAM_PATH: std::sync::OnceLock<
+    unsafe extern "C" fn(
+        <&'static str as FfiType>::CRepr,
+        <&'static str as FfiType>::CRepr,
+        <&'static [u8] as FfiType>::CRepr,
+        <u32 as FfiType>::CRepr,
+        <bool as FfiType>::CRepr,
+        *mut *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void,
+> = std::sync::OnceLock::new();
+#[allow(non_snake_case)]
+pub unsafe fn krun_net_device_new_unixgram_path(
+    id: <&'static str as FfiType>::CRepr,
+    path: <&'static str as FfiType>::CRepr,
+    mac: <&'static [u8] as FfiType>::CRepr,
+    features: <u32 as FfiType>::CRepr,
+    vfkit_magic: <bool as FfiType>::CRepr,
+    err_out: *mut *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    unsafe {
+        (KRUN_NET_DEVICE_NEW_UNIXGRAM_PATH
+            .get()
+            .expect("symbol `krun_net_device_new_unixgram_path` not loaded; call require() first"))(
+            id,
+            path,
+            mac,
+            features,
+            vfkit_magic,
+            err_out,
+        )
+    }
+}
+
+static KRUN_NET_DEVICE_NEW_UNIXGRAM_FD: std::sync::OnceLock<
+    unsafe extern "C" fn(
+        <&'static str as FfiType>::CRepr,
+        <i32 as FfiType>::CRepr,
+        <&'static [u8] as FfiType>::CRepr,
+        <u32 as FfiType>::CRepr,
+        *mut *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void,
+> = std::sync::OnceLock::new();
+#[allow(non_snake_case)]
+pub unsafe fn krun_net_device_new_unixgram_fd(
+    id: <&'static str as FfiType>::CRepr,
+    fd: <i32 as FfiType>::CRepr,
+    mac: <&'static [u8] as FfiType>::CRepr,
+    features: <u32 as FfiType>::CRepr,
+    err_out: *mut *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    unsafe {
+        (KRUN_NET_DEVICE_NEW_UNIXGRAM_FD
+            .get()
+            .expect("symbol `krun_net_device_new_unixgram_fd` not loaded; call require() first"))(
+            id, fd, mac, features, err_out,
+        )
+    }
+}
+
+static KRUN_NET_DEVICE_NEW_UNIXSTREAM_PATH: std::sync::OnceLock<
+    unsafe extern "C" fn(
+        <&'static str as FfiType>::CRepr,
+        <&'static str as FfiType>::CRepr,
+        <&'static [u8] as FfiType>::CRepr,
+        <u32 as FfiType>::CRepr,
+        *mut *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void,
+> = std::sync::OnceLock::new();
+#[allow(non_snake_case)]
+pub unsafe fn krun_net_device_new_unixstream_path(
+    id: <&'static str as FfiType>::CRepr,
+    path: <&'static str as FfiType>::CRepr,
+    mac: <&'static [u8] as FfiType>::CRepr,
+    features: <u32 as FfiType>::CRepr,
+    err_out: *mut *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    unsafe {
+        (KRUN_NET_DEVICE_NEW_UNIXSTREAM_PATH.get().expect(
+            "symbol `krun_net_device_new_unixstream_path` not loaded; call require() first",
+        ))(id, path, mac, features, err_out)
+    }
+}
+
+static KRUN_NET_DEVICE_NEW_UNIXSTREAM_FD: std::sync::OnceLock<
+    unsafe extern "C" fn(
+        <&'static str as FfiType>::CRepr,
+        <i32 as FfiType>::CRepr,
+        <&'static [u8] as FfiType>::CRepr,
+        <u32 as FfiType>::CRepr,
+        *mut *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void,
+> = std::sync::OnceLock::new();
+#[allow(non_snake_case)]
+pub unsafe fn krun_net_device_new_unixstream_fd(
+    id: <&'static str as FfiType>::CRepr,
+    fd: <i32 as FfiType>::CRepr,
+    mac: <&'static [u8] as FfiType>::CRepr,
+    features: <u32 as FfiType>::CRepr,
+    err_out: *mut *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    unsafe {
+        (KRUN_NET_DEVICE_NEW_UNIXSTREAM_FD
+            .get()
+            .expect("symbol `krun_net_device_new_unixstream_fd` not loaded; call require() first"))(
+            id, fd, mac, features, err_out,
+        )
+    }
+}
+
+static KRUN_NET_DEVICE_NEW_TAP: std::sync::OnceLock<
+    unsafe extern "C" fn(
+        <&'static str as FfiType>::CRepr,
+        <&'static str as FfiType>::CRepr,
+        <&'static [u8] as FfiType>::CRepr,
+        <u32 as FfiType>::CRepr,
+        *mut *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void,
+> = std::sync::OnceLock::new();
+#[allow(non_snake_case)]
+pub unsafe fn krun_net_device_new_tap(
+    id: <&'static str as FfiType>::CRepr,
+    tap_name: <&'static str as FfiType>::CRepr,
+    mac: <&'static [u8] as FfiType>::CRepr,
+    features: <u32 as FfiType>::CRepr,
+    err_out: *mut *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    unsafe {
+        (KRUN_NET_DEVICE_NEW_TAP
+            .get()
+            .expect("symbol `krun_net_device_new_tap` not loaded; call require() first"))(
+            id, tap_name, mac, features, err_out,
+        )
+    }
+}
+
+pub struct NetDevice(*mut core::ffi::c_void);
+
+impl NetDevice {
+    #[doc(hidden)]
+    pub fn __from_raw(ptr: *mut core::ffi::c_void) -> Self {
+        Self(ptr)
+    }
+    #[doc(hidden)]
+    pub fn __into_raw(self) -> *mut core::ffi::c_void {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.0
+    }
+}
+
+impl FfiHandle for NetDevice {
+    const C_HANDLE_NAME: &'static str = "KrunNetDevice";
+    const TYPE_TAG: u32 = 16777234u32;
+    unsafe fn as_handle(&self) -> *mut core::ffi::c_void {
+        self.0
+    }
+    fn __from_raw(handle: *mut core::ffi::c_void) -> Self {
+        Self(handle)
+    }
+}
+
+impl FfiType for NetDevice {
+    type CRepr = *mut core::ffi::c_void;
+    const C_TYPE_NAME: &'static str = "NetDevice";
+    fn into_c(self) -> *mut core::ffi::c_void {
+        self.__into_raw()
+    }
+    unsafe fn from_c(repr: *mut core::ffi::c_void) -> Self {
+        Self::__from_raw(repr)
+    }
+}
+
+impl std::fmt::Debug for NetDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("NetDevice").field(&self.0).finish()
+    }
+}
+
+impl NetDevice {
+    #[doc = " Create a net device backed by a Unix datagram socket path."]
+    pub fn new_unixgram_path(
+        id: &str,
+        path: &str,
+        mac: &[u8],
+        features: u32,
+        vfkit_magic: bool,
+    ) -> Result<NetDevice, Error> {
+        let mut __err: *mut core::ffi::c_void = core::ptr::null_mut();
+        let __raw = unsafe {
+            krun_net_device_new_unixgram_path(
+                <&str as FfiType>::into_c(id),
+                <&str as FfiType>::into_c(path),
+                <&[u8] as FfiType>::into_c(mac),
+                <u32 as FfiType>::into_c(features),
+                <bool as FfiType>::into_c(vfkit_magic),
+                &mut __err as *mut *mut core::ffi::c_void,
+            )
+        };
+        if !__raw.is_null() {
+            Ok(unsafe { <NetDevice as FfiType>::from_c(__raw) })
+        } else {
+            let __r = unsafe { krun_error_result(__err) };
+            Err(Error::from_ffi(__r, __err))
+        }
+    }
+    #[doc = " Create a net device backed by a Unix datagram socket fd."]
+    pub fn new_unixgram_fd(
+        id: &str,
+        fd: i32,
+        mac: &[u8],
+        features: u32,
+    ) -> Result<NetDevice, Error> {
+        let mut __err: *mut core::ffi::c_void = core::ptr::null_mut();
+        let __raw = unsafe {
+            krun_net_device_new_unixgram_fd(
+                <&str as FfiType>::into_c(id),
+                <i32 as FfiType>::into_c(fd),
+                <&[u8] as FfiType>::into_c(mac),
+                <u32 as FfiType>::into_c(features),
+                &mut __err as *mut *mut core::ffi::c_void,
+            )
+        };
+        if !__raw.is_null() {
+            Ok(unsafe { <NetDevice as FfiType>::from_c(__raw) })
+        } else {
+            let __r = unsafe { krun_error_result(__err) };
+            Err(Error::from_ffi(__r, __err))
+        }
+    }
+    #[doc = " Create a net device backed by a Unix stream socket path."]
+    pub fn new_unixstream_path(
+        id: &str,
+        path: &str,
+        mac: &[u8],
+        features: u32,
+    ) -> Result<NetDevice, Error> {
+        let mut __err: *mut core::ffi::c_void = core::ptr::null_mut();
+        let __raw = unsafe {
+            krun_net_device_new_unixstream_path(
+                <&str as FfiType>::into_c(id),
+                <&str as FfiType>::into_c(path),
+                <&[u8] as FfiType>::into_c(mac),
+                <u32 as FfiType>::into_c(features),
+                &mut __err as *mut *mut core::ffi::c_void,
+            )
+        };
+        if !__raw.is_null() {
+            Ok(unsafe { <NetDevice as FfiType>::from_c(__raw) })
+        } else {
+            let __r = unsafe { krun_error_result(__err) };
+            Err(Error::from_ffi(__r, __err))
+        }
+    }
+    #[doc = " Create a net device backed by a Unix stream socket fd."]
+    pub fn new_unixstream_fd(
+        id: &str,
+        fd: i32,
+        mac: &[u8],
+        features: u32,
+    ) -> Result<NetDevice, Error> {
+        let mut __err: *mut core::ffi::c_void = core::ptr::null_mut();
+        let __raw = unsafe {
+            krun_net_device_new_unixstream_fd(
+                <&str as FfiType>::into_c(id),
+                <i32 as FfiType>::into_c(fd),
+                <&[u8] as FfiType>::into_c(mac),
+                <u32 as FfiType>::into_c(features),
+                &mut __err as *mut *mut core::ffi::c_void,
+            )
+        };
+        if !__raw.is_null() {
+            Ok(unsafe { <NetDevice as FfiType>::from_c(__raw) })
+        } else {
+            let __r = unsafe { krun_error_result(__err) };
+            Err(Error::from_ffi(__r, __err))
+        }
+    }
+    #[doc = " Create a net device backed by a TAP interface."]
+    pub fn new_tap(
+        id: &str,
+        tap_name: &str,
+        mac: &[u8],
+        features: u32,
+    ) -> Result<NetDevice, Error> {
+        let mut __err: *mut core::ffi::c_void = core::ptr::null_mut();
+        let __raw = unsafe {
+            krun_net_device_new_tap(
+                <&str as FfiType>::into_c(id),
+                <&str as FfiType>::into_c(tap_name),
+                <&[u8] as FfiType>::into_c(mac),
+                <u32 as FfiType>::into_c(features),
+                &mut __err as *mut *mut core::ffi::c_void,
+            )
+        };
+        if !__raw.is_null() {
+            Ok(unsafe { <NetDevice as FfiType>::from_c(__raw) })
+        } else {
+            let __r = unsafe { krun_error_result(__err) };
+            Err(Error::from_ffi(__r, __err))
+        }
+    }
+}
+
+impl Drop for NetDevice {
+    fn drop(&mut self) {
+        unsafe { krun_net_device_destroy(self.0) }
+    }
+}
+
 pub trait PushStr {
     fn push(&mut self, s: &str) -> bool;
     #[doc(hidden)]
@@ -2535,6 +2856,13 @@ impl<'a> AttachDevice<'a> for ConsoleDevice<'a> {
 }
 
 impl<'a> AttachDevice<'a> for BlockDevice {
+    fn __into_raw_handle(self) -> *mut core::ffi::c_void {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.0
+    }
+}
+
+impl<'a> AttachDevice<'a> for NetDevice {
     fn __into_raw_handle(self) -> *mut core::ffi::c_void {
         let this = std::mem::ManuallyDrop::new(self);
         this.0
@@ -2702,6 +3030,18 @@ pub enum Symbol {
     KrunBlockDeviceDestroy,
     /// `krun_block_device_new`
     KrunBlockDeviceNew,
+    /// `krun_net_device_destroy`
+    KrunNetDeviceDestroy,
+    /// `krun_net_device_new_unixgram_path`
+    KrunNetDeviceNewUnixgramPath,
+    /// `krun_net_device_new_unixgram_fd`
+    KrunNetDeviceNewUnixgramFd,
+    /// `krun_net_device_new_unixstream_path`
+    KrunNetDeviceNewUnixstreamPath,
+    /// `krun_net_device_new_unixstream_fd`
+    KrunNetDeviceNewUnixstreamFd,
+    /// `krun_net_device_new_tap`
+    KrunNetDeviceNewTap,
     /// `krun_error_code`
     KrunErrorCode,
     /// `krun_error_message`
@@ -2768,6 +3108,12 @@ impl Symbol {
             Symbol::KrunVsockDeviceAddUnixPort => "krun_vsock_device_add_unix_port",
             Symbol::KrunBlockDeviceDestroy => "krun_block_device_destroy",
             Symbol::KrunBlockDeviceNew => "krun_block_device_new",
+            Symbol::KrunNetDeviceDestroy => "krun_net_device_destroy",
+            Symbol::KrunNetDeviceNewUnixgramPath => "krun_net_device_new_unixgram_path",
+            Symbol::KrunNetDeviceNewUnixgramFd => "krun_net_device_new_unixgram_fd",
+            Symbol::KrunNetDeviceNewUnixstreamPath => "krun_net_device_new_unixstream_path",
+            Symbol::KrunNetDeviceNewUnixstreamFd => "krun_net_device_new_unixstream_fd",
+            Symbol::KrunNetDeviceNewTap => "krun_net_device_new_tap",
             Symbol::KrunErrorCode => "krun_error_code",
             Symbol::KrunErrorMessage => "krun_error_message",
             Symbol::KrunErrorResult => "krun_error_result",
@@ -3403,6 +3749,102 @@ pub fn require(
                             )?
                         };
                         let _ = KRUN_BLOCK_DEVICE_NEW.set(f);
+                    }
+                }
+                Symbol::KrunNetDeviceDestroy => {
+                    if KRUN_NET_DEVICE_DESTROY.get().is_none() {
+                        let f = unsafe {
+                            *lib.get::<unsafe extern "C" fn(*mut core::ffi::c_void)>(
+                                b"krun_net_device_destroy\0",
+                            )?
+                        };
+                        let _ = KRUN_NET_DEVICE_DESTROY.set(f);
+                    }
+                }
+                Symbol::KrunNetDeviceNewUnixgramPath => {
+                    if KRUN_NET_DEVICE_NEW_UNIXGRAM_PATH.get().is_none() {
+                        let f = unsafe {
+                            *lib.get::<unsafe extern "C" fn(
+                                <&'static str as FfiType>::CRepr,
+                                <&'static str as FfiType>::CRepr,
+                                <&'static [u8] as FfiType>::CRepr,
+                                <u32 as FfiType>::CRepr,
+                                <bool as FfiType>::CRepr,
+                                *mut *mut core::ffi::c_void,
+                            )
+                                -> *mut core::ffi::c_void>(
+                                b"krun_net_device_new_unixgram_path\0"
+                            )?
+                        };
+                        let _ = KRUN_NET_DEVICE_NEW_UNIXGRAM_PATH.set(f);
+                    }
+                }
+                Symbol::KrunNetDeviceNewUnixgramFd => {
+                    if KRUN_NET_DEVICE_NEW_UNIXGRAM_FD.get().is_none() {
+                        let f = unsafe {
+                            *lib.get::<unsafe extern "C" fn(
+                                <&'static str as FfiType>::CRepr,
+                                <i32 as FfiType>::CRepr,
+                                <&'static [u8] as FfiType>::CRepr,
+                                <u32 as FfiType>::CRepr,
+                                *mut *mut core::ffi::c_void,
+                            )
+                                -> *mut core::ffi::c_void>(
+                                b"krun_net_device_new_unixgram_fd\0"
+                            )?
+                        };
+                        let _ = KRUN_NET_DEVICE_NEW_UNIXGRAM_FD.set(f);
+                    }
+                }
+                Symbol::KrunNetDeviceNewUnixstreamPath => {
+                    if KRUN_NET_DEVICE_NEW_UNIXSTREAM_PATH.get().is_none() {
+                        let f = unsafe {
+                            *lib.get::<unsafe extern "C" fn(
+                                <&'static str as FfiType>::CRepr,
+                                <&'static str as FfiType>::CRepr,
+                                <&'static [u8] as FfiType>::CRepr,
+                                <u32 as FfiType>::CRepr,
+                                *mut *mut core::ffi::c_void,
+                            )
+                                -> *mut core::ffi::c_void>(
+                                b"krun_net_device_new_unixstream_path\0",
+                            )?
+                        };
+                        let _ = KRUN_NET_DEVICE_NEW_UNIXSTREAM_PATH.set(f);
+                    }
+                }
+                Symbol::KrunNetDeviceNewUnixstreamFd => {
+                    if KRUN_NET_DEVICE_NEW_UNIXSTREAM_FD.get().is_none() {
+                        let f = unsafe {
+                            *lib.get::<unsafe extern "C" fn(
+                                <&'static str as FfiType>::CRepr,
+                                <i32 as FfiType>::CRepr,
+                                <&'static [u8] as FfiType>::CRepr,
+                                <u32 as FfiType>::CRepr,
+                                *mut *mut core::ffi::c_void,
+                            )
+                                -> *mut core::ffi::c_void>(
+                                b"krun_net_device_new_unixstream_fd\0"
+                            )?
+                        };
+                        let _ = KRUN_NET_DEVICE_NEW_UNIXSTREAM_FD.set(f);
+                    }
+                }
+                Symbol::KrunNetDeviceNewTap => {
+                    if KRUN_NET_DEVICE_NEW_TAP.get().is_none() {
+                        let f = unsafe {
+                            *lib.get::<unsafe extern "C" fn(
+                                <&'static str as FfiType>::CRepr,
+                                <&'static str as FfiType>::CRepr,
+                                <&'static [u8] as FfiType>::CRepr,
+                                <u32 as FfiType>::CRepr,
+                                *mut *mut core::ffi::c_void,
+                            )
+                                -> *mut core::ffi::c_void>(
+                                b"krun_net_device_new_tap\0"
+                            )?
+                        };
+                        let _ = KRUN_NET_DEVICE_NEW_TAP.set(f);
                     }
                 }
                 Symbol::KrunErrorCode => {
