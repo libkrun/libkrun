@@ -2281,6 +2281,115 @@ impl Drop for VsockDevice {
     }
 }
 
+static KRUN_BLOCK_DEVICE_DESTROY: std::sync::OnceLock<
+    unsafe extern "C" fn(*mut core::ffi::c_void),
+> = std::sync::OnceLock::new();
+#[allow(non_snake_case)]
+pub unsafe fn krun_block_device_destroy(handle: *mut core::ffi::c_void) {
+    unsafe {
+        (KRUN_BLOCK_DEVICE_DESTROY
+            .get()
+            .expect("symbol `krun_block_device_destroy` not loaded; call require() first"))(
+            handle
+        )
+    }
+}
+
+static KRUN_BLOCK_DEVICE_NEW: std::sync::OnceLock<
+    unsafe extern "C" fn(
+        <&'static str as FfiType>::CRepr,
+        <&'static str as FfiType>::CRepr,
+        <bool as FfiType>::CRepr,
+        *mut *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void,
+> = std::sync::OnceLock::new();
+#[allow(non_snake_case)]
+pub unsafe fn krun_block_device_new(
+    id: <&'static str as FfiType>::CRepr,
+    disk_image_path: <&'static str as FfiType>::CRepr,
+    is_read_only: <bool as FfiType>::CRepr,
+    err_out: *mut *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    unsafe {
+        (KRUN_BLOCK_DEVICE_NEW
+            .get()
+            .expect("symbol `krun_block_device_new` not loaded; call require() first"))(
+            id,
+            disk_image_path,
+            is_read_only,
+            err_out,
+        )
+    }
+}
+
+pub struct BlockDevice(*mut core::ffi::c_void);
+
+impl BlockDevice {
+    #[doc(hidden)]
+    pub fn __from_raw(ptr: *mut core::ffi::c_void) -> Self {
+        Self(ptr)
+    }
+    #[doc(hidden)]
+    pub fn __into_raw(self) -> *mut core::ffi::c_void {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.0
+    }
+}
+
+impl FfiHandle for BlockDevice {
+    const C_HANDLE_NAME: &'static str = "KrunBlockDevice";
+    const TYPE_TAG: u32 = 16777233u32;
+    unsafe fn as_handle(&self) -> *mut core::ffi::c_void {
+        self.0
+    }
+    fn __from_raw(handle: *mut core::ffi::c_void) -> Self {
+        Self(handle)
+    }
+}
+
+impl FfiType for BlockDevice {
+    type CRepr = *mut core::ffi::c_void;
+    const C_TYPE_NAME: &'static str = "BlockDevice";
+    fn into_c(self) -> *mut core::ffi::c_void {
+        self.__into_raw()
+    }
+    unsafe fn from_c(repr: *mut core::ffi::c_void) -> Self {
+        Self::__from_raw(repr)
+    }
+}
+
+impl std::fmt::Debug for BlockDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("BlockDevice").field(&self.0).finish()
+    }
+}
+
+impl BlockDevice {
+    pub fn new(id: &str, disk_image_path: &str, is_read_only: bool) -> Result<BlockDevice, Error> {
+        let mut __err: *mut core::ffi::c_void = core::ptr::null_mut();
+        let __raw = unsafe {
+            krun_block_device_new(
+                <&str as FfiType>::into_c(id),
+                <&str as FfiType>::into_c(disk_image_path),
+                <bool as FfiType>::into_c(is_read_only),
+                &mut __err as *mut *mut core::ffi::c_void,
+            )
+        };
+        if !__raw.is_null() {
+            Ok(unsafe { <BlockDevice as FfiType>::from_c(__raw) })
+        } else {
+            let __r = unsafe { krun_error_result(__err) };
+            Err(Error::from_ffi(__r, __err))
+        }
+    }
+}
+
+impl Drop for BlockDevice {
+    fn drop(&mut self) {
+        unsafe { krun_block_device_destroy(self.0) }
+    }
+}
+
 pub trait PushStr {
     fn push(&mut self, s: &str) -> bool;
     #[doc(hidden)]
@@ -2419,6 +2528,13 @@ impl<'a> AttachDevice<'a> for FsDevice<'a> {
 }
 
 impl<'a> AttachDevice<'a> for ConsoleDevice<'a> {
+    fn __into_raw_handle(self) -> *mut core::ffi::c_void {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.0
+    }
+}
+
+impl<'a> AttachDevice<'a> for BlockDevice {
     fn __into_raw_handle(self) -> *mut core::ffi::c_void {
         let this = std::mem::ManuallyDrop::new(self);
         this.0
@@ -2582,6 +2698,10 @@ pub enum Symbol {
     KrunVsockDeviceAddPortForward,
     /// `krun_vsock_device_add_unix_port`
     KrunVsockDeviceAddUnixPort,
+    /// `krun_block_device_destroy`
+    KrunBlockDeviceDestroy,
+    /// `krun_block_device_new`
+    KrunBlockDeviceNew,
     /// `krun_error_code`
     KrunErrorCode,
     /// `krun_error_message`
@@ -2646,6 +2766,8 @@ impl Symbol {
             Symbol::KrunVsockDeviceNew => "krun_vsock_device_new",
             Symbol::KrunVsockDeviceAddPortForward => "krun_vsock_device_add_port_forward",
             Symbol::KrunVsockDeviceAddUnixPort => "krun_vsock_device_add_unix_port",
+            Symbol::KrunBlockDeviceDestroy => "krun_block_device_destroy",
+            Symbol::KrunBlockDeviceNew => "krun_block_device_new",
             Symbol::KrunErrorCode => "krun_error_code",
             Symbol::KrunErrorMessage => "krun_error_message",
             Symbol::KrunErrorResult => "krun_error_result",
@@ -3255,6 +3377,32 @@ pub fn require(
                             )>(b"krun_vsock_device_add_unix_port\0")?
                         };
                         let _ = KRUN_VSOCK_DEVICE_ADD_UNIX_PORT.set(f);
+                    }
+                }
+                Symbol::KrunBlockDeviceDestroy => {
+                    if KRUN_BLOCK_DEVICE_DESTROY.get().is_none() {
+                        let f = unsafe {
+                            *lib.get::<unsafe extern "C" fn(*mut core::ffi::c_void)>(
+                                b"krun_block_device_destroy\0",
+                            )?
+                        };
+                        let _ = KRUN_BLOCK_DEVICE_DESTROY.set(f);
+                    }
+                }
+                Symbol::KrunBlockDeviceNew => {
+                    if KRUN_BLOCK_DEVICE_NEW.get().is_none() {
+                        let f = unsafe {
+                            *lib.get::<unsafe extern "C" fn(
+                                <&'static str as FfiType>::CRepr,
+                                <&'static str as FfiType>::CRepr,
+                                <bool as FfiType>::CRepr,
+                                *mut *mut core::ffi::c_void,
+                            )
+                                -> *mut core::ffi::c_void>(
+                                b"krun_block_device_new\0"
+                            )?
+                        };
+                        let _ = KRUN_BLOCK_DEVICE_NEW.set(f);
                     }
                 }
                 Symbol::KrunErrorCode => {

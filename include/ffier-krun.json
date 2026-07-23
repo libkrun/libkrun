@@ -20,6 +20,14 @@
       },
       "type_tag": 16777230
     },
+    "BlockDevice": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunBlockDevice"
+        }
+      },
+      "type_tag": 16777233
+    },
     "BorrowedFd": {
       "kind": {
         "alias": {
@@ -1146,6 +1154,45 @@
           "ffi_name": "krun_vsock_device_add_unix_port"
         }
       ]
+    },
+    {
+      "name": "BlockDevice",
+      "destroy_ffi_name": "krun_block_device_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "new",
+          "receiver": "none",
+          "params": [
+            {
+              "name": "id",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "disk_image_path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "is_read_only",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "BlockDevice"
+            },
+            "err_type": "Error",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_block_device_new"
+        }
+      ]
     }
   ],
   "errors": [
@@ -1505,6 +1552,17 @@
         "a"
       ],
       "struct_lifetime_args": [
+        "a"
+      ],
+      "methods": []
+    },
+    {
+      "trait_name": "AttachDevice",
+      "struct_name": "BlockDevice",
+      "lifetimes": [
+        "a"
+      ],
+      "trait_lifetime_args": [
         "a"
       ],
       "methods": []

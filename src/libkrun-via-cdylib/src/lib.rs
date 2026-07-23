@@ -1654,6 +1654,84 @@ impl Drop for VsockDevice {
     }
 }
 
+unsafe extern "C" {
+    pub fn krun_block_device_destroy(handle: *mut core::ffi::c_void);
+    pub fn krun_block_device_new(
+        id: <&'static str as FfiType>::CRepr,
+        disk_image_path: <&'static str as FfiType>::CRepr,
+        is_read_only: <bool as FfiType>::CRepr,
+        err_out: *mut *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void;
+}
+
+pub struct BlockDevice(*mut core::ffi::c_void);
+
+impl BlockDevice {
+    #[doc(hidden)]
+    pub fn __from_raw(ptr: *mut core::ffi::c_void) -> Self {
+        Self(ptr)
+    }
+    #[doc(hidden)]
+    pub fn __into_raw(self) -> *mut core::ffi::c_void {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.0
+    }
+}
+
+impl FfiHandle for BlockDevice {
+    const C_HANDLE_NAME: &'static str = "KrunBlockDevice";
+    const TYPE_TAG: u32 = 16777233u32;
+    unsafe fn as_handle(&self) -> *mut core::ffi::c_void {
+        self.0
+    }
+    fn __from_raw(handle: *mut core::ffi::c_void) -> Self {
+        Self(handle)
+    }
+}
+
+impl FfiType for BlockDevice {
+    type CRepr = *mut core::ffi::c_void;
+    const C_TYPE_NAME: &'static str = "BlockDevice";
+    fn into_c(self) -> *mut core::ffi::c_void {
+        self.__into_raw()
+    }
+    unsafe fn from_c(repr: *mut core::ffi::c_void) -> Self {
+        Self::__from_raw(repr)
+    }
+}
+
+impl std::fmt::Debug for BlockDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("BlockDevice").field(&self.0).finish()
+    }
+}
+
+impl BlockDevice {
+    pub fn new(id: &str, disk_image_path: &str, is_read_only: bool) -> Result<BlockDevice, Error> {
+        let mut __err: *mut core::ffi::c_void = core::ptr::null_mut();
+        let __raw = unsafe {
+            krun_block_device_new(
+                <&str as FfiType>::into_c(id),
+                <&str as FfiType>::into_c(disk_image_path),
+                <bool as FfiType>::into_c(is_read_only),
+                &mut __err as *mut *mut core::ffi::c_void,
+            )
+        };
+        if !__raw.is_null() {
+            Ok(unsafe { <BlockDevice as FfiType>::from_c(__raw) })
+        } else {
+            let __r = unsafe { krun_error_result(__err) };
+            Err(Error::from_ffi(__r, __err))
+        }
+    }
+}
+
+impl Drop for BlockDevice {
+    fn drop(&mut self) {
+        unsafe { krun_block_device_destroy(self.0) }
+    }
+}
+
 pub trait PushStr {
     fn push(&mut self, s: &str) -> bool;
     #[doc(hidden)]
@@ -1750,6 +1828,13 @@ impl<'a> AttachDevice<'a> for FsDevice<'a> {
 }
 
 impl<'a> AttachDevice<'a> for ConsoleDevice<'a> {
+    fn __into_raw_handle(self) -> *mut core::ffi::c_void {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.0
+    }
+}
+
+impl<'a> AttachDevice<'a> for BlockDevice {
     fn __into_raw_handle(self) -> *mut core::ffi::c_void {
         let this = std::mem::ManuallyDrop::new(self);
         this.0

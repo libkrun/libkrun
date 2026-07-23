@@ -12,6 +12,8 @@ pub use devices::FsDevice;
 pub use devices::RngDevice;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use devices::FsOverlay;
+#[cfg(feature = "blk")]
+pub use devices::BlockDevice;
 pub use devices::{
     AttachContext, AttachDevice, ConsoleBuilder, ConsoleDevice, DeviceManager, DeviceRequirements,
     MmioDeviceManager, ResolvedShmRegion, VsockDevice,
@@ -49,6 +51,10 @@ ffier::library_definition!("krun", library_tag = 1,
     #[cfg(not(feature = "tee"))]
     crate::api::devices::RngDevice = 15,
     crate::api::devices::VsockDevice = 16,
+    #[cfg(feature = "blk")]
+    crate::api::devices::BlockDevice = 17,
+    #[cfg(feature = "blk")]
+    crate::api::devices::AttachDevice for crate::api::devices::BlockDevice,
     #[cfg(not(feature = "tee"))]
     crate::api::devices::AttachDevice for crate::api::devices::BalloonDevice,
     #[cfg(not(feature = "tee"))]

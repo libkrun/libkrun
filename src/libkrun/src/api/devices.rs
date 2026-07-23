@@ -983,6 +983,51 @@ impl<'a> AttachDevice<'a> for VsockDevice {
     }
 }
 
+/// A virtio block device backed by a disk image.
+#[cfg(feature = "blk")]
+pub struct BlockDevice {
+    pub(crate) inner: Arc<Mutex<devices::virtio::Block>>,
+}
+
+#[cfg(feature = "blk")]
+#[ffier::export]
+impl BlockDevice {
+    pub fn new(id: &str, disk_image_path: &str, is_read_only: bool) -> Result<Self, Error> {
+        use devices::virtio::CacheType;
+        use devices::virtio::block::{ImageType, SyncMode};
+        let block = devices::virtio::Block::new(
+            id.to_string(),
+            None,
+            CacheType::auto(disk_image_path),
+            disk_image_path.to_string(),
+            ImageType::Raw,
+            is_read_only,
+            false,
+            #[cfg(not(target_os = "macos"))]
+            SyncMode::Full,
+            #[cfg(target_os = "macos")]
+            SyncMode::Relaxed,
+        )
+        .map_err(|e| {
+            log::error!("block: {e}");
+            Error::Internal()
+        })?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(block)),
+        })
+    }
+}
+
+#[cfg(feature = "blk")]
+#[ffier::export]
+impl<'a> AttachDevice<'a> for BlockDevice {
+    #[ffier(skip)]
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), DetailedError> {
+        let id = self.inner.lock().unwrap().id().to_string();
+        ctx.register(&id, self.inner)
+    }
+}
+
 /// Walk parent directory components in a virtual entry tree, returning the
 /// children vec of the deepest parent.
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]

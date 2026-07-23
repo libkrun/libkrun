@@ -213,20 +213,23 @@ impl Builder {
         self.inner
             .process
             .env
-            .retain(|e| !e.starts_with("KRUN_BLOCK_ROOT="));
-        let mut val = device.to_string();
-        if let Some(fs) = fstype {
-            val.push(':');
-            val.push_str(fs);
-        }
-        if let Some(opts) = options {
-            val.push(':');
-            val.push_str(opts);
-        }
+            .retain(|e| !e.starts_with("KRUN_BLOCK_ROOT_"));
         self.inner
             .process
             .env
-            .push(format!("KRUN_BLOCK_ROOT={val}"));
+            .push(format!("KRUN_BLOCK_ROOT_DEVICE={device}"));
+        if let Some(fs) = fstype {
+            self.inner
+                .process
+                .env
+                .push(format!("KRUN_BLOCK_ROOT_FSTYPE={fs}"));
+        }
+        if let Some(opts) = options {
+            self.inner
+                .process
+                .env
+                .push(format!("KRUN_BLOCK_ROOT_OPTIONS={opts}"));
+        }
         self
     }
 
