@@ -1462,6 +1462,72 @@ impl Drop for BalloonDevice {
     }
 }
 
+unsafe extern "C" {
+    pub fn krun_rng_device_destroy(handle: *mut core::ffi::c_void);
+    pub fn krun_rng_device_new(err_out: *mut *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+}
+
+pub struct RngDevice(*mut core::ffi::c_void);
+
+impl RngDevice {
+    #[doc(hidden)]
+    pub fn __from_raw(ptr: *mut core::ffi::c_void) -> Self {
+        Self(ptr)
+    }
+    #[doc(hidden)]
+    pub fn __into_raw(self) -> *mut core::ffi::c_void {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.0
+    }
+}
+
+impl FfiHandle for RngDevice {
+    const C_HANDLE_NAME: &'static str = "KrunRngDevice";
+    const TYPE_TAG: u32 = 16777231u32;
+    unsafe fn as_handle(&self) -> *mut core::ffi::c_void {
+        self.0
+    }
+    fn __from_raw(handle: *mut core::ffi::c_void) -> Self {
+        Self(handle)
+    }
+}
+
+impl FfiType for RngDevice {
+    type CRepr = *mut core::ffi::c_void;
+    const C_TYPE_NAME: &'static str = "RngDevice";
+    fn into_c(self) -> *mut core::ffi::c_void {
+        self.__into_raw()
+    }
+    unsafe fn from_c(repr: *mut core::ffi::c_void) -> Self {
+        Self::__from_raw(repr)
+    }
+}
+
+impl std::fmt::Debug for RngDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RngDevice").field(&self.0).finish()
+    }
+}
+
+impl RngDevice {
+    pub fn new() -> Result<RngDevice, Error> {
+        let mut __err: *mut core::ffi::c_void = core::ptr::null_mut();
+        let __raw = unsafe { krun_rng_device_new(&mut __err as *mut *mut core::ffi::c_void) };
+        if !__raw.is_null() {
+            Ok(unsafe { <RngDevice as FfiType>::from_c(__raw) })
+        } else {
+            let __r = unsafe { krun_error_result(__err) };
+            Err(Error::from_ffi(__r, __err))
+        }
+    }
+}
+
+impl Drop for RngDevice {
+    fn drop(&mut self) {
+        unsafe { krun_rng_device_destroy(self.0) }
+    }
+}
+
 pub trait PushStr {
     fn push(&mut self, s: &str) -> bool;
     #[doc(hidden)]
@@ -1565,6 +1631,13 @@ impl<'a> AttachDevice<'a> for ConsoleDevice<'a> {
 }
 
 impl<'a> AttachDevice<'a> for BalloonDevice {
+    fn __into_raw_handle(self) -> *mut core::ffi::c_void {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.0
+    }
+}
+
+impl<'a> AttachDevice<'a> for RngDevice {
     fn __into_raw_handle(self) -> *mut core::ffi::c_void {
         let this = std::mem::ManuallyDrop::new(self);
         this.0
