@@ -147,6 +147,12 @@ typedef void (*krun_init_builder_rlimit_fn)(KrunInitBuilder* handle, KrunStr lim
 /** Append multiple resource limits. */
 void krun_init_builder_rlimits(KrunInitBuilder* handle, const KrunStr* limits, size_t limits_len);
 typedef void (*krun_init_builder_rlimits_fn)(KrunInitBuilder* handle, const KrunStr* limits, size_t limits_len);
+/** Enable DHCP client in the guest. */
+void krun_init_builder_dhcp(KrunInitBuilder* handle, bool enable);
+typedef void (*krun_init_builder_dhcp_fn)(KrunInitBuilder* handle, bool enable);
+/** Set the root disk to remount on boot. */
+void krun_init_builder_set_root_disk_remount(KrunInitBuilder* handle, KrunStr device, KrunStr fstype, KrunStr options);
+typedef void (*krun_init_builder_set_root_disk_remount_fn)(KrunInitBuilder* handle, KrunStr device, KrunStr fstype, KrunStr options);
 /**
  * Consume the builder, serialize the config, and return the
  * finished [`Config`].

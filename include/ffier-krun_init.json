@@ -448,6 +448,59 @@
           "ffi_name": "krun_init_builder_rlimits"
         },
         {
+          "name": "dhcp",
+          "doc": [
+            " Enable DHCP client in the guest."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "enable",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_builder_dhcp"
+        },
+        {
+          "name": "set_root_disk_remount",
+          "doc": [
+            " Set the root disk to remount on boot."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "device",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "fstype",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared",
+              "optional": true
+            },
+            {
+              "name": "options",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared",
+              "optional": true
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_builder_set_root_disk_remount"
+        },
+        {
           "name": "build",
           "doc": [
             " Consume the builder, serialize the config, and return the",

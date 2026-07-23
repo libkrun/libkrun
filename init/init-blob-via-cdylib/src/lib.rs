@@ -553,6 +553,13 @@ unsafe extern "C" {
         limits: *const <&'static str as FfiType>::CRepr,
         limits_len: usize,
     );
+    pub fn krun_init_builder_dhcp(handle: *mut core::ffi::c_void, enable: <bool as FfiType>::CRepr);
+    pub fn krun_init_builder_set_root_disk_remount(
+        handle: *mut core::ffi::c_void,
+        device: <&'static str as FfiType>::CRepr,
+        fstype: <Option<&'static str> as FfiType>::CRepr,
+        options: <Option<&'static str> as FfiType>::CRepr,
+    );
     pub fn krun_init_builder_build(handle: *mut core::ffi::c_void) -> <Config as FfiType>::CRepr;
 }
 
@@ -740,6 +747,41 @@ impl Builder {
                 &mut __handle as *mut *mut core::ffi::c_void as *mut core::ffi::c_void,
                 __ffi_limits.as_ptr(),
                 __ffi_limits.len(),
+            )
+        };
+        Self(__handle)
+    }
+    #[doc = " Enable DHCP client in the guest."]
+    pub fn dhcp(self, enable: bool) -> Self {
+        let mut __handle = {
+            let this = std::mem::ManuallyDrop::new(self);
+            this.0
+        };
+        unsafe {
+            krun_init_builder_dhcp(
+                &mut __handle as *mut *mut core::ffi::c_void as *mut core::ffi::c_void,
+                <bool as FfiType>::into_c(enable),
+            )
+        };
+        Self(__handle)
+    }
+    #[doc = " Set the root disk to remount on boot."]
+    pub fn set_root_disk_remount(
+        self,
+        device: &str,
+        fstype: Option<&str>,
+        options: Option<&str>,
+    ) -> Self {
+        let mut __handle = {
+            let this = std::mem::ManuallyDrop::new(self);
+            this.0
+        };
+        unsafe {
+            krun_init_builder_set_root_disk_remount(
+                &mut __handle as *mut *mut core::ffi::c_void as *mut core::ffi::c_void,
+                <&str as FfiType>::into_c(device),
+                <Option<&str> as FfiType>::into_c(fstype),
+                <Option<&str> as FfiType>::into_c(options),
             )
         };
         Self(__handle)

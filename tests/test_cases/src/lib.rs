@@ -32,8 +32,8 @@ use test_virtiofs_root_ro::TestVirtiofsRootRo;
 mod test_augmentfs;
 use test_augmentfs::TestAugmentFs;
 
-// mod test_root_disk_remount;
-// use test_root_disk_remount::TestRootDiskRemount;
+mod test_root_disk_remount;
+use test_root_disk_remount::TestRootDiskRemount;
 
 mod test_pjdfstest;
 use test_pjdfstest::TestPjdfstest;
@@ -116,7 +116,7 @@ pub fn test_cases() -> Vec<TestCase> {
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-root-ro", Box::new(TestVirtiofsRootRo)),
         TestCase::new("augmentfs", Box::new(TestAugmentFs)),
-        // TestCase::new("root-disk-remount", Box::new(TestRootDiskRemount)),
+        TestCase::new("root-disk-remount", Box::new(TestRootDiskRemount)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-misc", Box::new(TestVirtioFsMisc)),
         TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
