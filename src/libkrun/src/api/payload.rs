@@ -3,14 +3,23 @@ use std::path::PathBuf;
 use super::error::Error;
 
 #[allow(dead_code)]
+pub(crate) enum PayloadKind {
+    Vmm {
+        bundle: Option<vmm::vmm_config::kernel_bundle::KernelBundle>,
+        payload: vmm::builder::Payload,
+        #[cfg(feature = "tee")]
+        qboot_bundle: Option<vmm::vmm_config::kernel_bundle::QbootBundle>,
+        #[cfg(feature = "tee")]
+        initrd_bundle: Option<vmm::vmm_config::kernel_bundle::InitrdBundle>,
+    },
+    #[cfg(feature = "aws-nitro")]
+    Nitro(crate::builder::NitroConfig),
+}
+
+#[allow(dead_code)]
 pub struct Payload {
-    pub(crate) bundle: Option<vmm::vmm_config::kernel_bundle::KernelBundle>,
-    pub(crate) payload: vmm::builder::Payload,
+    pub(crate) kind: PayloadKind,
     pub(crate) cmdline: String,
-    #[cfg(feature = "tee")]
-    pub(crate) qboot_bundle: Option<vmm::vmm_config::kernel_bundle::QbootBundle>,
-    #[cfg(feature = "tee")]
-    pub(crate) initrd_bundle: Option<vmm::vmm_config::kernel_bundle::InitrdBundle>,
 }
 
 #[ffier::export]
@@ -64,13 +73,15 @@ impl Payload {
         let cmdline = vmm::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE.replace(" quiet", "");
 
         Ok(Payload {
-            bundle: Some(bundle),
-            payload: payload_type,
+            kind: PayloadKind::Vmm {
+                bundle: Some(bundle),
+                payload: payload_type,
+                #[cfg(feature = "tee")]
+                qboot_bundle,
+                #[cfg(feature = "tee")]
+                initrd_bundle,
+            },
             cmdline,
-            #[cfg(feature = "tee")]
-            qboot_bundle,
-            #[cfg(feature = "tee")]
-            initrd_bundle,
         })
     }
 
@@ -105,13 +116,15 @@ impl Payload {
         })?;
 
         Ok(Payload {
-            bundle: None,
-            payload: payload_type,
+            kind: PayloadKind::Vmm {
+                bundle: None,
+                payload: payload_type,
+                #[cfg(feature = "tee")]
+                qboot_bundle: None,
+                #[cfg(feature = "tee")]
+                initrd_bundle: None,
+            },
             cmdline: cmdline.to_string(),
-            #[cfg(feature = "tee")]
-            qboot_bundle: None,
-            #[cfg(feature = "tee")]
-            initrd_bundle: None,
         })
     }
 
@@ -124,6 +137,17 @@ impl Payload {
             self.cmdline.push(' ');
             self.cmdline.push_str(extra);
         }
+    }
+}
+
+#[cfg(feature = "aws-nitro")]
+#[ffier::export]
+impl Payload {
+    pub fn nitro_enclave(config: crate::builder::NitroConfig) -> Result<Self, Error> {
+        Ok(Payload {
+            kind: PayloadKind::Nitro(config),
+            cmdline: String::new(),
+        })
     }
 }
 

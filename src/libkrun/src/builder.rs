@@ -494,9 +494,6 @@ pub(crate) fn build_microvm(
     // We use this atomic to record the exit code set by init/init.c in the VM.
     let exit_code = Arc::new(AtomicI32::new(i32::MAX));
 
-    #[cfg(target_os = "macos")]
-    let (vm_ctl_tx, vm_ctl_rx) = utils::pollable_channel::pollable_channel();
-
     let mut vmm = Vmm {
         guest_memory,
         arch_memory_info,
@@ -509,14 +506,6 @@ pub(crate) fn build_microvm(
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
-        #[cfg(target_os = "macos")]
-        vm_ctl_tx,
-        #[cfg(target_os = "macos")]
-        vm_ctl_rx,
-        #[cfg(target_os = "macos")]
-        paused: false,
-        #[cfg(target_os = "macos")]
-        paused_at: 0,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -611,67 +600,86 @@ static KRUN_NITRO_DEBUG: StdMutex<bool> = StdMutex::new(false);
 
 #[cfg(feature = "aws-nitro")]
 #[derive(Default)]
-pub(crate) struct NitroConfig {
-    pub(crate) workdir: Option<String>,
-    pub(crate) exec_path: Option<String>,
-    pub(crate) env: Option<String>,
-    pub(crate) args: Option<String>,
-    pub(crate) rlimits: Option<String>,
-    pub(crate) console_output: Option<PathBuf>,
+pub struct NitroConfig {
+    workdir: Option<String>,
+    exec_path: Option<String>,
+    env: Option<String>,
+    args: Option<String>,
+    rlimits: Option<String>,
+    console_output: Option<PathBuf>,
+    rootfs: Option<String>,
+    net_unixfd: Option<std::os::fd::RawFd>,
+}
+
+#[cfg(feature = "aws-nitro")]
+static NITRO_DEBUG: StdMutex<bool> = StdMutex::new(false);
+
+#[cfg(feature = "aws-nitro")]
+#[ffier::export]
+impl NitroConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn rootfs(mut self, path: &str) -> Self {
+        self.rootfs = Some(path.to_string());
+        self
+    }
+
+    pub fn exec_path(mut self, path: &str) -> Self {
+        self.exec_path = Some(path.to_string());
+        self
+    }
+
+    pub fn args(mut self, args: &str) -> Self {
+        self.args = Some(args.to_string());
+        self
+    }
+
+    pub fn env(mut self, env: &str) -> Self {
+        self.env = Some(env.to_string());
+        self
+    }
+
+    pub fn workdir(mut self, path: &str) -> Self {
+        self.workdir = Some(path.to_string());
+        self
+    }
+
+    pub fn rlimits(mut self, rlimits: &str) -> Self {
+        self.rlimits = Some(rlimits.to_string());
+        self
+    }
+
+    pub fn console_output(mut self, path: &str) -> Self {
+        self.console_output = Some(PathBuf::from(path));
+        self
+    }
+
+    pub fn net_fd(mut self, fd: i32) -> Self {
+        self.net_unixfd = if fd >= 0 { Some(fd) } else { None };
+        self
+    }
+
+    pub fn debug(mut self, enable: bool) -> Self {
+        *NITRO_DEBUG.lock().unwrap() = enable;
+        self
+    }
 }
 
 #[cfg(feature = "aws-nitro")]
 impl NitroConfig {
-    pub(crate) fn set_workdir(&mut self, workdir: String) {
-        self.workdir = Some(workdir);
-    }
-
-    pub(crate) fn set_exec_path(&mut self, exec_path: String) {
-        self.exec_path = Some(exec_path);
-    }
-
-    pub(crate) fn set_env(&mut self, env: String) {
-        self.env = Some(env);
-    }
-
-    pub(crate) fn set_args(&mut self, args: String) {
-        self.args = Some(args);
-    }
-
-    pub(crate) fn set_rlimits(&mut self, rlimits: String) {
-        self.rlimits = Some(rlimits);
-    }
-
-    }
-
-    pub(crate) fn set_debug(&mut self, debug: bool) {
-        *KRUN_NITRO_DEBUG.lock().unwrap() = debug;
-    }
-
     pub(crate) fn into_enclave(
         self,
         vcpus: u8,
         mem_size_mib: usize,
-        rootfs: String,
-        net_unixfd: Option<std::os::fd::RawFd>,
-    ) -> Result<aws_nitro::NitroEnclave, i32> {
-        let exec_path = self.exec_path.ok_or_else(|| {
-            log::error!("exec path not specified");
-            -libc::EINVAL
-        })?;
-        let exec_env = self.env.ok_or_else(|| {
-            log::error!("execution env not specified");
-            -libc::EINVAL
-        })?;
-        let exec_args = self.args.ok_or_else(|| {
-            log::error!("execution args not specified");
-            -libc::EINVAL
-        })?;
-        let output_path = self.console_output.ok_or_else(|| {
-            log::error!("console output path not specified");
-            -libc::EINVAL
-        })?;
-        let debug = *KRUN_NITRO_DEBUG.lock().unwrap();
+    ) -> Result<aws_nitro::NitroEnclave, String> {
+        let rootfs = self.rootfs.ok_or("rootfs not specified")?;
+        let exec_path = self.exec_path.ok_or("exec path not specified")?;
+        let exec_env = self.env.ok_or("execution env not specified")?;
+        let exec_args = self.args.ok_or("execution args not specified")?;
+        let output_path = self.console_output.ok_or("console output path not specified")?;
+        let debug = *NITRO_DEBUG.lock().unwrap();
 
         Ok(aws_nitro::NitroEnclave {
             mem_size_mib,
@@ -680,7 +688,7 @@ impl NitroConfig {
             exec_path,
             exec_args,
             exec_env,
-            net_unixfd,
+            net_unixfd: self.net_unixfd,
             output_path,
             debug,
         })

@@ -132,21 +132,53 @@ impl<'a> Vmm<'a> {
 }
 
 fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, DetailedError> {
+    use super::payload::PayloadKind;
+
     let vcpus_count = builder_cfg
         .vcpus
         .ok_or_else(|| DetailedError::new(Error::MissingConfig(), "vcpus not set"))?;
     let ram_mib = builder_cfg
         .ram_mib
         .ok_or_else(|| DetailedError::new(Error::MissingConfig(), "ram_mib not set"))?;
+    let loaded_kernel = builder_cfg
+        .kernel
+        .ok_or_else(|| DetailedError::new(Error::MissingConfig(), "kernel not set"))?;
+
+    #[cfg(feature = "aws-nitro")]
+    if let PayloadKind::Nitro(nitro_config) = loaded_kernel.kind {
+        return run_nitro(nitro_config, vcpus_count, ram_mib as usize);
+    }
+
     let device_manager = builder_cfg.device_manager.ok_or_else(|| {
         DetailedError::new(
             Error::MissingConfig(),
             "no device manager set (call .devices())",
         )
     })?;
-    let loaded_kernel = builder_cfg
-        .kernel
-        .ok_or_else(|| DetailedError::new(Error::MissingConfig(), "kernel not set"))?;
+
+    let (bundle, vmm_payload, _tee_qboot, _tee_initrd) = match loaded_kernel.kind {
+        PayloadKind::Vmm {
+            bundle,
+            payload,
+            #[cfg(feature = "tee")]
+            qboot_bundle,
+            #[cfg(feature = "tee")]
+            initrd_bundle,
+        } => (
+            bundle,
+            payload,
+            #[cfg(feature = "tee")]
+            qboot_bundle,
+            #[cfg(not(feature = "tee"))]
+            None::<()>,
+            #[cfg(feature = "tee")]
+            initrd_bundle,
+            #[cfg(not(feature = "tee"))]
+            None::<()>,
+        ),
+        #[cfg(feature = "aws-nitro")]
+        PayloadKind::Nitro(_) => unreachable!("handled above"),
+    };
 
     let mut vm_resources = VmResources::default();
     vm_resources
@@ -158,20 +190,20 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, DetailedError> {
         })
         .map_err(|e| DetailedError::new(Error::InvalidParam(), format!("{e:?}")))?;
 
-    vm_resources.kernel_bundle = loaded_kernel.bundle;
-    if let vmm::builder::Payload::ExternalKernel(ref ek) = loaded_kernel.payload {
+    vm_resources.kernel_bundle = bundle;
+    if let vmm::builder::Payload::ExternalKernel(ref ek) = vmm_payload {
         vm_resources.external_kernel = Some(ek.clone());
     }
 
     #[cfg(feature = "tee")]
-    if let Some(qboot) = loaded_kernel.qboot_bundle {
+    if let Some(qboot) = _tee_qboot {
         vm_resources
             .set_qboot_bundle(qboot)
             .map_err(|e| DetailedError::new(Error::InvalidParam(), format!("{e}")))?;
     }
 
     #[cfg(feature = "tee")]
-    if let Some(initrd) = loaded_kernel.initrd_bundle {
+    if let Some(initrd) = _tee_initrd {
         vm_resources
             .set_initrd_bundle(initrd)
             .map_err(|e| DetailedError::new(Error::InvalidParam(), format!("{e}")))?;
@@ -219,4 +251,19 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, DetailedError> {
         _worker_sender: sender,
         _lifetime: PhantomData,
     })
+}
+
+#[cfg(feature = "aws-nitro")]
+fn run_nitro(
+    nitro_config: crate::builder::NitroConfig,
+    vcpus: u8,
+    mem_size_mib: usize,
+) -> Result<Vmm<'_>, DetailedError> {
+    let enclave = nitro_config
+        .into_enclave(vcpus, mem_size_mib)
+        .map_err(|e| DetailedError::new(Error::MissingConfig(), e))?;
+    let exit_code = enclave
+        .run()
+        .map_err(|e| DetailedError::new(Error::BootError(), format!("{e}")))?;
+    unsafe { libc::_exit(exit_code) }
 }

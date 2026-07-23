@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use devices::legacy::IrqChip;
 #[cfg(feature = "gpu")]
-use devices::virtio::display::{DisplayInfo, DisplayInfoEdid, PhysicalSize};
+use devices::display::{DisplayInfo, DisplayInfoEdid, PhysicalSize};
 #[cfg(feature = "input")]
 use krun_input;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -1353,6 +1353,7 @@ impl<'a> AttachDevice<'a> for VhostUserDevice {
             self.name.clone(),
             self.num_queues,
             &self.queue_sizes,
+            None,
         )
         .map_err(|e| {
             DetailedError::new(Error::Internal(), format!("vhost-user: {e}"))
