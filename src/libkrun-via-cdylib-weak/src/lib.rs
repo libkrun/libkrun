@@ -1674,6 +1674,23 @@ pub unsafe fn krun_vmm_builder_set_kernel_console(
     }
 }
 
+static KRUN_VMM_BUILDER_SERIAL_INPUT_FD: std::sync::OnceLock<
+    unsafe extern "C" fn(*mut core::ffi::c_void, <i32 as FfiType>::CRepr),
+> = std::sync::OnceLock::new();
+#[allow(non_snake_case)]
+pub unsafe fn krun_vmm_builder_serial_input_fd(
+    handle: *mut core::ffi::c_void,
+    fd: <i32 as FfiType>::CRepr,
+) {
+    unsafe {
+        (KRUN_VMM_BUILDER_SERIAL_INPUT_FD
+            .get()
+            .expect("symbol `krun_vmm_builder_serial_input_fd` not loaded; call require() first"))(
+            handle, fd,
+        )
+    }
+}
+
 static KRUN_VMM_BUILDER_BUILD: std::sync::OnceLock<
     unsafe extern "C" fn(
         *mut core::ffi::c_void,
@@ -1814,6 +1831,24 @@ impl<'a> VmmBuilder<'a> {
             krun_vmm_builder_set_kernel_console(
                 &mut __handle as *mut *mut core::ffi::c_void as *mut core::ffi::c_void,
                 <&str as FfiType>::into_c(console),
+            )
+        };
+        Self(__handle, std::marker::PhantomData)
+    }
+    #[doc = " Set the fd used as input for the legacy serial console (e.g. a pipe read end)."]
+    #[doc = ""]
+    #[doc = " When set, a serial console device is created with this fd as input and the"]
+    #[doc = " corresponding output duplicated to stdout. This is required for FreeBSD guests"]
+    #[doc = " which use the legacy serial console instead of the virtio console."]
+    pub fn serial_input_fd(self, fd: i32) -> Self {
+        let mut __handle = {
+            let this = std::mem::ManuallyDrop::new(self);
+            this.0
+        };
+        unsafe {
+            krun_vmm_builder_serial_input_fd(
+                &mut __handle as *mut *mut core::ffi::c_void as *mut core::ffi::c_void,
+                <i32 as FfiType>::into_c(fd),
             )
         };
         Self(__handle, std::marker::PhantomData)
@@ -3004,6 +3039,8 @@ pub enum Symbol {
     KrunVmmBuilderDevices,
     /// `krun_vmm_builder_set_kernel_console`
     KrunVmmBuilderSetKernelConsole,
+    /// `krun_vmm_builder_serial_input_fd`
+    KrunVmmBuilderSerialInputFd,
     /// `krun_vmm_builder_build`
     KrunVmmBuilderBuild,
     /// `krun_vmm_destroy`
@@ -3095,6 +3132,7 @@ impl Symbol {
             Symbol::KrunVmmBuilderPayload => "krun_vmm_builder_payload",
             Symbol::KrunVmmBuilderDevices => "krun_vmm_builder_devices",
             Symbol::KrunVmmBuilderSetKernelConsole => "krun_vmm_builder_set_kernel_console",
+            Symbol::KrunVmmBuilderSerialInputFd => "krun_vmm_builder_serial_input_fd",
             Symbol::KrunVmmBuilderBuild => "krun_vmm_builder_build",
             Symbol::KrunVmmDestroy => "krun_vmm_destroy",
             Symbol::KrunVmmRun => "krun_vmm_run",
@@ -3590,6 +3628,19 @@ pub fn require(
                             )?
                         };
                         let _ = KRUN_VMM_BUILDER_SET_KERNEL_CONSOLE.set(f);
+                    }
+                }
+                Symbol::KrunVmmBuilderSerialInputFd => {
+                    if KRUN_VMM_BUILDER_SERIAL_INPUT_FD.get().is_none() {
+                        let f = unsafe {
+                            *lib.get::<unsafe extern "C" fn(
+                                *mut core::ffi::c_void,
+                                <i32 as FfiType>::CRepr,
+                            )>(
+                                b"krun_vmm_builder_serial_input_fd\0"
+                            )?
+                        };
+                        let _ = KRUN_VMM_BUILDER_SERIAL_INPUT_FD.set(f);
                     }
                 }
                 Symbol::KrunVmmBuilderBuild => {

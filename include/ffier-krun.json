@@ -999,6 +999,29 @@
           "ffi_name": "krun_vmm_builder_set_kernel_console"
         },
         {
+          "name": "serial_input_fd",
+          "doc": [
+            " Set the fd used as input for the legacy serial console (e.g. a pipe read end).",
+            "",
+            " When set, a serial console device is created with this fd as input and the",
+            " corresponding output duplicated to stdout. This is required for FreeBSD guests",
+            " which use the legacy serial console instead of the virtio console."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "fd",
+              "param_kind": "regular",
+              "type": "i32"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_vmm_builder_serial_input_fd"
+        },
+        {
           "name": "build",
           "receiver": "value",
           "params": [],
