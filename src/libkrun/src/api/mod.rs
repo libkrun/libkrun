@@ -4,6 +4,8 @@ pub mod logging;
 pub mod payload;
 pub mod vmm_builder;
 
+#[cfg(not(feature = "tee"))]
+pub use devices::BalloonDevice;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use devices::FsDevice;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -37,9 +39,13 @@ ffier::library_definition!("krun", library_tag = 1,
     crate::api::payload::Payload = 8,
     crate::api::vmm_builder::VmmBuilder<'_> = 10,
     crate::api::vmm_builder::Vmm<'_> = 11,
+    #[cfg(not(feature = "tee"))]
+    crate::api::devices::BalloonDevice = 14,
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     crate::api::devices::AttachDevice for crate::api::devices::FsDevice,
     crate::api::devices::AttachDevice for crate::api::devices::ConsoleDevice,
+    #[cfg(not(feature = "tee"))]
+    crate::api::devices::AttachDevice for crate::api::devices::BalloonDevice,
     trait ffier_builtins::PushStr = 12,
     trait ffier_builtins::Error = 13,
     Error for crate::api::error::Error,

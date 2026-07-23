@@ -90,6 +90,8 @@ pub fn require_vm_symbols() -> Result<(), libloading::Error> {
             KrunVmmBuilderPayload,
             KrunVmmBuilderDevices,
             KrunVmmBuilderBuild,
+            KrunBalloonDeviceNew,
+            KrunBalloonDeviceDestroy,
             KrunVmmDestroy,
             KrunVmmRun,
             KrunErrorPayload,
@@ -168,7 +170,7 @@ pub fn build_and_run(
     let mut devices = krun::MmioDeviceManager::new();
     devices.add(rootfs);
     devices.add(console);
-    // TODO: devices.add(krun::BalloonDevice::new()?);
+    devices.add(krun::BalloonDevice::new().map_err(|e| anyhow::anyhow!("BalloonDevice: {e:?}"))?);
     // TODO: devices.add(krun::RngDevice::new()?);
 
     let mut vmm = krun::VmmBuilder::new()

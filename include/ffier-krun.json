@@ -12,6 +12,14 @@
         "a"
       ]
     },
+    "BalloonDevice": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunBalloonDevice"
+        }
+      },
+      "type_tag": 16777230
+    },
     "BorrowedFd": {
       "kind": {
         "alias": {
@@ -975,6 +983,27 @@
           "ffi_name": "krun_vmm_run"
         }
       ]
+    },
+    {
+      "name": "BalloonDevice",
+      "destroy_ffi_name": "krun_balloon_device_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "new",
+          "receiver": "none",
+          "params": [],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "BalloonDevice"
+            },
+            "err_type": "Error",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_balloon_device_new"
+        }
+      ]
     }
   ],
   "errors": [
@@ -1334,6 +1363,17 @@
         "a"
       ],
       "struct_lifetime_args": [
+        "a"
+      ],
+      "methods": []
+    },
+    {
+      "trait_name": "AttachDevice",
+      "struct_name": "BalloonDevice",
+      "lifetimes": [
+        "a"
+      ],
+      "trait_lifetime_args": [
         "a"
       ],
       "methods": []

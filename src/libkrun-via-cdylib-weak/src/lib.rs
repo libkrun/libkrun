@@ -1909,6 +1909,97 @@ impl<'a> Drop for Vmm<'a> {
     }
 }
 
+static KRUN_BALLOON_DEVICE_DESTROY: std::sync::OnceLock<
+    unsafe extern "C" fn(*mut core::ffi::c_void),
+> = std::sync::OnceLock::new();
+#[allow(non_snake_case)]
+pub unsafe fn krun_balloon_device_destroy(handle: *mut core::ffi::c_void) {
+    unsafe {
+        (KRUN_BALLOON_DEVICE_DESTROY
+            .get()
+            .expect("symbol `krun_balloon_device_destroy` not loaded; call require() first"))(
+            handle,
+        )
+    }
+}
+
+static KRUN_BALLOON_DEVICE_NEW: std::sync::OnceLock<
+    unsafe extern "C" fn(*mut *mut core::ffi::c_void) -> *mut core::ffi::c_void,
+> = std::sync::OnceLock::new();
+#[allow(non_snake_case)]
+pub unsafe fn krun_balloon_device_new(
+    err_out: *mut *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    unsafe {
+        (KRUN_BALLOON_DEVICE_NEW
+            .get()
+            .expect("symbol `krun_balloon_device_new` not loaded; call require() first"))(
+            err_out
+        )
+    }
+}
+
+pub struct BalloonDevice(*mut core::ffi::c_void);
+
+impl BalloonDevice {
+    #[doc(hidden)]
+    pub fn __from_raw(ptr: *mut core::ffi::c_void) -> Self {
+        Self(ptr)
+    }
+    #[doc(hidden)]
+    pub fn __into_raw(self) -> *mut core::ffi::c_void {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.0
+    }
+}
+
+impl FfiHandle for BalloonDevice {
+    const C_HANDLE_NAME: &'static str = "KrunBalloonDevice";
+    const TYPE_TAG: u32 = 16777230u32;
+    unsafe fn as_handle(&self) -> *mut core::ffi::c_void {
+        self.0
+    }
+    fn __from_raw(handle: *mut core::ffi::c_void) -> Self {
+        Self(handle)
+    }
+}
+
+impl FfiType for BalloonDevice {
+    type CRepr = *mut core::ffi::c_void;
+    const C_TYPE_NAME: &'static str = "BalloonDevice";
+    fn into_c(self) -> *mut core::ffi::c_void {
+        self.__into_raw()
+    }
+    unsafe fn from_c(repr: *mut core::ffi::c_void) -> Self {
+        Self::__from_raw(repr)
+    }
+}
+
+impl std::fmt::Debug for BalloonDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("BalloonDevice").field(&self.0).finish()
+    }
+}
+
+impl BalloonDevice {
+    pub fn new() -> Result<BalloonDevice, Error> {
+        let mut __err: *mut core::ffi::c_void = core::ptr::null_mut();
+        let __raw = unsafe { krun_balloon_device_new(&mut __err as *mut *mut core::ffi::c_void) };
+        if !__raw.is_null() {
+            Ok(unsafe { <BalloonDevice as FfiType>::from_c(__raw) })
+        } else {
+            let __r = unsafe { krun_error_result(__err) };
+            Err(Error::from_ffi(__r, __err))
+        }
+    }
+}
+
+impl Drop for BalloonDevice {
+    fn drop(&mut self) {
+        unsafe { krun_balloon_device_destroy(self.0) }
+    }
+}
+
 pub trait PushStr {
     fn push(&mut self, s: &str) -> bool;
     #[doc(hidden)]
@@ -2053,6 +2144,13 @@ impl<'a> AttachDevice<'a> for ConsoleDevice<'a> {
     }
 }
 
+impl<'a> AttachDevice<'a> for BalloonDevice {
+    fn __into_raw_handle(self) -> *mut core::ffi::c_void {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.0
+    }
+}
+
 static KRUN_INIT_LOG: std::sync::OnceLock<
     unsafe extern "C" fn(
         <LogTarget as FfiType>::CRepr,
@@ -2173,6 +2271,10 @@ pub enum Symbol {
     KrunVmmDestroy,
     /// `krun_vmm_run`
     KrunVmmRun,
+    /// `krun_balloon_device_destroy`
+    KrunBalloonDeviceDestroy,
+    /// `krun_balloon_device_new`
+    KrunBalloonDeviceNew,
     /// `krun_error_code`
     KrunErrorCode,
     /// `krun_error_message`
@@ -2229,6 +2331,8 @@ impl Symbol {
             Symbol::KrunVmmBuilderBuild => "krun_vmm_builder_build",
             Symbol::KrunVmmDestroy => "krun_vmm_destroy",
             Symbol::KrunVmmRun => "krun_vmm_run",
+            Symbol::KrunBalloonDeviceDestroy => "krun_balloon_device_destroy",
+            Symbol::KrunBalloonDeviceNew => "krun_balloon_device_new",
             Symbol::KrunErrorCode => "krun_error_code",
             Symbol::KrunErrorMessage => "krun_error_message",
             Symbol::KrunErrorResult => "krun_error_result",
@@ -2736,6 +2840,29 @@ pub fn require(
                             )?
                         };
                         let _ = KRUN_VMM_RUN.set(f);
+                    }
+                }
+                Symbol::KrunBalloonDeviceDestroy => {
+                    if KRUN_BALLOON_DEVICE_DESTROY.get().is_none() {
+                        let f = unsafe {
+                            *lib.get::<unsafe extern "C" fn(*mut core::ffi::c_void)>(
+                                b"krun_balloon_device_destroy\0",
+                            )?
+                        };
+                        let _ = KRUN_BALLOON_DEVICE_DESTROY.set(f);
+                    }
+                }
+                Symbol::KrunBalloonDeviceNew => {
+                    if KRUN_BALLOON_DEVICE_NEW.get().is_none() {
+                        let f = unsafe {
+                            *lib.get::<unsafe extern "C" fn(
+                                *mut *mut core::ffi::c_void,
+                            )
+                                -> *mut core::ffi::c_void>(
+                                b"krun_balloon_device_new\0"
+                            )?
+                        };
+                        let _ = KRUN_BALLOON_DEVICE_NEW.set(f);
                     }
                 }
                 Symbol::KrunErrorCode => {
