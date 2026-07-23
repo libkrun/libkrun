@@ -2100,6 +2100,187 @@ impl Drop for RngDevice {
     }
 }
 
+static KRUN_VSOCK_DEVICE_DESTROY: std::sync::OnceLock<
+    unsafe extern "C" fn(*mut core::ffi::c_void),
+> = std::sync::OnceLock::new();
+#[allow(non_snake_case)]
+pub unsafe fn krun_vsock_device_destroy(handle: *mut core::ffi::c_void) {
+    unsafe {
+        (KRUN_VSOCK_DEVICE_DESTROY
+            .get()
+            .expect("symbol `krun_vsock_device_destroy` not loaded; call require() first"))(
+            handle
+        )
+    }
+}
+
+static KRUN_VSOCK_DEVICE_NEW: std::sync::OnceLock<
+    unsafe extern "C" fn(
+        <u64 as FfiType>::CRepr,
+        <u32 as FfiType>::CRepr,
+        *mut *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void,
+> = std::sync::OnceLock::new();
+#[allow(non_snake_case)]
+pub unsafe fn krun_vsock_device_new(
+    cid: <u64 as FfiType>::CRepr,
+    tsi_features: <u32 as FfiType>::CRepr,
+    err_out: *mut *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    unsafe {
+        (KRUN_VSOCK_DEVICE_NEW
+            .get()
+            .expect("symbol `krun_vsock_device_new` not loaded; call require() first"))(
+            cid,
+            tsi_features,
+            err_out,
+        )
+    }
+}
+
+static KRUN_VSOCK_DEVICE_ADD_PORT_FORWARD: std::sync::OnceLock<
+    unsafe extern "C" fn(
+        *mut core::ffi::c_void,
+        <&'static str as FfiType>::CRepr,
+        *mut *mut core::ffi::c_void,
+    ) -> ffier::FfierResult,
+> = std::sync::OnceLock::new();
+#[allow(non_snake_case)]
+pub unsafe fn krun_vsock_device_add_port_forward(
+    handle: *mut core::ffi::c_void,
+    mapping: <&'static str as FfiType>::CRepr,
+    err_out: *mut *mut core::ffi::c_void,
+) -> ffier::FfierResult {
+    unsafe {
+        (KRUN_VSOCK_DEVICE_ADD_PORT_FORWARD
+            .get()
+            .expect("symbol `krun_vsock_device_add_port_forward` not loaded; call require() first"))(
+            handle, mapping, err_out,
+        )
+    }
+}
+
+static KRUN_VSOCK_DEVICE_ADD_UNIX_PORT: std::sync::OnceLock<
+    unsafe extern "C" fn(
+        *mut core::ffi::c_void,
+        <u32 as FfiType>::CRepr,
+        <&'static str as FfiType>::CRepr,
+        <bool as FfiType>::CRepr,
+    ),
+> = std::sync::OnceLock::new();
+#[allow(non_snake_case)]
+pub unsafe fn krun_vsock_device_add_unix_port(
+    handle: *mut core::ffi::c_void,
+    port: <u32 as FfiType>::CRepr,
+    path: <&'static str as FfiType>::CRepr,
+    listen: <bool as FfiType>::CRepr,
+) {
+    unsafe {
+        (KRUN_VSOCK_DEVICE_ADD_UNIX_PORT
+            .get()
+            .expect("symbol `krun_vsock_device_add_unix_port` not loaded; call require() first"))(
+            handle, port, path, listen,
+        )
+    }
+}
+
+pub struct VsockDevice(*mut core::ffi::c_void);
+
+impl VsockDevice {
+    #[doc(hidden)]
+    pub fn __from_raw(ptr: *mut core::ffi::c_void) -> Self {
+        Self(ptr)
+    }
+    #[doc(hidden)]
+    pub fn __into_raw(self) -> *mut core::ffi::c_void {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.0
+    }
+}
+
+impl FfiHandle for VsockDevice {
+    const C_HANDLE_NAME: &'static str = "KrunVsockDevice";
+    const TYPE_TAG: u32 = 16777232u32;
+    unsafe fn as_handle(&self) -> *mut core::ffi::c_void {
+        self.0
+    }
+    fn __from_raw(handle: *mut core::ffi::c_void) -> Self {
+        Self(handle)
+    }
+}
+
+impl FfiType for VsockDevice {
+    type CRepr = *mut core::ffi::c_void;
+    const C_TYPE_NAME: &'static str = "VsockDevice";
+    fn into_c(self) -> *mut core::ffi::c_void {
+        self.__into_raw()
+    }
+    unsafe fn from_c(repr: *mut core::ffi::c_void) -> Self {
+        Self::__from_raw(repr)
+    }
+}
+
+impl std::fmt::Debug for VsockDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("VsockDevice").field(&self.0).finish()
+    }
+}
+
+impl VsockDevice {
+    #[doc = " Create a new vsock device."]
+    #[doc = ""]
+    #[doc = " `tsi_features` is a bitmask of TSI flags (0 to disable)."]
+    pub fn new(cid: u64, tsi_features: u32) -> Result<VsockDevice, Error> {
+        let mut __err: *mut core::ffi::c_void = core::ptr::null_mut();
+        let __raw = unsafe {
+            krun_vsock_device_new(
+                <u64 as FfiType>::into_c(cid),
+                <u32 as FfiType>::into_c(tsi_features),
+                &mut __err as *mut *mut core::ffi::c_void,
+            )
+        };
+        if !__raw.is_null() {
+            Ok(unsafe { <VsockDevice as FfiType>::from_c(__raw) })
+        } else {
+            let __r = unsafe { krun_error_result(__err) };
+            Err(Error::from_ffi(__r, __err))
+        }
+    }
+    #[doc = " Add a host port forwarding: `\"guest_port:host_port\"`."]
+    pub fn add_port_forward(&mut self, mapping: &str) -> Result<(), Error> {
+        let mut __err: *mut core::ffi::c_void = core::ptr::null_mut();
+        let __r = unsafe {
+            krun_vsock_device_add_port_forward(
+                self.0,
+                <&str as FfiType>::into_c(mapping),
+                &mut __err as *mut *mut core::ffi::c_void,
+            )
+        };
+        if __r == 0 {
+            Ok(())
+        } else {
+            Err(Error::from_ffi(__r, __err))
+        }
+    }
+    #[doc = " Add a Unix socket port mapping."]
+    pub fn add_unix_port(&mut self, port: u32, path: &str, listen: bool) {
+        unsafe {
+            krun_vsock_device_add_unix_port(
+                self.0,
+                <u32 as FfiType>::into_c(port),
+                <&str as FfiType>::into_c(path),
+                <bool as FfiType>::into_c(listen),
+            )
+        }
+    }
+}
+
+impl Drop for VsockDevice {
+    fn drop(&mut self) {
+        unsafe { krun_vsock_device_destroy(self.0) }
+    }
+}
+
 pub trait PushStr {
     fn push(&mut self, s: &str) -> bool;
     #[doc(hidden)]
@@ -2258,6 +2439,13 @@ impl<'a> AttachDevice<'a> for RngDevice {
     }
 }
 
+impl<'a> AttachDevice<'a> for VsockDevice {
+    fn __into_raw_handle(self) -> *mut core::ffi::c_void {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.0
+    }
+}
+
 static KRUN_INIT_LOG: std::sync::OnceLock<
     unsafe extern "C" fn(
         <LogTarget as FfiType>::CRepr,
@@ -2386,6 +2574,14 @@ pub enum Symbol {
     KrunRngDeviceDestroy,
     /// `krun_rng_device_new`
     KrunRngDeviceNew,
+    /// `krun_vsock_device_destroy`
+    KrunVsockDeviceDestroy,
+    /// `krun_vsock_device_new`
+    KrunVsockDeviceNew,
+    /// `krun_vsock_device_add_port_forward`
+    KrunVsockDeviceAddPortForward,
+    /// `krun_vsock_device_add_unix_port`
+    KrunVsockDeviceAddUnixPort,
     /// `krun_error_code`
     KrunErrorCode,
     /// `krun_error_message`
@@ -2446,6 +2642,10 @@ impl Symbol {
             Symbol::KrunBalloonDeviceNew => "krun_balloon_device_new",
             Symbol::KrunRngDeviceDestroy => "krun_rng_device_destroy",
             Symbol::KrunRngDeviceNew => "krun_rng_device_new",
+            Symbol::KrunVsockDeviceDestroy => "krun_vsock_device_destroy",
+            Symbol::KrunVsockDeviceNew => "krun_vsock_device_new",
+            Symbol::KrunVsockDeviceAddPortForward => "krun_vsock_device_add_port_forward",
+            Symbol::KrunVsockDeviceAddUnixPort => "krun_vsock_device_add_unix_port",
             Symbol::KrunErrorCode => "krun_error_code",
             Symbol::KrunErrorMessage => "krun_error_message",
             Symbol::KrunErrorResult => "krun_error_result",
@@ -3002,6 +3202,59 @@ pub fn require(
                             )?
                         };
                         let _ = KRUN_RNG_DEVICE_NEW.set(f);
+                    }
+                }
+                Symbol::KrunVsockDeviceDestroy => {
+                    if KRUN_VSOCK_DEVICE_DESTROY.get().is_none() {
+                        let f = unsafe {
+                            *lib.get::<unsafe extern "C" fn(*mut core::ffi::c_void)>(
+                                b"krun_vsock_device_destroy\0",
+                            )?
+                        };
+                        let _ = KRUN_VSOCK_DEVICE_DESTROY.set(f);
+                    }
+                }
+                Symbol::KrunVsockDeviceNew => {
+                    if KRUN_VSOCK_DEVICE_NEW.get().is_none() {
+                        let f = unsafe {
+                            *lib.get::<unsafe extern "C" fn(
+                                <u64 as FfiType>::CRepr,
+                                <u32 as FfiType>::CRepr,
+                                *mut *mut core::ffi::c_void,
+                            )
+                                -> *mut core::ffi::c_void>(
+                                b"krun_vsock_device_new\0"
+                            )?
+                        };
+                        let _ = KRUN_VSOCK_DEVICE_NEW.set(f);
+                    }
+                }
+                Symbol::KrunVsockDeviceAddPortForward => {
+                    if KRUN_VSOCK_DEVICE_ADD_PORT_FORWARD.get().is_none() {
+                        let f = unsafe {
+                            *lib.get::<unsafe extern "C" fn(
+                                *mut core::ffi::c_void,
+                                <&'static str as FfiType>::CRepr,
+                                *mut *mut core::ffi::c_void,
+                            )
+                                -> ffier::FfierResult>(
+                                b"krun_vsock_device_add_port_forward\0"
+                            )?
+                        };
+                        let _ = KRUN_VSOCK_DEVICE_ADD_PORT_FORWARD.set(f);
+                    }
+                }
+                Symbol::KrunVsockDeviceAddUnixPort => {
+                    if KRUN_VSOCK_DEVICE_ADD_UNIX_PORT.get().is_none() {
+                        let f = unsafe {
+                            *lib.get::<unsafe extern "C" fn(
+                                *mut core::ffi::c_void,
+                                <u32 as FfiType>::CRepr,
+                                <&'static str as FfiType>::CRepr,
+                                <bool as FfiType>::CRepr,
+                            )>(b"krun_vsock_device_add_unix_port\0")?
+                        };
+                        let _ = KRUN_VSOCK_DEVICE_ADD_UNIX_PORT.set(f);
                     }
                 }
                 Symbol::KrunErrorCode => {

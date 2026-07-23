@@ -14,7 +14,7 @@ pub use devices::RngDevice;
 pub use devices::FsOverlay;
 pub use devices::{
     AttachContext, AttachDevice, ConsoleBuilder, ConsoleDevice, DeviceManager, DeviceRequirements,
-    MmioDeviceManager, ResolvedShmRegion,
+    MmioDeviceManager, ResolvedShmRegion, VsockDevice,
 };
 pub use error::{DetailedError, Error};
 pub use logging::{LogLevel, LogStyle, LogTarget, init_log};
@@ -48,10 +48,12 @@ ffier::library_definition!("krun", library_tag = 1,
     crate::api::devices::AttachDevice for crate::api::devices::ConsoleDevice,
     #[cfg(not(feature = "tee"))]
     crate::api::devices::RngDevice = 15,
+    crate::api::devices::VsockDevice = 16,
     #[cfg(not(feature = "tee"))]
     crate::api::devices::AttachDevice for crate::api::devices::BalloonDevice,
     #[cfg(not(feature = "tee"))]
     crate::api::devices::AttachDevice for crate::api::devices::RngDevice,
+    crate::api::devices::AttachDevice for crate::api::devices::VsockDevice,
     trait ffier_builtins::PushStr = 12,
     trait ffier_builtins::Error = 13,
     Error for crate::api::error::Error,

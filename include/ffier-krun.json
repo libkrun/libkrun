@@ -215,6 +215,14 @@
         "a"
       ]
     },
+    "VsockDevice": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunVsockDevice"
+        }
+      },
+      "type_tag": 16777232
+    },
     "[u8]": {
       "kind": {
         "bytes": {
@@ -1050,6 +1058,94 @@
           "ffi_name": "krun_rng_device_new"
         }
       ]
+    },
+    {
+      "name": "VsockDevice",
+      "destroy_ffi_name": "krun_vsock_device_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "new",
+          "doc": [
+            " Create a new vsock device.",
+            "",
+            " `tsi_features` is a bitmask of TSI flags (0 to disable)."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "cid",
+              "param_kind": "regular",
+              "type": "u64"
+            },
+            {
+              "name": "tsi_features",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "VsockDevice"
+            },
+            "err_type": "Error",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_vsock_device_new"
+        },
+        {
+          "name": "add_port_forward",
+          "doc": [
+            " Add a host port forwarding: `\"guest_port:host_port\"`."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "mapping",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "Error",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vsock_device_add_port_forward"
+        },
+        {
+          "name": "add_unix_port",
+          "doc": [
+            " Add a Unix socket port mapping."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "port",
+              "param_kind": "regular",
+              "type": "u32"
+            },
+            {
+              "name": "path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "listen",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_vsock_device_add_unix_port"
+        }
+      ]
     }
   ],
   "errors": [
@@ -1427,6 +1523,17 @@
     {
       "trait_name": "AttachDevice",
       "struct_name": "RngDevice",
+      "lifetimes": [
+        "a"
+      ],
+      "trait_lifetime_args": [
+        "a"
+      ],
+      "methods": []
+    },
+    {
+      "trait_name": "AttachDevice",
+      "struct_name": "VsockDevice",
       "lifetimes": [
         "a"
       ],

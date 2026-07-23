@@ -1537,6 +1537,123 @@ impl Drop for RngDevice {
     }
 }
 
+unsafe extern "C" {
+    pub fn krun_vsock_device_destroy(handle: *mut core::ffi::c_void);
+    pub fn krun_vsock_device_new(
+        cid: <u64 as FfiType>::CRepr,
+        tsi_features: <u32 as FfiType>::CRepr,
+        err_out: *mut *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void;
+    pub fn krun_vsock_device_add_port_forward(
+        handle: *mut core::ffi::c_void,
+        mapping: <&'static str as FfiType>::CRepr,
+        err_out: *mut *mut core::ffi::c_void,
+    ) -> ffier::FfierResult;
+    pub fn krun_vsock_device_add_unix_port(
+        handle: *mut core::ffi::c_void,
+        port: <u32 as FfiType>::CRepr,
+        path: <&'static str as FfiType>::CRepr,
+        listen: <bool as FfiType>::CRepr,
+    );
+}
+
+pub struct VsockDevice(*mut core::ffi::c_void);
+
+impl VsockDevice {
+    #[doc(hidden)]
+    pub fn __from_raw(ptr: *mut core::ffi::c_void) -> Self {
+        Self(ptr)
+    }
+    #[doc(hidden)]
+    pub fn __into_raw(self) -> *mut core::ffi::c_void {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.0
+    }
+}
+
+impl FfiHandle for VsockDevice {
+    const C_HANDLE_NAME: &'static str = "KrunVsockDevice";
+    const TYPE_TAG: u32 = 16777232u32;
+    unsafe fn as_handle(&self) -> *mut core::ffi::c_void {
+        self.0
+    }
+    fn __from_raw(handle: *mut core::ffi::c_void) -> Self {
+        Self(handle)
+    }
+}
+
+impl FfiType for VsockDevice {
+    type CRepr = *mut core::ffi::c_void;
+    const C_TYPE_NAME: &'static str = "VsockDevice";
+    fn into_c(self) -> *mut core::ffi::c_void {
+        self.__into_raw()
+    }
+    unsafe fn from_c(repr: *mut core::ffi::c_void) -> Self {
+        Self::__from_raw(repr)
+    }
+}
+
+impl std::fmt::Debug for VsockDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("VsockDevice").field(&self.0).finish()
+    }
+}
+
+impl VsockDevice {
+    #[doc = " Create a new vsock device."]
+    #[doc = ""]
+    #[doc = " `tsi_features` is a bitmask of TSI flags (0 to disable)."]
+    pub fn new(cid: u64, tsi_features: u32) -> Result<VsockDevice, Error> {
+        let mut __err: *mut core::ffi::c_void = core::ptr::null_mut();
+        let __raw = unsafe {
+            krun_vsock_device_new(
+                <u64 as FfiType>::into_c(cid),
+                <u32 as FfiType>::into_c(tsi_features),
+                &mut __err as *mut *mut core::ffi::c_void,
+            )
+        };
+        if !__raw.is_null() {
+            Ok(unsafe { <VsockDevice as FfiType>::from_c(__raw) })
+        } else {
+            let __r = unsafe { krun_error_result(__err) };
+            Err(Error::from_ffi(__r, __err))
+        }
+    }
+    #[doc = " Add a host port forwarding: `\"guest_port:host_port\"`."]
+    pub fn add_port_forward(&mut self, mapping: &str) -> Result<(), Error> {
+        let mut __err: *mut core::ffi::c_void = core::ptr::null_mut();
+        let __r = unsafe {
+            krun_vsock_device_add_port_forward(
+                self.0,
+                <&str as FfiType>::into_c(mapping),
+                &mut __err as *mut *mut core::ffi::c_void,
+            )
+        };
+        if __r == 0 {
+            Ok(())
+        } else {
+            Err(Error::from_ffi(__r, __err))
+        }
+    }
+    #[doc = " Add a Unix socket port mapping."]
+    pub fn add_unix_port(&mut self, port: u32, path: &str, listen: bool) {
+        unsafe {
+            krun_vsock_device_add_unix_port(
+                self.0,
+                <u32 as FfiType>::into_c(port),
+                <&str as FfiType>::into_c(path),
+                <bool as FfiType>::into_c(listen),
+            )
+        }
+    }
+}
+
+impl Drop for VsockDevice {
+    fn drop(&mut self) {
+        unsafe { krun_vsock_device_destroy(self.0) }
+    }
+}
+
 pub trait PushStr {
     fn push(&mut self, s: &str) -> bool;
     #[doc(hidden)]
@@ -1647,6 +1764,13 @@ impl<'a> AttachDevice<'a> for BalloonDevice {
 }
 
 impl<'a> AttachDevice<'a> for RngDevice {
+    fn __into_raw_handle(self) -> *mut core::ffi::c_void {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.0
+    }
+}
+
+impl<'a> AttachDevice<'a> for VsockDevice {
     fn __into_raw_handle(self) -> *mut core::ffi::c_void {
         let this = std::mem::ManuallyDrop::new(self);
         this.0

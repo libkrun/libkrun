@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use std::ffi::CString;
 use std::io::IsTerminal;
 use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 
@@ -894,6 +896,90 @@ impl<'a> AttachDevice<'a> for RngDevice {
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), DetailedError> {
         ctx.subscribe_events(self.inner.clone())?;
         ctx.register("rng", self.inner)
+    }
+}
+
+/// A virtio vsock device for host-guest communication.
+pub struct VsockDevice {
+    cid: u64,
+    tsi_flags: devices::virtio::TsiFlags,
+    host_port_map: HashMap<u16, u16>,
+    unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+}
+
+#[ffier::export]
+impl VsockDevice {
+    /// Create a new vsock device.
+    ///
+    /// `tsi_features` is a bitmask of TSI flags (0 to disable).
+    pub fn new(cid: u64, tsi_features: u32) -> Result<Self, Error> {
+        let tsi_flags =
+            devices::virtio::TsiFlags::from_bits(tsi_features).ok_or(Error::InvalidParam())?;
+        Ok(Self {
+            cid,
+            tsi_flags,
+            host_port_map: HashMap::new(),
+            unix_ipc_port_map: HashMap::new(),
+        })
+    }
+
+    /// Add a host port forwarding: `"guest_port:host_port"`.
+    // TODO: accept proper typed params once ffier supports something like
+    // an array of by-value FFI-transparent structs (or tuples?)
+    pub fn add_port_forward(&mut self, mapping: &str) -> Result<(), Error> {
+        let (guest, host) = mapping.split_once(':').ok_or(Error::InvalidParam())?;
+        let g = guest.parse::<u16>().map_err(|_| Error::InvalidParam())?;
+        let h = host.parse::<u16>().map_err(|_| Error::InvalidParam())?;
+        self.host_port_map.insert(g, h);
+        Ok(())
+    }
+
+    /// Add a Unix socket port mapping.
+    pub fn add_unix_port(&mut self, port: u32, path: &str, listen: bool) {
+        self.unix_ipc_port_map
+            .insert(port, (PathBuf::from(path), listen));
+    }
+}
+
+#[ffier::export]
+impl<'a> AttachDevice<'a> for VsockDevice {
+    #[ffier(skip)]
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), DetailedError> {
+        let host_port_map = if self.host_port_map.is_empty() {
+            None
+        } else {
+            Some(self.host_port_map)
+        };
+        let unix_ipc_port_map = if self.unix_ipc_port_map.is_empty() {
+            None
+        } else {
+            Some(self.unix_ipc_port_map)
+        };
+
+        let vsock =
+            devices::virtio::Vsock::new(self.cid, host_port_map, unix_ipc_port_map, self.tsi_flags)
+                .map_err(|e| DetailedError::new(Error::Internal(), format!("vsock: {e:?}")))?;
+
+        let inner = Arc::new(Mutex::new(vsock));
+        ctx.subscribe_events(inner.clone())?;
+
+        let id = inner.lock().unwrap().id().to_string();
+        ctx.register(&id, inner)?;
+
+        if self
+            .tsi_flags
+            .contains(devices::virtio::TsiFlags::HIJACK_INET)
+        {
+            ctx.append_kernel_cmdline("tsi_hijack");
+        }
+        if self
+            .tsi_flags
+            .contains(devices::virtio::TsiFlags::HIJACK_UNIX)
+        {
+            ctx.append_kernel_cmdline("tsi_hijack_unix");
+        }
+
+        Ok(())
     }
 }
 
