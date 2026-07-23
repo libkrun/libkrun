@@ -21,8 +21,8 @@ use test_vm_config::TestVmConfig;
 // mod test_net_perf;
 // use test_net_perf::TestNetPerf;
 
-// mod test_multiport_console;
-// use test_multiport_console::TestMultiportConsole;
+mod test_multiport_console;
+use test_multiport_console::TestMultiportConsole;
 
 #[cfg(any(feature = "host", target_os = "linux"))]
 mod test_virtiofs_root_ro;
@@ -112,7 +112,7 @@ pub fn test_cases() -> Vec<TestCase> {
         //     Box::new(TestNet::new_gvproxy_long_path()),
         // ),
         // TestCase::new("net-vmnet-helper", Box::new(TestNet::new_vmnet_helper())),
-        // TestCase::new("multiport-console", Box::new(TestMultiportConsole)),
+        TestCase::new("multiport-console", Box::new(TestMultiportConsole)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-root-ro", Box::new(TestVirtiofsRootRo)),
         TestCase::new("augmentfs", Box::new(TestAugmentFs)),

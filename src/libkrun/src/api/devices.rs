@@ -584,9 +584,6 @@ impl<'a> AttachDevice<'a> for FsDevice<'a> {
 /// [`ConsoleBuilder::build`] to finalize.
 pub struct ConsoleDevice<'a> {
     pub(crate) ports: Vec<PortDescription>,
-    #[allow(dead_code)]
-    pub(crate) kernel_console_port: Option<u32>,
-    /// Raw fds of TTY ports that need raw mode set after Vmm is constructed.
     pub(crate) tty_fds: Vec<i32>,
     _lifetime: PhantomData<&'a ()>,
 }
@@ -597,7 +594,6 @@ pub struct ConsoleDevice<'a> {
 /// then call [`build`](ConsoleBuilder::build) to create the device.
 pub struct ConsoleBuilder<'a> {
     ports: Vec<PortDescription>,
-    kernel_console_port: Option<u32>,
     tty_fds: Vec<i32>,
     _lifetime: PhantomData<&'a ()>,
 }
@@ -608,7 +604,6 @@ impl<'a> ConsoleDevice<'a> {
     pub fn builder() -> ConsoleBuilder<'a> {
         ConsoleBuilder {
             ports: Vec::new(),
-            kernel_console_port: None,
             tty_fds: Vec::new(),
             _lifetime: PhantomData,
         }
@@ -629,24 +624,45 @@ impl<'a> ConsoleBuilder<'a> {
     ///
     /// # Returns
     ///
-    /// The zero-based port index, usable with [`set_kernel_console`](ConsoleBuilder::set_kernel_console).
+    /// The zero-based port index.
     pub fn add_tty_port(&mut self, name: &str, tty_fd: BorrowedFd<'a>) -> Result<u32, Error> {
         let index = self.ports.len() as u32;
         self.add_tty_port_inner(name, tty_fd)?;
         Ok(index)
     }
 
-    /// Designate a port as the kernel console (`console=hvcN`).
-    ///
-    /// # Arguments
-    ///
-    /// - `port_index`: a value returned by [`add_tty_port`](ConsoleBuilder::add_tty_port).
-    pub fn set_kernel_console(&mut self, port_index: u32) -> Result<(), Error> {
-        if port_index as usize >= self.ports.len() {
-            return Err(Error::OutOfRange());
-        }
-        self.kernel_console_port = Some(port_index);
-        Ok(())
+    /// Add a port with separate input and output fds (no terminal properties).
+    /// Pass -1 for input_fd or output_fd to disable that direction.
+    pub fn add_inout_port(
+        &mut self,
+        name: &str,
+        input_fd: i32,
+        output_fd: i32,
+    ) -> Result<u32, Error> {
+        let index = self.ports.len() as u32;
+        let input = if input_fd >= 0 {
+            Some(port_io::input_to_raw_fd_dup(input_fd).map_err(|e| {
+                log::error!("dup input fd: {e}");
+                Error::BadFd()
+            })?)
+        } else {
+            None
+        };
+        let output = if output_fd >= 0 {
+            Some(port_io::output_to_raw_fd_dup(output_fd).map_err(|e| {
+                log::error!("dup output fd: {e}");
+                Error::BadFd()
+            })?)
+        } else {
+            None
+        };
+        self.ports.push(PortDescription {
+            name: name.to_string().into(),
+            input,
+            output,
+            terminal: None,
+        });
+        Ok(index)
     }
 
     /// Build the console device. At least one port must have been added.
@@ -656,7 +672,6 @@ impl<'a> ConsoleBuilder<'a> {
         }
         Ok(ConsoleDevice {
             ports: self.ports,
-            kernel_console_port: self.kernel_console_port,
             tty_fds: self.tty_fds,
             _lifetime: PhantomData,
         })
@@ -711,13 +726,13 @@ impl<'a> ConsoleBuilder<'a> {
 
         // Named redirect ports for non-terminal fds
         if stdin >= 0 && !stdin_is_tty {
-            self.add_io_port("krun-stdin", Some(stdin), None)?;
+            self.add_inout_port("krun-stdin", stdin, -1)?;
         }
         if stdout >= 0 && !stdout_is_tty {
-            self.add_io_port("krun-stdout", None, Some(stdout))?;
+            self.add_inout_port("krun-stdout", -1, stdout)?;
         }
         if stderr >= 0 && !stderr_is_tty {
-            self.add_io_port("krun-stderr", None, Some(stderr))?;
+            self.add_inout_port("krun-stderr", -1, stderr)?;
         }
 
         Ok(())
@@ -756,37 +771,6 @@ impl ConsoleBuilder<'_> {
             terminal: Some(port_io::term_fixed_size(80, 24)),
         });
         index
-    }
-
-    /// Add a port with separate input and output fds (no terminal properties).
-    pub fn add_io_port(
-        &mut self,
-        name: &str,
-        input_fd: Option<i32>,
-        output_fd: Option<i32>,
-    ) -> Result<u32, Error> {
-        let index = self.ports.len() as u32;
-        let input = match input_fd {
-            Some(fd) if fd >= 0 => Some(port_io::input_to_raw_fd_dup(fd).map_err(|e| {
-                log::error!("dup input fd: {e}");
-                Error::BadFd()
-            })?),
-            _ => None,
-        };
-        let output = match output_fd {
-            Some(fd) if fd >= 0 => Some(port_io::output_to_raw_fd_dup(fd).map_err(|e| {
-                log::error!("dup output fd: {e}");
-                Error::BadFd()
-            })?),
-            _ => None,
-        };
-        self.ports.push(PortDescription {
-            name: name.to_string().into(),
-            input,
-            output,
-            terminal: None,
-        });
-        Ok(index)
     }
 
     fn add_tty_port_inner(&mut self, name: &str, tty_fd: BorrowedFd<'_>) -> Result<(), Error> {

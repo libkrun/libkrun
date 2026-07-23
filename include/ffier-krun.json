@@ -230,6 +230,13 @@
         }
       }
     },
+    "i32": {
+      "kind": {
+        "primitive": {
+          "c_type": "int32_t"
+        }
+      }
+    },
     "str": {
       "kind": {
         "string": {
@@ -572,7 +579,7 @@
             "",
             " # Returns",
             "",
-            " The zero-based port index, usable with [`set_kernel_console`](ConsoleBuilder::set_kernel_console)."
+            " The zero-based port index."
           ],
           "receiver": "mut",
           "params": [
@@ -602,29 +609,39 @@
           "ffi_name": "krun_console_builder_add_tty_port"
         },
         {
-          "name": "set_kernel_console",
+          "name": "add_inout_port",
           "doc": [
-            " Designate a port as the kernel console (`console=hvcN`).",
-            "",
-            " # Arguments",
-            "",
-            " - `port_index`: a value returned by [`add_tty_port`](ConsoleBuilder::add_tty_port)."
+            " Add a port with separate input and output fds (no terminal properties).",
+            " Pass -1 for input_fd or output_fd to disable that direction."
           ],
           "receiver": "mut",
           "params": [
             {
-              "name": "port_index",
+              "name": "name",
               "param_kind": "regular",
-              "type": "u32"
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "input_fd",
+              "param_kind": "regular",
+              "type": "i32"
+            },
+            {
+              "name": "output_fd",
+              "param_kind": "regular",
+              "type": "i32"
             }
           ],
           "ret": {
             "return_kind": "result",
-            "ok": null,
+            "ok": {
+              "type": "u32"
+            },
             "err_type": "Error",
             "c_convention": "out_param"
           },
-          "ffi_name": "krun_console_builder_set_kernel_console"
+          "ffi_name": "krun_console_builder_add_inout_port"
         },
         {
           "name": "build",

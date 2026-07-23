@@ -778,9 +778,12 @@ unsafe extern "C" {
         result: *mut <u32 as FfiType>::CRepr,
         err_out: *mut *mut core::ffi::c_void,
     ) -> ffier::FfierResult;
-    pub fn krun_console_builder_set_kernel_console(
+    pub fn krun_console_builder_add_inout_port(
         handle: *mut core::ffi::c_void,
-        port_index: <u32 as FfiType>::CRepr,
+        name: <&'static str as FfiType>::CRepr,
+        input_fd: <i32 as FfiType>::CRepr,
+        output_fd: <i32 as FfiType>::CRepr,
+        result: *mut <u32 as FfiType>::CRepr,
         err_out: *mut *mut core::ffi::c_void,
     ) -> ffier::FfierResult;
     pub fn krun_console_builder_build(
@@ -851,7 +854,7 @@ impl<'a> ConsoleBuilder<'a> {
     #[doc = ""]
     #[doc = " # Returns"]
     #[doc = ""]
-    #[doc = " The zero-based port index, usable with [`set_kernel_console`](ConsoleBuilder::set_kernel_console)."]
+    #[doc = " The zero-based port index."]
     pub fn add_tty_port(&mut self, name: &str, tty_fd: BorrowedFd<'a>) -> Result<u32, Error> {
         let mut __out = std::mem::MaybeUninit::uninit();
         let mut __err: *mut core::ffi::c_void = core::ptr::null_mut();
@@ -870,22 +873,28 @@ impl<'a> ConsoleBuilder<'a> {
             Err(Error::from_ffi(__r, __err))
         }
     }
-    #[doc = " Designate a port as the kernel console (`console=hvcN`)."]
-    #[doc = ""]
-    #[doc = " # Arguments"]
-    #[doc = ""]
-    #[doc = " - `port_index`: a value returned by [`add_tty_port`](ConsoleBuilder::add_tty_port)."]
-    pub fn set_kernel_console(&mut self, port_index: u32) -> Result<(), Error> {
+    #[doc = " Add a port with separate input and output fds (no terminal properties)."]
+    #[doc = " Pass -1 for input_fd or output_fd to disable that direction."]
+    pub fn add_inout_port(
+        &mut self,
+        name: &str,
+        input_fd: i32,
+        output_fd: i32,
+    ) -> Result<u32, Error> {
+        let mut __out = std::mem::MaybeUninit::uninit();
         let mut __err: *mut core::ffi::c_void = core::ptr::null_mut();
         let __r = unsafe {
-            krun_console_builder_set_kernel_console(
+            krun_console_builder_add_inout_port(
                 self.0,
-                <u32 as FfiType>::into_c(port_index),
+                <&str as FfiType>::into_c(name),
+                <i32 as FfiType>::into_c(input_fd),
+                <i32 as FfiType>::into_c(output_fd),
+                __out.as_mut_ptr(),
                 &mut __err as *mut *mut core::ffi::c_void,
             )
         };
         if __r == 0 {
-            Ok(())
+            Ok(unsafe { <u32 as FfiType>::from_c(__out.assume_init()) })
         } else {
             Err(Error::from_ffi(__r, __err))
         }
