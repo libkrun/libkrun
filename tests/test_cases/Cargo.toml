@@ -3,7 +3,7 @@ name = "test_cases"
 edition = "2024"
 
 [features]
-host = ["krun-via-cdylib-weak", "krun-init-blob-via-cdylib", "serde", "serde_json"]
+host = ["krun-via-cdylib-weak", "krun-init-blob-via-cdylib", "libloading", "serde", "serde_json"]
 guest = []
 
 [lib]
@@ -12,6 +12,7 @@ name = "test_cases"
 [dependencies]
 krun-via-cdylib-weak = { path = "../../src/libkrun-via-cdylib-weak", optional = true }
 krun-init-blob-via-cdylib = { path = "../../init/init-blob-via-cdylib", optional = true }
+libloading = { version = "0.8", optional = true }
 macros = { path = "../macros" }
 nix = { version = "0.29.0", features = ["fs", "socket", "ioctl", "user"] }
 anyhow = "1.0.95"

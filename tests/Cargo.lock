@@ -461,6 +461,7 @@ dependencies = [
  "anyhow",
  "krun-init-blob-via-cdylib",
  "krun-via-cdylib-weak",
+ "libloading",
  "macros",
  "nix",
  "serde",

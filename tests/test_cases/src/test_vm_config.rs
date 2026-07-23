@@ -9,32 +9,12 @@ pub struct TestVmConfig {
 mod host {
     use super::*;
 
-    use crate::common::setup_fs_and_enter;
+    use crate::common::setup_and_run;
     use crate::{Test, TestSetup};
-    use crate::{krun_call, krun_call_u32};
-    use krun_sys::*;
-    use std::os::fd::AsRawFd;
 
     impl Test for TestVmConfig {
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            unsafe {
-                krun_call!(krun_init_log(
-                    KRUN_LOG_TARGET_DEFAULT,
-                    KRUN_LOG_LEVEL_TRACE,
-                    KRUN_LOG_STYLE_AUTO,
-                    0
-                ))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_set_vm_config(ctx, self.num_cpus, self.ram_mib))?;
-                krun_call!(krun_add_virtio_console_default(
-                    ctx,
-                    std::io::stdin().as_raw_fd(),
-                    std::io::stdout().as_raw_fd(),
-                    std::io::stderr().as_raw_fd(),
-                ))?;
-                setup_fs_and_enter(ctx, test_setup)?;
-            }
-            Ok(())
+            setup_and_run(self.num_cpus, self.ram_mib, test_setup)
         }
     }
 }
