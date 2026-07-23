@@ -1,6 +1,10 @@
 [package]
 name = "krun-via-cdylib-weak"
-version = "0.1.0"
+version = "2.0.0-dev"
 edition = "2024"
+description = "Weak (dlsym) Rust client for libkrun — stub, populated later"
+license = "Apache-2.0"
 
 [dependencies]
+ffier = { git = "https://github.com/mtjhrc/ffier.git", rev = "f5c8083" }
+libloading = "0.8"

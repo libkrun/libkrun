@@ -1,0 +1,1373 @@
+{
+  "prefix": "krun",
+  "primitives_prefix": "krun",
+  "type_registry": {
+    "AttachDevice": {
+      "kind": {
+        "trait": {
+          "c_name": "KrunAttachDevice"
+        }
+      },
+      "lifetime_params": [
+        "a"
+      ]
+    },
+    "BorrowedFd": {
+      "kind": {
+        "alias": {
+          "alias_of": "RawFd"
+        }
+      },
+      "bless": "borrowed_fd",
+      "lifetime_params": [
+        "fd"
+      ]
+    },
+    "ConsoleBuilder": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunConsoleBuilder"
+        }
+      },
+      "type_tag": 16777221,
+      "lifetime_params": [
+        "a"
+      ]
+    },
+    "ConsoleDevice": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunConsoleDevice"
+        }
+      },
+      "type_tag": 16777220,
+      "lifetime_params": [
+        "a"
+      ]
+    },
+    "Error": {
+      "kind": {
+        "trait": {
+          "c_name": "KrunError"
+        }
+      },
+      "type_tag": 16777229,
+      "bless": "error_trait"
+    },
+    "FfierObject": {
+      "kind": {
+        "primitive": {
+          "c_type": "KrunObject"
+        }
+      },
+      "bless": "object"
+    },
+    "FfierObjectArray": {
+      "kind": {
+        "primitive": {
+          "c_type": "KrunObjectArray"
+        }
+      },
+      "bless": "object_array"
+    },
+    "FfierResult": {
+      "kind": {
+        "primitive": {
+          "c_type": "KrunResult"
+        }
+      },
+      "bless": "result"
+    },
+    "FfierVtableHandle": {
+      "kind": {
+        "primitive": {
+          "c_type": "KrunVtableHandle"
+        }
+      },
+      "bless": "vtable_handle"
+    },
+    "FsDevice": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunFsDevice"
+        }
+      },
+      "type_tag": 16777219,
+      "lifetime_params": [
+        "a"
+      ]
+    },
+    "FsOverlay": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunFsOverlay"
+        }
+      },
+      "type_tag": 16777222
+    },
+    "KernelFormat": {
+      "kind": {
+        "enum": {
+          "alias_of": "u32"
+        }
+      }
+    },
+    "LogLevel": {
+      "kind": {
+        "enum": {
+          "alias_of": "u32"
+        }
+      }
+    },
+    "LogStyle": {
+      "kind": {
+        "enum": {
+          "alias_of": "u32"
+        }
+      }
+    },
+    "LogTarget": {
+      "kind": {
+        "enum": {
+          "alias_of": "u32"
+        }
+      }
+    },
+    "MmioDeviceManager": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunMmioDeviceManager"
+        }
+      },
+      "type_tag": 16777218,
+      "lifetime_params": [
+        "a"
+      ]
+    },
+    "Payload": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunPayload"
+        }
+      },
+      "type_tag": 16777224
+    },
+    "PushStr": {
+      "kind": {
+        "trait": {
+          "c_name": "KrunPushStr"
+        }
+      },
+      "type_tag": 16777228,
+      "bless": "push_str"
+    },
+    "RawFd": {
+      "kind": {
+        "primitive": {
+          "c_type": "int"
+        }
+      },
+      "bless": "raw_fd"
+    },
+    "Self": {
+      "kind": {
+        "primitive": {
+          "c_type": "void"
+        }
+      },
+      "bless": "replaces_self"
+    },
+    "Vmm": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunVmm"
+        }
+      },
+      "type_tag": 16777227,
+      "lifetime_params": [
+        "a"
+      ]
+    },
+    "VmmBuilder": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunVmmBuilder"
+        }
+      },
+      "type_tag": 16777226,
+      "lifetime_params": [
+        "a"
+      ]
+    },
+    "[u8]": {
+      "kind": {
+        "bytes": {
+          "c_name": "KrunBytes"
+        }
+      },
+      "bless": "bytes"
+    },
+    "bool": {
+      "kind": {
+        "primitive": {
+          "c_type": "bool"
+        }
+      }
+    },
+    "str": {
+      "kind": {
+        "string": {
+          "c_name": "KrunStr"
+        }
+      },
+      "bless": "str"
+    },
+    "u32": {
+      "kind": {
+        "primitive": {
+          "c_type": "uint32_t"
+        }
+      }
+    },
+    "u64": {
+      "kind": {
+        "primitive": {
+          "c_type": "uint64_t"
+        }
+      }
+    },
+    "u8": {
+      "kind": {
+        "primitive": {
+          "c_type": "uint8_t"
+        }
+      }
+    }
+  },
+  "exported_types": [
+    {
+      "name": "MmioDeviceManager",
+      "destroy_ffi_name": "krun_mmio_device_manager_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "new",
+          "doc": [
+            " Create an empty device manager."
+          ],
+          "receiver": "none",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "MmioDeviceManager",
+            "type_args": [
+              "a"
+            ]
+          },
+          "ffi_name": "krun_mmio_device_manager_new"
+        },
+        {
+          "name": "add",
+          "doc": [
+            " Add a device to this manager.",
+            "",
+            " Devices are attached in the order they are added. The device must",
+            " implement [`AttachDevice`] — all built-in device types",
+            " (`FsDevice`, `ConsoleDevice`, etc.) implement this trait."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "device",
+              "param_kind": "impl_trait",
+              "trait_name": "AttachDevice",
+              "type_args": [
+                "a"
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_mmio_device_manager_add"
+        }
+      ]
+    },
+    {
+      "name": "FsDevice",
+      "destroy_ffi_name": "krun_fs_device_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "new",
+          "doc": [
+            " Create a new virtiofs device sharing a host directory.",
+            "",
+            " # Arguments",
+            "",
+            " - `tag`: the filesystem tag visible to the guest (e.g. `\"/dev/root\"`).",
+            " - `host_path`: the host directory to share."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "tag",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "host_path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "FsDevice",
+              "type_args": [
+                "a"
+              ]
+            },
+            "err_type": "Error",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_fs_device_new"
+        },
+        {
+          "name": "new_read_only",
+          "doc": [
+            " Create a read-only virtiofs device sharing a host directory."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "tag",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "host_path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "FsDevice",
+              "type_args": [
+                "a"
+              ]
+            },
+            "err_type": "Error",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_fs_device_new_read_only"
+        },
+        {
+          "name": "new_null",
+          "doc": [
+            " Create a virtiofs device with no host directory (NullFs).",
+            "",
+            " The guest sees an empty filesystem. Use",
+            " [`add_overlay_dir`](Self::add_overlay_dir) and",
+            " [`add_overlay_file`](Self::add_overlay_file) to populate it",
+            " with virtual entries."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "tag",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "FsDevice",
+              "type_args": [
+                "a"
+              ]
+            },
+            "err_type": "Error",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_fs_device_new_null"
+        },
+        {
+          "name": "add_overlay_dir",
+          "doc": [
+            " Add a virtual directory overlay entry.",
+            "",
+            " `path` may contain `/` separators for nested entries (e.g.",
+            " `\"etc/nested\"`). Intermediate directories must already exist."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "mode",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_fs_device_add_overlay_dir"
+        },
+        {
+          "name": "add_overlay_file",
+          "doc": [
+            " Add a virtual file overlay entry.",
+            "",
+            " `path` may contain `/` separators for nested entries (e.g.",
+            " `\"etc/nested/deep.txt\"`). Intermediate directories must already",
+            " exist."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "data",
+              "param_kind": "regular",
+              "type": "[u8]",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "mode",
+              "param_kind": "regular",
+              "type": "u32"
+            },
+            {
+              "name": "one_shot",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_fs_device_add_overlay_file"
+        },
+        {
+          "name": "set_overlay",
+          "doc": [
+            " Apply a pre-built [`FsOverlay`] to this device.",
+            "",
+            " All entries from the overlay are added as virtual entries into",
+            " the underlying virtiofs device."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "overlay",
+              "param_kind": "regular",
+              "type": "FsOverlay"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_fs_device_set_overlay"
+        },
+        {
+          "name": "set_dax_window_size",
+          "doc": [
+            " Set the size of the DAX (direct access) shared memory window.",
+            "",
+            " When set, the guest can memory-map files from the shared filesystem",
+            " directly into its address space, avoiding data copies. If not set,",
+            " no DAX window is allocated."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "bytes",
+              "param_kind": "regular",
+              "type": "u64"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_fs_device_set_dax_window_size"
+        }
+      ]
+    },
+    {
+      "name": "ConsoleDevice",
+      "destroy_ffi_name": "krun_console_device_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "builder",
+          "doc": [
+            " Create a new console builder."
+          ],
+          "receiver": "none",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "ConsoleBuilder",
+            "type_args": [
+              "a"
+            ]
+          },
+          "ffi_name": "krun_console_device_builder"
+        }
+      ]
+    },
+    {
+      "name": "ConsoleBuilder",
+      "destroy_ffi_name": "krun_console_builder_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "add_tty_port",
+          "doc": [
+            " Add a TTY-backed port to the console.",
+            "",
+            " If the fd refers to a real terminal, raw mode will be enabled on it",
+            " when the VM starts, and restored on shutdown.",
+            "",
+            " # Arguments",
+            "",
+            " - `name`: the port name visible to the guest (e.g. `\"tty0\"`).",
+            " - `tty_fd`: borrowed fd for the host TTY; duplicated internally, caller retains ownership.",
+            "",
+            " # Returns",
+            "",
+            " The zero-based port index, usable with [`set_kernel_console`](ConsoleBuilder::set_kernel_console)."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "name",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "tty_fd",
+              "param_kind": "regular",
+              "type": "BorrowedFd",
+              "type_args": [
+                "a"
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "u32"
+            },
+            "err_type": "Error",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_console_builder_add_tty_port"
+        },
+        {
+          "name": "set_kernel_console",
+          "doc": [
+            " Designate a port as the kernel console (`console=hvcN`).",
+            "",
+            " # Arguments",
+            "",
+            " - `port_index`: a value returned by [`add_tty_port`](ConsoleBuilder::add_tty_port)."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "port_index",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "Error",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_console_builder_set_kernel_console"
+        },
+        {
+          "name": "build",
+          "doc": [
+            " Build the console device. At least one port must have been added."
+          ],
+          "receiver": "value",
+          "params": [],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "ConsoleDevice",
+              "type_args": [
+                "a"
+              ]
+            },
+            "err_type": "Error",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_console_builder_build"
+        },
+        {
+          "name": "add_default_console",
+          "doc": [
+            " Set up the default console: port 0 (hvc0) plus named redirect ports.",
+            "",
+            " Replicates the v1 `krun_add_virtio_console_default` behaviour:",
+            "",
+            " - If any fd is a terminal, port 0 becomes a full TTY console",
+            "   (raw mode enabled), and that fd is NOT added as a redirect port.",
+            " - Otherwise, port 0 gets log output and named redirect ports",
+            "   (`krun-stdin`, `krun-stdout`, `krun-stderr`) are added.",
+            "",
+            " Pass -1 to skip a stream."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "stdin",
+              "param_kind": "regular",
+              "type": "RawFd"
+            },
+            {
+              "name": "stdout",
+              "param_kind": "regular",
+              "type": "RawFd"
+            },
+            {
+              "name": "stderr",
+              "param_kind": "regular",
+              "type": "RawFd"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "Error",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_console_builder_add_default_console"
+        }
+      ]
+    },
+    {
+      "name": "FsOverlay",
+      "destroy_ffi_name": "krun_fs_overlay_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "new",
+          "doc": [
+            " Create a new empty overlay."
+          ],
+          "receiver": "none",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "FsOverlay"
+          },
+          "ffi_name": "krun_fs_overlay_new"
+        },
+        {
+          "name": "add_dir",
+          "doc": [
+            " Add a virtual directory entry."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "mode",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_fs_overlay_add_dir"
+        },
+        {
+          "name": "add_file",
+          "doc": [
+            " Add a virtual file entry."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "data",
+              "param_kind": "regular",
+              "type": "[u8]",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "mode",
+              "param_kind": "regular",
+              "type": "u32"
+            },
+            {
+              "name": "one_shot",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_fs_overlay_add_file"
+        }
+      ]
+    },
+    {
+      "name": "Payload",
+      "destroy_ffi_name": "krun_payload_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "load_krunfw",
+          "receiver": "none",
+          "params": [],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Payload"
+            },
+            "err_type": "Error",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_payload_load_krunfw"
+        },
+        {
+          "name": "load_external",
+          "receiver": "none",
+          "params": [
+            {
+              "name": "path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "format",
+              "param_kind": "regular",
+              "type": "KernelFormat"
+            },
+            {
+              "name": "cmdline",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Payload"
+            },
+            "err_type": "Error",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_payload_load_external"
+        },
+        {
+          "name": "cmdline",
+          "receiver": "ref",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "str",
+            "ref_kind": "shared"
+          },
+          "ffi_name": "krun_payload_cmdline"
+        },
+        {
+          "name": "append_cmdline",
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "extra",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_payload_append_cmdline"
+        }
+      ]
+    },
+    {
+      "name": "VmmBuilder",
+      "destroy_ffi_name": "krun_vmm_builder_destroy",
+      "is_builder_type": true,
+      "methods": [
+        {
+          "name": "new",
+          "receiver": "none",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "VmmBuilder",
+            "type_args": [
+              "a"
+            ]
+          },
+          "ffi_name": "krun_vmm_builder_new"
+        },
+        {
+          "name": "vcpus",
+          "receiver": "value",
+          "params": [
+            {
+              "name": "count",
+              "param_kind": "regular",
+              "type": "u8"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "Error",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vmm_builder_vcpus"
+        },
+        {
+          "name": "ram_mib",
+          "receiver": "value",
+          "params": [
+            {
+              "name": "mib",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "Error",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vmm_builder_ram_mib"
+        },
+        {
+          "name": "payload",
+          "receiver": "value",
+          "params": [
+            {
+              "name": "payload",
+              "param_kind": "regular",
+              "type": "Payload"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_vmm_builder_payload"
+        },
+        {
+          "name": "devices",
+          "receiver": "value",
+          "params": [
+            {
+              "name": "devices",
+              "param_kind": "regular",
+              "type": "MmioDeviceManager",
+              "type_args": [
+                "a"
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_vmm_builder_devices"
+        },
+        {
+          "name": "set_kernel_console",
+          "receiver": "value",
+          "params": [
+            {
+              "name": "console",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_vmm_builder_set_kernel_console"
+        },
+        {
+          "name": "build",
+          "receiver": "value",
+          "params": [],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Vmm",
+              "type_args": [
+                "a"
+              ]
+            },
+            "err_type": "Error",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_vmm_builder_build"
+        }
+      ]
+    },
+    {
+      "name": "Vmm",
+      "destroy_ffi_name": "krun_vmm_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "run",
+          "receiver": "mut",
+          "params": [],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_vmm_run"
+        }
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "name": "Error",
+      "variants": [
+        {
+          "name": "InvalidParam",
+          "c_name": "KRUN_ERROR__INVALID_PARAM",
+          "code": 100,
+          "message": "InvalidParam"
+        },
+        {
+          "name": "DuplicateDevice",
+          "c_name": "KRUN_ERROR__DUPLICATE_DEVICE",
+          "code": 101,
+          "message": "DuplicateDevice"
+        },
+        {
+          "name": "DeviceLimitExceeded",
+          "c_name": "KRUN_ERROR__DEVICE_LIMIT_EXCEEDED",
+          "code": 102,
+          "message": "DeviceLimitExceeded"
+        },
+        {
+          "name": "MissingConfig",
+          "c_name": "KRUN_ERROR__MISSING_CONFIG",
+          "code": 103,
+          "message": "MissingConfig"
+        },
+        {
+          "name": "ConflictingConfig",
+          "c_name": "KRUN_ERROR__CONFLICTING_CONFIG",
+          "code": 104,
+          "message": "ConflictingConfig"
+        },
+        {
+          "name": "OutOfRange",
+          "c_name": "KRUN_ERROR__OUT_OF_RANGE",
+          "code": 105,
+          "message": "OutOfRange"
+        },
+        {
+          "name": "FileNotFound",
+          "c_name": "KRUN_ERROR__FILE_NOT_FOUND",
+          "code": 200,
+          "message": "FileNotFound"
+        },
+        {
+          "name": "PermissionDenied",
+          "c_name": "KRUN_ERROR__PERMISSION_DENIED",
+          "code": 201,
+          "message": "PermissionDenied"
+        },
+        {
+          "name": "ResourceAlloc",
+          "c_name": "KRUN_ERROR__RESOURCE_ALLOC",
+          "code": 202,
+          "message": "ResourceAlloc"
+        },
+        {
+          "name": "BadFd",
+          "c_name": "KRUN_ERROR__BAD_FD",
+          "code": 203,
+          "message": "BadFd"
+        },
+        {
+          "name": "BackendUnavailable",
+          "c_name": "KRUN_ERROR__BACKEND_UNAVAILABLE",
+          "code": 300,
+          "message": "BackendUnavailable"
+        },
+        {
+          "name": "FeatureDisabled",
+          "c_name": "KRUN_ERROR__FEATURE_DISABLED",
+          "code": 301,
+          "message": "feature not enabled in this build"
+        },
+        {
+          "name": "DiskFormatError",
+          "c_name": "KRUN_ERROR__DISK_FORMAT_ERROR",
+          "code": 302,
+          "message": "DiskFormatError"
+        },
+        {
+          "name": "AlreadyStarted",
+          "c_name": "KRUN_ERROR__ALREADY_STARTED",
+          "code": 400,
+          "message": "AlreadyStarted"
+        },
+        {
+          "name": "ValidationFailed",
+          "c_name": "KRUN_ERROR__VALIDATION_FAILED",
+          "code": 401,
+          "message": "ValidationFailed"
+        },
+        {
+          "name": "HypervisorError",
+          "c_name": "KRUN_ERROR__HYPERVISOR_ERROR",
+          "code": 402,
+          "message": "HypervisorError"
+        },
+        {
+          "name": "BootError",
+          "c_name": "KRUN_ERROR__BOOT_ERROR",
+          "code": 403,
+          "message": "BootError"
+        },
+        {
+          "name": "Internal",
+          "c_name": "KRUN_ERROR__INTERNAL",
+          "code": 900,
+          "message": "Internal"
+        }
+      ]
+    }
+  ],
+  "enum_constants": [
+    {
+      "name": "KernelFormat",
+      "variants": [
+        {
+          "name": "Elf",
+          "c_name": "KRUN_KERNEL_FORMAT_ELF",
+          "value": 0
+        },
+        {
+          "name": "Raw",
+          "c_name": "KRUN_KERNEL_FORMAT_RAW",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "LogLevel",
+      "variants": [
+        {
+          "name": "Off",
+          "c_name": "KRUN_LOG_LEVEL_OFF",
+          "value": 0
+        },
+        {
+          "name": "Error",
+          "c_name": "KRUN_LOG_LEVEL_ERROR",
+          "value": 1
+        },
+        {
+          "name": "Warn",
+          "c_name": "KRUN_LOG_LEVEL_WARN",
+          "value": 2
+        },
+        {
+          "name": "Info",
+          "c_name": "KRUN_LOG_LEVEL_INFO",
+          "value": 3
+        },
+        {
+          "name": "Debug",
+          "c_name": "KRUN_LOG_LEVEL_DEBUG",
+          "value": 4
+        },
+        {
+          "name": "Trace",
+          "c_name": "KRUN_LOG_LEVEL_TRACE",
+          "value": 5
+        }
+      ]
+    },
+    {
+      "name": "LogStyle",
+      "variants": [
+        {
+          "name": "Auto",
+          "c_name": "KRUN_LOG_STYLE_AUTO",
+          "value": 0
+        },
+        {
+          "name": "Always",
+          "c_name": "KRUN_LOG_STYLE_ALWAYS",
+          "value": 1
+        },
+        {
+          "name": "Never",
+          "c_name": "KRUN_LOG_STYLE_NEVER",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "name": "LogTarget",
+      "variants": [
+        {
+          "name": "Default",
+          "c_name": "KRUN_LOG_TARGET_DEFAULT",
+          "value": 0
+        },
+        {
+          "name": "Stdout",
+          "c_name": "KRUN_LOG_TARGET_STDOUT",
+          "value": 1
+        },
+        {
+          "name": "Stderr",
+          "c_name": "KRUN_LOG_TARGET_STDERR",
+          "value": 2
+        }
+      ]
+    }
+  ],
+  "free_functions": [
+    {
+      "name": "init_log",
+      "ffi_name": "krun_init_log",
+      "params": [
+        {
+          "name": "target",
+          "param_kind": "regular",
+          "type": "LogTarget"
+        },
+        {
+          "name": "level",
+          "param_kind": "regular",
+          "type": "LogLevel"
+        },
+        {
+          "name": "style",
+          "param_kind": "regular",
+          "type": "LogStyle"
+        }
+      ],
+      "ret": {
+        "return_kind": "result",
+        "ok": null,
+        "err_type": "Error",
+        "c_convention": "out_param"
+      }
+    }
+  ],
+  "traits": [
+    {
+      "name": "PushStr",
+      "destroy_ffi_name": "krun_push_str_destroy",
+      "type_tag_constant": "KRUN_PUSH_STR_TYPE_TAG",
+      "vtable_struct_c_name": "KrunPushStrVtable",
+      "wrapper_c_name": "KrunVtablePushStr",
+      "vtable_struct_name": "PushStrVtable",
+      "wrapper_name": "VtablePushStr",
+      "methods": [
+        {
+          "name": "push",
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "s",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "bool"
+          },
+          "ffi_name": "krun_push_str_push",
+          "trait_definition": {
+            "index": 0,
+            "has_default": false
+          }
+        }
+      ],
+      "own_method_count": 1,
+      "max_vtable_slot": 0
+    },
+    {
+      "name": "Error",
+      "destroy_ffi_name": "krun_error_destroy",
+      "type_tag_constant": "KRUN_ERROR_TYPE_TAG",
+      "vtable_struct_c_name": "KrunErrorVtable",
+      "wrapper_c_name": "KrunVtableError",
+      "vtable_struct_name": "ErrorVtable",
+      "wrapper_name": "VtableError",
+      "methods": [
+        {
+          "name": "code",
+          "receiver": "ref",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "u32"
+          },
+          "ffi_name": "krun_error_code",
+          "trait_definition": {
+            "index": 0,
+            "has_default": false
+          }
+        },
+        {
+          "name": "message",
+          "receiver": "ref",
+          "params": [
+            {
+              "name": "writer",
+              "param_kind": "impl_trait",
+              "trait_name": "PushStr"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_error_message",
+          "trait_definition": {
+            "index": 1,
+            "has_default": false
+          }
+        },
+        {
+          "name": "result",
+          "receiver": "none",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "u64"
+          },
+          "ffi_name": "krun_error_result",
+          "trait_definition": {
+            "index": 2,
+            "has_default": true
+          }
+        }
+      ],
+      "own_method_count": 3,
+      "max_vtable_slot": 2
+    }
+  ],
+  "trait_impls": [
+    {
+      "trait_name": "AttachDevice",
+      "struct_name": "FsDevice",
+      "lifetimes": [
+        "a"
+      ],
+      "trait_lifetime_args": [
+        "a"
+      ],
+      "struct_lifetime_args": [
+        "a"
+      ],
+      "methods": []
+    },
+    {
+      "trait_name": "AttachDevice",
+      "struct_name": "ConsoleDevice",
+      "lifetimes": [
+        "a"
+      ],
+      "trait_lifetime_args": [
+        "a"
+      ],
+      "struct_lifetime_args": [
+        "a"
+      ],
+      "methods": []
+    },
+    {
+      "trait_name": "Error",
+      "struct_name": "Error",
+      "methods": [
+        {
+          "name": "code",
+          "receiver": "ref",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "u32"
+          },
+          "ffi_name": "krun_error_code"
+        },
+        {
+          "name": "message",
+          "receiver": "ref",
+          "params": [
+            {
+              "name": "writer",
+              "param_kind": "impl_trait",
+              "trait_name": "PushStr"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_error_message"
+        }
+      ]
+    }
+  ]
+}

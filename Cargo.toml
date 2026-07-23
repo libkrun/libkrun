@@ -20,6 +20,7 @@ members = [
     "src/rutabaga_gfx",
     "src/whp",
     "src/libkrun-via-cdylib-weak",
+    "src/libkrun-via-cdylib",
 ]
 exclude = ["examples/gtk_display"]
 resolver = "2"

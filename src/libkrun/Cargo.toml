@@ -20,6 +20,7 @@ virgl_resource_map2 = ["devices/virgl_resource_map2"]
 aws-nitro = ["vmm/aws-nitro", "devices/aws-nitro", "dep:aws-nitro", "dep:nitro-enclaves"]
 vhost-user = ["vmm/vhost-user", "devices/vhost-user"]
 timesync = ["devices/timesync"]
+ffi = ["ffier-gen-c-header", "ffier-gen-rust-client", "ffier-schema", "serde_json"]
 
 [dependencies]
 arch = { package = "krun-arch", version = "=0.1.0-2.0.0-dev", path = "../arch" }
@@ -27,6 +28,10 @@ crossbeam-channel = ">=0.5.15"
 env_logger = "0.11"
 ffier = { git = "https://github.com/mtjhrc/ffier.git", rev = "f5c8083" }
 ffier-builtins = { git = "https://github.com/mtjhrc/ffier.git", rev = "f5c8083" }
+ffier-gen-c-header = { git = "https://github.com/mtjhrc/ffier.git", rev = "f5c8083", optional = true }
+ffier-gen-rust-client = { git = "https://github.com/mtjhrc/ffier.git", rev = "f5c8083", optional = true }
+ffier-schema = { git = "https://github.com/mtjhrc/ffier.git", rev = "f5c8083", optional = true }
+serde_json = { version = "1", optional = true }
 kernel = { package = "krun-kernel", version = "=0.1.0-2.0.0-dev", path = "../kernel" }
 kbs-types = { version = "0.13.0", optional = true }
 libc = ">=0.2.39"
@@ -63,3 +68,8 @@ windows-sys = { version = "0.61.2", features = [
 [lib]
 name = "krun"
 crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "libkrun-gen"
+path = "src/gen.rs"
+required-features = ["ffi"]

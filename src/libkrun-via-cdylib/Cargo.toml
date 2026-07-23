@@ -1,0 +1,17 @@
+[package]
+name = "krun-via-cdylib"
+version = "2.0.0-dev"
+edition = "2024"
+description = "Strong Rust client for libkrun (links libkrun.so)"
+license = "Apache-2.0"
+build = "build.rs"
+
+[lib]
+test = false
+doctest = false
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[dependencies]
+ffier = { git = "https://github.com/mtjhrc/ffier.git", rev = "f5c8083" }
