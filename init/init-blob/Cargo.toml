@@ -11,11 +11,14 @@ build = "build.rs"
 amd-sev = []
 tdx = []
 timesync = []
-ffi = []
+ffi = ["ffier-gen-c-header", "ffier-gen-rust-client", "ffier-schema"]
 
 [dependencies]
-ffier = { git = "https://github.com/mtjhrc/ffier.git", rev = "9ee67e2" }
-libloading = "0.8"
+ffier = { git = "https://github.com/mtjhrc/ffier.git", rev = "f5c8083" }
+ffier-gen-c-header = { git = "https://github.com/mtjhrc/ffier.git", rev = "f5c8083", optional = true }
+ffier-gen-rust-client = { git = "https://github.com/mtjhrc/ffier.git", rev = "f5c8083", optional = true }
+ffier-schema = { git = "https://github.com/mtjhrc/ffier.git", rev = "f5c8083", optional = true }
+krun-via-cdylib-weak = { path = "../../src/libkrun-via-cdylib-weak" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -24,3 +27,8 @@ thiserror = "2"
 name = "krun_init"
 path = "src/lib.rs"
 crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "krun-init-blob-gen"
+path = "src/gen.rs"
+required-features = ["ffi"]

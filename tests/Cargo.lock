@@ -131,7 +131,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 [[package]]
 name = "ffier"
 version = "0.2.0"
-source = "git+https://github.com/mtjhrc/ffier.git?rev=9ee67e2#9ee67e2b0fcc7fbc32a60dc40de12c774101c7ae"
+source = "git+https://github.com/mtjhrc/ffier.git?rev=f5c8083#f5c808381316b6bb4ab447be9b252bf4012fcc20"
 dependencies = [
  "ffier-builtins",
  "ffier-impl",
@@ -141,7 +141,7 @@ dependencies = [
 [[package]]
 name = "ffier-builtins"
 version = "0.2.0"
-source = "git+https://github.com/mtjhrc/ffier.git?rev=9ee67e2#9ee67e2b0fcc7fbc32a60dc40de12c774101c7ae"
+source = "git+https://github.com/mtjhrc/ffier.git?rev=f5c8083#f5c808381316b6bb4ab447be9b252bf4012fcc20"
 dependencies = [
  "ffier-impl",
  "ffier-rt",
@@ -150,7 +150,7 @@ dependencies = [
 [[package]]
 name = "ffier-gen-rust-client"
 version = "0.2.0"
-source = "git+https://github.com/mtjhrc/ffier.git?rev=9ee67e2#9ee67e2b0fcc7fbc32a60dc40de12c774101c7ae"
+source = "git+https://github.com/mtjhrc/ffier.git?rev=f5c8083#f5c808381316b6bb4ab447be9b252bf4012fcc20"
 dependencies = [
  "ffier-schema",
  "serde_json",
@@ -159,7 +159,7 @@ dependencies = [
 [[package]]
 name = "ffier-impl"
 version = "0.2.0"
-source = "git+https://github.com/mtjhrc/ffier.git?rev=9ee67e2#9ee67e2b0fcc7fbc32a60dc40de12c774101c7ae"
+source = "git+https://github.com/mtjhrc/ffier.git?rev=f5c8083#f5c808381316b6bb4ab447be9b252bf4012fcc20"
 dependencies = [
  "ffier-schema",
  "proc-macro2",
@@ -171,12 +171,12 @@ dependencies = [
 [[package]]
 name = "ffier-rt"
 version = "0.2.0"
-source = "git+https://github.com/mtjhrc/ffier.git?rev=9ee67e2#9ee67e2b0fcc7fbc32a60dc40de12c774101c7ae"
+source = "git+https://github.com/mtjhrc/ffier.git?rev=f5c8083#f5c808381316b6bb4ab447be9b252bf4012fcc20"
 
 [[package]]
 name = "ffier-schema"
 version = "0.2.0"
-source = "git+https://github.com/mtjhrc/ffier.git?rev=9ee67e2#9ee67e2b0fcc7fbc32a60dc40de12c774101c7ae"
+source = "git+https://github.com/mtjhrc/ffier.git?rev=f5c8083#f5c808381316b6bb4ab447be9b252bf4012fcc20"
 dependencies = [
  "serde",
  "serde_json",
@@ -221,6 +221,7 @@ dependencies = [
  "anyhow",
  "ffier",
  "ffier-gen-rust-client",
+ "krun-via-cdylib-weak",
  "pkg-config",
 ]
 
