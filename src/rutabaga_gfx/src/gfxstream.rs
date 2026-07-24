@@ -28,6 +28,8 @@ use crate::renderer_utils::*;
 use crate::rutabaga_core::RutabagaComponent;
 use crate::rutabaga_core::RutabagaContext;
 use crate::rutabaga_core::RutabagaResource;
+#[cfg(target_os = "macos")]
+use crate::rutabaga_os::AsRawDescriptor;
 use crate::rutabaga_os::FromRawDescriptor;
 use crate::rutabaga_os::IntoRawDescriptor;
 use crate::rutabaga_os::RawDescriptor;
@@ -91,7 +93,7 @@ pub type stream_renderer_fence = RutabagaFence;
 #[allow(non_camel_case_types)]
 pub type stream_renderer_debug = RutabagaDebug;
 
-extern "C" {
+unsafe extern "C" {
     // Entry point for the stream renderer.
     fn stream_renderer_init(
         stream_renderer_params: *mut stream_renderer_param,
@@ -457,6 +459,8 @@ impl RutabagaComponent for Gfxstream {
             blob_mem: 0,
             blob_flags: 0,
             map_info: None,
+            #[cfg(target_os = "macos")]
+            map_ptr: None,
             info_2d: None,
             info_3d: None,
             vulkan_info: None,
@@ -630,13 +634,68 @@ impl RutabagaComponent for Gfxstream {
 
         ret_to_res(ret)?;
 
+        // NOTE: `export_blob()` goes through gfxstream's `releaseHandle()`,
+        // which is a one-shot `std::exchange(mFd, invalid)` on the host side;
+        // calling it twice would hand back an invalid descriptor on the second
+        // call. Compute the handle once and derive `map_ptr` from it below so
+        // the same descriptor backs both fields.
+        let handle = self.export_blob(resource_id).ok();
+
+        // The macOS mapping path (RESOURCE_MAP_BLOB -> hypervisor mapping)
+        // needs a host pointer for the resource, matching what the
+        // virglrenderer component provides via
+        // virgl_renderer_resource_get_map_ptr():
+        //  - SHM-backed blobs: map the exported descriptor.
+        //  - blobs without an exportable descriptor (e.g. host-visible
+        //    VkDeviceMemory, which MoltenVK cannot export): fall back to
+        //    gfxstream's own mapping, a vkMapMemory wrapper it keeps alive
+        //    for the resource's lifetime.
+        // Blobs that support neither stay unmapped (None), as before.
+        #[cfg(target_os = "macos")]
+        let map_ptr = {
+            let shm_ptr = handle.as_ref().and_then(|h| {
+                if h.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM {
+                    let addr = unsafe {
+                        libc::mmap(
+                            null_mut(),
+                            resource_create_blob.size as usize,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_SHARED,
+                            h.os_handle.as_raw_descriptor(),
+                            0,
+                        )
+                    };
+                    if addr == libc::MAP_FAILED {
+                        None
+                    } else {
+                        Some(addr as u64)
+                    }
+                } else {
+                    None
+                }
+            });
+            shm_ptr.or_else(|| {
+                let mut map: *mut c_void = null_mut();
+                let mut size: u64 = 0;
+                let ret =
+                    unsafe { stream_renderer_resource_map(resource_id, &mut map, &mut size) };
+                if ret == 0 && !map.is_null() {
+                    Some(map as u64)
+                } else {
+                    None
+                }
+            })
+        };
+
         Ok(RutabagaResource {
             resource_id,
-            handle: self.export_blob(resource_id).ok(),
+            handle,
             blob: true,
             blob_mem: resource_create_blob.blob_mem,
             blob_flags: resource_create_blob.blob_flags,
             map_info: self.map_info(resource_id).ok(),
+            #[cfg(target_os = "macos")]
+            map_ptr,
             info_2d: None,
             info_3d: None,
             vulkan_info: self.vulkan_info(resource_id).ok(),
