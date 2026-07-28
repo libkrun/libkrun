@@ -20,7 +20,7 @@ use krun_display::{
 use libc::c_void;
 #[cfg(target_os = "macos")]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_APPLE;
-#[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_DMABUF;
 #[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
@@ -66,6 +66,32 @@ fn sglist_to_rutabaga_iovecs(
         });
     }
     Ok(rutabaga_iovecs)
+}
+
+/// A dma-buf mapping is `VM_PFNMAP`, which KVM cannot fault in on its own: on a
+/// guest write to a page that has no writable PTE yet, `hva_to_pfn_remapped()`
+/// returns `KVM_PFN_ERR_RO_FAULT` and `KVM_RUN` fails with `EFAULT`, taking the
+/// VM down. Establishing the PTEs is therefore up to the VMM. Rewriting each
+/// page with the value it already holds leaves the contents untouched.
+///
+/// `MAP_POPULATE` is no substitute; it skips `VM_PFNMAP` VMAs.
+#[cfg(target_os = "linux")]
+fn prefault_dmabuf(addr: *mut c_void, size: usize, prot: i32) {
+    if prot & (libc::PROT_READ | libc::PROT_WRITE) != libc::PROT_READ | libc::PROT_WRITE {
+        return;
+    }
+
+    // SAFETY: `_SC_PAGESIZE` is always available.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+
+    for offset in (0..size).step_by(page_size) {
+        // SAFETY: `offset` is within the readable and writable mapping of
+        // `size` bytes that starts at `addr`.
+        unsafe {
+            let page = (addr as *mut u8).add(offset);
+            page.write_volatile(page.read_volatile());
+        }
+    }
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -800,6 +826,9 @@ impl VirtioGpu {
                 if ret == libc::MAP_FAILED {
                     return Err(ErrUnspec);
                 }
+                if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_DMABUF {
+                    prefault_dmabuf(ret, resource.size as usize, prot);
+                }
             } else {
                 return Err(ErrUnspec);
             }
@@ -871,6 +900,9 @@ impl VirtioGpu {
                         export.handle_type
                     );
                     return Err(ErrUnspec);
+                }
+                if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_DMABUF {
+                    prefault_dmabuf(ret, resource.size as usize, prot);
                 }
             } else {
                 self.rutabaga.resource_map(
