@@ -980,6 +980,7 @@ int32_t krun_check_nested_virt(void);
 #define KRUN_FEATURE_AWS_NITRO 9
 #define KRUN_FEATURE_VIRGL_RESOURCE_MAP2 10
 #define KRUN_FEATURE_INIT_BLOB 11
+#define KRUN_FEATURE_VHOST_USER 12
 
 /**
  * Checks if a specific feature was enabled at build time.

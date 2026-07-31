@@ -1,10 +1,11 @@
 //! vmnet-helper backend for virtio-net test (macOS only)
 
+use super::NetBackend;
 use crate::test_net::get_krun_add_net_unixgram;
-use crate::{ShouldRun, TestSetup, krun_call};
+use crate::{ShouldRun, TestSetup, krun_call, krun_call_u32};
 use krun_sys::{
-    NET_FEATURE_CSUM, NET_FEATURE_GUEST_CSUM, NET_FEATURE_GUEST_TSO4, NET_FEATURE_HOST_TSO4,
-    NET_FLAG_DHCP_CLIENT,
+    KRUN_FEATURE_NET, NET_FEATURE_CSUM, NET_FEATURE_GUEST_CSUM, NET_FEATURE_GUEST_TSO4,
+    NET_FEATURE_HOST_TSO4, NET_FLAG_DHCP_CLIENT, krun_has_feature,
 };
 use nix::libc;
 use std::io::{BufRead, BufReader, Read};
@@ -130,41 +131,48 @@ fn start_vmnet_helper(log_path: &std::path::Path) -> std::io::Result<VmnetConfig
     })
 }
 
-pub(crate) fn should_run() -> ShouldRun {
-    #[cfg(not(target_os = "macos"))]
-    return ShouldRun::No("vmnet-helper only supported on macOS");
+pub(crate) struct VmnetHelper;
 
-    #[cfg(target_os = "macos")]
-    {
-        if vmnet_helper_path().is_none() {
-            return ShouldRun::No("vmnet-helper not installed");
+impl NetBackend for VmnetHelper {
+    fn should_run(&self) -> ShouldRun {
+        if unsafe { krun_call_u32!(krun_has_feature(KRUN_FEATURE_NET.into())) }.ok() != Some(1) {
+            return ShouldRun::No("libkrun compiled without NET");
         }
-        ShouldRun::Yes
+        #[cfg(not(target_os = "macos"))]
+        return ShouldRun::No("vmnet-helper only supported on macOS");
+
+        #[cfg(target_os = "macos")]
+        {
+            if vmnet_helper_path().is_none() {
+                return ShouldRun::No("vmnet-helper not installed");
+            }
+            ShouldRun::Yes
+        }
     }
-}
 
-pub(crate) fn setup_backend(ctx: u32, test_setup: &TestSetup) -> anyhow::Result<()> {
-    let tmp_dir = test_setup
-        .tmp_dir
-        .canonicalize()
-        .unwrap_or_else(|_| test_setup.tmp_dir.clone());
-    let vmnet_log = tmp_dir.join("vmnet-helper.log");
+    fn setup_backend(&self, ctx: u32, test_setup: &TestSetup) -> anyhow::Result<()> {
+        let tmp_dir = test_setup
+            .tmp_dir
+            .canonicalize()
+            .unwrap_or_else(|_| test_setup.tmp_dir.clone());
+        let vmnet_log = tmp_dir.join("vmnet-helper.log");
 
-    let mut config = start_vmnet_helper(&vmnet_log)?;
-    test_setup.register_cleanup_pid(config.pid);
+        let mut config = start_vmnet_helper(&vmnet_log)?;
+        test_setup.register_cleanup_pid(config.pid);
 
-    unsafe {
-        krun_call!(get_krun_add_net_unixgram()(
-            ctx,
-            std::ptr::null(),
-            config.fd,
-            config.mac.as_mut_ptr(),
-            NET_FEATURE_CSUM
-                | NET_FEATURE_GUEST_CSUM
-                | NET_FEATURE_GUEST_TSO4
-                | NET_FEATURE_HOST_TSO4,
-            NET_FLAG_DHCP_CLIENT,
-        ))?;
+        unsafe {
+            krun_call!(get_krun_add_net_unixgram()(
+                ctx,
+                std::ptr::null(),
+                config.fd,
+                config.mac.as_mut_ptr(),
+                NET_FEATURE_CSUM
+                    | NET_FEATURE_GUEST_CSUM
+                    | NET_FEATURE_GUEST_TSO4
+                    | NET_FEATURE_HOST_TSO4,
+                NET_FLAG_DHCP_CLIENT,
+            ))?;
+        }
+        Ok(())
     }
-    Ok(())
 }

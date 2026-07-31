@@ -1841,6 +1841,7 @@ const KRUN_FEATURE_INTEL_TDX: u64 = 8;
 const KRUN_FEATURE_AWS_NITRO: u64 = 9;
 const KRUN_FEATURE_VIRGL_RESOURCE_MAP2: u64 = 10;
 const KRUN_FEATURE_INIT_BLOB: u64 = 11;
+const KRUN_FEATURE_VHOST_USER: u64 = 12;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_has_feature(feature: u64) -> c_int {
@@ -1855,6 +1856,7 @@ pub extern "C" fn krun_has_feature(feature: u64) -> c_int {
         KRUN_FEATURE_AWS_NITRO => cfg!(feature = "aws-nitro"),
         KRUN_FEATURE_VIRGL_RESOURCE_MAP2 => cfg!(feature = "virgl_resource_map2"),
         KRUN_FEATURE_INIT_BLOB => cfg!(feature = "init-blob"),
+        KRUN_FEATURE_VHOST_USER => cfg!(feature = "vhost-user"),
         _ => return -libc::EINVAL,
     };
 

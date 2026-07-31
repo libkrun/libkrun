@@ -23,17 +23,38 @@ pub(crate) mod passt;
 #[cfg(feature = "host")]
 pub(crate) mod tap;
 #[cfg(feature = "host")]
+pub(crate) mod vhost_user_passt;
+#[cfg(feature = "host")]
 pub(crate) mod vmnet_helper;
+
+/// Backend-specific behavior for a virtio-net test.
+///
+/// Each backend (passt, tap, gvproxy, ...) implements this trait.
+/// The generic `TestNet` and `TestNetPerf` structs hold a `Box<dyn NetBackend>`
+/// and delegate backend-specific work to it.
+#[host]
+pub(crate) trait NetBackend {
+    /// Check if this backend can run on the current system.
+    fn should_run(&self) -> ShouldRun;
+
+    /// Configure the network device on the VM context.
+    fn setup_backend(&self, ctx: u32, test_setup: &TestSetup) -> anyhow::Result<()>;
+
+    /// Optional cleanup after the test (e.g. removing persistent TAP devices).
+    fn cleanup(&self) {}
+
+    /// Extra env vars for the guest init (kernel cmdline).
+    /// Override this to e.g. pass `KRUN_DHCP=1` for vhost-user backends.
+    fn guest_env(&self) -> &[&'static std::ffi::CStr] {
+        &[]
+    }
+}
 
 /// Virtio-net test with configurable backend
 pub struct TestNet {
     tcp_tester: TcpTester,
     #[cfg(feature = "host")]
-    should_run: fn() -> ShouldRun,
-    #[cfg(feature = "host")]
-    setup_backend: fn(u32, &TestSetup) -> anyhow::Result<()>,
-    #[cfg(feature = "host")]
-    cleanup: Option<fn()>,
+    backend: Box<dyn NetBackend>,
 }
 
 impl TestNet {
@@ -41,11 +62,7 @@ impl TestNet {
         Self {
             tcp_tester: TcpTester::new([169, 254, 2, 2].into(), 9000),
             #[cfg(feature = "host")]
-            should_run: passt::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: passt::setup_backend,
-            #[cfg(feature = "host")]
-            cleanup: None,
+            backend: Box::new(passt::Passt),
         }
     }
 
@@ -53,11 +70,7 @@ impl TestNet {
         Self {
             tcp_tester: TcpTester::new([10, 0, 0, 1].into(), 9001),
             #[cfg(feature = "host")]
-            should_run: tap::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: tap::setup_backend,
-            #[cfg(feature = "host")]
-            cleanup: Some(tap::cleanup),
+            backend: Box::new(tap::Tap),
         }
     }
 
@@ -65,11 +78,7 @@ impl TestNet {
         Self {
             tcp_tester: TcpTester::new([192, 168, 127, 254].into(), 9002),
             #[cfg(feature = "host")]
-            should_run: gvproxy::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: gvproxy::setup_backend,
-            #[cfg(feature = "host")]
-            cleanup: None,
+            backend: Box::new(gvproxy::GvproxyBackend),
         }
     }
 
@@ -77,25 +86,25 @@ impl TestNet {
         Self {
             tcp_tester: TcpTester::new([192, 168, 105, 1].into(), 9003),
             #[cfg(feature = "host")]
-            should_run: vmnet_helper::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: vmnet_helper::setup_backend,
-            #[cfg(feature = "host")]
-            cleanup: None,
+            backend: Box::new(vmnet_helper::VmnetHelper),
         }
     }
 
-    /// Gvproxy backend variant with a socket path ≥ 96 bytes, triggering the
+    pub fn new_vhost_user_passt() -> Self {
+        Self {
+            tcp_tester: TcpTester::new([169, 254, 2, 2].into(), 9005),
+            #[cfg(feature = "host")]
+            backend: Box::new(vhost_user_passt::VhostUserPasst),
+        }
+    }
+
+    /// Gvproxy backend variant with a socket path >= 96 bytes, triggering the
     /// ENAMETOOLONG bug when the local socket was derived from the peer path.
     pub fn new_gvproxy_long_path() -> Self {
         Self {
             tcp_tester: TcpTester::new([192, 168, 127, 254].into(), 9004),
             #[cfg(feature = "host")]
-            should_run: gvproxy::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: gvproxy::setup_backend_long_path,
-            #[cfg(feature = "host")]
-            cleanup: None,
+            backend: Box::new(gvproxy::GvproxyLongPath),
         }
     }
 }
@@ -103,7 +112,7 @@ impl TestNet {
 #[host]
 mod host {
     use super::*;
-    use crate::common::setup_fs_and_enter;
+    use crate::common::setup_fs_and_enter_with_env;
     use crate::{Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
     use krun_sys::*;
     use std::os::fd::AsRawFd;
@@ -111,17 +120,11 @@ mod host {
 
     impl Test for TestNet {
         fn should_run(&self) -> ShouldRun {
-            if unsafe { krun_call_u32!(krun_has_feature(KRUN_FEATURE_NET.into())) }.ok() != Some(1)
-            {
-                return ShouldRun::No("libkrun compiled without NET");
-            }
-            (self.should_run)()
+            self.backend.should_run()
         }
 
         fn check(self: Box<Self>, stdout: Vec<u8>, _test_setup: TestSetup) -> TestOutcome {
-            if let Some(cleanup) = self.cleanup {
-                cleanup();
-            }
+            self.backend.cleanup();
             let output = String::from_utf8(stdout).unwrap();
             if output == "OK\n" {
                 TestOutcome::Pass
@@ -147,7 +150,7 @@ mod host {
                 krun_call!(krun_set_vm_config(ctx, 1, 512))?;
 
                 // Backend-specific setup
-                (self.setup_backend)(ctx, &test_setup)?;
+                self.backend.setup_backend(ctx, &test_setup)?;
 
                 krun_call!(krun_add_virtio_console_default(
                     ctx,
@@ -155,7 +158,7 @@ mod host {
                     std::io::stdout().as_raw_fd(),
                     std::io::stderr().as_raw_fd(),
                 ))?;
-                setup_fs_and_enter(ctx, test_setup)?;
+                setup_fs_and_enter_with_env(ctx, test_setup, self.backend.guest_env())?;
             }
             Ok(())
         }

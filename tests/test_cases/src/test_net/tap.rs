@@ -1,7 +1,8 @@
 //! TAP backend for virtio-net test
 
-use crate::{ShouldRun, TestSetup, krun_call};
-use krun_sys::{COMPAT_NET_FEATURES, NET_FLAG_DHCP_CLIENT};
+use super::NetBackend;
+use crate::{ShouldRun, TestSetup, krun_call, krun_call_u32};
+use krun_sys::{COMPAT_NET_FEATURES, KRUN_FEATURE_NET, NET_FLAG_DHCP_CLIENT, krun_has_feature};
 use nix::libc;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
 use std::ffi::CString;
@@ -127,24 +128,7 @@ fn dnsmasq_available() -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn should_run() -> ShouldRun {
-    if cfg!(target_os = "macos") {
-        return ShouldRun::No("TAP not supported on macOS");
-    }
-    if let Ok(tap_name) = std::env::var("LIBKRUN_TAP_NAME") {
-        if !interface_exists(&tap_name) {
-            return ShouldRun::No("TAP interface not found");
-        }
-    } else if !std::path::Path::new("/dev/net/tun").exists() {
-        return ShouldRun::No("/dev/net/tun not available");
-    }
-    if !dnsmasq_available() {
-        return ShouldRun::No("dnsmasq not installed");
-    }
-    ShouldRun::Yes
-}
-
-pub(crate) fn cleanup() {
+fn do_cleanup() {
     if let Ok(tun) = OpenOptions::new()
         .read(true)
         .write(true)
@@ -190,28 +174,56 @@ fn start_dhcp_server(tap_name: &str, test_setup: &TestSetup) -> anyhow::Result<(
     anyhow::bail!("dnsmasq did not start in time");
 }
 
-pub(crate) fn setup_backend(ctx: u32, test_setup: &TestSetup) -> anyhow::Result<()> {
-    let tap_name = if let Ok(name) = std::env::var("LIBKRUN_TAP_NAME") {
-        name
-    } else {
-        create_tap(DEFAULT_TAP_NAME)?;
-        configure_host_interface(DEFAULT_TAP_NAME, HOST_IP, NETMASK)
-            .map_err(|e| anyhow::anyhow!("Failed to configure TAP: {}", e))?;
-        start_dhcp_server(DEFAULT_TAP_NAME, test_setup)?;
-        DEFAULT_TAP_NAME.to_string()
-    };
+pub(crate) struct Tap;
 
-    let mut mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
-    let tap_name_c = CString::new(tap_name).unwrap();
-
-    unsafe {
-        krun_call!(get_krun_add_net_tap()(
-            ctx,
-            tap_name_c.as_ptr(),
-            mac.as_mut_ptr(),
-            COMPAT_NET_FEATURES,
-            NET_FLAG_DHCP_CLIENT,
-        ))?;
+impl NetBackend for Tap {
+    fn should_run(&self) -> ShouldRun {
+        if unsafe { krun_call_u32!(krun_has_feature(KRUN_FEATURE_NET.into())) }.ok() != Some(1) {
+            return ShouldRun::No("libkrun compiled without NET");
+        }
+        if cfg!(target_os = "macos") {
+            return ShouldRun::No("TAP not supported on macOS");
+        }
+        if let Ok(tap_name) = std::env::var("LIBKRUN_TAP_NAME") {
+            if !interface_exists(&tap_name) {
+                return ShouldRun::No("TAP interface not found");
+            }
+        } else if !std::path::Path::new("/dev/net/tun").exists() {
+            return ShouldRun::No("/dev/net/tun not available");
+        }
+        if !dnsmasq_available() {
+            return ShouldRun::No("dnsmasq not installed");
+        }
+        ShouldRun::Yes
     }
-    Ok(())
+
+    fn setup_backend(&self, ctx: u32, test_setup: &TestSetup) -> anyhow::Result<()> {
+        let tap_name = if let Ok(name) = std::env::var("LIBKRUN_TAP_NAME") {
+            name
+        } else {
+            create_tap(DEFAULT_TAP_NAME)?;
+            configure_host_interface(DEFAULT_TAP_NAME, HOST_IP, NETMASK)
+                .map_err(|e| anyhow::anyhow!("Failed to configure TAP: {}", e))?;
+            start_dhcp_server(DEFAULT_TAP_NAME, test_setup)?;
+            DEFAULT_TAP_NAME.to_string()
+        };
+
+        let mut mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
+        let tap_name_c = CString::new(tap_name).unwrap();
+
+        unsafe {
+            krun_call!(get_krun_add_net_tap()(
+                ctx,
+                tap_name_c.as_ptr(),
+                mac.as_mut_ptr(),
+                COMPAT_NET_FEATURES,
+                NET_FLAG_DHCP_CLIENT,
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn cleanup(&self) {
+        do_cleanup();
+    }
 }

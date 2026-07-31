@@ -114,6 +114,10 @@ pub fn test_cases() -> Vec<TestCase> {
             Box::new(TestNet::new_gvproxy_long_path()),
         ),
         TestCase::new("net-vmnet-helper", Box::new(TestNet::new_vmnet_helper())),
+        TestCase::new(
+            "net-vhost-user-passt",
+            Box::new(TestNet::new_vhost_user_passt()),
+        ),
         TestCase::new("multiport-console", Box::new(TestMultiportConsole)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-root-ro", Box::new(TestVirtiofsRootRo)),
@@ -133,6 +137,14 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new(
             "perf-net-gvproxy-rx",
             Box::new(TestNetPerf::new_gvproxy_rx()),
+        ),
+        TestCase::new(
+            "perf-net-vhost-user-passt-tx",
+            Box::new(TestNetPerf::new_vhost_user_passt_tx()),
+        ),
+        TestCase::new(
+            "perf-net-vhost-user-passt-rx",
+            Box::new(TestNetPerf::new_vhost_user_passt_rx()),
         ),
         TestCase::new(
             "perf-net-vmnet-helper-tx",
