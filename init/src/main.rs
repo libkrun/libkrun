@@ -121,7 +121,16 @@ fn main() -> anyhow::Result<()> {
     // The kernel places everything after `--` in the cmdline as this
     // process's argv[1..].  The C init built exec_argv by replacing argv[0]
     // with KRUN_INIT (or /bin/sh) and keeping argv[1..] in every branch.
-    let proc_args: Vec<String> = std::env::args().collect();
+    //
+    // The kernel also forwards unrecognised bare-word parameters from
+    // *before* `--` as init arguments.  Filter out tokens that libkrun
+    // places on the cmdline for its own use so they don't leak into the
+    // user's command.
+    let proc_args: Vec<String> = std::env::args()
+        .enumerate()
+        .filter(|(i, a)| *i == 0 || !a.starts_with("tsi_hijack"))
+        .map(|(_, a)| a)
+        .collect();
 
     let argv: Vec<String> = if let Ok(init) = std::env::var("KRUN_INIT") {
         // KRUN_INIT holds the binary; kernel cmdline args are the arguments.

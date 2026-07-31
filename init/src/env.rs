@@ -99,8 +99,8 @@ fn setup_dhcp(iface: &str, sock: i32) {
     }
 }
 
-/// Returns true if `tsi_hijack` appears in the kernel command line before any
-/// `--` delimiter. Mirrors `tsi_enabled()` in init.c.
+/// Returns true if any `tsi_hijack` token appears in the kernel command line
+/// before the `--` delimiter.
 #[cfg(target_os = "linux")]
 pub fn tsi_enabled() -> bool {
     let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") else {
@@ -109,7 +109,7 @@ pub fn tsi_enabled() -> bool {
     cmdline
         .split_whitespace()
         .take_while(|tok| *tok != "--")
-        .any(|tok| tok == "tsi_hijack")
+        .any(|tok| tok.starts_with("tsi_hijack"))
 }
 
 /// Brings up `dummy0` and assigns it 203.0.113.1/24 (IANA TEST-NET-3) so
