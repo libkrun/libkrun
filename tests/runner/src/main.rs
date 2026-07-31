@@ -7,7 +7,7 @@ use std::io::Write;
 use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use tempdir::TempDir;
+use tempfile::TempDir;
 use test_cases::{Report, ShouldRun, Test, TestCase, TestOutcome, TestSetup, test_cases};
 
 struct TestResult {
@@ -349,9 +349,9 @@ fn run_tests(
             fs::create_dir_all(&path).context("Failed to create base directory")?;
             path
         }
-        None => TempDir::new_in("/tmp", "libkrun-tests")
+        None => TempDir::with_prefix_in("libkrun-tests", "/tmp")
             .context("Failed to create temp base directory")?
-            .into_path(),
+            .keep(),
     };
 
     let mut results: Vec<TestResult> = Vec::new();
