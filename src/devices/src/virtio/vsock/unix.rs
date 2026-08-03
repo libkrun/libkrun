@@ -534,7 +534,14 @@ impl Proxy for UnixProxy {
             "release: id={}, tx_cnt={}, last_tx_cnt={}",
             self.id, self.tx_cnt, self.last_tx_cnt_sent
         );
-        let remove_proxy = ProxyRemoval::Deferred;
+        // A connection that never reached Connected carries no data and is not
+        // registered for polling yet, so there is nothing to reserve its id for.
+        // Keeping it would leave the accepted host socket open, and its peer
+        // blocked, until the reaper reclaims the proxy.
+        let remove_proxy = match self.status {
+            ProxyStatus::ReverseInit | ProxyStatus::Connecting => ProxyRemoval::Immediate,
+            _ => ProxyRemoval::Deferred,
+        };
 
         ProxyUpdate {
             remove_proxy,
