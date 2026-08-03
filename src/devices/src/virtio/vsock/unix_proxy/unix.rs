@@ -327,7 +327,15 @@ pub(crate) fn release(proxy: &mut super::UnixProxy) -> ProxyUpdate {
         "release: id={}, tx_cnt={}, last_tx_cnt={}",
         proxy.id, proxy.tx_cnt, proxy.last_tx_cnt_sent
     );
-    let remove_proxy = ProxyRemoval::Deferred;
+
+    // A connection that never reached Connected carries no data and is not
+    // registered for polling yet, so there is nothing to reserve its id for.
+    // Keeping it would leave the accepted host socket open, and its peer
+    // blocked, until the reaper reclaims the proxy.
+    let remove_proxy = match proxy.status {
+        ProxyStatus::ReverseInit | ProxyStatus::Connecting => ProxyRemoval::Immediate,
+        _ => ProxyRemoval::Deferred,
+    };
 
     ProxyUpdate {
         remove_proxy,
