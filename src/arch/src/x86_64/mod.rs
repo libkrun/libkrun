@@ -195,6 +195,8 @@ pub fn arch_memory_regions(
         ram_above_gap,
         ram_last_addr,
         shm_start_addr,
+        // To be filled later using GuestMemory.
+        guest_last_addr: 0,
         page_size,
         initrd_addr: ram_last_addr - initrd_size,
         firmware_addr,
@@ -265,6 +267,8 @@ pub fn arch_memory_regions(
         ram_above_gap,
         ram_last_addr,
         shm_start_addr,
+        // To be filled later with GuestMemory.
+        guest_last_addr: 0,
         page_size,
         initrd_addr: layout::INITRD_SEV_START,
         firmware_addr: 0,

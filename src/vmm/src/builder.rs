@@ -107,7 +107,6 @@ use nix::unistd::isatty;
 use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
 use utils::worker_message::WorkerMessage;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use vm_memory::Address;
 use vm_memory::Bytes;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
@@ -588,14 +587,16 @@ pub fn build_microvm(
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     let payload = choose_payload(vm_resources)?;
 
-    let (guest_memory, arch_memory_info, mut _shm_manager, payload_config) = create_guest_memory(
-        vm_resources
-            .vm_config()
-            .mem_size_mib
-            .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
-        vm_resources,
-        &payload,
-    )?;
+    #[allow(unused_mut)]
+    let (guest_memory, mut arch_memory_info, mut _shm_manager, payload_config) =
+        create_guest_memory(
+            vm_resources
+                .vm_config()
+                .mem_size_mib
+                .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
+            vm_resources,
+            &payload,
+        )?;
 
     let vcpu_config = vm_resources.vcpu_config();
 
@@ -631,7 +632,11 @@ pub fn build_microvm(
 
     #[cfg(not(feature = "tee"))]
     #[allow(unused_mut)]
-    let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
+    let mut vm = setup_vm(
+        &guest_memory,
+        &mut arch_memory_info,
+        vm_resources.nested_enabled,
+    )?;
 
     #[cfg(feature = "tee")]
     let (_kvm, vm) = {
@@ -932,10 +937,11 @@ pub fn build_microvm(
         intc = {
             // If the system supports the in-kernel GIC, use it. Otherwise, fall back to the
             // userspace implementation.
-            let gic = match HvfGicV3::new(vm_resources.vm_config().vcpu_count.unwrap() as u64) {
-                Ok(hvfgic) => IrqChipDevice::new(Box::new(hvfgic)),
-                Err(_) => IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
-            };
+            let gic: IrqChipDevice =
+                match HvfGicV3::new(vm_resources.vm_config().vcpu_count.unwrap() as u64) {
+                    Ok(hvfgic) => IrqChipDevice::new(Box::new(hvfgic)),
+                    Err(_) => IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
+                };
             Arc::new(Mutex::new(gic))
         };
 
@@ -1617,7 +1623,7 @@ pub fn create_guest_memory(
     };
 
     #[cfg(target_arch = "x86_64")]
-    let (arch_mem_info, mut arch_mem_regions) = match payload {
+    let (mut arch_mem_info, mut arch_mem_regions) = match payload {
         #[cfg(not(feature = "tee"))]
         Payload::KernelMmap => {
             let (kernel_guest_addr, kernel_size) =
@@ -1650,7 +1656,7 @@ pub fn create_guest_memory(
         Payload::Firmware => arch::arch_memory_regions(mem_size, None, 0, 0, firmware_size),
     };
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    let (arch_mem_info, mut arch_mem_regions) = match payload {
+    let (mut arch_mem_info, mut arch_mem_regions) = match payload {
         Payload::ExternalKernel(external_kernel) => {
             arch::arch_memory_regions(mem_size, external_kernel.initramfs_size, None)
         }
@@ -1765,6 +1771,8 @@ pub fn create_guest_memory(
         pvh,
     };
 
+    arch_mem_info.guest_last_addr = guest_mem.last_addr().raw_value();
+
     Ok((guest_mem, arch_mem_info, shm_manager, payload_config))
 }
 
@@ -1783,6 +1791,7 @@ fn load_cmdline(vmm: &Vmm) -> std::result::Result<(), StartMicrovmError> {
 #[cfg(all(target_os = "linux", not(feature = "tee")))]
 pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
+    _arch_mem_info: &mut ArchMemoryInfo,
     _nested_enabled: bool,
 ) -> std::result::Result<Vm, StartMicrovmError> {
     let kvm = KvmContext::new()
@@ -1838,9 +1847,10 @@ pub(crate) fn setup_vm(
 #[cfg(target_os = "macos")]
 pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
+    arch_mem_info: &mut ArchMemoryInfo,
     nested_enabled: bool,
 ) -> std::result::Result<Vm, StartMicrovmError> {
-    let mut vm = Vm::new(nested_enabled)
+    let mut vm = Vm::new(arch_mem_info, nested_enabled)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     vm.memory_init(guest_memory)
@@ -2059,6 +2069,7 @@ fn create_vcpus_aarch64(
 
         let mut vcpu = Vcpu::new_aarch64(
             cpu_index,
+            mem_info.ipa_size,
             entry_addr,
             boot_receiver,
             exit_evt.try_clone().map_err(Error::EventFd)?,
@@ -2818,9 +2829,9 @@ pub mod tests {
             nested_enabled: false,
         };
 
-        let (guest_memory, _arch_memory_info, _shm_manager, _payload_config) =
+        let (guest_memory, mut arch_memory_info, _shm_manager, _payload_config) =
             default_guest_memory(128).unwrap();
-        let vm = setup_vm(&guest_memory, false).unwrap();
+        let vm = setup_vm(&guest_memory, &mut arch_memory_info, false).unwrap();
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
 
         // Dummy entry_addr, vcpus will not boot.
@@ -2843,9 +2854,9 @@ pub mod tests {
     #[test]
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     fn test_create_vcpus_aarch64() {
-        let (guest_memory, arch_memory_info, _shm_manager, _payload_config) =
+        let (guest_memory, mut arch_memory_info, _shm_manager, _payload_config) =
             default_guest_memory(128).unwrap();
-        let vm = setup_vm(&guest_memory, false).unwrap();
+        let vm = setup_vm(&guest_memory, &mut arch_memory_info, false).unwrap();
         let vcpu_count = 2;
 
         let vcpu_config = VcpuConfig {

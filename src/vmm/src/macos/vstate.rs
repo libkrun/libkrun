@@ -100,8 +100,8 @@ pub struct Vm {
 
 impl Vm {
     /// Constructs a new `Vm` using the given `Kvm` instance.
-    pub fn new(nested_enabled: bool) -> Result<Self> {
-        let hvf_vm = HvfVm::new(nested_enabled).map_err(Error::VmSetup)?;
+    pub fn new(arch_mem_info: &mut ArchMemoryInfo, nested_enabled: bool) -> Result<Self> {
+        let hvf_vm = HvfVm::new(arch_mem_info, nested_enabled).map_err(Error::VmSetup)?;
 
         Ok(Vm { hvf_vm })
     }
@@ -181,6 +181,7 @@ type VcpuCell = Cell<Option<*const Vcpu>>;
 /// A wrapper around creating and using a kvm-based VCPU.
 pub struct Vcpu {
     id: u8,
+    ipa_size: u32,
     boot_entry_addr: u64,
     boot_receiver: Option<Receiver<u64>>,
     boot_senders: Option<HashMap<u64, Sender<u64>>>,
@@ -271,6 +272,7 @@ impl Vcpu {
     /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
     pub fn new_aarch64(
         id: u8,
+        ipa_size: u32,
         boot_entry_addr: GuestAddress,
         boot_receiver: Option<Receiver<u64>>,
         exit_evt: EventFd,
@@ -282,6 +284,7 @@ impl Vcpu {
 
         Ok(Vcpu {
             id,
+            ipa_size,
             boot_entry_addr: boot_entry_addr.raw_value(),
             boot_receiver,
             boot_senders: None,
@@ -459,7 +462,7 @@ impl Vcpu {
         };
 
         hvf_vcpu
-            .set_initial_state(entry_addr, self.fdt_addr)
+            .set_initial_state(self.ipa_size, entry_addr, self.fdt_addr)
             .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
 
         loop {
