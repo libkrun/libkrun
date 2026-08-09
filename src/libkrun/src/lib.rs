@@ -48,6 +48,8 @@ use utils::windows::AsRawFd;
 use utils::windows::SendHandle;
 #[cfg(target_os = "macos")]
 use vmm::VmCtl;
+#[cfg(feature = "tee")]
+use vmm::resources::TeeType;
 use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
     VmResources, VsockConfig,
@@ -79,6 +81,10 @@ use krun_input::{InputConfigBackend, InputEventProviderBackend};
 
 // Value returned on success. We use libc's errors otherwise.
 const KRUN_SUCCESS: i32 = 0;
+#[cfg(feature = "tee")]
+const KRUN_TEE_SNP: u32 = 0;
+#[cfg(feature = "tee")]
+const KRUN_TEE_TDX: u32 = 1;
 // Maximum number of arguments/environment variables we allow
 const MAX_ARGS: usize = 4096;
 /// Maximum number of virtqueues allowed by virtio spec (16-bit queue index: 0-65535)
@@ -152,6 +158,13 @@ impl KrunfwBindingsResult {
     }
 }
 
+#[cfg(feature = "tee")]
+#[derive(Clone)]
+enum TeeConfigSource {
+    File(PathBuf),
+    Type(TeeType),
+}
+
 /// AWS Nitro enclave-specific configuration.
 ///
 /// These fields are only used by the aws-nitro path, which delivers
@@ -181,7 +194,7 @@ struct ContextConfig {
     #[cfg(feature = "blk")]
     block_root: Option<BlockRootConfig>,
     #[cfg(feature = "tee")]
-    tee_config_file: Option<PathBuf>,
+    tee_config: Option<TeeConfigSource>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     shutdown_efd: Option<EventFd>,
     gpu_virgl_flags: Option<u32>,
@@ -266,12 +279,17 @@ impl ContextConfig {
 
     #[cfg(feature = "tee")]
     fn set_tee_config_file(&mut self, filepath: PathBuf) {
-        self.tee_config_file = Some(filepath);
+        self.tee_config = Some(TeeConfigSource::File(filepath));
     }
 
     #[cfg(feature = "tee")]
-    fn get_tee_config_file(&self) -> Option<PathBuf> {
-        self.tee_config_file.clone()
+    fn set_tee_type(&mut self, tee: TeeType) {
+        self.tee_config = Some(TeeConfigSource::Type(tee));
+    }
+
+    #[cfg(feature = "tee")]
+    fn get_tee_config(&self) -> Option<TeeConfigSource> {
+        self.tee_config.clone()
     }
 
     fn add_vsock_port(&mut self, port: u32, filepath: PathBuf, listen: bool) {
@@ -1311,6 +1329,24 @@ pub unsafe extern "C" fn krun_set_tee_config_file(ctx_id: u32, c_filepath: *cons
 
         KRUN_SUCCESS
     }
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "tee")]
+pub extern "C" fn krun_set_tee_type(ctx_id: u32, tee_type: u32) -> i32 {
+    let tee = match tee_type {
+        KRUN_TEE_SNP if cfg!(feature = "amd-sev") => TeeType::Snp,
+        KRUN_TEE_TDX if cfg!(feature = "tdx") => TeeType::Tdx,
+        KRUN_TEE_SNP | KRUN_TEE_TDX => return -libc::ENOTSUP,
+        _ => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => ctx_cfg.get_mut().set_tee_type(tee),
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -2896,21 +2932,19 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     }
 
-    /*
-     * Before krun_start_enter() is called in an encrypted context, the TEE
-     * config must have been set via krun_set_tee_config_file(). If the TEE
-     * config is not set by this point, print the relevant error message and
-     * fail.
-     */
     #[cfg(feature = "tee")]
-    if let Some(tee_config) = ctx_cfg.get_tee_config_file() {
-        if let Err(e) = ctx_cfg.vmr.set_tee_config(tee_config) {
-            error!("Error setting up TEE config: {e:?}");
+    match ctx_cfg.get_tee_config() {
+        Some(TeeConfigSource::File(tee_config)) => {
+            if let Err(e) = ctx_cfg.vmr.set_tee_config(tee_config) {
+                error!("Error setting up TEE config: {e:?}");
+                return -libc::EINVAL;
+            }
+        }
+        Some(TeeConfigSource::Type(tee)) => ctx_cfg.vmr.set_tee_type(tee),
+        None => {
+            error!("Missing TEE type");
             return -libc::EINVAL;
         }
-    } else {
-        error!("Missing TEE config file");
-        return -libc::EINVAL;
     }
 
     let mut prolog = DEFAULT_KERNEL_CMDLINE.to_string();
@@ -3074,5 +3108,31 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 
             -libc::EINVAL
         }
+    }
+}
+
+#[cfg(all(test, feature = "tee"))]
+mod tee_tests {
+    use super::*;
+
+    #[test]
+    fn typed_tee_selection_rejects_unknown_and_incompatible_types() {
+        let ctx_id = krun_create_ctx();
+        assert!(ctx_id >= 0);
+        let ctx_id = ctx_id as u32;
+
+        assert_eq!(krun_set_tee_type(ctx_id, u32::MAX), -libc::EINVAL);
+        #[cfg(feature = "amd-sev")]
+        {
+            assert_eq!(krun_set_tee_type(ctx_id, KRUN_TEE_TDX), -libc::ENOTSUP);
+            assert_eq!(krun_set_tee_type(ctx_id, KRUN_TEE_SNP), KRUN_SUCCESS);
+        }
+        #[cfg(feature = "tdx")]
+        {
+            assert_eq!(krun_set_tee_type(ctx_id, KRUN_TEE_SNP), -libc::ENOTSUP);
+            assert_eq!(krun_set_tee_type(ctx_id, KRUN_TEE_TDX), KRUN_SUCCESS);
+        }
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
     }
 }

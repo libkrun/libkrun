@@ -852,7 +852,8 @@ int32_t krun_set_kernel(uint32_t ctx_id,
                         const char *cmdline);
 
 /**
- * Sets the file path to the TEE configuration file. Only available in libkrun-sev.
+ * Sets the file path to the legacy JSON TEE configuration file. Only available
+ * in TEE variants.
  *
  * Arguments:
  *  "ctx_id"    - the configuration context ID.
@@ -862,6 +863,25 @@ int32_t krun_set_kernel(uint32_t ctx_id,
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_set_tee_config_file(uint32_t ctx_id, const char *filepath);
+
+#define KRUN_TEE_SNP 0
+#define KRUN_TEE_TDX 1
+/**
+ * Selects the confidential-computing technology for this context. Only
+ * available in TEE variants. CPU and memory configuration remains owned by
+ * krun_set_vm_config().
+ *
+ * Arguments:
+ *  "ctx_id"    - the configuration context ID.
+ *  "tee_type"  - KRUN_TEE_SNP or KRUN_TEE_TDX.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ *  -EINVAL  - tee_type is unknown.
+ *  -ENOTSUP - tee_type is not supported by this libkrun variant.
+ *  -ENOENT  - ctx_id does not exist.
+ */
+int32_t krun_set_tee_type(uint32_t ctx_id, uint32_t tee_type);
 
 /**
  * Adds a port-path pairing for guest IPC with a process in the host.

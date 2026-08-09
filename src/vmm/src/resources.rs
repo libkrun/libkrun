@@ -41,6 +41,26 @@ use krun_display::DisplayBackend;
 
 type Result<E> = std::result::Result<(), E>;
 
+/// TEE selected by a libkrun caller without a JSON configuration file.
+#[cfg(feature = "tee")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TeeType {
+    /// AMD Secure Encrypted Virtualization with Secure Nested Paging.
+    Snp,
+    /// Intel Trust Domain Extensions.
+    Tdx,
+}
+
+#[cfg(feature = "tee")]
+impl From<TeeType> for Tee {
+    fn from(tee: TeeType) -> Self {
+        match tee {
+            TeeType::Snp => Self::Snp,
+            TeeType::Tdx => Self::Tdx,
+        }
+    }
+}
+
 // Re-export TsiFlags from devices crate
 pub use devices::virtio::TsiFlags;
 
@@ -400,6 +420,11 @@ impl VmResources {
     }
 
     #[cfg(feature = "tee")]
+    pub fn set_tee_type(&mut self, tee: TeeType) {
+        self.tee_config.tee = tee.into();
+    }
+
+    #[cfg(feature = "tee")]
     pub fn set_tee_config(&mut self, filepath: PathBuf) -> Result<Error> {
         let file = File::open(filepath.as_path()).map_err(Error::OpenTeeConfig)?;
         let reader = BufReader::new(file);
@@ -428,6 +453,11 @@ mod tests {
     use crate::vmm_config::machine_config::{CpuFeaturesTemplate, VmConfig, VmConfigError};
     use crate::vmm_config::vsock::tests::{TempSockFile, default_config};
     use crate::vstate::VcpuConfig;
+    #[cfg(feature = "tee")]
+    use kbs_types::Tee;
+
+    #[cfg(feature = "tee")]
+    use super::TeeType;
     use utils::tempfile::TempFile;
 
     fn default_kernel_cmdline() -> KernelCmdlineConfig {
@@ -527,6 +557,18 @@ mod tests {
             vm_resources.set_vm_config(&aux_vm_config),
             Err(VmConfigError::InvalidMemorySize)
         );
+    }
+
+    #[cfg(feature = "tee")]
+    #[test]
+    fn test_set_tee_type() {
+        let mut vm_resources = default_vm_resources();
+
+        vm_resources.set_tee_type(TeeType::Snp);
+        assert_eq!(vm_resources.tee_config().tee, Tee::Snp);
+
+        vm_resources.set_tee_type(TeeType::Tdx);
+        assert_eq!(vm_resources.tee_config().tee, Tee::Tdx);
     }
 
     #[test]
