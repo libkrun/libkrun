@@ -50,6 +50,8 @@ use utils::windows::SendHandle;
 use vmm::VmCtl;
 #[cfg(feature = "tee")]
 use vmm::resources::TeeType;
+#[cfg(all(feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+use vmm::resources::VfioDeviceConfig;
 use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
     VmResources, VsockConfig,
@@ -1361,6 +1363,69 @@ pub extern "C" fn krun_set_tee_type(ctx_id: u32, tee_type: u32) -> i32 {
     KRUN_SUCCESS
 }
 
+/// Adds a pre-opened VFIO cdev as a cold-plugged PCI function.
+///
+/// The file descriptor is duplicated with `F_DUPFD_CLOEXEC`; the caller may
+/// close its copy after this function returns. The descriptor must refer to a
+/// `/dev/vfio/devices/vfioN` cdev. Device 0 is reserved for the virtual host
+/// bridge, and duplicate guest BDFs are rejected.
+#[unsafe(no_mangle)]
+#[cfg(all(feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+pub extern "C" fn krun_add_vfio_device(
+    ctx_id: u32,
+    vfio_cdev_fd: c_int,
+    guest_device: u8,
+    guest_function: u8,
+) -> i32 {
+    if vfio_cdev_fd < 0 || guest_device == 0 || guest_device > 31 || guest_function > 7 {
+        return -libc::EINVAL;
+    }
+
+    // SAFETY: fcntl does not take ownership of the source descriptor. A
+    // non-negative return value is a new descriptor owned by this context.
+    let duplicated = unsafe { libc::fcntl(vfio_cdev_fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated < 0 {
+        return -std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+    }
+    // SAFETY: `duplicated` is a fresh descriptor returned by fcntl and its
+    // ownership is transferred into File exactly once.
+    let device = unsafe { File::from_raw_fd(duplicated) };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            if ctx_cfg
+                .get_mut()
+                .vmr
+                .add_vfio_device(VfioDeviceConfig {
+                    device,
+                    guest_device,
+                    guest_function,
+                })
+                .is_err()
+            {
+                return -libc::EEXIST;
+            }
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+/// Reports that VFIO PCI assignment is unavailable in this build or target.
+#[unsafe(no_mangle)]
+#[cfg(not(all(feature = "vfio", target_os = "linux", target_arch = "x86_64")))]
+pub extern "C" fn krun_add_vfio_device(
+    _ctx_id: u32,
+    _vfio_cdev_fd: c_int,
+    _guest_device: u8,
+    _guest_function: u8,
+) -> i32 {
+    -libc::ENOTSUP
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 #[cfg(feature = "tdx")]
@@ -1926,6 +1991,7 @@ const KRUN_FEATURE_AMD_SEV: u64 = 7;
 const KRUN_FEATURE_INTEL_TDX: u64 = 8;
 const KRUN_FEATURE_AWS_NITRO: u64 = 9;
 const KRUN_FEATURE_VIRGL_RESOURCE_MAP2: u64 = 10;
+const KRUN_FEATURE_VFIO: u64 = 12;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_has_feature(feature: u64) -> c_int {
@@ -1939,6 +2005,11 @@ pub extern "C" fn krun_has_feature(feature: u64) -> c_int {
         KRUN_FEATURE_INTEL_TDX => cfg!(feature = "tdx"),
         KRUN_FEATURE_AWS_NITRO => cfg!(feature = "aws-nitro"),
         KRUN_FEATURE_VIRGL_RESOURCE_MAP2 => cfg!(feature = "virgl_resource_map2"),
+        KRUN_FEATURE_VFIO => cfg!(all(
+            feature = "vfio",
+            target_os = "linux",
+            target_arch = "x86_64"
+        )),
         _ => return -libc::EINVAL,
     };
 
@@ -3195,6 +3266,39 @@ mod tee_tests {
                 .get_tdx_quote_generation_socket(),
             Some(PathBuf::from("/run/tdx-qgs/qgs.socket"))
         );
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+}
+
+#[cfg(all(test, feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+mod vfio_tests {
+    use super::*;
+
+    #[test]
+    fn vfio_api_retains_a_duplicate_and_rejects_duplicate_bdfs() {
+        let source = File::open("/dev/null").unwrap();
+        let ctx_id = krun_create_ctx();
+        assert!(ctx_id >= 0);
+        let ctx_id = ctx_id as u32;
+
+        assert_eq!(
+            krun_add_vfio_device(ctx_id, source.as_raw_fd(), 0, 0),
+            -libc::EINVAL
+        );
+        assert_eq!(
+            krun_add_vfio_device(ctx_id, source.as_raw_fd(), 1, 0),
+            KRUN_SUCCESS
+        );
+        assert_eq!(
+            krun_add_vfio_device(ctx_id, source.as_raw_fd(), 1, 0),
+            -libc::EEXIST
+        );
+
+        let context = CTX_MAP.lock().unwrap();
+        let retained = &context.get(&ctx_id).unwrap().vmr.vfio_devices[0].device;
+        assert_ne!(retained.as_raw_fd(), source.as_raw_fd());
+        drop(context);
+
         assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
     }
 }

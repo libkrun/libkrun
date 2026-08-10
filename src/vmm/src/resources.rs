@@ -3,7 +3,7 @@
 
 //#![deny(warnings)]
 
-#[cfg(feature = "tee")]
+#[cfg(any(feature = "tee", feature = "vfio"))]
 use std::fs::File;
 #[cfg(feature = "tee")]
 use std::io::BufReader;
@@ -78,6 +78,27 @@ pub struct VhostUserDeviceConfig {
     pub num_queues: u16,
     /// Size of each queue (empty = use device defaults)
     pub queue_sizes: Vec<u16>,
+}
+
+/// A pre-opened VFIO cdev assigned to a fixed guest PCI function.
+#[cfg(feature = "vfio")]
+pub struct VfioDeviceConfig {
+    /// Open `/dev/vfio/devices/vfioN` file. Ownership is retained by the VM.
+    pub device: File,
+    /// Guest PCI device number on bus 0.
+    pub guest_device: u8,
+    /// Guest PCI function number.
+    pub guest_function: u8,
+}
+
+/// Invalid guest PCI placement for a VFIO function.
+#[cfg(feature = "vfio")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VfioConfigError {
+    /// Device/function is outside bus 0's supported range or uses slot 0.
+    InvalidBdf,
+    /// Another function already occupies the requested guest BDF.
+    DuplicateBdf,
 }
 
 /// Errors encountered when configuring microVM resources.
@@ -243,6 +264,9 @@ pub struct VmResources {
     #[cfg(feature = "vhost-user")]
     /// Vhost-user device configurations
     pub vhost_user_devices: Vec<VhostUserDeviceConfig>,
+    /// Cold-plugged VFIO PCI functions.
+    #[cfg(feature = "vfio")]
+    pub vfio_devices: Vec<VfioDeviceConfig>,
     /// SMBIOS OEM Strings
     pub smbios_oem_strings: Option<Vec<String>>,
     /// Whether to enable nested virtualization.
@@ -395,6 +419,25 @@ impl VmResources {
         self.block.insert(config)
     }
 
+    /// Adds a pre-opened VFIO cdev at an explicit guest BDF.
+    #[cfg(feature = "vfio")]
+    pub fn add_vfio_device(
+        &mut self,
+        config: VfioDeviceConfig,
+    ) -> std::result::Result<(), VfioConfigError> {
+        if config.guest_device == 0 || config.guest_device > 31 || config.guest_function > 7 {
+            return Err(VfioConfigError::InvalidBdf);
+        }
+        if self.vfio_devices.iter().any(|existing| {
+            existing.guest_device == config.guest_device
+                && existing.guest_function == config.guest_function
+        }) {
+            return Err(VfioConfigError::DuplicateBdf);
+        }
+        self.vfio_devices.push(config);
+        Ok(())
+    }
+
     /// Sets a vsock device to be attached when the VM starts.
     pub fn set_vsock_device(&mut self, config: VsockDeviceConfig) -> Result<VsockConfigError> {
         self.vsock.insert(config)
@@ -513,6 +556,8 @@ mod tests {
             input_backends: Vec::new(),
             #[cfg(feature = "vhost-user")]
             vhost_user_devices: Vec::new(),
+            #[cfg(feature = "vfio")]
+            vfio_devices: Vec::new(),
             smbios_oem_strings: None,
             nested_enabled: false,
             split_irqchip: false,

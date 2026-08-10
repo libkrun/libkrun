@@ -243,6 +243,9 @@ pub enum StartMicrovmError {
     ShmHostAddr(vm_memory::GuestMemoryError),
     /// The TEE specified is not supported.
     InvalidTee,
+    /// Cannot create or attach the VFIO PCI subsystem.
+    #[cfg(all(feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+    Vfio(device_manager::vfio::Error),
 }
 
 /// It's convenient to automatically convert `kernel::cmdline::Error`s
@@ -532,6 +535,8 @@ impl Display for StartMicrovmError {
             InvalidTee => {
                 write!(f, "TEE selected is not currently supported")
             }
+            #[cfg(all(feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+            Vfio(ref err) => write!(f, "Cannot initialize VFIO PCI devices: {err}"),
         }
     }
 }
@@ -846,6 +851,8 @@ pub fn build_microvm(
 
     let vcpus;
     let intc: IrqChip;
+    #[cfg(all(feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+    let vfio_dma_manager;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
     #[cfg(target_arch = "x86_64")]
@@ -867,6 +874,19 @@ pub fn build_microvm(
             &mut mmio_device_manager,
             Some(intc.clone()),
         )?;
+
+        #[cfg(all(feature = "vfio", target_os = "linux"))]
+        {
+            vfio_dma_manager = device_manager::vfio::attach_devices(
+                vm.fd(),
+                &guest_memory,
+                &vm_resources.vfio_devices,
+                &mut pio_device_manager,
+                &mut mmio_device_manager,
+                cfg!(feature = "tee"),
+            )
+            .map_err(StartMicrovmError::Vfio)?;
+        }
 
         let kernel_boot = vm_resources.firmware_config.is_none() && !cfg!(feature = "tee");
 
@@ -1013,6 +1033,8 @@ pub fn build_microvm(
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
+        #[cfg(all(feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+        vfio_dma_manager,
         #[cfg(target_os = "macos")]
         vm_ctl_tx,
         #[cfg(target_os = "macos")]

@@ -900,6 +900,26 @@ int32_t krun_set_tdx_quote_generation_socket(uint32_t ctx_id,
                                               const char *filepath);
 
 /**
+ * Adds a pre-opened VFIO cdev as a cold-plugged PCI function.
+ *
+ * The descriptor must refer to /dev/vfio/devices/vfioN and is duplicated by
+ * libkrun, so the caller may close its copy after this call. The device must
+ * already be bound to a VFIO PCI variant driver. All devices in its effective
+ * IOMMU isolation group must be assigned together or otherwise detached from
+ * host drivers.
+ *
+ * On confidential VMs, DMA is mapped only for guest pages converted to shared
+ * state. Device assignment does not by itself establish TDISP, PCIe IDE, or a
+ * vendor confidential-computing trust relationship.
+ *
+ * Returns zero on success or a negative errno on failure.
+ */
+int32_t krun_add_vfio_device(uint32_t ctx_id,
+                             int vfio_cdev_fd,
+                             uint8_t guest_device,
+                             uint8_t guest_function);
+
+/**
  * Adds a port-path pairing for guest IPC with a process in the host.
  *
  * Arguments:
@@ -1035,6 +1055,7 @@ int32_t krun_check_nested_virt(void);
 #define KRUN_FEATURE_INTEL_TDX 8
 #define KRUN_FEATURE_AWS_NITRO 9
 #define KRUN_FEATURE_VIRGL_RESOURCE_MAP2 10
+#define KRUN_FEATURE_VFIO 12
 
 /**
  * Checks if a specific feature was enabled at build time.

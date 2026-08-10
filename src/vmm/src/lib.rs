@@ -12,6 +12,9 @@
 
 #[macro_use]
 extern crate log;
+#[cfg(all(feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+#[macro_use]
+extern crate vmm_sys_util;
 
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
@@ -211,6 +214,9 @@ pub struct Vmm {
     mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
+    #[cfg(all(feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+    #[allow(dead_code)] // Owns the IOAS and ordinary-guest DMA mappings for the VM lifetime.
+    vfio_dma_manager: Option<Arc<crate::device_manager::vfio::VfioDmaManager>>,
 
     // Out-of-band live pause/resume requests: the C API sends `VmCtl` from
     // another thread; the event loop freezes or wakes the vCPUs. A single
@@ -237,6 +243,18 @@ pub enum VmCtl {
 }
 
 impl Vmm {
+    #[cfg(all(
+        feature = "vfio",
+        feature = "tee",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    pub(crate) fn vfio_dma_manager(
+        &self,
+    ) -> Option<&Arc<crate::device_manager::vfio::VfioDmaManager>> {
+        self.vfio_dma_manager.as_ref()
+    }
+
     /// Gets the the specified bus device.
     pub fn get_bus_device(
         &self,

@@ -11,6 +11,10 @@ pub mod legacy;
 /// Device Shared Memory Region Manager.
 pub mod shm;
 
+/// Linux x86 PCI/VFIO cold-plug support.
+#[cfg(all(feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+pub mod vfio;
+
 /// Memory Mapped I/O Manager.
 #[cfg(target_os = "linux")]
 pub mod kvm;
