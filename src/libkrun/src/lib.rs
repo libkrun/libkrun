@@ -195,6 +195,8 @@ struct ContextConfig {
     block_root: Option<BlockRootConfig>,
     #[cfg(feature = "tee")]
     tee_config: Option<TeeConfigSource>,
+    #[cfg(feature = "tdx")]
+    tdx_quote_generation_socket: Option<PathBuf>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     shutdown_efd: Option<EventFd>,
     gpu_virgl_flags: Option<u32>,
@@ -290,6 +292,16 @@ impl ContextConfig {
     #[cfg(feature = "tee")]
     fn get_tee_config(&self) -> Option<TeeConfigSource> {
         self.tee_config.clone()
+    }
+
+    #[cfg(feature = "tdx")]
+    fn set_tdx_quote_generation_socket(&mut self, socket: PathBuf) {
+        self.tdx_quote_generation_socket = Some(socket);
+    }
+
+    #[cfg(feature = "tdx")]
+    fn get_tdx_quote_generation_socket(&self) -> Option<PathBuf> {
+        self.tdx_quote_generation_socket.clone()
     }
 
     fn add_vsock_port(&mut self, port: u32, filepath: PathBuf, listen: bool) {
@@ -1343,6 +1355,26 @@ pub extern "C" fn krun_set_tee_type(ctx_id: u32, tee_type: u32) -> i32 {
 
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => ctx_cfg.get_mut().set_tee_type(tee),
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(feature = "tdx")]
+pub unsafe extern "C" fn krun_set_tdx_quote_generation_socket(
+    ctx_id: u32,
+    c_filepath: *const c_char,
+) -> i32 {
+    let filepath = match unsafe { CStr::from_ptr(c_filepath) }.to_str() {
+        Ok(filepath) => PathBuf::from(filepath),
+        Err(_) => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => ctx_cfg.get_mut().set_tdx_quote_generation_socket(filepath),
         Entry::Vacant(_) => return -libc::ENOENT,
     }
 
@@ -2947,6 +2979,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     }
 
+    #[cfg(feature = "tdx")]
+    if let Some(socket) = ctx_cfg.get_tdx_quote_generation_socket() {
+        ctx_cfg.vmr.set_tdx_quote_generation_socket(socket);
+    }
+
     let mut prolog = DEFAULT_KERNEL_CMDLINE.to_string();
     for arg in &ctx_cfg.extra_kernel_cmdline {
         prolog.push(' ');
@@ -3133,6 +3170,31 @@ mod tee_tests {
             assert_eq!(krun_set_tee_type(ctx_id, KRUN_TEE_TDX), KRUN_SUCCESS);
         }
 
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(feature = "tdx")]
+    #[test]
+    fn tdx_quote_generation_socket_is_retained() {
+        let ctx_id = krun_create_ctx();
+        assert!(ctx_id >= 0);
+        let ctx_id = ctx_id as u32;
+
+        assert_eq!(
+            unsafe {
+                krun_set_tdx_quote_generation_socket(ctx_id, c"/run/tdx-qgs/qgs.socket".as_ptr())
+            },
+            KRUN_SUCCESS
+        );
+        assert_eq!(
+            CTX_MAP
+                .lock()
+                .unwrap()
+                .get(&ctx_id)
+                .unwrap()
+                .get_tdx_quote_generation_socket(),
+            Some(PathBuf::from("/run/tdx-qgs/qgs.socket"))
+        );
         assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
     }
 }

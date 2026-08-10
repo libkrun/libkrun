@@ -225,6 +225,9 @@ pub struct VmResources {
     /// TEE configuration
     #[cfg(feature = "tee")]
     pub tee_config: TeeConfig,
+    /// Intel QGS Unix socket used for TDX GetQuote requests.
+    #[cfg(feature = "tdx")]
+    pub tdx_quote_generation_socket: Option<PathBuf>,
     /// Flags for the virtio-gpu device.
     pub gpu_virgl_flags: Option<u32>,
     pub gpu_shm_size: Option<usize>,
@@ -424,6 +427,16 @@ impl VmResources {
         self.tee_config.tee = tee.into();
     }
 
+    #[cfg(feature = "tdx")]
+    pub fn set_tdx_quote_generation_socket(&mut self, socket: PathBuf) {
+        self.tdx_quote_generation_socket = Some(socket);
+    }
+
+    #[cfg(feature = "tdx")]
+    pub fn tdx_quote_generation_socket(&self) -> Option<&PathBuf> {
+        self.tdx_quote_generation_socket.as_ref()
+    }
+
     #[cfg(feature = "tee")]
     pub fn set_tee_config(&mut self, filepath: PathBuf) -> Result<Error> {
         let file = File::open(filepath.as_path()).map_err(Error::OpenTeeConfig)?;
@@ -475,12 +488,21 @@ mod tests {
             kernel_cmdline: default_kernel_cmdline(),
             kernel_bundle: Default::default(),
             external_kernel: None,
+            #[cfg(feature = "tee")]
+            qboot_bundle: None,
+            #[cfg(feature = "tee")]
+            initrd_bundle: None,
+            #[cfg(not(feature = "tee"))]
             fs: Default::default(),
             vsock: Default::default(),
             #[cfg(feature = "blk")]
             block: Default::default(),
             #[cfg(feature = "net")]
             net: Default::default(),
+            #[cfg(feature = "tee")]
+            tee_config: Default::default(),
+            #[cfg(feature = "tdx")]
+            tdx_quote_generation_socket: None,
             gpu_virgl_flags: None,
             gpu_shm_size: None,
             #[cfg(feature = "gpu")]

@@ -599,6 +599,12 @@ pub fn build_microvm(
 
     let vcpu_config = vm_resources.vcpu_config();
 
+    #[cfg(feature = "tdx")]
+    let quote_generator = vm_resources
+        .tdx_quote_generation_socket()
+        .cloned()
+        .map(crate::linux::tee::inteltdx::quote::QuoteGenerator::new);
+
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
     let mut kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
@@ -875,6 +881,8 @@ pub fn build_microvm(
             payload_config.pvh,
             #[cfg(feature = "tee")]
             _sender,
+            #[cfg(feature = "tdx")]
+            quote_generator,
         )
         .map_err(StartMicrovmError::Internal)?;
     }
@@ -1988,6 +1996,9 @@ fn create_vcpus_x86_64(
     kernel_boot: bool,
     pvh: bool,
     #[cfg(feature = "tee")] pm_sender: Sender<WorkerMessage>,
+    #[cfg(feature = "tdx")] quote_generator: Option<
+        crate::linux::tee::inteltdx::quote::QuoteGenerator,
+    >,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     for cpu_index in 0..vcpu_config.vcpu_count {
@@ -1998,8 +2009,14 @@ fn create_vcpus_x86_64(
             vm.supported_msrs().clone(),
             io_bus.clone(),
             exit_evt.try_clone().map_err(Error::EventFd)?,
-            #[cfg(feature = "tee")]
+            #[cfg(all(feature = "tee", not(feature = "tdx")))]
             pm_sender.clone(),
+            #[cfg(feature = "tdx")]
+            crate::vstate::TdxVcpuConfig {
+                pm_sender: pm_sender.clone(),
+                guest_memory: guest_mem.clone(),
+                quote_generator: quote_generator.clone(),
+            },
         )
         .map_err(Error::Vcpu)?;
 
@@ -2783,7 +2800,7 @@ fn attach_input_devices(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "tee")))]
 pub mod tests {
     use super::*;
     use crate::vmm_config::kernel_bundle::KernelBundle;

@@ -884,6 +884,22 @@ int32_t krun_set_tee_config_file(uint32_t ctx_id, const char *filepath);
 int32_t krun_set_tee_type(uint32_t ctx_id, uint32_t tee_type);
 
 /**
+ * Sets the host Quote Generation Service Unix socket used to service the TDX
+ * TDG.VP.VMCALL<GetQuote> interface. Only available in the TDX variant.
+ *
+ * Arguments:
+ *  "ctx_id"    - the configuration context ID.
+ *  "filepath"  - a null-terminated host Unix socket path.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ *  -EINVAL - filepath is not valid UTF-8.
+ *  -ENOENT - ctx_id does not exist.
+ */
+int32_t krun_set_tdx_quote_generation_socket(uint32_t ctx_id,
+                                              const char *filepath);
+
+/**
  * Adds a port-path pairing for guest IPC with a process in the host.
  *
  * Arguments:
