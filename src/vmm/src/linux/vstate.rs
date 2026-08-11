@@ -1617,6 +1617,8 @@ impl Vcpu {
                     }
                     Ok(VcpuEmulation::Stopped)
                 }
+                #[cfg(feature = "tdx")]
+                VcpuExit::Unsupported(KVM_EXIT_TDX) => self.handle_tdx_exit(),
                 r => {
                     // TODO: Are we sure we want to finish running a vcpu upon
                     // receiving a vm exit that is not necessarily an error?
