@@ -571,7 +571,6 @@ dependencies = [
  "rustc_version",
  "tokio",
  "tracing",
- "vm-memory 0.17.1",
  "windows-sys",
 ]
 

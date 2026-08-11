@@ -4,11 +4,15 @@
 
 use std::fs::File;
 use std::io::{Error, ErrorKind, Result};
+#[cfg(feature = "blk")]
+use std::io::{IoSlice, IoSliceMut};
 use std::os::unix::io::AsRawFd;
 
 #[cfg(feature = "blk")]
 use imago::io_buffers::{IoVector, IoVectorMut};
 use vm_memory::VolatileSlice;
+#[cfg(feature = "blk")]
+use vm_memory::bitmap::Bitmap;
 
 use libc::{c_int, c_void, read, readv, size_t, write, writev};
 
@@ -427,12 +431,29 @@ impl FileReadWriteAtVolatile for DiskProperties {
             return Ok(0);
         }
 
-        let (iovec, _guard) = IoVectorMut::from_volatile_slice(bufs);
+        let guards = bufs
+            .iter()
+            .map(VolatileSlice::ptr_guard_mut)
+            .collect::<Vec<_>>();
+        let buffers = guards
+            .iter()
+            .map(|guard| {
+                // SAFETY: each pointer guard keeps its guest mapping valid for
+                // the lifetime of the I/O vector, and exposes exactly `len`
+                // writable bytes.
+                let slice = unsafe { std::slice::from_raw_parts_mut(guard.as_ptr(), guard.len()) };
+                IoSliceMut::new(slice)
+            })
+            .collect::<Vec<_>>();
+        let iovec = IoVectorMut::from(buffers);
         let full_length = iovec
             .len()
             .try_into()
             .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
         self.file.lock().unwrap().readv(iovec, offset)?;
+        for buf in bufs {
+            buf.bitmap().mark_dirty(0, buf.len());
+        }
         Ok(full_length)
     }
 
@@ -445,7 +466,21 @@ impl FileReadWriteAtVolatile for DiskProperties {
             return Ok(0);
         }
 
-        let (iovec, _guard) = IoVector::from_volatile_slice(bufs);
+        let guards = bufs
+            .iter()
+            .map(VolatileSlice::ptr_guard)
+            .collect::<Vec<_>>();
+        let buffers = guards
+            .iter()
+            .map(|guard| {
+                // SAFETY: each pointer guard keeps its guest mapping valid for
+                // the lifetime of the I/O vector, and exposes exactly `len`
+                // readable bytes.
+                let slice = unsafe { std::slice::from_raw_parts(guard.as_ptr(), guard.len()) };
+                IoSlice::new(slice)
+            })
+            .collect::<Vec<_>>();
+        let iovec = IoVector::from(buffers);
         let full_length = iovec
             .len()
             .try_into()
