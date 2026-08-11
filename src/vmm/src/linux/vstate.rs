@@ -32,6 +32,8 @@ use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 use super::tee::amdsnp::{AmdSnp, Error as SnpError};
 
 #[cfg(feature = "tdx")]
+use super::tee::inteltdx::quote::{QuoteGenerator, TDVMCALL_GET_QUOTE, handle_get_quote};
+#[cfg(feature = "tdx")]
 use super::tee::inteltdx::{Error as TdxError, IntelTdx};
 
 #[cfg(feature = "tee")]
@@ -847,10 +849,11 @@ impl Vm {
         guest_mem: &GuestMemoryMmap,
         measured_regions: Vec<MeasuredRegion>,
         launcher: snp::Launcher<snp::Started, RawFd, RawFd>,
+        host_data: [u8; 32],
     ) -> Result<()> {
         match &self.tee {
             Some(s) => s
-                .vm_measure(cpuid, guest_mem, measured_regions, launcher)
+                .vm_measure(cpuid, guest_mem, measured_regions, launcher, host_data)
                 .map_err(Error::SnpSecVirtAttest),
             None => Err(Error::InvalidTee),
         }
@@ -949,6 +952,13 @@ pub struct VcpuConfig {
     pub nested_enabled: bool,
 }
 
+#[cfg(feature = "tdx")]
+pub struct TdxVcpuConfig {
+    pub pm_sender: Sender<WorkerMessage>,
+    pub guest_memory: GuestMemoryMmap,
+    pub quote_generator: Option<QuoteGenerator>,
+}
+
 // Using this for easier explicit type-casting to help IDEs interpret the code.
 type VcpuCell = Cell<Option<*mut Vcpu>>;
 
@@ -984,6 +994,25 @@ pub struct Vcpu {
 
     #[cfg(feature = "tee")]
     pm_sender: Sender<WorkerMessage>,
+    #[cfg(feature = "tdx")]
+    guest_memory: GuestMemoryMmap,
+    #[cfg(feature = "tdx")]
+    quote_generator: Option<QuoteGenerator>,
+}
+
+#[cfg(feature = "tdx")]
+const KVM_EXIT_TDX: u32 = 40;
+
+// kvm-ioctls 0.24 predates KVM_EXIT_TDX, but its generated kvm_run union
+// retains the UAPI-mandated 256-byte padding. Keep this prefix identical to
+// the kernel UAPI until rust-vmm exposes a typed TDX exit.
+#[cfg(feature = "tdx")]
+#[repr(C)]
+struct KvmTdxExit {
+    flags: u64,
+    nr: u64,
+    ret: u64,
+    data: [u64; 5],
 }
 
 impl Vcpu {
@@ -1089,7 +1118,8 @@ impl Vcpu {
         msr_list: MsrList,
         io_bus: devices::Bus,
         exit_evt: EventFd,
-        #[cfg(feature = "tee")] pm_sender: Sender<WorkerMessage>,
+        #[cfg(all(feature = "tee", not(feature = "tdx")))] pm_sender: Sender<WorkerMessage>,
+        #[cfg(feature = "tdx")] tdx: TdxVcpuConfig,
     ) -> Result<Self> {
         let kvm_vcpu = vm_fd.create_vcpu(id as u64).map_err(Error::VcpuFd)?;
         let (event_sender, event_receiver) = unbounded();
@@ -1101,6 +1131,13 @@ impl Vcpu {
         } else {
             false
         };
+
+        #[cfg(feature = "tdx")]
+        let TdxVcpuConfig {
+            pm_sender,
+            guest_memory,
+            quote_generator,
+        } = tdx;
 
         // Initially the cpuid per vCPU is the one supported by this VM.
         Ok(Vcpu {
@@ -1118,6 +1155,10 @@ impl Vcpu {
             response_sender,
             #[cfg(feature = "tee")]
             pm_sender,
+            #[cfg(feature = "tdx")]
+            guest_memory,
+            #[cfg(feature = "tdx")]
+            quote_generator,
         })
     }
 
@@ -1577,6 +1618,8 @@ impl Vcpu {
                     }
                     Ok(VcpuEmulation::Stopped)
                 }
+                #[cfg(feature = "tdx")]
+                VcpuExit::Unsupported(KVM_EXIT_TDX) => self.handle_tdx_exit(),
                 r => {
                     // TODO: Are we sure we want to finish running a vcpu upon
                     // receiving a vm exit that is not necessarily an error?
@@ -1587,6 +1630,10 @@ impl Vcpu {
             // The unwrap on raw_os_error can only fail if we have a logic
             // error in our code in which case it is better to panic.
             Err(ref e) => {
+                #[cfg(feature = "tdx")]
+                if self.fd.get_kvm_run().exit_reason == KVM_EXIT_TDX {
+                    return self.handle_tdx_exit();
+                }
                 match e.errno() {
                     libc::EAGAIN => Ok(VcpuEmulation::Handled),
                     libc::EINTR => {
@@ -1601,6 +1648,32 @@ impl Vcpu {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "tdx")]
+    fn handle_tdx_exit(&mut self) -> Result<VcpuEmulation> {
+        let (flags, nr, gpa, size) = {
+            let run = self.fd.get_kvm_run();
+            // SAFETY: KVM_EXIT_TDX identifies the union payload and KvmTdxExit
+            // is the documented prefix of that payload.
+            let tdx = unsafe { &mut *(&mut run.__bindgen_anon_1 as *mut _ as *mut KvmTdxExit) };
+            (tdx.flags, tdx.nr, tdx.data[0], tdx.data[1])
+        };
+
+        if flags != 0 {
+            error!("KVM_EXIT_TDX returned unsupported flags 0x{flags:x}");
+            return Err(Error::VcpuUnhandledKvmExit);
+        }
+        if nr != TDVMCALL_GET_QUOTE {
+            return Ok(VcpuEmulation::Handled);
+        }
+
+        let ret = handle_get_quote(&self.guest_memory, self.quote_generator.as_ref(), gpa, size);
+        let run = self.fd.get_kvm_run();
+        // SAFETY: This is the same KVM_EXIT_TDX payload validated above.
+        let tdx = unsafe { &mut *(&mut run.__bindgen_anon_1 as *mut _ as *mut KvmTdxExit) };
+        tdx.ret = ret;
+        Ok(VcpuEmulation::Handled)
     }
 
     /// Main loop of the vCPU thread.
@@ -1827,7 +1900,7 @@ enum VcpuEmulation {
     Stopped,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "tee")))]
 mod tests {
     use crossbeam_channel::unbounded;
     use std::sync::{Arc, Barrier};

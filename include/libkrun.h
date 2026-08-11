@@ -852,7 +852,8 @@ int32_t krun_set_kernel(uint32_t ctx_id,
                         const char *cmdline);
 
 /**
- * Sets the file path to the TEE configuration file. Only available in libkrun-sev.
+ * Sets the file path to the legacy JSON TEE configuration file. Only available
+ * in TEE variants.
  *
  * Arguments:
  *  "ctx_id"    - the configuration context ID.
@@ -862,6 +863,73 @@ int32_t krun_set_kernel(uint32_t ctx_id,
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_set_tee_config_file(uint32_t ctx_id, const char *filepath);
+
+#define KRUN_TEE_SNP 0
+#define KRUN_TEE_TDX 1
+/**
+ * Selects the confidential-computing technology for this context. Only
+ * available in TEE variants. CPU and memory configuration remains owned by
+ * krun_set_vm_config().
+ *
+ * Arguments:
+ *  "ctx_id"    - the configuration context ID.
+ *  "tee_type"  - KRUN_TEE_SNP or KRUN_TEE_TDX.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ *  -EINVAL  - tee_type is unknown.
+ *  -ENOTSUP - tee_type is not supported by this libkrun variant.
+ *  -ENOENT  - ctx_id does not exist.
+ */
+int32_t krun_set_tee_type(uint32_t ctx_id, uint32_t tee_type);
+
+/**
+ * Sets the exact 32-byte guest-owner commitment returned in the HOST_DATA
+ * field of every SEV-SNP attestation report for this VM. The value is copied.
+ * Only available in AMD SEV-SNP variants.
+ *
+ * Returns zero on success, -EINVAL for a null or non-32-byte input, -ENOENT
+ * when ctx_id does not exist, or -ENOTSUP in non-SNP builds.
+ */
+int32_t krun_set_snp_host_data(uint32_t ctx_id,
+                               const uint8_t *host_data,
+                               size_t host_data_len);
+
+/**
+ * Sets the host Quote Generation Service Unix socket used to service the TDX
+ * TDG.VP.VMCALL<GetQuote> interface. Only available in the TDX variant.
+ *
+ * Arguments:
+ *  "ctx_id"    - the configuration context ID.
+ *  "filepath"  - a null-terminated host Unix socket path.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ *  -EINVAL - filepath is not valid UTF-8.
+ *  -ENOENT - ctx_id does not exist.
+ */
+int32_t krun_set_tdx_quote_generation_socket(uint32_t ctx_id,
+                                              const char *filepath);
+
+/**
+ * Adds a pre-opened VFIO cdev as a cold-plugged PCI function.
+ *
+ * The descriptor must refer to /dev/vfio/devices/vfioN and is duplicated by
+ * libkrun, so the caller may close its copy after this call. The device must
+ * already be bound to a VFIO PCI variant driver. All devices in its effective
+ * IOMMU isolation group must be assigned together or otherwise detached from
+ * host drivers.
+ *
+ * On confidential VMs, DMA is mapped only for guest pages converted to shared
+ * state. Device assignment does not by itself establish TDISP, PCIe IDE, or a
+ * vendor confidential-computing trust relationship.
+ *
+ * Returns zero on success or a negative errno on failure.
+ */
+int32_t krun_add_vfio_device(uint32_t ctx_id,
+                             int vfio_cdev_fd,
+                             uint8_t guest_device,
+                             uint8_t guest_function);
 
 /**
  * Adds a port-path pairing for guest IPC with a process in the host.
@@ -999,6 +1067,7 @@ int32_t krun_check_nested_virt(void);
 #define KRUN_FEATURE_INTEL_TDX 8
 #define KRUN_FEATURE_AWS_NITRO 9
 #define KRUN_FEATURE_VIRGL_RESOURCE_MAP2 10
+#define KRUN_FEATURE_VFIO 12
 
 /**
  * Checks if a specific feature was enabled at build time.

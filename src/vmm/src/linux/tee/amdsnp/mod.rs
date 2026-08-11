@@ -309,6 +309,7 @@ impl AmdSnp {
         guest_mem: &GuestMemoryMmap,
         measured_regions: Vec<MeasuredRegion>,
         mut launcher: Launcher<Started, RawFd, RawFd>,
+        host_data: [u8; 32],
     ) -> Result<(), Error> {
         for region in measured_regions {
             self.add_region(guest_mem, region, &mut launcher, PageType::Normal)?;
@@ -390,7 +391,7 @@ impl AmdSnp {
             PageType::Zero,
         )?;
 
-        let finish = Finish::new(None, None, [0; 32]);
+        let finish = Finish::new(None, None, host_data);
 
         let (_vmfd, _fwfd) = launcher.finish(finish).map_err(Error::LaunchFinish)?;
 

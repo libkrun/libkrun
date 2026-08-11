@@ -73,7 +73,7 @@ impl super::Vmm {
                     let _ = _sender.send(false);
                 }
             }
-        }
+        };
     }
 
     #[cfg(all(feature = "tee", target_arch = "x86_64"))]
@@ -88,53 +88,67 @@ impl super::Vmm {
             return;
         };
 
-        let attributes: u64 = if properties.private {
-            KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
-        } else {
-            0
-        };
-
-        let attr = kvm_memory_attributes {
-            address: properties.gpa,
-            size: properties.size,
-            attributes,
-            flags: 0,
-        };
-
-        if self.kvm_vm().fd().set_memory_attributes(attr).is_err() {
-            error!(
-                "unable to set memory attributes for memory region corresponding to guest address 0x{:x}",
-                properties.gpa
-            );
-            sender.send(false).unwrap();
-            return;
-        }
-
-        let region = self
+        let Some(region) = self
             .guest_memory()
-            .find_region(GuestAddress(properties.gpa));
-        if region.is_none() {
+            .find_region(GuestAddress(properties.gpa))
+        else {
             error!(
                 "guest memory region corresponding to GPA 0x{:x} not found",
                 properties.gpa
             );
             sender.send(false).unwrap();
             return;
-        }
+        };
 
         let offset = properties.gpa - region_start;
+        let region_addr = MemoryRegionAddress(offset);
+        let Ok(host_startaddr) = region.get_host_address(region_addr) else {
+            error!(
+                "host address corresponding to memory region address 0x{:x} not found",
+                region_addr.raw_value()
+            );
+            sender.send(false).unwrap();
+            return;
+        };
+
+        let attr = |private| kvm_memory_attributes {
+            address: properties.gpa,
+            size: properties.size,
+            attributes: if private {
+                KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
+            } else {
+                0
+            },
+            flags: 0,
+        };
 
         if properties.private {
-            let region_addr = MemoryRegionAddress(offset);
+            #[cfg(feature = "vfio")]
+            if let Some(dma) = self.vfio_dma_manager()
+                && let Err(error) = dma.unmap_range(properties.gpa, properties.size)
+            {
+                error!("unable to remove confidential VFIO DMA mapping: {error}");
+                sender.send(false).unwrap();
+                return;
+            }
 
-            let Ok(host_startaddr) = region.unwrap().get_host_address(region_addr) else {
+            if self
+                .kvm_vm()
+                .fd()
+                .set_memory_attributes(attr(true))
+                .is_err()
+            {
+                #[cfg(feature = "vfio")]
+                if let Some(dma) = self.vfio_dma_manager() {
+                    let _ = dma.map_range(properties.gpa, properties.size, host_startaddr.cast());
+                }
                 error!(
-                    "host address corresponding to memory region address 0x{:x} not found",
-                    region_addr.raw_value()
+                    "unable to make guest memory private at GPA 0x{:x}",
+                    properties.gpa
                 );
                 sender.send(false).unwrap();
                 return;
-            };
+            }
 
             let ret = unsafe {
                 madvise(
@@ -150,8 +164,23 @@ impl super::Vmm {
                     properties.gpa
                 );
                 sender.send(false).unwrap();
+                return;
             }
         } else {
+            if self
+                .kvm_vm()
+                .fd()
+                .set_memory_attributes(attr(false))
+                .is_err()
+            {
+                error!(
+                    "unable to make guest memory shared at GPA 0x{:x}",
+                    properties.gpa
+                );
+                sender.send(false).unwrap();
+                return;
+            }
+
             let ret = unsafe {
                 fallocate(
                     guest_memfd,
@@ -163,7 +192,28 @@ impl super::Vmm {
 
             if ret < 0 {
                 error!("unable to allocate space in guest_memfd for shared memory (fallocate)");
+                let _ = self.kvm_vm().fd().set_memory_attributes(attr(true));
                 sender.send(false).unwrap();
+                return;
+            }
+
+            #[cfg(feature = "vfio")]
+            if let Some(dma) = self.vfio_dma_manager()
+                && let Err(error) =
+                    dma.map_range(properties.gpa, properties.size, host_startaddr.cast())
+            {
+                error!("unable to install confidential VFIO DMA mapping: {error}");
+                let _ = self.kvm_vm().fd().set_memory_attributes(attr(true));
+                // SAFETY: the host mapping covers the validated converted range.
+                let _ = unsafe {
+                    madvise(
+                        host_startaddr as *mut c_void,
+                        properties.size.try_into().unwrap(),
+                        MADV_DONTNEED,
+                    )
+                };
+                sender.send(false).unwrap();
+                return;
             }
         }
 

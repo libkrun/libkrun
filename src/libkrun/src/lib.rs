@@ -48,6 +48,10 @@ use utils::windows::AsRawFd;
 use utils::windows::SendHandle;
 #[cfg(target_os = "macos")]
 use vmm::VmCtl;
+#[cfg(feature = "tee")]
+use vmm::resources::TeeType;
+#[cfg(all(feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+use vmm::resources::VfioDeviceConfig;
 use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
     VmResources, VsockConfig,
@@ -79,6 +83,10 @@ use krun_input::{InputConfigBackend, InputEventProviderBackend};
 
 // Value returned on success. We use libc's errors otherwise.
 const KRUN_SUCCESS: i32 = 0;
+#[cfg(feature = "tee")]
+const KRUN_TEE_SNP: u32 = 0;
+#[cfg(feature = "tee")]
+const KRUN_TEE_TDX: u32 = 1;
 // Maximum number of arguments/environment variables we allow
 const MAX_ARGS: usize = 4096;
 /// Maximum number of virtqueues allowed by virtio spec (16-bit queue index: 0-65535)
@@ -152,6 +160,13 @@ impl KrunfwBindingsResult {
     }
 }
 
+#[cfg(feature = "tee")]
+#[derive(Clone)]
+enum TeeConfigSource {
+    File(PathBuf),
+    Type(TeeType),
+}
+
 /// AWS Nitro enclave-specific configuration.
 ///
 /// These fields are only used by the aws-nitro path, which delivers
@@ -181,7 +196,9 @@ struct ContextConfig {
     #[cfg(feature = "blk")]
     block_root: Option<BlockRootConfig>,
     #[cfg(feature = "tee")]
-    tee_config_file: Option<PathBuf>,
+    tee_config: Option<TeeConfigSource>,
+    #[cfg(feature = "tdx")]
+    tdx_quote_generation_socket: Option<PathBuf>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     shutdown_efd: Option<EventFd>,
     gpu_virgl_flags: Option<u32>,
@@ -266,12 +283,27 @@ impl ContextConfig {
 
     #[cfg(feature = "tee")]
     fn set_tee_config_file(&mut self, filepath: PathBuf) {
-        self.tee_config_file = Some(filepath);
+        self.tee_config = Some(TeeConfigSource::File(filepath));
     }
 
     #[cfg(feature = "tee")]
-    fn get_tee_config_file(&self) -> Option<PathBuf> {
-        self.tee_config_file.clone()
+    fn set_tee_type(&mut self, tee: TeeType) {
+        self.tee_config = Some(TeeConfigSource::Type(tee));
+    }
+
+    #[cfg(feature = "tee")]
+    fn get_tee_config(&self) -> Option<TeeConfigSource> {
+        self.tee_config.clone()
+    }
+
+    #[cfg(feature = "tdx")]
+    fn set_tdx_quote_generation_socket(&mut self, socket: PathBuf) {
+        self.tdx_quote_generation_socket = Some(socket);
+    }
+
+    #[cfg(feature = "tdx")]
+    fn get_tdx_quote_generation_socket(&self) -> Option<PathBuf> {
+        self.tdx_quote_generation_socket.clone()
     }
 
     fn add_vsock_port(&mut self, port: u32, filepath: PathBuf, listen: bool) {
@@ -1313,6 +1345,144 @@ pub unsafe extern "C" fn krun_set_tee_config_file(ctx_id: u32, c_filepath: *cons
     }
 }
 
+#[unsafe(no_mangle)]
+#[cfg(feature = "tee")]
+pub extern "C" fn krun_set_tee_type(ctx_id: u32, tee_type: u32) -> i32 {
+    let tee = match tee_type {
+        KRUN_TEE_SNP if cfg!(feature = "amd-sev") => TeeType::Snp,
+        KRUN_TEE_TDX if cfg!(feature = "tdx") => TeeType::Tdx,
+        KRUN_TEE_SNP | KRUN_TEE_TDX => return -libc::ENOTSUP,
+        _ => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => ctx_cfg.get_mut().set_tee_type(tee),
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+/// Sets the 32-byte guest-owner commitment included in SEV-SNP `HOST_DATA`.
+///
+/// The firmware returns these exact bytes in every attestation report for the
+/// lifetime of the VM. The input is copied before this function returns.
+#[unsafe(no_mangle)]
+#[cfg(feature = "amd-sev")]
+pub unsafe extern "C" fn krun_set_snp_host_data(
+    ctx_id: u32,
+    host_data: *const u8,
+    host_data_len: usize,
+) -> i32 {
+    if host_data.is_null() || host_data_len != 32 {
+        return -libc::EINVAL;
+    }
+    let mut value = [0_u8; 32];
+    // SAFETY: the caller promises `host_data_len` readable bytes; the exact
+    // length was checked above and the destination has the same size.
+    unsafe { std::ptr::copy_nonoverlapping(host_data, value.as_mut_ptr(), value.len()) };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => ctx_cfg.get_mut().vmr.set_snp_host_data(value),
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+    KRUN_SUCCESS
+}
+
+/// Reports that SEV-SNP launch host data is unavailable in this build.
+#[unsafe(no_mangle)]
+#[cfg(not(feature = "amd-sev"))]
+pub unsafe extern "C" fn krun_set_snp_host_data(
+    _ctx_id: u32,
+    _host_data: *const u8,
+    _host_data_len: usize,
+) -> i32 {
+    -libc::ENOTSUP
+}
+
+/// Adds a pre-opened VFIO cdev as a cold-plugged PCI function.
+///
+/// The file descriptor is duplicated with `F_DUPFD_CLOEXEC`; the caller may
+/// close its copy after this function returns. The descriptor must refer to a
+/// `/dev/vfio/devices/vfioN` cdev. Device 0 is reserved for the virtual host
+/// bridge, and duplicate guest BDFs are rejected.
+#[unsafe(no_mangle)]
+#[cfg(all(feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+pub extern "C" fn krun_add_vfio_device(
+    ctx_id: u32,
+    vfio_cdev_fd: c_int,
+    guest_device: u8,
+    guest_function: u8,
+) -> i32 {
+    if vfio_cdev_fd < 0 || guest_device == 0 || guest_device > 31 || guest_function > 7 {
+        return -libc::EINVAL;
+    }
+
+    // SAFETY: fcntl does not take ownership of the source descriptor. A
+    // non-negative return value is a new descriptor owned by this context.
+    let duplicated = unsafe { libc::fcntl(vfio_cdev_fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated < 0 {
+        return -std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+    }
+    // SAFETY: `duplicated` is a fresh descriptor returned by fcntl and its
+    // ownership is transferred into File exactly once.
+    let device = unsafe { File::from_raw_fd(duplicated) };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            if ctx_cfg
+                .get_mut()
+                .vmr
+                .add_vfio_device(VfioDeviceConfig {
+                    device,
+                    guest_device,
+                    guest_function,
+                })
+                .is_err()
+            {
+                return -libc::EEXIST;
+            }
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+/// Reports that VFIO PCI assignment is unavailable in this build or target.
+#[unsafe(no_mangle)]
+#[cfg(not(all(feature = "vfio", target_os = "linux", target_arch = "x86_64")))]
+pub extern "C" fn krun_add_vfio_device(
+    _ctx_id: u32,
+    _vfio_cdev_fd: c_int,
+    _guest_device: u8,
+    _guest_function: u8,
+) -> i32 {
+    -libc::ENOTSUP
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(feature = "tdx")]
+pub unsafe extern "C" fn krun_set_tdx_quote_generation_socket(
+    ctx_id: u32,
+    c_filepath: *const c_char,
+) -> i32 {
+    let filepath = match unsafe { CStr::from_ptr(c_filepath) }.to_str() {
+        Ok(filepath) => PathBuf::from(filepath),
+        Err(_) => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => ctx_cfg.get_mut().set_tdx_quote_generation_socket(filepath),
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn krun_add_vsock_port(
@@ -1858,6 +2028,7 @@ const KRUN_FEATURE_AMD_SEV: u64 = 7;
 const KRUN_FEATURE_INTEL_TDX: u64 = 8;
 const KRUN_FEATURE_AWS_NITRO: u64 = 9;
 const KRUN_FEATURE_VIRGL_RESOURCE_MAP2: u64 = 10;
+const KRUN_FEATURE_VFIO: u64 = 12;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_has_feature(feature: u64) -> c_int {
@@ -1871,6 +2042,11 @@ pub extern "C" fn krun_has_feature(feature: u64) -> c_int {
         KRUN_FEATURE_INTEL_TDX => cfg!(feature = "tdx"),
         KRUN_FEATURE_AWS_NITRO => cfg!(feature = "aws-nitro"),
         KRUN_FEATURE_VIRGL_RESOURCE_MAP2 => cfg!(feature = "virgl_resource_map2"),
+        KRUN_FEATURE_VFIO => cfg!(all(
+            feature = "vfio",
+            target_os = "linux",
+            target_arch = "x86_64"
+        )),
         _ => return -libc::EINVAL,
     };
 
@@ -2896,21 +3072,24 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     }
 
-    /*
-     * Before krun_start_enter() is called in an encrypted context, the TEE
-     * config must have been set via krun_set_tee_config_file(). If the TEE
-     * config is not set by this point, print the relevant error message and
-     * fail.
-     */
     #[cfg(feature = "tee")]
-    if let Some(tee_config) = ctx_cfg.get_tee_config_file() {
-        if let Err(e) = ctx_cfg.vmr.set_tee_config(tee_config) {
-            error!("Error setting up TEE config: {e:?}");
+    match ctx_cfg.get_tee_config() {
+        Some(TeeConfigSource::File(tee_config)) => {
+            if let Err(e) = ctx_cfg.vmr.set_tee_config(tee_config) {
+                error!("Error setting up TEE config: {e:?}");
+                return -libc::EINVAL;
+            }
+        }
+        Some(TeeConfigSource::Type(tee)) => ctx_cfg.vmr.set_tee_type(tee),
+        None => {
+            error!("Missing TEE type");
             return -libc::EINVAL;
         }
-    } else {
-        error!("Missing TEE config file");
-        return -libc::EINVAL;
+    }
+
+    #[cfg(feature = "tdx")]
+    if let Some(socket) = ctx_cfg.get_tdx_quote_generation_socket() {
+        ctx_cfg.vmr.set_tdx_quote_generation_socket(socket);
     }
 
     let mut prolog = DEFAULT_KERNEL_CMDLINE.to_string();
@@ -3074,5 +3253,118 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 
             -libc::EINVAL
         }
+    }
+}
+
+#[cfg(all(test, feature = "tee"))]
+mod tee_tests {
+    use super::*;
+
+    #[test]
+    fn typed_tee_selection_rejects_unknown_and_incompatible_types() {
+        let ctx_id = krun_create_ctx();
+        assert!(ctx_id >= 0);
+        let ctx_id = ctx_id as u32;
+
+        assert_eq!(krun_set_tee_type(ctx_id, u32::MAX), -libc::EINVAL);
+        #[cfg(feature = "amd-sev")]
+        {
+            assert_eq!(krun_set_tee_type(ctx_id, KRUN_TEE_TDX), -libc::ENOTSUP);
+            assert_eq!(krun_set_tee_type(ctx_id, KRUN_TEE_SNP), KRUN_SUCCESS);
+        }
+        #[cfg(feature = "tdx")]
+        {
+            assert_eq!(krun_set_tee_type(ctx_id, KRUN_TEE_SNP), -libc::ENOTSUP);
+            assert_eq!(krun_set_tee_type(ctx_id, KRUN_TEE_TDX), KRUN_SUCCESS);
+        }
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(feature = "amd-sev")]
+    #[test]
+    fn snp_host_data_is_copied_into_vm_resources() {
+        let ctx_id = krun_create_ctx();
+        assert!(ctx_id >= 0);
+        let ctx_id = ctx_id as u32;
+        let host_data = [0x5a_u8; 32];
+
+        assert_eq!(
+            unsafe { krun_set_snp_host_data(ctx_id, host_data.as_ptr(), host_data.len()) },
+            KRUN_SUCCESS
+        );
+        assert_eq!(
+            CTX_MAP
+                .lock()
+                .unwrap()
+                .get(&ctx_id)
+                .unwrap()
+                .vmr
+                .snp_host_data,
+            host_data
+        );
+        assert_eq!(
+            unsafe { krun_set_snp_host_data(ctx_id, host_data.as_ptr(), 31) },
+            -libc::EINVAL
+        );
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(feature = "tdx")]
+    #[test]
+    fn tdx_quote_generation_socket_is_retained() {
+        let ctx_id = krun_create_ctx();
+        assert!(ctx_id >= 0);
+        let ctx_id = ctx_id as u32;
+
+        assert_eq!(
+            unsafe {
+                krun_set_tdx_quote_generation_socket(ctx_id, c"/run/tdx-qgs/qgs.socket".as_ptr())
+            },
+            KRUN_SUCCESS
+        );
+        assert_eq!(
+            CTX_MAP
+                .lock()
+                .unwrap()
+                .get(&ctx_id)
+                .unwrap()
+                .get_tdx_quote_generation_socket(),
+            Some(PathBuf::from("/run/tdx-qgs/qgs.socket"))
+        );
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+}
+
+#[cfg(all(test, feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+mod vfio_tests {
+    use super::*;
+
+    #[test]
+    fn vfio_api_retains_a_duplicate_and_rejects_duplicate_bdfs() {
+        let source = File::open("/dev/null").unwrap();
+        let ctx_id = krun_create_ctx();
+        assert!(ctx_id >= 0);
+        let ctx_id = ctx_id as u32;
+
+        assert_eq!(
+            krun_add_vfio_device(ctx_id, source.as_raw_fd(), 0, 0),
+            -libc::EINVAL
+        );
+        assert_eq!(
+            krun_add_vfio_device(ctx_id, source.as_raw_fd(), 1, 0),
+            KRUN_SUCCESS
+        );
+        assert_eq!(
+            krun_add_vfio_device(ctx_id, source.as_raw_fd(), 1, 0),
+            -libc::EEXIST
+        );
+
+        let context = CTX_MAP.lock().unwrap();
+        let retained = &context.get(&ctx_id).unwrap().vmr.vfio_devices[0].device;
+        assert_ne!(retained.as_raw_fd(), source.as_raw_fd());
+        drop(context);
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
     }
 }

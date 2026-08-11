@@ -187,6 +187,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
 name = "bzip2"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -565,7 +571,6 @@ dependencies = [
  "rustc_version",
  "tokio",
  "tracing",
- "vm-memory",
  "windows-sys",
 ]
 
@@ -586,6 +591,23 @@ name = "iocuddle"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8972d5be69940353d5347a1344cb375d9b457d6809b428b05bb1ca2fb9ce007"
+
+[[package]]
+name = "iommufd-bindings"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd7de3a04f6fd55f171a6682852f7aa360bb848a85e0c610513349e006b3c139"
+
+[[package]]
+name = "iommufd-ioctls"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8050f03ef0c6979597140b6d20da076931fb7a06389b8b0eb971b8f65b271748"
+dependencies = [
+ "iommufd-bindings",
+ "thiserror 2.0.18",
+ "vmm-sys-util",
+]
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -676,12 +698,12 @@ dependencies = [
  "krun-utils",
  "krun-whp",
  "kvm-bindings",
- "kvm-ioctls",
+ "kvm-ioctls 0.24.0",
  "libc",
  "linux-loader",
  "tdx",
- "vm-memory",
- "vmm-sys-util 0.15.0",
+ "vm-memory 0.17.1",
+ "vmm-sys-util",
  "windows-sys",
 ]
 
@@ -708,8 +730,8 @@ name = "krun-cpuid"
 version = "0.1.0-2.0.0-dev"
 dependencies = [
  "kvm-bindings",
- "kvm-ioctls",
- "vmm-sys-util 0.15.0",
+ "kvm-ioctls 0.24.0",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -729,7 +751,7 @@ dependencies = [
  "krun-utils",
  "krun-whp",
  "kvm-bindings",
- "kvm-ioctls",
+ "kvm-ioctls 0.24.0",
  "libc",
  "libloading",
  "log",
@@ -740,8 +762,8 @@ dependencies = [
  "vhost",
  "virtio-bindings",
  "vm-fdt",
- "vm-memory",
- "vmm-sys-util 0.15.0",
+ "vm-memory 0.17.1",
+ "vmm-sys-util",
  "windows-sys",
  "zerocopy",
 ]
@@ -816,7 +838,7 @@ name = "krun-kernel"
 version = "0.1.0-2.0.0-dev"
 dependencies = [
  "krun-utils",
- "vm-memory",
+ "vm-memory 0.17.1",
 ]
 
 [[package]]
@@ -839,7 +861,7 @@ dependencies = [
  "pkg-config",
  "remain",
  "thiserror 1.0.69",
- "vmm-sys-util 0.15.0",
+ "vmm-sys-util",
  "winapi",
  "zerocopy",
 ]
@@ -848,7 +870,7 @@ dependencies = [
 name = "krun-smbios"
 version = "0.1.0-2.0.0-dev"
 dependencies = [
- "vm-memory",
+ "vm-memory 0.17.1",
 ]
 
 [[package]]
@@ -861,7 +883,7 @@ dependencies = [
  "libc",
  "log",
  "nix 0.30.1",
- "vmm-sys-util 0.15.0",
+ "vmm-sys-util",
  "windows-sys",
 ]
 
@@ -875,6 +897,7 @@ dependencies = [
  "crossbeam-channel",
  "flate2",
  "iocuddle",
+ "iommufd-ioctls",
  "kbs-types",
  "krun-arch",
  "krun-arch-gen",
@@ -887,7 +910,8 @@ dependencies = [
  "krun-polly",
  "krun-utils",
  "kvm-bindings",
- "kvm-ioctls",
+ "kvm-ioctls 0.24.0",
+ "kvm-ioctls 0.25.0",
  "libc",
  "linux-loader",
  "log",
@@ -895,8 +919,10 @@ dependencies = [
  "serde",
  "serde_json",
  "tdx",
- "vm-memory",
- "vmm-sys-util 0.14.0",
+ "vfio-bindings",
+ "vfio-ioctls",
+ "vm-memory 0.17.1",
+ "vmm-sys-util",
  "windows-sys",
  "zstd",
 ]
@@ -911,11 +937,11 @@ dependencies = [
 
 [[package]]
 name = "kvm-bindings"
-version = "0.14.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b3c06ff73c7ce03e780887ec2389d62d2a2a9ddf471ab05c2ff69207cd3f3b4"
+checksum = "11cf0ca75d59e9d298647c59cf6c5286fa048120caa77972a7a504a0824d234f"
 dependencies = [
- "vmm-sys-util 0.15.0",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -927,7 +953,19 @@ dependencies = [
  "bitflags 2.11.0",
  "kvm-bindings",
  "libc",
- "vmm-sys-util 0.15.0",
+ "vmm-sys-util",
+]
+
+[[package]]
+name = "kvm-ioctls"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06ac372c120eb893b086d1a12027669cf2b478d1f71204021ffa7adf57948d63"
+dependencies = [
+ "bitflags 2.11.0",
+ "kvm-bindings",
+ "libc",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -957,13 +995,13 @@ dependencies = [
  "krun-utils",
  "krun-vmm",
  "kvm-bindings",
- "kvm-ioctls",
+ "kvm-ioctls 0.24.0",
  "libc",
  "libloading",
  "log",
  "nitro-enclaves 0.5.0",
  "once_cell",
- "vm-memory",
+ "vm-memory 0.17.1",
  "windows-sys",
 ]
 
@@ -995,7 +1033,7 @@ version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de72cb02c55ecffcf75fe78295926f872eb6eb0a58d629c58a8c324dc26380f6"
 dependencies = [
- "vm-memory",
+ "vm-memory 0.17.1",
 ]
 
 [[package]]
@@ -1531,10 +1569,10 @@ dependencies = [
  "bitflags 2.11.0",
  "iocuddle",
  "kvm-bindings",
- "kvm-ioctls",
+ "kvm-ioctls 0.24.0",
  "libc",
  "uuid",
- "vmm-sys-util 0.15.0",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -1666,6 +1704,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vfio-bindings"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "188dac3057a0cbc94470085204c84b82ff7ec5dac629a514323cd133d1f9abe0"
+
+[[package]]
+name = "vfio-ioctls"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a22f93a7f6cc51b8671b9282ed6487b0c905890be20ffa4a26835d2652a7c638"
+dependencies = [
+ "byteorder",
+ "iommufd-bindings",
+ "iommufd-ioctls",
+ "kvm-bindings",
+ "kvm-ioctls 0.25.0",
+ "libc",
+ "log",
+ "thiserror 2.0.18",
+ "vfio-bindings",
+ "vm-memory 0.18.0",
+ "vmm-sys-util",
+]
+
+[[package]]
 name = "vhost"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1674,8 +1737,8 @@ dependencies = [
  "bitflags 2.11.0",
  "libc",
  "uuid",
- "vm-memory",
- "vmm-sys-util 0.15.0",
+ "vm-memory 0.17.1",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -1708,13 +1771,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "vmm-sys-util"
-version = "0.14.0"
+name = "vm-memory"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d21f366bf22bfba3e868349978766a965cbe628c323d58e026be80b8357ab789"
+checksum = "9b55e753c7725603745cb32b2287ef7ef3da05c03c7702cda3fa8abe25ae0465"
 dependencies = [
- "bitflags 1.3.2",
  "libc",
+ "thiserror 2.0.18",
+ "winapi",
 ]
 
 [[package]]

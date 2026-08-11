@@ -3,6 +3,8 @@ use tdx::launch::{self, Launcher};
 
 use std::os::unix::io::AsRawFd;
 
+pub mod quote;
+
 #[derive(Debug)]
 pub enum Error {
     GetCapabilities(launch::Error),

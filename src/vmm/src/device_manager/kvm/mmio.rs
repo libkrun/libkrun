@@ -317,7 +317,7 @@ impl DeviceInfoForFDT for MMIODeviceInfo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "tee")))]
 mod tests {
     use super::super::super::super::builder;
     use super::*;

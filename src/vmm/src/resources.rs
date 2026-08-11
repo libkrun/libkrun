@@ -3,7 +3,7 @@
 
 //#![deny(warnings)]
 
-#[cfg(feature = "tee")]
+#[cfg(any(feature = "tee", feature = "vfio"))]
 use std::fs::File;
 #[cfg(feature = "tee")]
 use std::io::BufReader;
@@ -41,6 +41,26 @@ use krun_display::DisplayBackend;
 
 type Result<E> = std::result::Result<(), E>;
 
+/// TEE selected by a libkrun caller without a JSON configuration file.
+#[cfg(feature = "tee")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TeeType {
+    /// AMD Secure Encrypted Virtualization with Secure Nested Paging.
+    Snp,
+    /// Intel Trust Domain Extensions.
+    Tdx,
+}
+
+#[cfg(feature = "tee")]
+impl From<TeeType> for Tee {
+    fn from(tee: TeeType) -> Self {
+        match tee {
+            TeeType::Snp => Self::Snp,
+            TeeType::Tdx => Self::Tdx,
+        }
+    }
+}
+
 // Re-export TsiFlags from devices crate
 pub use devices::virtio::TsiFlags;
 
@@ -58,6 +78,27 @@ pub struct VhostUserDeviceConfig {
     pub num_queues: u16,
     /// Size of each queue (empty = use device defaults)
     pub queue_sizes: Vec<u16>,
+}
+
+/// A pre-opened VFIO cdev assigned to a fixed guest PCI function.
+#[cfg(feature = "vfio")]
+pub struct VfioDeviceConfig {
+    /// Open `/dev/vfio/devices/vfioN` file. Ownership is retained by the VM.
+    pub device: File,
+    /// Guest PCI device number on bus 0.
+    pub guest_device: u8,
+    /// Guest PCI function number.
+    pub guest_function: u8,
+}
+
+/// Invalid guest PCI placement for a VFIO function.
+#[cfg(feature = "vfio")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VfioConfigError {
+    /// Device/function is outside bus 0's supported range or uses slot 0.
+    InvalidBdf,
+    /// Another function already occupies the requested guest BDF.
+    DuplicateBdf,
 }
 
 /// Errors encountered when configuring microVM resources.
@@ -205,6 +246,12 @@ pub struct VmResources {
     /// TEE configuration
     #[cfg(feature = "tee")]
     pub tee_config: TeeConfig,
+    /// Opaque guest-owner commitment included in every SEV-SNP report.
+    #[cfg(feature = "amd-sev")]
+    pub snp_host_data: [u8; 32],
+    /// Intel QGS Unix socket used for TDX GetQuote requests.
+    #[cfg(feature = "tdx")]
+    pub tdx_quote_generation_socket: Option<PathBuf>,
     /// Flags for the virtio-gpu device.
     pub gpu_virgl_flags: Option<u32>,
     pub gpu_shm_size: Option<usize>,
@@ -220,6 +267,9 @@ pub struct VmResources {
     #[cfg(feature = "vhost-user")]
     /// Vhost-user device configurations
     pub vhost_user_devices: Vec<VhostUserDeviceConfig>,
+    /// Cold-plugged VFIO PCI functions.
+    #[cfg(feature = "vfio")]
+    pub vfio_devices: Vec<VfioDeviceConfig>,
     /// SMBIOS OEM Strings
     pub smbios_oem_strings: Option<Vec<String>>,
     /// Whether to enable nested virtualization.
@@ -372,6 +422,25 @@ impl VmResources {
         self.block.insert(config)
     }
 
+    /// Adds a pre-opened VFIO cdev at an explicit guest BDF.
+    #[cfg(feature = "vfio")]
+    pub fn add_vfio_device(
+        &mut self,
+        config: VfioDeviceConfig,
+    ) -> std::result::Result<(), VfioConfigError> {
+        if config.guest_device == 0 || config.guest_device > 31 || config.guest_function > 7 {
+            return Err(VfioConfigError::InvalidBdf);
+        }
+        if self.vfio_devices.iter().any(|existing| {
+            existing.guest_device == config.guest_device
+                && existing.guest_function == config.guest_function
+        }) {
+            return Err(VfioConfigError::DuplicateBdf);
+        }
+        self.vfio_devices.push(config);
+        Ok(())
+    }
+
     /// Sets a vsock device to be attached when the VM starts.
     pub fn set_vsock_device(&mut self, config: VsockDeviceConfig) -> Result<VsockConfigError> {
         self.vsock.insert(config)
@@ -397,6 +466,27 @@ impl VmResources {
     #[cfg(feature = "tee")]
     pub fn tee_config(&self) -> &TeeConfig {
         &self.tee_config
+    }
+
+    #[cfg(feature = "tee")]
+    pub fn set_tee_type(&mut self, tee: TeeType) {
+        self.tee_config.tee = tee.into();
+    }
+
+    /// Sets the guest-owner commitment included in SEV-SNP `HOST_DATA`.
+    #[cfg(feature = "amd-sev")]
+    pub fn set_snp_host_data(&mut self, host_data: [u8; 32]) {
+        self.snp_host_data = host_data;
+    }
+
+    #[cfg(feature = "tdx")]
+    pub fn set_tdx_quote_generation_socket(&mut self, socket: PathBuf) {
+        self.tdx_quote_generation_socket = Some(socket);
+    }
+
+    #[cfg(feature = "tdx")]
+    pub fn tdx_quote_generation_socket(&self) -> Option<&PathBuf> {
+        self.tdx_quote_generation_socket.as_ref()
     }
 
     #[cfg(feature = "tee")]
@@ -428,6 +518,11 @@ mod tests {
     use crate::vmm_config::machine_config::{CpuFeaturesTemplate, VmConfig, VmConfigError};
     use crate::vmm_config::vsock::tests::{TempSockFile, default_config};
     use crate::vstate::VcpuConfig;
+    #[cfg(feature = "tee")]
+    use kbs_types::Tee;
+
+    #[cfg(feature = "tee")]
+    use super::TeeType;
     use utils::tempfile::TempFile;
 
     fn default_kernel_cmdline() -> KernelCmdlineConfig {
@@ -445,12 +540,23 @@ mod tests {
             kernel_cmdline: default_kernel_cmdline(),
             kernel_bundle: Default::default(),
             external_kernel: None,
+            #[cfg(feature = "tee")]
+            qboot_bundle: None,
+            #[cfg(feature = "tee")]
+            initrd_bundle: None,
+            #[cfg(not(feature = "tee"))]
             fs: Default::default(),
             vsock: Default::default(),
             #[cfg(feature = "blk")]
             block: Default::default(),
             #[cfg(feature = "net")]
             net: Default::default(),
+            #[cfg(feature = "tee")]
+            tee_config: Default::default(),
+            #[cfg(feature = "amd-sev")]
+            snp_host_data: [0; 32],
+            #[cfg(feature = "tdx")]
+            tdx_quote_generation_socket: None,
             gpu_virgl_flags: None,
             gpu_shm_size: None,
             #[cfg(feature = "gpu")]
@@ -461,6 +567,8 @@ mod tests {
             input_backends: Vec::new(),
             #[cfg(feature = "vhost-user")]
             vhost_user_devices: Vec::new(),
+            #[cfg(feature = "vfio")]
+            vfio_devices: Vec::new(),
             smbios_oem_strings: None,
             nested_enabled: false,
             split_irqchip: false,
@@ -527,6 +635,18 @@ mod tests {
             vm_resources.set_vm_config(&aux_vm_config),
             Err(VmConfigError::InvalidMemorySize)
         );
+    }
+
+    #[cfg(feature = "tee")]
+    #[test]
+    fn test_set_tee_type() {
+        let mut vm_resources = default_vm_resources();
+
+        vm_resources.set_tee_type(TeeType::Snp);
+        assert_eq!(vm_resources.tee_config().tee, Tee::Snp);
+
+        vm_resources.set_tee_type(TeeType::Tdx);
+        assert_eq!(vm_resources.tee_config().tee, Tee::Tdx);
     }
 
     #[test]

@@ -243,6 +243,9 @@ pub enum StartMicrovmError {
     ShmHostAddr(vm_memory::GuestMemoryError),
     /// The TEE specified is not supported.
     InvalidTee,
+    /// Cannot create or attach the VFIO PCI subsystem.
+    #[cfg(all(feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+    Vfio(device_manager::vfio::Error),
 }
 
 /// It's convenient to automatically convert `kernel::cmdline::Error`s
@@ -532,6 +535,8 @@ impl Display for StartMicrovmError {
             InvalidTee => {
                 write!(f, "TEE selected is not currently supported")
             }
+            #[cfg(all(feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+            Vfio(ref err) => write!(f, "Cannot initialize VFIO PCI devices: {err}"),
         }
     }
 }
@@ -598,6 +603,12 @@ pub fn build_microvm(
     )?;
 
     let vcpu_config = vm_resources.vcpu_config();
+
+    #[cfg(feature = "tdx")]
+    let quote_generator = vm_resources
+        .tdx_quote_generation_socket()
+        .cloned()
+        .map(crate::linux::tee::inteltdx::quote::QuoteGenerator::new);
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
@@ -670,7 +681,7 @@ pub fn build_microvm(
 
     #[cfg(all(feature = "tee", not(feature = "tdx")))]
     let measured_regions = {
-        println!("Injecting and measuring memory regions. This may take a while.");
+        eprintln!("Injecting and measuring memory regions. This may take a while.");
 
         let qboot_size = if let Some(qboot_bundle) = &vm_resources.qboot_bundle {
             qboot_bundle.size
@@ -722,17 +733,21 @@ pub fn build_microvm(
 
     #[cfg(feature = "tdx")]
     let measured_regions = {
-        println!("Injecting and measuring memory regions. This may take a while.");
+        eprintln!("Injecting and measuring memory regions. This may take a while.");
+        let low_memory_size = arch_memory_info
+            .ram_below_gap
+            .try_into()
+            .map_err(|_| StartMicrovmError::MissingKernelConfig)?;
         let qboot_size = if let Some(qboot_bundle) = &vm_resources.qboot_bundle {
             qboot_bundle.size
         } else {
             return Err(StartMicrovmError::MissingKernelConfig);
         };
-        let m = vec![
+        let mut regions = vec![
             MeasuredRegion {
                 guest_addr: 0,
                 host_addr: guest_memory.get_host_address(GuestAddress(0)).unwrap() as u64,
-                size: 0x8000_0000,
+                size: low_memory_size,
             },
             MeasuredRegion {
                 guest_addr: arch::FIRMWARE_START,
@@ -743,7 +758,21 @@ pub fn build_microvm(
             },
         ];
 
-        m
+        if arch_memory_info.ram_above_gap != 0 {
+            let guest_addr = arch::x86_64::layout::FIRST_ADDR_PAST_32BITS;
+            regions.push(MeasuredRegion {
+                guest_addr,
+                host_addr: guest_memory
+                    .get_host_address(GuestAddress(guest_addr))
+                    .unwrap() as u64,
+                size: arch_memory_info
+                    .ram_above_gap
+                    .try_into()
+                    .map_err(|_| StartMicrovmError::MissingKernelConfig)?,
+            });
+        }
+
+        regions
     };
 
     let mut serial_devices = Vec::new();
@@ -840,6 +869,8 @@ pub fn build_microvm(
 
     let vcpus;
     let intc: IrqChip;
+    #[cfg(all(feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+    let vfio_dma_manager;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
     #[cfg(target_arch = "x86_64")]
@@ -862,6 +893,19 @@ pub fn build_microvm(
             Some(intc.clone()),
         )?;
 
+        #[cfg(all(feature = "vfio", target_os = "linux"))]
+        {
+            vfio_dma_manager = device_manager::vfio::attach_devices(
+                vm.fd(),
+                &guest_memory,
+                &vm_resources.vfio_devices,
+                &mut pio_device_manager,
+                &mut mmio_device_manager,
+                cfg!(feature = "tee"),
+            )
+            .map_err(StartMicrovmError::Vfio)?;
+        }
+
         let kernel_boot = vm_resources.firmware_config.is_none() && !cfg!(feature = "tee");
 
         vcpus = create_vcpus_x86_64(
@@ -875,6 +919,8 @@ pub fn build_microvm(
             payload_config.pvh,
             #[cfg(feature = "tee")]
             _sender,
+            #[cfg(feature = "tdx")]
+            quote_generator,
         )
         .map_err(StartMicrovmError::Internal)?;
     }
@@ -1005,6 +1051,8 @@ pub fn build_microvm(
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
+        #[cfg(all(feature = "vfio", target_os = "linux", target_arch = "x86_64"))]
+        vfio_dma_manager,
         #[cfg(target_os = "macos")]
         vm_ctl_tx,
         #[cfg(target_os = "macos")]
@@ -1162,6 +1210,7 @@ pub fn build_microvm(
                         vmm.guest_memory(),
                         measured_regions,
                         snp_launcher.unwrap(),
+                        vm_resources.snp_host_data,
                     )
                     .map_err(StartMicrovmError::SecureVirtAttest)?;
             }
@@ -1169,7 +1218,7 @@ pub fn build_microvm(
             Tee::Tdx => {
                 vmm.kvm_vm()
                     .tdx_secure_virt_prepare_memory(&mut tdx_launcher, &measured_regions)
-                    .unwrap();
+                    .map_err(StartMicrovmError::SecureVirtPrepare)?;
                 vmm.kvm_vm()
                     .tdx_secure_virt_finalize_vm(tdx_launcher)
                     .map_err(StartMicrovmError::SecureVirtPrepare)?;
@@ -1177,7 +1226,7 @@ pub fn build_microvm(
             _ => return Err(StartMicrovmError::InvalidTee),
         }
 
-        println!("Starting TEE/microVM.");
+        eprintln!("Starting TEE/microVM.");
     }
 
     vmm.start_vcpus(vcpus)
@@ -1988,6 +2037,9 @@ fn create_vcpus_x86_64(
     kernel_boot: bool,
     pvh: bool,
     #[cfg(feature = "tee")] pm_sender: Sender<WorkerMessage>,
+    #[cfg(feature = "tdx")] quote_generator: Option<
+        crate::linux::tee::inteltdx::quote::QuoteGenerator,
+    >,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     for cpu_index in 0..vcpu_config.vcpu_count {
@@ -1998,8 +2050,14 @@ fn create_vcpus_x86_64(
             vm.supported_msrs().clone(),
             io_bus.clone(),
             exit_evt.try_clone().map_err(Error::EventFd)?,
-            #[cfg(feature = "tee")]
+            #[cfg(all(feature = "tee", not(feature = "tdx")))]
             pm_sender.clone(),
+            #[cfg(feature = "tdx")]
+            crate::vstate::TdxVcpuConfig {
+                pm_sender: pm_sender.clone(),
+                guest_memory: guest_mem.clone(),
+                quote_generator: quote_generator.clone(),
+            },
         )
         .map_err(Error::Vcpu)?;
 
@@ -2783,7 +2841,7 @@ fn attach_input_devices(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "tee")))]
 pub mod tests {
     use super::*;
     use crate::vmm_config::kernel_bundle::KernelBundle;
