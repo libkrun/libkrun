@@ -681,7 +681,7 @@ pub fn build_microvm(
 
     #[cfg(all(feature = "tee", not(feature = "tdx")))]
     let measured_regions = {
-        println!("Injecting and measuring memory regions. This may take a while.");
+        eprintln!("Injecting and measuring memory regions. This may take a while.");
 
         let qboot_size = if let Some(qboot_bundle) = &vm_resources.qboot_bundle {
             qboot_bundle.size
@@ -733,17 +733,21 @@ pub fn build_microvm(
 
     #[cfg(feature = "tdx")]
     let measured_regions = {
-        println!("Injecting and measuring memory regions. This may take a while.");
+        eprintln!("Injecting and measuring memory regions. This may take a while.");
+        let low_memory_size = arch_memory_info
+            .ram_below_gap
+            .try_into()
+            .map_err(|_| StartMicrovmError::MissingKernelConfig)?;
         let qboot_size = if let Some(qboot_bundle) = &vm_resources.qboot_bundle {
             qboot_bundle.size
         } else {
             return Err(StartMicrovmError::MissingKernelConfig);
         };
-        let m = vec![
+        let mut regions = vec![
             MeasuredRegion {
                 guest_addr: 0,
                 host_addr: guest_memory.get_host_address(GuestAddress(0)).unwrap() as u64,
-                size: 0x8000_0000,
+                size: low_memory_size,
             },
             MeasuredRegion {
                 guest_addr: arch::FIRMWARE_START,
@@ -754,7 +758,21 @@ pub fn build_microvm(
             },
         ];
 
-        m
+        if arch_memory_info.ram_above_gap != 0 {
+            let guest_addr = arch::x86_64::layout::FIRST_ADDR_PAST_32BITS;
+            regions.push(MeasuredRegion {
+                guest_addr,
+                host_addr: guest_memory
+                    .get_host_address(GuestAddress(guest_addr))
+                    .unwrap() as u64,
+                size: arch_memory_info
+                    .ram_above_gap
+                    .try_into()
+                    .map_err(|_| StartMicrovmError::MissingKernelConfig)?,
+            });
+        }
+
+        regions
     };
 
     let mut serial_devices = Vec::new();
@@ -1199,7 +1217,7 @@ pub fn build_microvm(
             Tee::Tdx => {
                 vmm.kvm_vm()
                     .tdx_secure_virt_prepare_memory(&mut tdx_launcher, &measured_regions)
-                    .unwrap();
+                    .map_err(StartMicrovmError::SecureVirtPrepare)?;
                 vmm.kvm_vm()
                     .tdx_secure_virt_finalize_vm(tdx_launcher)
                     .map_err(StartMicrovmError::SecureVirtPrepare)?;
@@ -1207,7 +1225,7 @@ pub fn build_microvm(
             _ => return Err(StartMicrovmError::InvalidTee),
         }
 
-        println!("Starting TEE/microVM.");
+        eprintln!("Starting TEE/microVM.");
     }
 
     vmm.start_vcpus(vcpus)
