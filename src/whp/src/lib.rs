@@ -346,7 +346,7 @@ impl WhpVm {
             unsafe { MaybeUninit::<WHV_PROCESSOR_FEATURES_BANKS>::zeroed().assume_init() }
         });
         if processor_features_banks.BanksCount >= 2 {
-            Self::set_property_optional(
+            let result = Self::set_property_optional(
                 handle,
                 WHvPartitionPropertyCodeProcessorFeaturesBanks,
                 |p| {
@@ -356,7 +356,22 @@ impl WhpVm {
                         p.ProcessorFeaturesBanks.Anonymous.AsUINT64[1] |= 0x2; // TscInvariantSupport
                     }
                 },
-            )?;
+            );
+
+            // Some Windows 10 WHP builds expose ProcessorFeaturesBanks but
+            // reject attempts to set the capability-derived value after the
+            // invariant-TSC bit is added. Invariant TSC is also advertised via
+            // CPUID below, so this optional refinement can be skipped safely.
+            const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+            match result {
+                Err(Error::SetPartitionProperty(hr)) if hr == E_INVALIDARG => {
+                    log::warn!(
+                        "processor features banks rejected by this WHP host; \
+                         skipping invariant-TSC partition property"
+                    );
+                }
+                other => other?,
+            }
         }
 
         // This unlocks the MSRs you are advertising in CPUID.
