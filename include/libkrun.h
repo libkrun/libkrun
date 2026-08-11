@@ -884,6 +884,18 @@ int32_t krun_set_tee_config_file(uint32_t ctx_id, const char *filepath);
 int32_t krun_set_tee_type(uint32_t ctx_id, uint32_t tee_type);
 
 /**
+ * Sets the exact 32-byte guest-owner commitment returned in the HOST_DATA
+ * field of every SEV-SNP attestation report for this VM. The value is copied.
+ * Only available in AMD SEV-SNP variants.
+ *
+ * Returns zero on success, -EINVAL for a null or non-32-byte input, -ENOENT
+ * when ctx_id does not exist, or -ENOTSUP in non-SNP builds.
+ */
+int32_t krun_set_snp_host_data(uint32_t ctx_id,
+                               const uint8_t *host_data,
+                               size_t host_data_len);
+
+/**
  * Sets the host Quote Generation Service Unix socket used to service the TDX
  * TDG.VP.VMCALL<GetQuote> interface. Only available in the TDX variant.
  *

@@ -849,10 +849,11 @@ impl Vm {
         guest_mem: &GuestMemoryMmap,
         measured_regions: Vec<MeasuredRegion>,
         launcher: snp::Launcher<snp::Started, RawFd, RawFd>,
+        host_data: [u8; 32],
     ) -> Result<()> {
         match &self.tee {
             Some(s) => s
-                .vm_measure(cpuid, guest_mem, measured_regions, launcher)
+                .vm_measure(cpuid, guest_mem, measured_regions, launcher, host_data)
                 .map_err(Error::SnpSecVirtAttest),
             None => Err(Error::InvalidTee),
         }

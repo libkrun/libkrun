@@ -246,6 +246,9 @@ pub struct VmResources {
     /// TEE configuration
     #[cfg(feature = "tee")]
     pub tee_config: TeeConfig,
+    /// Opaque guest-owner commitment included in every SEV-SNP report.
+    #[cfg(feature = "amd-sev")]
+    pub snp_host_data: [u8; 32],
     /// Intel QGS Unix socket used for TDX GetQuote requests.
     #[cfg(feature = "tdx")]
     pub tdx_quote_generation_socket: Option<PathBuf>,
@@ -470,6 +473,12 @@ impl VmResources {
         self.tee_config.tee = tee.into();
     }
 
+    /// Sets the guest-owner commitment included in SEV-SNP `HOST_DATA`.
+    #[cfg(feature = "amd-sev")]
+    pub fn set_snp_host_data(&mut self, host_data: [u8; 32]) {
+        self.snp_host_data = host_data;
+    }
+
     #[cfg(feature = "tdx")]
     pub fn set_tdx_quote_generation_socket(&mut self, socket: PathBuf) {
         self.tdx_quote_generation_socket = Some(socket);
@@ -544,6 +553,8 @@ mod tests {
             net: Default::default(),
             #[cfg(feature = "tee")]
             tee_config: Default::default(),
+            #[cfg(feature = "amd-sev")]
+            snp_host_data: [0; 32],
             #[cfg(feature = "tdx")]
             tdx_quote_generation_socket: None,
             gpu_virgl_flags: None,

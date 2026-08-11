@@ -1363,6 +1363,43 @@ pub extern "C" fn krun_set_tee_type(ctx_id: u32, tee_type: u32) -> i32 {
     KRUN_SUCCESS
 }
 
+/// Sets the 32-byte guest-owner commitment included in SEV-SNP `HOST_DATA`.
+///
+/// The firmware returns these exact bytes in every attestation report for the
+/// lifetime of the VM. The input is copied before this function returns.
+#[unsafe(no_mangle)]
+#[cfg(feature = "amd-sev")]
+pub unsafe extern "C" fn krun_set_snp_host_data(
+    ctx_id: u32,
+    host_data: *const u8,
+    host_data_len: usize,
+) -> i32 {
+    if host_data.is_null() || host_data_len != 32 {
+        return -libc::EINVAL;
+    }
+    let mut value = [0_u8; 32];
+    // SAFETY: the caller promises `host_data_len` readable bytes; the exact
+    // length was checked above and the destination has the same size.
+    unsafe { std::ptr::copy_nonoverlapping(host_data, value.as_mut_ptr(), value.len()) };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => ctx_cfg.get_mut().vmr.set_snp_host_data(value),
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+    KRUN_SUCCESS
+}
+
+/// Reports that SEV-SNP launch host data is unavailable in this build.
+#[unsafe(no_mangle)]
+#[cfg(not(feature = "amd-sev"))]
+pub unsafe extern "C" fn krun_set_snp_host_data(
+    _ctx_id: u32,
+    _host_data: *const u8,
+    _host_data_len: usize,
+) -> i32 {
+    -libc::ENOTSUP
+}
+
 /// Adds a pre-opened VFIO cdev as a cold-plugged PCI function.
 ///
 /// The file descriptor is duplicated with `F_DUPFD_CLOEXEC`; the caller may
@@ -3241,6 +3278,35 @@ mod tee_tests {
             assert_eq!(krun_set_tee_type(ctx_id, KRUN_TEE_TDX), KRUN_SUCCESS);
         }
 
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(feature = "amd-sev")]
+    #[test]
+    fn snp_host_data_is_copied_into_vm_resources() {
+        let ctx_id = krun_create_ctx();
+        assert!(ctx_id >= 0);
+        let ctx_id = ctx_id as u32;
+        let host_data = [0x5a_u8; 32];
+
+        assert_eq!(
+            unsafe { krun_set_snp_host_data(ctx_id, host_data.as_ptr(), host_data.len()) },
+            KRUN_SUCCESS
+        );
+        assert_eq!(
+            CTX_MAP
+                .lock()
+                .unwrap()
+                .get(&ctx_id)
+                .unwrap()
+                .vmr
+                .snp_host_data,
+            host_data
+        );
+        assert_eq!(
+            unsafe { krun_set_snp_host_data(ctx_id, host_data.as_ptr(), 31) },
+            -libc::EINVAL
+        );
         assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
     }
 

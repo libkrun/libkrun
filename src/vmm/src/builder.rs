@@ -1210,6 +1210,7 @@ pub fn build_microvm(
                         vmm.guest_memory(),
                         measured_regions,
                         snp_launcher.unwrap(),
+                        vm_resources.snp_host_data,
                     )
                     .map_err(StartMicrovmError::SecureVirtAttest)?;
             }
