@@ -27,8 +27,10 @@ use std::env;
 use std::ffi::CString;
 use std::ffi::{CStr, c_void};
 use std::fs::File;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+use std::io::Error;
 use std::io::IsTerminal;
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, target_arch = "x86_64", not(feature = "tee")))]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
@@ -489,18 +491,7 @@ pub unsafe extern "C" fn krun_init_log(target: RawFd, level: u32, style: u32, op
 
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_create_ctx() -> i32 {
-    let shutdown_efd = if cfg!(target_arch = "aarch64") && cfg!(target_os = "macos") {
-        Some(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap())
-    } else {
-        None
-    };
-
-    let ctx_cfg = {
-        ContextConfig {
-            shutdown_efd,
-            ..Default::default()
-        }
-    };
+    let ctx_cfg = ContextConfig::default();
 
     let ctx_id = CTX_IDS.fetch_add(1, Ordering::SeqCst);
     if ctx_id == i32::MAX || CTX_MAP.lock().unwrap().contains_key(&(ctx_id as u32)) {
@@ -1849,20 +1840,40 @@ pub unsafe extern "C" fn krun_set_console_output(ctx_id: u32, c_filepath: *const
     }
 }
 
-#[allow(unused_assignments)]
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn duplicate_eventfd(efd: &EventFd) -> Result<RawFd, i32> {
+    let fd = unsafe { libc::dup(efd.get_write_fd()) };
+    if fd < 0 {
+        Err(-Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+    } else {
+        Ok(fd)
+    }
+}
+
 #[unsafe(no_mangle)]
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
+
             if let Some(efd) = cfg.shutdown_efd.as_ref() {
-                #[cfg(target_os = "macos")]
-                return efd.get_write_fd();
-                #[cfg(target_os = "linux")]
-                return efd.as_raw_fd();
-            } else {
-                -libc::EINVAL
+                return match duplicate_eventfd(efd) {
+                    Ok(fd) => fd,
+                    Err(err) => err,
+                };
             }
+
+            let efd = match EventFd::new(utils::eventfd::EFD_NONBLOCK) {
+                Ok(efd) => efd,
+                Err(err) => return -err.raw_os_error().unwrap_or(libc::EIO),
+            };
+            let fd = match duplicate_eventfd(&efd) {
+                Ok(fd) => fd,
+                Err(err) => return err,
+            };
+            cfg.shutdown_efd = Some(efd);
+            fd
         }
         Entry::Vacant(_) => -libc::ENOENT,
     }
@@ -3160,5 +3171,40 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 
             -libc::EINVAL
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64", target_os = "macos"))]
+mod test_shutdown_eventfd {
+    use super::*;
+
+    #[test]
+    fn test_shutdown_eventfd_is_opt_in() {
+        let ctx = krun_create_ctx() as u32;
+
+        assert!(
+            CTX_MAP
+                .lock()
+                .unwrap()
+                .get(&ctx)
+                .unwrap()
+                .shutdown_efd
+                .is_none()
+        );
+
+        let fd = krun_get_shutdown_eventfd(ctx);
+        assert!(fd >= 0);
+        assert!(
+            CTX_MAP
+                .lock()
+                .unwrap()
+                .get(&ctx)
+                .unwrap()
+                .shutdown_efd
+                .is_some()
+        );
+
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+        assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
     }
 }

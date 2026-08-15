@@ -939,14 +939,16 @@ int32_t krun_add_vsock_port2(uint32_t ctx_id,
 int32_t krun_add_vsock(uint32_t ctx_id, uint32_t tsi_features);
 
 /**
- * Returns the eventfd file descriptor to signal the guest to shut down orderly. This must be
- * called before starting the microVM with "krun_start_event".
+ * Returns the eventfd file descriptor to signal the guest to shut down orderly. Calling this
+ * function enables the guest shutdown device for the context. This must be called before starting
+ * the microVM with "krun_start_enter". Only available on macOS/aarch64.
  *
  * Arguments:
  *  "ctx_id"    - the configuration context ID.
  *
  * Returns:
- *  The eventfd file descriptor or a negative error number on failure.
+ *  A new eventfd file descriptor owned by the caller, which must be closed, or a negative error
+ *  number on failure.
  */
 int32_t krun_get_shutdown_eventfd(uint32_t ctx_id);
 
