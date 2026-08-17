@@ -1307,23 +1307,13 @@ impl RutabagaContext for CrossDomainContext {
     }
 
     fn attach(&mut self, resource: &mut RutabagaResource) {
-        if resource.blob_mem == RUTABAGA_BLOB_MEM_GUEST {
-            self.context_resources.lock().unwrap().insert(
-                resource.resource_id,
-                CrossDomainResource {
-                    handle: None,
-                    backing_iovecs: resource.backing_iovecs.take(),
-                },
-            );
-        } else if let Some(ref handle) = resource.handle {
-            self.context_resources.lock().unwrap().insert(
-                resource.resource_id,
-                CrossDomainResource {
-                    handle: Some(handle.clone()),
-                    backing_iovecs: None,
-                },
-            );
-        }
+        self.context_resources.lock().unwrap().insert(
+            resource.resource_id,
+            CrossDomainResource {
+                handle: resource.handle.clone(),
+                backing_iovecs: resource.backing_iovecs.take(),
+            },
+        );
     }
 
     fn detach(&mut self, resource: &RutabagaResource) {
