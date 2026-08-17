@@ -3,7 +3,7 @@ use std::convert::TryInto;
 use std::io::Write;
 
 use utils::eventfd::EventFd;
-use vm_memory::{ByteValued, GuestMemory, GuestMemoryMmap};
+use vm_memory::{ByteValued, GuestMemoryBackend, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, BalloonError, DeviceQueue, DeviceState, QueueConfig,

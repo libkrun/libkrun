@@ -7,4 +7,4 @@ license = "Apache-2.0"
 repository = "https://github.com/containers/libkrun"
 
 [dependencies]
-vm-memory = { version = "0.17", default-features = false, features = ["backend-mmap"] }
+vm-memory = { version = "0.18", default-features = false, features = ["backend-mmap"] }
