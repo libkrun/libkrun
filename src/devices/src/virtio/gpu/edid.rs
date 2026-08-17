@@ -85,7 +85,7 @@ impl EdidInfo {
         populate_header(edid);
         populate_edid_version(edid);
         populate_size(edid, &self);
-        populate_standard_timings(edid);
+        populate_standard_timings(edid, &self);
 
         // 4 available descriptor blocks
         let block0 = &mut edid[54..72];
@@ -244,7 +244,7 @@ fn populate_header(edid: &mut [u8]) {
 
 // The standard timings are 8 timing modes with a lower priority (and different data format)
 // than the 4 detailed timing modes.
-fn populate_standard_timings(edid: &mut [u8]) {
+fn populate_standard_timings(edid: &mut [u8], info: &EdidInfo) {
     const fn aspect_ratio(width: u32, height: u32) -> (u32, u32) {
         let divisor = gcd(width, height);
         (width / divisor, height / divisor)
@@ -265,22 +265,28 @@ fn populate_standard_timings(edid: &mut [u8]) {
     }
 
     const RESOLUTIONS: [(u32, u32, u8); 8] = [
-        resolution(1440, 900),
-        resolution(1600, 900),
         resolution(800, 600),
-        resolution(1680, 1050),
-        resolution(1856, 1392),
         resolution(1280, 1024),
         resolution(1400, 1050),
+        resolution(1440, 900),
+        resolution(1600, 900),
+        resolution(1680, 1050),
+        resolution(1856, 1392),
         resolution(1920, 1200),
     ];
 
-    // Index 0 is horizontal pixels / 8 - 31
-    // Index 1 is a combination of the refresh_rate - 60 (so we are setting to 0, for now) and two
-    // bits for the aspect ratio.
-    for (index, (width, _height, aspect_ratio_bits)) in RESOLUTIONS.into_iter().enumerate() {
-        edid[0x26 + (index * 2)] = (width / 8 - 31) as u8;
-        edid[0x27 + (index * 2)] = aspect_ratio_bits;
+    let mut slot = 0;
+    for (width, height, aspect_ratio_bits) in RESOLUTIONS {
+        if width > info.width || height > info.height {
+            continue;
+        }
+        edid[0x26 + (slot * 2)] = (width / 8 - 31) as u8;
+        edid[0x27 + (slot * 2)] = aspect_ratio_bits;
+        slot += 1;
+    }
+    for i in slot..8 {
+        edid[0x26 + (i * 2)] = 0x01;
+        edid[0x27 + (i * 2)] = 0x01;
     }
 }
 
