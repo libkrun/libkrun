@@ -40,11 +40,11 @@ vmm = { package = "krun-vmm", version = "=0.1.0-2.0.0-dev", path = "../vmm" }
 hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
-kvm-ioctls = "0.24"
+kvm-bindings = { version = "0.14.1", features = ["fam-wrappers"] }
+kvm-ioctls = "0.25"
 aws-nitro = { package = "krun-aws-nitro", version = "=0.1.0-2.0.0-dev", path = "../aws_nitro", optional = true }
 nitro-enclaves = { version = "0.5.0", optional = true }
-vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
+vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = [

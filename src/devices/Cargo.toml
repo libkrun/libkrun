@@ -33,7 +33,7 @@ thiserror = { version = "2.0", optional = true }
 vhost = { version = "0.17", optional = true, features = ["vhost-user-frontend"] }
 vmm-sys-util = { version = "0.15", optional = true }
 virtio-bindings = "0.2.0"
-vm-memory = { version = "0.17", default-features = false, features = ["backend-mmap", "rawfd"] }
+vm-memory = { version = "0.18", default-features = false, features = ["backend-mmap", "rawfd"] }
 zerocopy = { version = "0.8.26", optional = true, features = ["derive"] }
 krun_display = { package = "krun-display", version = "0.1.0", path = "../display", optional = true, features = ["bindgen_clang_runtime"] }
 krun_input = { package = "krun-input", version = "0.1.0", path = "../input", features = ["bindgen_clang_runtime"], optional = true }
@@ -42,7 +42,7 @@ arch = { package = "krun-arch", version = "=0.1.0-2.0.0-dev", path = "../arch" }
 utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }
 polly = { package = "krun-polly", version = "=0.1.0-2.0.0-dev", path = "../polly" }
 rutabaga_gfx = { version = "0.1.85", features = ["virgl_renderer"], optional = true }
-imago = { version = "0.2.3", features = ["sync-wrappers", "vm-memory"] }
+imago = { version = "0.2.4", features = ["sync-wrappers", "vm-memory"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30.1", features = ["ioctl", "net", "poll", "socket", "fs"] }
@@ -54,8 +54,8 @@ lru = ">=0.9"
 [target.'cfg(target_os = "linux")'.dependencies]
 rutabaga_gfx = { version = "0.1.85", features = ["virgl_renderer"], optional = true }
 caps = "0.5.5"
-kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
-kvm-ioctls = "0.24"
+kvm-bindings = { version = "0.14.1", features = ["fam-wrappers"] }
+kvm-ioctls = "0.25"
 
 [target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
 vm-fdt = ">= 0.2.0"

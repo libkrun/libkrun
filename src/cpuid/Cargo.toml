@@ -14,5 +14,5 @@ tdx = []
 vmm-sys-util = "0.15"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
-kvm-ioctls = "0.24"
+kvm-bindings = { version = "0.14.1", features = ["fam-wrappers"] }
+kvm-ioctls = "0.25"

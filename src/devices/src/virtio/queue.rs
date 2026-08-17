@@ -11,8 +11,8 @@ use std::num::Wrapping;
 use std::sync::atomic::{Ordering, fence};
 use virtio_bindings::virtio_ring::VRING_USED_F_NO_NOTIFY;
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap,
-    VolatileMemoryError,
+    Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryError,
+    GuestMemoryMmap, VolatileMemoryError,
 };
 
 /// Size of used ring header: flags (u16) + idx (u16)

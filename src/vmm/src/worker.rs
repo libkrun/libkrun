@@ -16,7 +16,7 @@ use libc::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, MADV_DONTNEED, fallocate, 
 use std::ffi::c_void;
 #[cfg(all(feature = "tee", target_arch = "x86_64"))]
 use vm_memory::{
-    Address, GuestAddress, GuestMemoryRegion, MemoryRegionAddress, guest_memory::GuestMemory,
+    Address, GuestAddress, GuestMemoryRegion, MemoryRegionAddress, guest_memory::GuestMemoryBackend,
 };
 
 pub fn start_worker_thread(

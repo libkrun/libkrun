@@ -28,7 +28,7 @@ use vhost::vhost_user::{
     VhostUserProtocolFeatures,
 };
 use vhost::{VhostBackend, VhostUserMemoryRegionInfo, VringConfigData};
-use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Address, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
 use vmm_sys_util::eventfd::EventFd as VhostEventFd;
 
 use crate::display::DisplayInfo;

@@ -117,7 +117,7 @@ use vm_memory::Bytes;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
 use vm_memory::FileOffset;
 #[cfg(not(feature = "aws-nitro"))]
-use vm_memory::GuestMemory;
+use vm_memory::GuestMemoryBackend;
 #[cfg(feature = "tdx")]
 use vm_memory::GuestMemoryRegion;
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
@@ -224,7 +224,7 @@ pub enum StartMicrovmError {
     RegisterConsoleDevice(device_manager::mmio::Error),
     /// Cannot register SIGWINCH event file descriptor.
     #[cfg(target_os = "linux")]
-    RegisterFsSigwinch(kvm_ioctls::Error),
+    RegisterFsSigwinch(vmm_sys_util::errno::Error),
     /// Cannot initialize a MMIO Gpu device or add a device to the MMIO Bus.
     RegisterGpuDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Input device or add a device to the MMIO Bus.

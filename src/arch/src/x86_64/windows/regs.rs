@@ -134,7 +134,7 @@ mod tests {
     use super::*;
     use std::ffi::c_void;
     use std::sync::Arc;
-    use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
     use whp::{WhpVcpu, WhpVm};
 
     const GUEST_MEM_SIZE: usize = 0x10000;

@@ -9,7 +9,7 @@ use std::mem;
 
 use super::gdt::{SegmentDescriptor, gdt_entry, segment_from_gdt};
 
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 // Initial pagetables.
 pub const PML4_START: u64 = 0x9000;
