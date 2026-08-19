@@ -281,7 +281,7 @@ fn populate_standard_timings(edid: &mut [u8], info: &EdidInfo) {
             continue;
         }
         edid[0x26 + (slot * 2)] = (width / 8 - 31) as u8;
-        edid[0x27 + (slot * 2)] = aspect_ratio_bits;
+        edid[0x27 + (slot * 2)] = aspect_ratio_bits << 6;
         slot += 1;
     }
     for i in slot..8 {
