@@ -495,7 +495,7 @@ impl Queue {
         self.next_avail -= Wrapping(1);
     }
 
-    pub fn add_used(
+    fn add_used_elem(
         &mut self,
         mem: &GuestMemoryMmap,
         head_index: u16,
@@ -519,7 +519,10 @@ impl Queue {
 
         self.next_used += Wrapping(1);
         self.num_added += Wrapping(1);
+        Ok(())
+    }
 
+    fn publish_used(&self, mem: &GuestMemoryMmap) -> Result<(), Error> {
         mem.store(
             self.next_used.0,
             self.used_ring
@@ -530,6 +533,31 @@ impl Queue {
         .map_err(Error::GuestMemory)
     }
 
+    /// Add multiple used descriptor chains to the used ring and publish the updated
+    /// index to the guest with a single atomic Release store.
+    pub fn add_used_many<I>(&mut self, mem: &GuestMemoryMmap, iter: I) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = (u16, u32)>,
+    {
+        let mut added = false;
+        for (head_index, len) in iter {
+            self.add_used_elem(mem, head_index, len)?;
+            added = true;
+        }
+        if added {
+            self.publish_used(mem)?;
+        }
+        Ok(())
+    }
+
+    pub fn add_used(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        head_index: u16,
+        len: u32,
+    ) -> Result<(), Error> {
+        self.add_used_many(mem, [(head_index, len)])
+    }
     // Return the value present in the used_event field of the avail ring.
     //
     // If the VIRTIO_F_EVENT_IDX feature bit is not negotiated, the flags field in the available
@@ -1135,5 +1163,25 @@ pub(crate) mod tests {
         let x = vq.used.ring[0].get();
         assert_eq!(x.id, 1);
         assert_eq!(x.len, 0x1000);
+    }
+
+    #[test]
+    fn test_add_used_many() {
+        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+
+        let mut q = vq.create_queue();
+        assert_eq!(vq.used.idx.get(), 0);
+
+        let entries = [(0u16, 0x100u32), (1u16, 0x200u32), (2u16, 0x300u32)];
+        q.add_used_many(m, entries).unwrap();
+        assert_eq!(vq.used.idx.get(), 3);
+        assert_eq!(q.next_used, Wrapping(3));
+
+        for (i, (expected_id, expected_len)) in entries.iter().enumerate() {
+            let elem = vq.used.ring[i].get();
+            assert_eq!(elem.id, *expected_id as u32);
+            assert_eq!(elem.len, *expected_len);
+        }
     }
 }
