@@ -38,11 +38,12 @@ pub enum ConnectError {
 #[derive(Debug)]
 pub enum ReadError {
     /// Nothing was written
+    #[cfg(windows)]
     NothingRead,
     /// The guest queue ran out of available descriptors
     #[cfg(windows)]
     DescriptorStarvation,
-    #[cfg(windows)]
+    /// Backend process not running (EPIPE)
     ProcessNotRunning,
     #[cfg(windows)]
     Queue(crate::virtio::queue::Error),
@@ -53,22 +54,34 @@ pub enum ReadError {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum WriteError {
-    /// Nothing was written, you can drop the frame or try to resend it later
-    NothingWritten,
-    /// Part of the buffer was written, the write has to be finished using try_finish_write
-    PartialWrite,
-    /// Passt doesnt seem to be running (received EPIPE)
+    /// Backend process not running (EPIPE)
     ProcessNotRunning,
+    /// Nothing was written (e.g. ENOBUFS on macOS); caller should retry later.
+    NothingWritten,
     /// Another internal error occurred
     Internal(SysError),
 }
 
 #[cfg(unix)]
+/// Network backend trait.
+///
+/// Backends own both the socket and the queue consumers. The send/recv methods
+/// operate on internal queues. EAGAIN is not an error - it just means nothing
+/// happened this call.
 pub trait NetBackend {
-    fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError>;
-    fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError>;
-    fn has_unfinished_write(&self) -> bool;
-    fn try_finish_write(&mut self, hdr_len: usize, buf: &[u8]) -> Result<(), WriteError>;
+    /// Send pending frames from the TX queue to the network.
+    ///
+    /// Pulls frames from internal TxQueueConsumer and sends using batched I/O.
+    /// EAGAIN returns Ok(()) - pending frames kept for retry.
+    fn send(&mut self) -> Result<(), WriteError>;
+
+    /// Receive frames from the network into the RX queue.
+    ///
+    /// Reads from socket into internal RxQueueProvider.
+    /// EAGAIN returns Ok(()).
+    fn recv(&mut self) -> Result<(), ReadError>;
+
+    /// Returns the raw socket fd for epoll registration.
     fn raw_socket_fd(&self) -> RawFd;
 
     /// Delay in microseconds before retrying after NothingWritten.

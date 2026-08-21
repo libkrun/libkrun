@@ -101,7 +101,7 @@ impl<'s, 'iov> IovecAppender<'s, 'iov> {
     pub fn reserve(&mut self, count: usize) -> bool {
         assert!(self.reserved == 0, "reserve() called twice");
         let cap = self.storage.buf.len();
-        let phys_tail = self.storage.abs_tail % cap;
+        let phys_tail = self.storage.abs_tail & self.storage.mask;
         if phys_tail + count > cap {
             // wrap to physical 0 — the gap is dead space
             self.storage.abs_tail += cap - phys_tail;
@@ -167,6 +167,7 @@ impl<'s, 'iov> IovecAppender<'s, 'iov> {
 /// is reclaimed when the chain is released.
 pub(crate) struct IovecStorage {
     buf: Box<[RawAliasedIoSlice]>,
+    mask: usize,
     /// Monotonically increasing logical head / tail.
     abs_head: usize,
     abs_tail: usize,
@@ -178,8 +179,10 @@ unsafe impl Send for IovecStorage {}
 
 impl IovecStorage {
     pub(crate) fn with_capacity(cap: usize) -> Self {
+        let cap = cap.next_power_of_two();
         Self {
             buf: vec![RawAliasedIoSlice::zeroed(); cap].into_boxed_slice(),
+            mask: cap - 1,
             abs_head: 0,
             abs_tail: 0,
         }
@@ -190,7 +193,7 @@ impl IovecStorage {
     }
 
     pub(crate) fn push(&mut self, iov: RawAliasedIoSlice) {
-        let phys = self.abs_tail % self.buf.len();
+        let phys = self.abs_tail & self.mask;
         self.buf[phys] = iov;
         self.abs_tail += 1;
     }
@@ -200,7 +203,7 @@ impl IovecStorage {
             return &[];
         }
         let cap = self.buf.len();
-        let start = range.start % cap;
+        let start = range.start & self.mask;
         let len = range.end - range.start;
         assert!(
             start + len <= cap,
@@ -216,7 +219,7 @@ impl IovecStorage {
             return &mut [];
         }
         let cap = self.buf.len();
-        let start = range.start % cap;
+        let start = range.start & self.mask;
         let len = range.end - range.start;
         assert!(
             start + len <= cap,

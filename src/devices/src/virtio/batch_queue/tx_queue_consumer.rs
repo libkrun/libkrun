@@ -16,21 +16,28 @@ use super::{IovecAppender, IovecStorage, WorkItem, WorkItemState, raw_as_io_slic
 /// Implements `ExactSizeIterator` so the transform can call `.len()` to know
 /// how many iovecs to reserve before pushing.
 pub struct ReadableChainIter<'a> {
+    head_index: u16,
     inner: DescIter<'a>,
     remaining: usize,
 }
 
 impl<'a> ReadableChainIter<'a> {
     fn new(head: DescriptorChain<'a>) -> Self {
+        let head_index = head.index;
         let remaining = head
             .clone()
             .into_iter()
             .filter(DescriptorChain::is_read_only)
             .count();
         Self {
+            head_index,
             inner: head.into_iter(),
             remaining,
         }
+    }
+
+    pub fn head_index(&self) -> u16 {
+        self.head_index
     }
 }
 
@@ -131,8 +138,6 @@ impl<T: WorkItemState> TxQueueConsumer<T> {
             let allocation = alloc_start..live.end;
 
             let item = WorkItem::new(head_index, max_bytes, 0, allocation, live);
-            let mut state = state;
-            state.set_iovecs(item.raw_slice(&self.iovecs));
             self.work_items.push(item);
             self.transformed.push(state);
 
@@ -173,6 +178,11 @@ impl<T: WorkItemState> TxQueueConsumer<T> {
     {
         if !self.has_pending() {
             return 0;
+        }
+
+        for i in self.head..self.work_items.len() {
+            let item = &self.work_items[i];
+            self.transformed[i].set_iovecs(item.raw_slice(&self.iovecs));
         }
 
         let finished_count;
@@ -268,6 +278,40 @@ impl<T: WorkItemState> TxConsumerBatch<'_, T> {
     pub fn io_slices(&self, index: usize) -> &[AliasedIoSlice<'_>] {
         self.assert_not_finished(index);
         raw_as_io_slices(self.work_items[index].raw_slice(self.iovecs))
+    }
+
+    /// Returns a contiguous slice of iovecs starting from chain `start_chain`
+    /// spanning as many contiguous chains as possible (up to `max_iovecs`).
+    /// Returns `(&[AliasedIoSlice], chains_spanned)`.
+    pub fn contiguous_io_slices(
+        &self,
+        start_chain: usize,
+        max_iovecs: usize,
+    ) -> (&[AliasedIoSlice<'_>], usize) {
+        if start_chain >= self.work_items.len() {
+            return (&[], 0);
+        }
+        self.assert_not_finished(start_chain);
+        let first_live = &self.work_items[start_chain].live;
+        if first_live.is_empty() {
+            return (&[], 1);
+        }
+        let start_pos = first_live.start;
+        let mut end_pos = first_live.end;
+        let mut chains = 1;
+
+        while start_chain + chains < self.work_items.len() && (end_pos - start_pos) < max_iovecs {
+            let next_item = &self.work_items[start_chain + chains];
+            if next_item.live.start == end_pos && (next_item.live.end - start_pos) <= max_iovecs {
+                end_pos = next_item.live.end;
+                chains += 1;
+            } else {
+                break;
+            }
+        }
+
+        let slice = raw_as_io_slices(self.iovecs.slice(start_pos..end_pos));
+        (slice, chains)
     }
 
     pub fn transformed(&self, range: Range<usize>) -> &[T] {

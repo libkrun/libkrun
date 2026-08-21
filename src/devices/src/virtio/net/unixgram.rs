@@ -1,21 +1,32 @@
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
+#[cfg(target_os = "macos")]
+use libc::c_int;
+use libc::iovec;
+#[cfg(target_os = "linux")]
+use libc::mmsghdr;
 use nix::sys::socket::{
-    AddressFamily, MsgFlags, SockFlag, SockType, UnixAddr, bind, connect, getsockopt, recv, send,
+    AddressFamily, MsgFlags, SockFlag, SockType, UnixAddr, bind, connect, getsockopt, send,
     setsockopt, socket, sockopt,
 };
-use nix::unistd::unlink;
+use std::fs::remove_file;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicU32, Ordering};
+use utils::fd::SetNonblockingExt;
+use vm_memory::GuestMemoryMmap;
 
 use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
-use super::write_virtio_net_hdr;
+use crate::virtio::InterruptTransport;
+use crate::virtio::batch_queue::aliased_ioslice::{
+    AliasedIoSlice, AliasedIoSliceMut, AnyIoSlice, RawAliasedIoSlice,
+};
+use crate::virtio::batch_queue::{ReceivedBytes, RxQueueProducer, TxQueueConsumer, WorkItemState};
+use crate::virtio::queue::Queue;
+
 #[cfg(target_os = "macos")]
-use super::{MAX_BUFFER_SIZE, VNET_HDR_LEN};
+use super::socket_x::msghdr_x;
 
 const VFKIT_MAGIC: [u8; 4] = *b"VFKT";
-
 /// Per-process counter to generate unique local unixgram socket filenames.
 ///
 /// The local socket is placed in the same directory as the peer using a short
@@ -24,39 +35,126 @@ const VFKIT_MAGIC: [u8; 4] = *b"VFKT";
 /// the local path within macOS's 104-byte unix socket limit.
 static NET_SOCK_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-const DEFAULT_SOCKET_BUF_SIZE: usize = 7 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+type RawMsgHdr = mmsghdr;
 
-// On macOS, with UNIX datagram sockets the send buffer is not used for queuing;
-// it determines the maximum frame size.
-// https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/uipc_usrreq.c#L953
 #[cfg(target_os = "macos")]
-const SOCKET_SNDBUF: usize = MAX_BUFFER_SIZE - VNET_HDR_LEN;
+type RawMsgHdr = msghdr_x;
 
-#[cfg(not(target_os = "macos"))]
-const SOCKET_SNDBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MacosSendRecvMode {
+    /// Plain sendmsg/recvmsg, one packet at a time in a loop.
+    Plain,
+    /// sendmsg_x/recvmsg_x with configurable max batch size.
+    Batched { max_batch: usize },
+    /// Flatten iovecs into a contiguous buffer, then use plain send/recv.
+    Copied,
+}
 
-const SOCKET_RCVBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
+#[cfg(target_os = "macos")]
+const MACOS_MODE: MacosSendRecvMode = MacosSendRecvMode::Batched { max_batch: 32 };
+
+/// Busy-loop iterations after each finish() call (0 = no delay).
+/// Gives the guest CPU time to reclaim used buffers.
+#[cfg(target_os = "macos")]
+const FINISH_SPIN_ITERS: u32 = 0;
+
+/// User-owned syscall header state aligned with the batch queue's work items.
+#[repr(transparent)]
+pub struct MsgHdrItem(RawMsgHdr);
+
+unsafe impl Send for MsgHdrItem {}
+
+impl Default for MsgHdrItem {
+    #[cfg(target_os = "linux")]
+    fn default() -> Self {
+        Self(unsafe { std::mem::zeroed() })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn default() -> Self {
+        Self(msghdr_x::default())
+    }
+}
+
+impl WorkItemState for MsgHdrItem {
+    fn set_iovecs(&mut self, iovecs: &[RawAliasedIoSlice]) {
+        let ptr = if iovecs.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            iovecs.as_ptr() as *mut iovec
+        };
+
+        #[cfg(target_os = "linux")]
+        {
+            self.0.msg_hdr.msg_iov = ptr;
+            self.0.msg_hdr.msg_iovlen = iovecs.len();
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            self.0.msg_iov = ptr;
+            self.0.msg_iovlen = iovecs.len() as c_int;
+        }
+    }
+}
+
+impl ReceivedBytes for MsgHdrItem {
+    #[cfg(target_os = "linux")]
+    #[inline]
+    fn received_bytes(&self) -> usize {
+        self.0.msg_len as usize
+    }
+
+    #[cfg(target_os = "macos")]
+    #[inline]
+    fn received_bytes(&self) -> usize {
+        self.0.msg_datalen
+    }
+}
 
 pub struct Unixgram {
     fd: OwnedFd,
-    retries: u64,
+    interrupt: InterruptTransport,
+    tx_consumer: TxQueueConsumer<MsgHdrItem>,
+    rx_producer: RxQueueProducer<MsgHdrItem>,
+    local_path: Option<PathBuf>,
+}
+
+impl Drop for Unixgram {
+    fn drop(&mut self) {
+        if let Some(path) = &self.local_path {
+            _ = remove_file(path);
+        }
+    }
 }
 
 impl Unixgram {
     /// Create the backend with a pre-established connection to the userspace network proxy.
-    pub fn new(fd: OwnedFd) -> Self {
+    pub fn new(
+        fd: OwnedFd,
+        tx_queue: Queue,
+        rx_queue: Queue,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+    ) -> Self {
+        Self::new_with_path(fd, tx_queue, rx_queue, mem, interrupt, None)
+    }
+
+    fn new_with_path(
+        fd: OwnedFd,
+        tx_queue: Queue,
+        rx_queue: Queue,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        local_path: Option<PathBuf>,
+    ) -> Self {
         // Ensure the socket is in non-blocking mode.
-        match fcntl(&fd, FcntlArg::F_GETFL) {
-            Ok(flags) => match OFlag::from_bits(flags) {
-                Some(flags) => {
-                    if let Err(e) = fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)) {
-                        warn!("error switching to non-blocking: id={fd:?}, err={e}");
-                    }
-                }
-                None => error!("invalid fd flags id={fd:?}"),
-            },
-            Err(e) => error!("couldn't obtain fd flags id={fd:?}, err={e}"),
-        };
+        if let Err(e) = fd.set_nonblocking(true) {
+            log::error!("Failed to set O_NONBLOCK on unixgram socket: {e}");
+        }
 
         #[cfg(target_os = "macos")]
         {
@@ -73,11 +171,40 @@ impl Unixgram {
             };
         }
 
-        Self { fd, retries: 0 }
+        #[cfg(target_os = "macos")]
+        let sndbuf_size: usize = super::MAX_BUFFER_SIZE - super::vnet_hdr_len();
+        #[cfg(not(target_os = "macos"))]
+        let sndbuf_size: usize = 7 * 1024 * 1024;
+
+        if let Err(e) = setsockopt(&fd, sockopt::SndBuf, &sndbuf_size) {
+            log::warn!("Failed to set SO_SNDBUF: {e}");
+        }
+        if let Err(e) = setsockopt(&fd, sockopt::RcvBuf, &(7 * 1024 * 1024)) {
+            log::warn!("Failed to set SO_RCVBUF: {e}");
+        }
+
+        let iovec_capacity = tx_queue.size as usize * 2;
+        let tx_consumer = TxQueueConsumer::new(tx_queue, mem.clone(), iovec_capacity);
+        let rx_producer = RxQueueProducer::new(rx_queue, mem, iovec_capacity);
+
+        Self {
+            fd,
+            interrupt,
+            tx_consumer,
+            rx_producer,
+            local_path,
+        }
     }
 
     /// Create the backend opening a connection to the userspace network proxy.
-    pub fn open(path: PathBuf, send_vfkit_magic: bool) -> Result<Self, ConnectError> {
+    pub fn open(
+        path: PathBuf,
+        send_vfkit_magic: bool,
+        tx_queue: Queue,
+        rx_queue: Queue,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+    ) -> Result<Self, ConnectError> {
         // We cannot create a non-blocking socket on macOS here. This is done later in new().
         let fd = socket(
             AddressFamily::Unix,
@@ -95,7 +222,7 @@ impl Unixgram {
         let local_path = std::env::temp_dir().join(&socket_name);
         let local_addr = UnixAddr::new(&local_path).map_err(ConnectError::InvalidAddress)?;
         if let Some(path) = local_addr.path() {
-            _ = unlink(path);
+            _ = remove_file(path);
         }
         bind(fd.as_raw_fd(), &local_addr).map_err(ConnectError::Binding)?;
 
@@ -108,10 +235,15 @@ impl Unixgram {
                 .map_err(ConnectError::SendingMagic)?;
         }
 
-        if let Err(e) = setsockopt(&fd, sockopt::SndBuf, &SOCKET_SNDBUF) {
+        #[cfg(target_os = "macos")]
+        let sndbuf_size: usize = super::MAX_BUFFER_SIZE - super::vnet_hdr_len();
+        #[cfg(not(target_os = "macos"))]
+        let sndbuf_size: usize = 7 * 1024 * 1024;
+
+        if let Err(e) = setsockopt(&fd, sockopt::SndBuf, &sndbuf_size) {
             log::warn!("Failed to set SO_SNDBUF: {e}");
         }
-        if let Err(e) = setsockopt(&fd, sockopt::RcvBuf, &SOCKET_RCVBUF) {
+        if let Err(e) = setsockopt(&fd, sockopt::RcvBuf, &(7 * 1024 * 1024)) {
             log::warn!("Failed to set SO_RCVBUF: {e}");
         }
 
@@ -121,60 +253,122 @@ impl Unixgram {
             getsockopt(&fd, sockopt::RcvBuf)
         );
 
-        Ok(Self::new(fd))
+        Ok(Self::new_with_path(
+            fd,
+            tx_queue,
+            rx_queue,
+            mem,
+            interrupt,
+            Some(local_path),
+        ))
     }
 }
 
 impl NetBackend for Unixgram {
-    /// Try to read a frame the proxy. If no bytes are available reports ReadError::NothingRead
-    fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
-        let hdr_len = write_virtio_net_hdr(buf);
-        let frame_length = match recv(self.fd.as_raw_fd(), &mut buf[hdr_len..], MsgFlags::empty()) {
-            Ok(f) => f,
-            #[allow(unreachable_patterns)]
-            Err(nix::Error::EAGAIN | nix::Error::EWOULDBLOCK) => {
-                return Err(ReadError::NothingRead);
-            }
-            Err(e) => {
-                return Err(ReadError::Internal(e));
-            }
-        };
-        debug!("Read eth frame from proxy: {frame_length} bytes");
-        Ok(hdr_len + frame_length)
-    }
+    fn send(&mut self) -> Result<(), WriteError> {
+        let skip = super::vnet_hdr_len();
 
-    /// Try to write a frame to the proxy.
-    fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
-        let ret = match send(self.fd.as_raw_fd(), &buf[hdr_len..], MsgFlags::empty()) {
-            Ok(ret) => ret,
-            // macOS returns ENOBUFS when the kernel socket buffer is full,
-            // rather than blocking or returning EAGAIN on non-blocking sockets.
-            Err(nix::Error::ENOBUFS) => {
-                if self.retries == 0 {
-                    info!("write_frame: ENOBUFS");
+        let mut total_sent = 0;
+
+        self.tx_consumer.disable_notification();
+
+        loop {
+            self.tx_consumer.feed_with_transform(|iovecs, out| {
+                if !out.reserve(iovecs.len()) {
+                    return None;
                 }
-                self.retries += 1;
-                return Err(WriteError::NothingWritten);
+                out.extend(AliasedIoSlice::skip_bytes(iovecs, skip));
+                Some(MsgHdrItem::default())
+            });
+
+            if !self.tx_consumer.has_pending() {
+                if self.tx_consumer.enable_notification() {
+                    self.tx_consumer.disable_notification();
+                    continue;
+                }
+                break;
             }
-            Err(e) => return Err(WriteError::Internal(e)),
-        };
-        if self.retries > 0 {
-            info!(
-                "write_frame: ENOBUFS resolved after {} retries",
-                self.retries
-            );
-            self.retries = 0;
+
+            #[cfg(target_os = "linux")]
+            let send_result = self.send_linux();
+
+            #[cfg(target_os = "macos")]
+            let send_result = self.send_macos();
+
+            let sent = match send_result {
+                Ok(sent) => sent,
+                Err(WriteError::NothingWritten) => {
+                    if total_sent > 0 && self.tx_consumer.needs_notification() {
+                        self.interrupt.signal_used_queue();
+                    }
+                    return Err(WriteError::NothingWritten);
+                }
+                Err(e) => return Err(e),
+            };
+
+            total_sent += sent;
+
+            // Socket fully blocked — wait for EPOLLOUT.
+            if sent == 0 {
+                break;
+            }
         }
-        debug!("Written eth frame to proxy: {ret} bytes");
+
+        if total_sent > 0 && self.tx_consumer.needs_notification() {
+            self.interrupt.signal_used_queue();
+        }
+
+        if total_sent == 0 && self.tx_consumer.has_pending() {
+            return Err(WriteError::NothingWritten);
+        }
+
         Ok(())
     }
 
-    fn has_unfinished_write(&self) -> bool {
-        false
-    }
+    fn recv(&mut self) -> Result<(), ReadError> {
+        let vnet_offset = super::vnet_hdr_len();
+        let mut total_finished = 0;
 
-    fn try_finish_write(&mut self, _hdr_len: usize, _buf: &[u8]) -> Result<(), WriteError> {
-        // The unixgram backend doesn't do partial writes.
+        self.rx_producer.disable_notification();
+
+        loop {
+            self.rx_producer.feed_with_transform(|iovecs, out| {
+                if !out.reserve(iovecs.len()) {
+                    return None;
+                }
+                out.extend(AliasedIoSliceMut::write_prefix(
+                    iovecs,
+                    &super::DEFAULT_VNET_HDR[..vnet_offset],
+                ));
+                let max_bytes = out.total_bytes() + vnet_offset;
+                Some((max_bytes, MsgHdrItem::default()))
+            });
+
+            if !self.rx_producer.has_pending() {
+                if self.rx_producer.enable_notification() {
+                    self.rx_producer.disable_notification();
+                    continue;
+                }
+                break;
+            }
+
+            #[cfg(target_os = "linux")]
+            let finished = self.recv_linux();
+
+            #[cfg(target_os = "macos")]
+            let finished = self.recv_macos();
+
+            total_finished += finished;
+            // If we still have pending buffers in the producer, we assume we drained the whole socket
+            if finished == 0 {
+                break;
+            }
+        }
+
+        if total_finished > 0 && self.rx_producer.needs_notification() {
+            self.interrupt.signal_used_queue();
+        }
+
         Ok(())
     }
 
@@ -185,5 +379,279 @@ impl NetBackend for Unixgram {
     #[cfg(target_os = "macos")]
     fn write_retry_delay_us(&self) -> u64 {
         50
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Unixgram {
+    fn send_linux(&mut self) -> Result<usize, WriteError> {
+        let fd = self.fd.as_raw_fd();
+
+        let sent = self.tx_consumer.consume(|batch| {
+            let len = batch.len();
+            let headers = batch.transformed(0..len);
+            let ptr = headers.as_ptr() as *mut mmsghdr;
+
+            let ret = unsafe { libc::sendmmsg(fd, ptr, len as libc::c_uint, libc::MSG_DONTWAIT) };
+
+            if ret < 0 {
+                let err = nix::errno::Errno::last();
+                if err != nix::errno::Errno::EAGAIN {
+                    log::error!("sendmmsg failed: {err}");
+                }
+                return;
+            }
+
+            batch.finish_many(0..ret as usize);
+        });
+
+        Ok(sent)
+    }
+
+    fn recv_linux(&mut self) -> usize {
+        let fd = self.fd.as_raw_fd();
+
+        self.rx_producer.produce(|batch| {
+            let len = batch.len();
+            let ret = {
+                let headers = batch.transformed_mut(0..len);
+                let ptr = headers.as_mut_ptr() as *mut mmsghdr;
+                unsafe {
+                    libc::recvmmsg(
+                        fd,
+                        ptr,
+                        len as libc::c_uint,
+                        libc::MSG_DONTWAIT,
+                        std::ptr::null_mut(),
+                    )
+                }
+            };
+
+            match ret {
+                n if n > 0 => {
+                    batch.complete_received_many(0..n as usize);
+                }
+                0 => log::warn!("recvmmsg returned 0 (unexpected)"),
+                _ => {
+                    let err = nix::errno::Errno::last();
+                    if err != nix::errno::Errno::EAGAIN {
+                        log::error!("recvmmsg failed: {err}");
+                    }
+                }
+            }
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Unixgram {
+    fn send_macos(&mut self) -> Result<usize, WriteError> {
+        let fd = self.fd.as_raw_fd();
+
+        let sent = self.tx_consumer.consume(|batch| match MACOS_MODE {
+            MacosSendRecvMode::Plain => {
+                for i in 0..batch.len() {
+                    let slices = batch.io_slices(i);
+                    if slices.is_empty() {
+                        batch.finish(i);
+                        continue;
+                    }
+                    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+                    hdr.msg_iov = AliasedIoSlice::as_iovec_ptr(slices) as *mut libc::iovec;
+                    hdr.msg_iovlen = slices.len() as _;
+                    let ret = unsafe { libc::sendmsg(fd, &hdr, libc::MSG_DONTWAIT) };
+                    if ret < 0 {
+                        let err = nix::errno::Errno::last();
+                        if err != nix::errno::Errno::ENOBUFS && err != nix::errno::Errno::EAGAIN {
+                            log::error!("sendmsg failed: {err:?}");
+                        }
+                        return;
+                    }
+                    batch.finish(i);
+                    for _ in 0..FINISH_SPIN_ITERS {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+            MacosSendRecvMode::Batched { max_batch } => {
+                let mut i = 0;
+                while i < batch.len() {
+                    let chunk = max_batch.min(batch.len() - i);
+                    let headers = batch.transformed(i..i + chunk);
+                    let ptr = headers.as_ptr() as *const super::socket_x::msghdr_x;
+
+                    let ret = unsafe {
+                        super::socket_x::sendmsg_x(
+                            fd,
+                            ptr,
+                            chunk as libc::c_uint,
+                            libc::MSG_DONTWAIT,
+                        )
+                    };
+
+                    if ret < 0 {
+                        let err = nix::errno::Errno::last();
+                        if err != nix::errno::Errno::ENOBUFS && err != nix::errno::Errno::EAGAIN {
+                            log::error!("sendmsg_x failed: {err:?}");
+                        }
+                        return;
+                    }
+
+                    let sent = ret as usize;
+                    batch.finish_many(i..i + sent);
+                    for _ in 0..FINISH_SPIN_ITERS {
+                        std::hint::spin_loop();
+                    }
+                    i += sent;
+                    if sent < chunk {
+                        return;
+                    }
+                }
+            }
+            MacosSendRecvMode::Copied => {
+                let mut buf = [0u8; 65536];
+                for i in 0..batch.len() {
+                    let slices = batch.io_slices(i);
+                    if slices.is_empty() {
+                        batch.finish(i);
+                        continue;
+                    }
+                    let mut off = 0;
+                    for s in slices {
+                        off += s.read(&mut buf[off..]);
+                    }
+                    let ret = unsafe {
+                        libc::send(
+                            fd,
+                            buf.as_ptr() as *const libc::c_void,
+                            off,
+                            libc::MSG_DONTWAIT,
+                        )
+                    };
+                    if ret < 0 {
+                        let err = nix::errno::Errno::last();
+                        if err != nix::errno::Errno::ENOBUFS && err != nix::errno::Errno::EAGAIN {
+                            log::error!("send failed: {err:?}");
+                        }
+                        return;
+                    }
+                    batch.finish(i);
+                }
+            }
+        });
+
+        if sent == 0 {
+            return Err(WriteError::NothingWritten);
+        }
+
+        Ok(sent)
+    }
+
+    fn recv_macos(&mut self) -> usize {
+        let fd = self.fd.as_raw_fd();
+
+        self.rx_producer.produce(|batch| match MACOS_MODE {
+            MacosSendRecvMode::Plain => {
+                for i in 0..batch.len() {
+                    let iovecs = batch.io_slices_mut(i);
+                    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+                    hdr.msg_iov = AliasedIoSliceMut::as_iovec_ptr(iovecs) as *mut libc::iovec;
+                    hdr.msg_iovlen = iovecs.len() as _;
+                    let ret = unsafe { libc::recvmsg(fd, &mut hdr, libc::MSG_DONTWAIT) };
+                    match ret {
+                        n if n > 0 => {
+                            batch.complete(i, n as usize);
+                        }
+                        0 => {
+                            log::warn!("recvmsg returned 0 (unexpected)");
+                            return;
+                        }
+                        _ => {
+                            let err = nix::errno::Errno::last();
+                            match err {
+                                nix::errno::Errno::EAGAIN | nix::errno::Errno::ENOBUFS => {}
+                                _ => log::error!("recvmsg failed: {err}"),
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            MacosSendRecvMode::Batched { max_batch } => {
+                let mut i = 0;
+                while i < batch.len() {
+                    let chunk = max_batch.min(batch.len() - i);
+                    let ret = {
+                        let headers = batch.transformed_mut(i..i + chunk);
+                        let ptr = headers.as_mut_ptr() as *mut super::socket_x::msghdr_x;
+                        unsafe {
+                            super::socket_x::recvmsg_x(
+                                fd,
+                                ptr,
+                                chunk as libc::c_uint,
+                                libc::MSG_DONTWAIT,
+                            )
+                        }
+                    };
+
+                    match ret {
+                        n if n > 0 => {
+                            batch.complete_received_many(i..i + n as usize);
+                            i += n as usize;
+                            if (n as usize) < chunk {
+                                return;
+                            }
+                        }
+                        0 => {
+                            log::warn!("recvmsg_x returned 0 (unexpected)");
+                            return;
+                        }
+                        _ => {
+                            let err = nix::errno::Errno::last();
+                            match err {
+                                nix::errno::Errno::EAGAIN | nix::errno::Errno::ENOBUFS => {}
+                                _ => log::error!("recvmsg_x failed: {err}"),
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            MacosSendRecvMode::Copied => {
+                let mut buf = [0u8; 65536];
+                for i in 0..batch.len() {
+                    let ret = unsafe {
+                        libc::recv(
+                            fd,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            buf.len(),
+                            libc::MSG_DONTWAIT,
+                        )
+                    };
+                    match ret {
+                        n if n > 0 => {
+                            let iovecs = batch.io_slices_mut(i);
+                            AliasedIoSliceMut::scatter_write(
+                                iovecs.iter().copied(),
+                                &buf[..n as usize],
+                            );
+                            batch.complete(i, n as usize);
+                        }
+                        0 => {
+                            log::warn!("recv returned 0 (unexpected)");
+                            return;
+                        }
+                        _ => {
+                            let err = nix::errno::Errno::last();
+                            match err {
+                                nix::errno::Errno::EAGAIN | nix::errno::Errno::ENOBUFS => {}
+                                _ => log::error!("recv failed: {err}"),
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        })
     }
 }
