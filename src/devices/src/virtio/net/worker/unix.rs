@@ -24,12 +24,14 @@ pub struct NetWorker {
 }
 
 impl NetWorker {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rx_q: DeviceQueue,
         tx_q: DeviceQueue,
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
         _vnet_features: u64,
+        include_vnet_header: bool,
         cfg_backend: VirtioNetBackend,
     ) -> Result<Self, ConnectError> {
         let DeviceQueue {
@@ -45,19 +47,37 @@ impl NetWorker {
             VirtioNetBackend::UnixstreamFd(fd) => {
                 let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
                 Box::new(Unixstream::new(
-                    owned_fd, tx_queue, rx_queue, mem, interrupt,
+                    owned_fd,
+                    include_vnet_header,
+                    tx_queue,
+                    rx_queue,
+                    mem,
+                    interrupt,
                 ))
             }
-            VirtioNetBackend::UnixstreamPath(path) => {
-                Box::new(Unixstream::open(path, tx_queue, rx_queue, mem, interrupt)?)
-            }
+            VirtioNetBackend::UnixstreamPath(path) => Box::new(Unixstream::open(
+                path,
+                include_vnet_header,
+                tx_queue,
+                rx_queue,
+                mem,
+                interrupt,
+            )?),
             VirtioNetBackend::UnixgramFd(fd) => {
                 let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-                Box::new(Unixgram::new(owned_fd, tx_queue, rx_queue, mem, interrupt))
+                Box::new(Unixgram::new(
+                    owned_fd,
+                    include_vnet_header,
+                    tx_queue,
+                    rx_queue,
+                    mem,
+                    interrupt,
+                ))
             }
             VirtioNetBackend::UnixgramPath(path, vfkit_magic) => Box::new(Unixgram::open(
                 path,
                 vfkit_magic,
+                include_vnet_header,
                 tx_queue,
                 rx_queue,
                 mem,
@@ -67,6 +87,7 @@ impl NetWorker {
             VirtioNetBackend::Tap(tap_name) => Box::new(Tap::new(
                 tap_name,
                 _vnet_features,
+                include_vnet_header,
                 tx_queue,
                 rx_queue,
                 mem,

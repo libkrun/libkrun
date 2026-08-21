@@ -117,6 +117,7 @@ impl ReceivedBytes for MsgHdrItem {
 
 pub struct Unixgram {
     fd: OwnedFd,
+    include_vnet_header: bool,
     interrupt: InterruptTransport,
     tx_consumer: TxQueueConsumer<MsgHdrItem>,
     rx_producer: RxQueueProducer<MsgHdrItem>,
@@ -135,16 +136,26 @@ impl Unixgram {
     /// Create the backend with a pre-established connection to the userspace network proxy.
     pub fn new(
         fd: OwnedFd,
+        include_vnet_header: bool,
         tx_queue: Queue,
         rx_queue: Queue,
         mem: GuestMemoryMmap,
         interrupt: InterruptTransport,
     ) -> Self {
-        Self::new_with_path(fd, tx_queue, rx_queue, mem, interrupt, None)
+        Self::new_with_path(
+            fd,
+            include_vnet_header,
+            tx_queue,
+            rx_queue,
+            mem,
+            interrupt,
+            None,
+        )
     }
 
     fn new_with_path(
         fd: OwnedFd,
+        include_vnet_header: bool,
         tx_queue: Queue,
         rx_queue: Queue,
         mem: GuestMemoryMmap,
@@ -189,6 +200,7 @@ impl Unixgram {
 
         Self {
             fd,
+            include_vnet_header,
             interrupt,
             tx_consumer,
             rx_producer,
@@ -200,6 +212,7 @@ impl Unixgram {
     pub fn open(
         path: PathBuf,
         send_vfkit_magic: bool,
+        include_vnet_header: bool,
         tx_queue: Queue,
         rx_queue: Queue,
         mem: GuestMemoryMmap,
@@ -255,6 +268,7 @@ impl Unixgram {
 
         Ok(Self::new_with_path(
             fd,
+            include_vnet_header,
             tx_queue,
             rx_queue,
             mem,
@@ -266,7 +280,11 @@ impl Unixgram {
 
 impl NetBackend for Unixgram {
     fn send(&mut self) -> Result<(), WriteError> {
-        let skip = super::vnet_hdr_len();
+        let skip = if !self.include_vnet_header {
+            super::vnet_hdr_len()
+        } else {
+            0
+        };
 
         let mut total_sent = 0;
 
@@ -326,7 +344,11 @@ impl NetBackend for Unixgram {
     }
 
     fn recv(&mut self) -> Result<(), ReadError> {
-        let vnet_offset = super::vnet_hdr_len();
+        let vnet_offset = if !self.include_vnet_header {
+            super::vnet_hdr_len()
+        } else {
+            0
+        };
         let mut total_finished = 0;
 
         self.rx_producer.disable_notification();

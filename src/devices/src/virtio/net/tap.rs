@@ -36,6 +36,7 @@ impl Tap {
     pub fn new(
         tap_name: String,
         vnet_features: u64,
+        include_vnet_header: bool,
         tx_queue: Queue,
         rx_queue: Queue,
         mem: GuestMemoryMmap,
@@ -59,7 +60,11 @@ impl Tap {
             );
         }
 
-        req.ifr_ifru.ifru_flags = IFF_TAP as i16 | IFF_NO_PI as i16 | IFF_VNET_HDR as i16;
+        let mut flags = IFF_TAP as i16 | IFF_NO_PI as i16;
+        if include_vnet_header {
+            flags |= IFF_VNET_HDR as i16;
+        }
+        req.ifr_ifru.ifru_flags = flags;
 
         log::info!("Tap::new() fd={} tap={}", fd.as_raw_fd(), tap_name);
 
