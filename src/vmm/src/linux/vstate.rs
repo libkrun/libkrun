@@ -1036,13 +1036,17 @@ impl Vm {
     pub fn save_state(&self) -> Result<VmState> {
         match &self.vgic {
             Some(handle) => vgic::save(handle).map_err(Error::VmGicState),
-            None => {
-                warn!(
-                    "no vGICv3 registered for snapshot; checkpoint carries no GIC state \
-                     (a restored clone may not receive device IRQs)"
-                );
-                Ok(VmState::default())
-            }
+            // Refuse rather than warn: an empty GIC blob produces a clone whose
+            // freshly-created GIC has every interrupt masked, so the restored
+            // guest is deaf — vsock kicks never interrupt it and the agent can
+            // never answer (verified on a GICv2 QEMU host: the clone boots,
+            // accepts socket connects, and times out readiness). Failing the
+            // checkpoint here lets the fork roll back and the golden resume.
+            None => Err(Error::VmGicState(
+                "snapshot/fork requires an in-kernel GICv3; this host's KVM fell back to GICv2, \
+                 whose state capture is not implemented"
+                    .to_string(),
+            )),
         }
     }
 
@@ -1431,6 +1435,12 @@ pub struct Vcpu {
 
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
+    /// The guest virtual counter (`CNTVCT`) captured when this vCPU paused,
+    /// written back at resume so guest time freezes across the pause. `None`
+    /// for a vCPU that entered the paused state without running first (a fork
+    /// clone's initial state — its counter comes from the checkpoint restore).
+    #[cfg(target_arch = "aarch64")]
+    paused_cntvct: Option<u64>,
 
     // The receiving end of events channel owned by the vcpu side.
     event_receiver: Receiver<VcpuEvent>,
@@ -1617,6 +1627,7 @@ impl Vcpu {
             mmio_bus: None,
             exit_evt,
             mpidr: 0,
+            paused_cntvct: None,
             event_receiver,
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
@@ -2179,12 +2190,6 @@ impl Vcpu {
             }
         }
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            arch::aarch64::regs::adjust_virtual_timer_offset(&self.fd, paused_ns)
-                .map_err(Error::REGSConfiguration)?;
-        }
-
         Ok(())
     }
 
@@ -2218,7 +2223,21 @@ impl Vcpu {
         match self.event_receiver.try_recv() {
             // Running ---- Pause ----> Paused
             Ok(VcpuEvent::Pause) => {
-                // Nothing special to do.
+                // Capture the guest's virtual counter so resume can freeze
+                // guest time across the pause. Best-effort: a capture failure
+                // only costs freeze semantics (the guest sees time jump),
+                // never the pause itself.
+                #[cfg(target_arch = "aarch64")]
+                {
+                    self.paused_cntvct =
+                        match arch::aarch64::regs::read_virtual_timer_count(&self.fd) {
+                            Ok(cnt) => Some(cnt),
+                            Err(e) => {
+                                warn!("could not capture the virtual counter at pause: {e:?}");
+                                None
+                            }
+                        };
+                }
                 self.response_sender
                     .send(VcpuResponse::Paused)
                     .expect("failed to send pause status");
@@ -2255,9 +2274,28 @@ impl Vcpu {
         match self.event_receiver.recv() {
             // Paused ---- Resume ----> Running
             Ok(VcpuEvent::Resume { paused_ns }) => {
+                // x86_64: a failed kvmclock adjustment leaves the guest clock
+                // undefined, so treat it as fatal as before. aarch64: writing
+                // the pause-time counter back is freeze-semantics best-effort —
+                // a failure means the guest sees the paused wall time elapse,
+                // which is strictly better than killing the vCPU (a fork
+                // rollback resumes through here; a fatal exit here is what
+                // turned one failed fork into a dead golden on arm KVM hosts).
+                #[cfg(target_arch = "x86_64")]
                 if let Err(e) = self.adjust_guest_clock_after_pause(paused_ns) {
                     error!("failed to adjust guest clock after pause: {e}");
                     return self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let _ = paused_ns;
+                    if let Some(cnt) = self.paused_cntvct.take() {
+                        if let Err(e) =
+                            arch::aarch64::regs::write_virtual_timer_count(&self.fd, cnt)
+                        {
+                            warn!("could not restore the virtual counter at resume: {e:?}");
+                        }
+                    }
                 }
                 self.response_sender
                     .send(VcpuResponse::Resumed)
