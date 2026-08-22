@@ -563,13 +563,21 @@ pub struct Vm {
     vgic: Option<VgicSnapshotHandle>,
 }
 
-/// The pieces needed to capture/restore the in-kernel vGICv3 state: a dup of
-/// the GIC `DeviceFd` (attribute ioctls) plus each vCPU's MPIDR (redistributor
-/// and CPU-interface state is addressed by CPU affinity).
+/// The pieces needed to capture/restore the in-kernel vGIC state: a dup of
+/// the GIC `DeviceFd` (attribute ioctls) plus the per-CPU addressing the
+/// device's flavor uses — GICv3 addresses per-CPU state by MPIDR affinity,
+/// GICv2 by vCPU index.
 #[cfg(target_arch = "aarch64")]
 pub struct VgicSnapshotHandle {
     fd: DeviceFd,
-    mpidrs: Vec<u64>,
+    flavor: VgicFlavor,
+}
+
+/// Which in-kernel GIC the snapshot handle drives, with its per-CPU keys.
+#[cfg(target_arch = "aarch64")]
+pub enum VgicFlavor {
+    V3 { mpidrs: Vec<u64> },
+    V2 { vcpu_count: u64 },
 }
 
 impl Vm {
@@ -602,9 +610,21 @@ impl Vm {
 
     /// Register the in-kernel vGICv3 for checkpoint/restore. Called by the
     /// builder once the GIC device and the (configured) vCPUs exist; without
-    /// it, `save_state` captures an empty GIC and warns.
+    /// a registered vGIC, `save_state` refuses the checkpoint.
     #[cfg(target_arch = "aarch64")]
     pub fn register_vgic(&mut self, gic_fd: &DeviceFd, mpidrs: Vec<u64>) {
+        self.register_vgic_flavor(gic_fd, VgicFlavor::V3 { mpidrs });
+    }
+
+    /// Register the in-kernel vGICv2 for checkpoint/restore (the GICv3-less
+    /// fallback). Per-CPU state is addressed by vCPU index, not MPIDR.
+    #[cfg(target_arch = "aarch64")]
+    pub fn register_vgic_v2(&mut self, gic_fd: &DeviceFd, vcpu_count: u64) {
+        self.register_vgic_flavor(gic_fd, VgicFlavor::V2 { vcpu_count });
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn register_vgic_flavor(&mut self, gic_fd: &DeviceFd, flavor: VgicFlavor) {
         // Dup so the handle stays valid independent of the device object's
         // lifetime inside the IRQ-chip container.
         let fd = unsafe { libc::dup(gic_fd.as_raw_fd()) };
@@ -617,7 +637,7 @@ impl Vm {
         }
         self.vgic = Some(VgicSnapshotHandle {
             fd: unsafe { DeviceFd::from_raw_fd(fd) },
-            mpidrs,
+            flavor,
         });
     }
 
@@ -1043,8 +1063,7 @@ impl Vm {
             // accepts socket connects, and times out readiness). Failing the
             // checkpoint here lets the fork roll back and the golden resume.
             None => Err(Error::VmGicState(
-                "snapshot/fork requires an in-kernel GICv3; this host's KVM fell back to GICv2, \
-                 whose state capture is not implemented"
+                "snapshot/fork requires an in-kernel vGIC handle; none was registered"
                     .to_string(),
             )),
         }
@@ -1055,13 +1074,13 @@ impl Vm {
     /// only enables once the rest of the state is in place). No-op if empty.
     #[cfg(target_arch = "aarch64")]
     pub fn restore_state(&self, state: &VmState) -> Result<()> {
-        if state.dist_regs.is_empty() && state.redist_regs.is_empty() && state.icc_regs.is_empty() {
+        if state.is_empty() {
             return Ok(());
         }
         match &self.vgic {
             Some(handle) => vgic::restore(handle, state).map_err(Error::VmGicState),
             None => {
-                warn!("checkpoint carries GIC state but no vGICv3 is registered; skipping");
+                warn!("checkpoint carries GIC state but no vGIC is registered; skipping");
                 Ok(())
             }
         }
@@ -1090,6 +1109,13 @@ pub struct VmState {
     dist_regs: Vec<(u32, u32)>,
     redist_regs: Vec<(u64, u32)>,
     icc_regs: Vec<(u64, u64)>,
+    /// GICv2 distributor registers, keyed by the full device-attribute id
+    /// (vCPU index in the cpuid field for banked SGI/PPI ranges, register byte
+    /// offset in the low bits). Populated only for checkpoints taken on a
+    /// GICv2 host; disjoint from the v3 fields above.
+    gicv2_dist: Vec<(u64, u32)>,
+    /// GICv2 CPU-interface (`GICC_*`) registers, keyed the same way.
+    gicv2_cpu: Vec<(u64, u32)>,
 }
 
 /// In-kernel vGICv3 state transfer via `KVM_{GET,SET}_DEVICE_ATTR`, the KVM
@@ -1251,7 +1277,34 @@ mod vgic {
     }
 
     pub(super) fn save(handle: &VgicSnapshotHandle) -> Result<VmState, String> {
-        let fd = &handle.fd;
+        match &handle.flavor {
+            super::VgicFlavor::V3 { mpidrs } => save_v3(&handle.fd, mpidrs),
+            super::VgicFlavor::V2 { vcpu_count } => save_v2(&handle.fd, *vcpu_count),
+        }
+    }
+
+    pub(super) fn restore(handle: &VgicSnapshotHandle, state: &VmState) -> Result<(), String> {
+        // A checkpoint taken under one GIC flavor cannot replay onto the
+        // other: the register namespaces are disjoint (v3 redistributor/sysreg
+        // attrs vs v2 cpuid-banked distributor/GICC attrs), so a mismatch means
+        // the checkpoint moved to a host with different interrupt hardware.
+        let has_v3 = !state.dist_regs.is_empty()
+            || !state.redist_regs.is_empty()
+            || !state.icc_regs.is_empty();
+        let has_v2 = !state.gicv2_dist.is_empty() || !state.gicv2_cpu.is_empty();
+        match &handle.flavor {
+            super::VgicFlavor::V3 { .. } if has_v2 => Err(
+                "checkpoint was captured on a GICv2 host but this host uses a GICv3".to_string(),
+            ),
+            super::VgicFlavor::V2 { .. } if has_v3 => Err(
+                "checkpoint was captured on a GICv3 host but this host uses a GICv2".to_string(),
+            ),
+            super::VgicFlavor::V3 { .. } => restore_v3(&handle.fd, state),
+            super::VgicFlavor::V2 { .. } => restore_v2(&handle.fd, state),
+        }
+    }
+
+    fn save_v3(fd: &DeviceFd, mpidrs: &[u64]) -> Result<VmState, String> {
         // Flush LPI pending state into guest RAM first. Without an ITS there
         // are no LPIs and some kernels reject the request — best-effort.
         let flush = kvm_device_attr {
@@ -1276,7 +1329,7 @@ mod vgic {
 
         let mut redist_regs = Vec::new();
         let mut icc_regs = Vec::new();
-        for &mpidr in &handle.mpidrs {
+        for &mpidr in mpidrs {
             let aff = affinity(mpidr);
             for offset in REDIST_OFFSETS {
                 let attr = aff | offset as u64;
@@ -1302,11 +1355,11 @@ mod vgic {
             dist_regs,
             redist_regs,
             icc_regs,
+            ..VmState::default()
         })
     }
 
-    pub(super) fn restore(handle: &VgicSnapshotHandle, state: &VmState) -> Result<(), String> {
-        let fd = &handle.fd;
+    fn restore_v3(fd: &DeviceFd, state: &VmState) -> Result<(), String> {
         // Everything except GICD_CTLR first, so the distributor only starts
         // delivering once pending/enable/routing state is fully in place.
         let mut ctlr = None;
@@ -1328,10 +1381,162 @@ mod vgic {
         }
         Ok(())
     }
+
+    // ---- GICv2 -------------------------------------------------------------
+    //
+    // v2's device-attribute API (Documentation/virt/kvm/devices/arm-vgic.rst)
+    // shares KVM_DEV_ARM_VGIC_GRP_DIST_REGS with v3 but addresses per-CPU
+    // (banked SGI/PPI) state by packing the vCPU INDEX into the attr's cpuid
+    // field (bits 39:32) — there are no redistributors. The CPU interface is
+    // the memory-mapped GICC frame, exposed through its own attribute group.
+    // Like v3, only the set-variants (IS*) of enable/pending/active are
+    // walked: KVM's uaccess write handlers keep set/clear semantics, so
+    // replaying a saved IS* mask onto a reset (all-clear) GIC installs
+    // exactly the saved bits.
+
+    /// `KVM_DEV_ARM_VGIC_GRP_CPU_REGS`: the GICC frame's registers. Fixed
+    /// UAPI value (arch/arm64/include/uapi/asm/kvm.h); spelled locally because
+    /// kvm-bindings' generated name set varies by version.
+    const KVM_DEV_ARM_VGIC_GRP_CPU_REGS: u32 = 2;
+    /// v2 cpuid field: the vCPU index lives in attr bits 39:32.
+    const VGIC_V2_CPUID_SHIFT: u64 = 32;
+
+    /// Banked (per-CPU) distributor offsets covering SGIs/PPIs (INTIDs 0..31).
+    /// Ordered so restore replays configuration before enables/pending/active.
+    /// GICD_ICFGR0 (SGIs, always edge) and GICD_ITARGETSR0..7 (read-as-cpuid)
+    /// are read-only and deliberately absent.
+    const V2_BANKED_DIST_OFFSETS: [u32; 12] = [
+        GICD_IGROUPR,       // IGROUPR0
+        GICD_ICFGR + 4,     // ICFGR1 (PPIs)
+        GICD_IPRIORITYR,    // IPRIORITYR0..7
+        GICD_IPRIORITYR + 4,
+        GICD_IPRIORITYR + 8,
+        GICD_IPRIORITYR + 12,
+        GICD_IPRIORITYR + 16,
+        GICD_IPRIORITYR + 20,
+        GICD_IPRIORITYR + 24,
+        GICD_ISENABLER,     // ISENABLER0
+        GICD_ISPENDR,       // ISPENDR0
+        GICD_ISACTIVER,     // ISACTIVER0
+    ];
+
+    /// GICv2 SPI target registers: one byte per INTID from GICD_ITARGETSR8
+    /// (INTID 32) upward — v2's routing, in place of v3's GICD_IROUTERn.
+    const GICD_ITARGETSR: u32 = 0x0800;
+
+    /// GICC registers, in restore order: masks/priorities/config first,
+    /// GICC_CTLR last so the interface only re-enables once its state stands.
+    const V2_CPU_OFFSETS: [u32; 8] = [
+        0x04, // GICC_PMR
+        0x08, // GICC_BPR
+        0x1c, // GICC_ABPR
+        0xd0, // GICC_APR0
+        0xd4, // GICC_APR1
+        0xd8, // GICC_APR2
+        0xdc, // GICC_APR3
+        0x00, // GICC_CTLR (last)
+    ];
+
+    /// Shared (SPI) distributor offsets for `nr_irqs` INTIDs, configuration
+    /// before set-state, matching the banked ordering above.
+    fn v2_shared_dist_offsets(nr_irqs: u32) -> Vec<u32> {
+        // No GICD_STATUSR here: that offset is GICv3-only (reserved on v2,
+        // where the kernel's uaccess would reject it).
+        let mut offsets = Vec::new();
+        for irq in (32..nr_irqs).step_by(32) {
+            offsets.push(GICD_IGROUPR + (irq / 32) * 4);
+        }
+        for irq in (32..nr_irqs).step_by(16) {
+            offsets.push(GICD_ICFGR + (irq / 16) * 4);
+        }
+        for irq in (32..nr_irqs).step_by(4) {
+            offsets.push(GICD_IPRIORITYR + irq);
+        }
+        for irq in (32..nr_irqs).step_by(4) {
+            offsets.push(GICD_ITARGETSR + irq);
+        }
+        for base in [GICD_ISENABLER, GICD_ISPENDR, GICD_ISACTIVER] {
+            for irq in (32..nr_irqs).step_by(32) {
+                offsets.push(base + (irq / 32) * 4);
+            }
+        }
+        offsets
+    }
+
+    fn save_v2(fd: &DeviceFd, vcpu_count: u64) -> Result<VmState, String> {
+        let typer: u32 = get_reg(fd, KVM_DEV_ARM_VGIC_GRP_DIST_REGS, GICD_TYPER as u64)?;
+        let nr_irqs = 32 * ((typer & 0x1f) + 1);
+
+        let mut gicv2_dist = Vec::new();
+        // Banked SGI/PPI state per vCPU, then the shared SPI ranges (cpuid 0
+        // in the attr — shared registers ignore it), then GICD_CTLR, which
+        // restore replays last.
+        for cpu in 0..vcpu_count {
+            let aff = cpu << VGIC_V2_CPUID_SHIFT;
+            for offset in V2_BANKED_DIST_OFFSETS {
+                let attr = aff | offset as u64;
+                let val: u32 = get_reg(fd, KVM_DEV_ARM_VGIC_GRP_DIST_REGS, attr)?;
+                gicv2_dist.push((attr, val));
+            }
+        }
+        for offset in v2_shared_dist_offsets(nr_irqs) {
+            let val: u32 = get_reg(fd, KVM_DEV_ARM_VGIC_GRP_DIST_REGS, offset as u64)?;
+            gicv2_dist.push((offset as u64, val));
+        }
+        let ctlr: u32 = get_reg(fd, KVM_DEV_ARM_VGIC_GRP_DIST_REGS, GICD_CTLR as u64)?;
+        gicv2_dist.push((GICD_CTLR as u64, ctlr));
+
+        let mut gicv2_cpu = Vec::new();
+        for cpu in 0..vcpu_count {
+            let aff = cpu << VGIC_V2_CPUID_SHIFT;
+            for offset in V2_CPU_OFFSETS {
+                let attr = aff | offset as u64;
+                let val: u32 = get_reg(fd, KVM_DEV_ARM_VGIC_GRP_CPU_REGS, attr)?;
+                gicv2_cpu.push((attr, val));
+            }
+        }
+
+        Ok(VmState {
+            gicv2_dist,
+            gicv2_cpu,
+            ..VmState::default()
+        })
+    }
+
+    fn restore_v2(fd: &DeviceFd, state: &VmState) -> Result<(), String> {
+        // Everything except GICD_CTLR first (save appended it last, but keep
+        // the guard explicit), so delivery only enables once routing, config,
+        // and pending state are fully in place; the GICC frames follow, each
+        // ending with its own GICC_CTLR per the saved ordering.
+        let mut ctlr = None;
+        for &(attr, val) in &state.gicv2_dist {
+            if attr == GICD_CTLR as u64 {
+                ctlr = Some(val);
+                continue;
+            }
+            set_reg(fd, KVM_DEV_ARM_VGIC_GRP_DIST_REGS, attr, val)?;
+        }
+        for &(attr, val) in &state.gicv2_cpu {
+            set_reg(fd, KVM_DEV_ARM_VGIC_GRP_CPU_REGS, attr, val)?;
+        }
+        if let Some(val) = ctlr {
+            set_reg(fd, KVM_DEV_ARM_VGIC_GRP_DIST_REGS, GICD_CTLR as u64, val)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
 impl VmState {
+    /// Whether the checkpoint carries no GIC state at all.
+    fn is_empty(&self) -> bool {
+        self.dist_regs.is_empty()
+            && self.redist_regs.is_empty()
+            && self.icc_regs.is_empty()
+            && self.gicv2_dist.is_empty()
+            && self.gicv2_cpu.is_empty()
+    }
+
     /// Serialize to a byte blob (mirrors the x86 `VmState::serialize`
     /// signature so the cross-platform `VmCheckpoint` can call it uniformly).
     pub fn serialize(&self) -> Vec<u8> {
@@ -1348,6 +1553,19 @@ impl VmState {
         }
         out.extend_from_slice(&(self.icc_regs.len() as u32).to_le_bytes());
         for &(attr, val) in &self.icc_regs {
+            out.extend_from_slice(&attr.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        // GICv2 sections, appended after the v3 ones so blobs written before
+        // GICv2 support existed still deserialize (absent trailing sections
+        // read back as empty).
+        out.extend_from_slice(&(self.gicv2_dist.len() as u32).to_le_bytes());
+        for &(attr, val) in &self.gicv2_dist {
+            out.extend_from_slice(&attr.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.gicv2_cpu.len() as u32).to_le_bytes());
+        for &(attr, val) in &self.gicv2_cpu {
             out.extend_from_slice(&attr.to_le_bytes());
             out.extend_from_slice(&val.to_le_bytes());
         }
@@ -1387,10 +1605,32 @@ impl VmState {
             let val = u64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
             icc_regs.push((attr, val));
         }
+        // Trailing GICv2 sections: absent in blobs written before GICv2
+        // support, so exhausted-bytes here means empty, not truncation.
+        let mut gicv2_dist = Vec::new();
+        let mut gicv2_cpu = Vec::new();
+        if pos < bytes.len() {
+            let n = count(&mut pos)?;
+            gicv2_dist.reserve(n);
+            for _ in 0..n {
+                let attr = u64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
+                let val = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap());
+                gicv2_dist.push((attr, val));
+            }
+            let n = count(&mut pos)?;
+            gicv2_cpu.reserve(n);
+            for _ in 0..n {
+                let attr = u64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
+                let val = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap());
+                gicv2_cpu.push((attr, val));
+            }
+        }
         Ok(VmState {
             dist_regs,
             redist_regs,
             icc_regs,
+            gicv2_dist,
+            gicv2_cpu,
         })
     }
 }
