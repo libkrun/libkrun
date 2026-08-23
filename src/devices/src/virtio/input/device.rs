@@ -94,7 +94,17 @@ impl InputConfig {
             }
             Err(e) => {
                 error!("Failed to query config select={select}, subsel={subsel}: {e:?}");
-                self.invalidate();
+                // Keep the guest-written select/subsel and report size 0
+                // ("unsupported") instead of resetting to UNSET: the guest
+                // writes select and subsel as two separate config writes, so
+                // the first write pairs the new select with a stale subsel.
+                // Wiping the stored select here made that transient error
+                // permanent — the following subsel write recombined with
+                // UNSET and the real query never ran (observed as ABS_X
+                // getting no absinfo while ABS_Y did).
+                self.repr.size = 0;
+                self.repr.select = select;
+                self.repr.subsel = subsel;
             }
         };
     }
