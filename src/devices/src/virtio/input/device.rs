@@ -78,7 +78,7 @@ impl InputConfig {
             }
             config_select::VIRTIO_INPUT_CFG_ABS_INFO => cfg
                 .query_abs_info(subsel, unsafe { &mut self.repr.payload.abs })
-                .map(|_| size_of::<InputDeviceIds>() as u8),
+                .map(|_| size_of::<InputAbsInfo>() as u8),
             select => {
                 error!("Invalid config selection select = {select}");
                 self.invalidate();
