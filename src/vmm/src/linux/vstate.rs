@@ -1063,8 +1063,7 @@ impl Vm {
             // accepts socket connects, and times out readiness). Failing the
             // checkpoint here lets the fork roll back and the golden resume.
             None => Err(Error::VmGicState(
-                "snapshot/fork requires an in-kernel vGIC handle; none was registered"
-                    .to_string(),
+                "snapshot/fork requires an in-kernel vGIC handle; none was registered".to_string(),
             )),
         }
     }
@@ -1406,18 +1405,18 @@ mod vgic {
     /// GICD_ICFGR0 (SGIs, always edge) and GICD_ITARGETSR0..7 (read-as-cpuid)
     /// are read-only and deliberately absent.
     const V2_BANKED_DIST_OFFSETS: [u32; 12] = [
-        GICD_IGROUPR,       // IGROUPR0
-        GICD_ICFGR + 4,     // ICFGR1 (PPIs)
-        GICD_IPRIORITYR,    // IPRIORITYR0..7
+        GICD_IGROUPR,    // IGROUPR0
+        GICD_ICFGR + 4,  // ICFGR1 (PPIs)
+        GICD_IPRIORITYR, // IPRIORITYR0..7
         GICD_IPRIORITYR + 4,
         GICD_IPRIORITYR + 8,
         GICD_IPRIORITYR + 12,
         GICD_IPRIORITYR + 16,
         GICD_IPRIORITYR + 20,
         GICD_IPRIORITYR + 24,
-        GICD_ISENABLER,     // ISENABLER0
-        GICD_ISPENDR,       // ISPENDR0
-        GICD_ISACTIVER,     // ISACTIVER0
+        GICD_ISENABLER, // ISENABLER0
+        GICD_ISPENDR,   // ISPENDR0
+        GICD_ISACTIVER, // ISACTIVER0
     ];
 
     /// GICv2 SPI target registers: one byte per INTID from GICD_ITARGETSR8
@@ -2417,6 +2416,9 @@ impl Vcpu {
         StateMachine::run(self, Self::paused);
     }
 
+    // aarch64 freezes guest time via the paused_cntvct capture/write-back in
+    // the pause/resume handlers instead; only x86_64 still takes this path.
+    #[cfg(target_arch = "x86_64")]
     fn adjust_guest_clock_after_pause(&self, paused_ns: u64) -> Result<()> {
         if paused_ns == 0 {
             return Ok(());
@@ -2529,12 +2531,11 @@ impl Vcpu {
                 #[cfg(target_arch = "aarch64")]
                 {
                     let _ = paused_ns;
-                    if let Some(cnt) = self.paused_cntvct.take() {
-                        if let Err(e) =
+                    if let Some(cnt) = self.paused_cntvct.take()
+                        && let Err(e) =
                             arch::aarch64::regs::write_virtual_timer_count(&self.fd, cnt)
-                        {
-                            warn!("could not restore the virtual counter at resume: {e:?}");
-                        }
+                    {
+                        warn!("could not restore the virtual counter at resume: {e:?}");
                     }
                 }
                 self.response_sender
