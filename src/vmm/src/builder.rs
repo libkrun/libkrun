@@ -990,7 +990,12 @@ pub fn build_microvm(
                 }
                 Err(_) => {
                     warn!("KVM GICv3 creation failed, falling back to KVM GICv2");
-                    IrqChipDevice::new(Box::new(KvmGicV2::new(vm.fd(), vcpu_count)))
+                    let gicv2 = KvmGicV2::new(vm.fd(), vcpu_count);
+                    // Register the vGICv2 with the VM so checkpoint/restore
+                    // (fork) can transfer its state; per-CPU registers are
+                    // addressed by vCPU index (v2's cpuid attr field).
+                    vm.register_vgic_v2(gicv2.device_fd(), vcpu_count);
+                    IrqChipDevice::new(Box::new(gicv2))
                 }
             };
             Arc::new(Mutex::new(gic))

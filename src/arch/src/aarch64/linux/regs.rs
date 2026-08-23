@@ -5,7 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use std::{arch::asm, mem, mem::offset_of, num::TryFromIntError, result};
+use std::{mem, mem::offset_of, num::TryFromIntError, result};
 
 use crate::ArchMemoryInfo;
 
@@ -100,39 +100,38 @@ macro_rules! arm64_sys_reg {
 // https://elixir.bootlin.com/linux/v4.20.17/source/arch/arm64/include/asm/sysreg.h#L135
 arm64_sys_reg!(MPIDR_EL1, 3, 0, 0, 0, 5);
 
-// CNTVOFF_EL2: virtual timer counter offset register (op0=3, op1=4, CRn=14, CRm=0, op2=3).
-// Used by KVM to implement CNTVCT_EL0 = CNTPCT_EL0 - CNTVOFF_EL2.
-arm64_sys_reg!(CNTVOFF_EL2, 3, 4, 14, 0, 3);
+// KVM_REG_ARM_TIMER_CNT: the guest's virtual counter (CNTVCT_EL0) as exposed by KVM's
+// userspace timer API. NOTE the deliberately non-architectural encoding (op0=3, op1=3,
+// CRn=14, CRm=3, op2=2): this is KVM's legacy UAPI id (see kvm/api.rst and
+// arch/arm64/include/uapi/asm/kvm.h), NOT the CNTVCT_EL0 sysreg encoding. Writing it
+// makes KVM recompute the virtual counter offset so the guest observes the written
+// value — the sanctioned way for userspace to move guest time. CNTVOFF_EL2 itself is
+// an EL2 register that mainline KVM only exposes to nested-virt guests; get/set on an
+// ordinary guest fails with ENOENT, which is why the previous CNTVOFF-based adjuster
+// broke every pause/resume (and fork rollback) on aarch64 KVM hosts.
+arm64_sys_reg!(KVM_REG_ARM_TIMER_CNT, 3, 3, 14, 3, 2);
 
-/// Adjust the virtual timer offset (CNTVOFF_EL2) after a vCPU pause.
+/// Read the guest's virtual counter (`CNTVCT`) via KVM's userspace timer register.
 ///
-/// The ARM virtual counter is `CNTVCT_EL0 = CNTPCT_EL0 - CNTVOFF_EL2`. When the vCPU
-/// is paused, the physical counter advances while the guest is frozen. Adding the paused
-/// duration in ticks to the offset compensates, giving the guest freeze semantics.
-pub fn adjust_virtual_timer_offset(vcpu: &VcpuFd, delta_ns: u64) -> Result<()> {
-    if delta_ns == 0 {
-        return Ok(());
-    }
-
-    // Read the host timer frequency. On bare metal it equals the guest's CNTFRQ_EL0.
-    let cntfrq: u64;
-    unsafe { asm!("mrs {}, cntfrq_el0", out(reg) cntfrq) };
-
-    let delta_ticks = ((delta_ns as u128) * (cntfrq as u128) / 1_000_000_000)
-        .try_into()
-        .unwrap_or(u64::MAX);
-    if delta_ticks == 0 {
-        return Ok(());
-    }
-
+/// Captured when a vCPU pauses; writing the same value back at resume freezes guest
+/// time across the pause (KVM derives the new counter offset from the written value).
+pub fn read_virtual_timer_count(vcpu: &VcpuFd) -> Result<u64> {
     let mut data = [0u8; 8];
-    vcpu.get_one_reg(CNTVOFF_EL2, &mut data)
+    vcpu.get_one_reg(KVM_REG_ARM_TIMER_CNT, &mut data)
         .map_err(Error::GetSysRegister)?;
-    let current = u64::from_le_bytes(data);
-    let new_offset = current.saturating_add(delta_ticks);
-    vcpu.set_one_reg(CNTVOFF_EL2, &new_offset.to_le_bytes())
-        .map_err(Error::SetCoreRegister)?;
+    Ok(u64::from_le_bytes(data))
+}
 
+/// Write the guest's virtual counter (`CNTVCT`) via KVM's userspace timer register.
+///
+/// On kernels with a per-VM counter offset (6.4+) any vCPU's write retargets the whole
+/// VM; on older per-vCPU-offset kernels each vCPU needs its own write. Writing every
+/// vCPU's pause-time capture back satisfies both: the captures are taken at the same
+/// pause instant, so the per-VM case converges on the last writer's near-identical
+/// value instead of compounding (which a delta-based read-modify-write would do).
+pub fn write_virtual_timer_count(vcpu: &VcpuFd, count: u64) -> Result<()> {
+    vcpu.set_one_reg(KVM_REG_ARM_TIMER_CNT, &count.to_le_bytes())
+        .map_err(Error::SetCoreRegister)?;
     Ok(())
 }
 
