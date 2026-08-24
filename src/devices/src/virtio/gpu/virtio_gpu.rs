@@ -146,6 +146,8 @@ impl VirtioGpuResource {
 
 pub struct VirtioGpuScanout {
     resource_id: u32,
+    width: u32,
+    height: u32,
 }
 
 pub struct VirtioGpu {
@@ -422,12 +424,20 @@ impl VirtioGpu {
         #[cfg(target_os = "linux")]
         let virgl_flags = virgl_flags | (1 << 1) | (1 << 8);
 
-        let builder = RutabagaBuilder::new(
-            rutabaga_gfx::RutabagaComponentType::VirglRenderer,
-            virgl_flags,
-            0,
-        )
-        .set_rutabaga_channels(rutabaga_channels_opt);
+        // KRUN_GPU_BACKEND=2d selects rutabaga's CPU 2D component instead of
+        // virglrenderer. Display-only guests (software-rendered compositor
+        // scanned out through virtio-gpu KMS) need working 2D resources,
+        // transfers, and fences — on hosts whose virglrenderer build has no
+        // GL/virgl support (e.g. the Venus-oriented macOS build) all of those
+        // fail, so the desktop path selects the 2D component explicitly.
+        let component = if env::var("KRUN_GPU_BACKEND").as_deref() == Ok("2d") {
+            rutabaga_gfx::RutabagaComponentType::Rutabaga2D
+        } else {
+            rutabaga_gfx::RutabagaComponentType::VirglRenderer
+        };
+
+        let builder = RutabagaBuilder::new(component, virgl_flags, 0)
+            .set_rutabaga_channels(rutabaga_channels_opt);
         let builder = if let Some(export_table) = export_table {
             builder.set_export_table(export_table)
         } else {
@@ -755,7 +765,30 @@ impl VirtioGpu {
             format,
         )?;
 
-        *scanout = Some(VirtioGpuScanout { resource_id });
+        *scanout = Some(VirtioGpuScanout {
+            resource_id,
+            width,
+            height,
+        });
+
+        // Present the newly scanned-out buffer. A page-flipping compositor
+        // changes the scanout resource every frame and may never send a
+        // RESOURCE_FLUSH for it; the flip itself means "this buffer is now on
+        // screen", so a frame must reach the display backend here or such
+        // compositors are invisible.
+        let resource = *self
+            .resources
+            .get(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
+        if let Err(e) = Self::read_2d_resource(&mut self.rutabaga, resource, buffer, width, height)
+        {
+            log::error!("Failed to read resource {resource_id} for scanout {scanout_id}: {e}");
+            return Err(ErrUnspec);
+        }
+        self.display_backend
+            .present_frame(scanout_id, frame_id, None)?;
+
         Ok(OkNoData)
     }
 
@@ -763,16 +796,22 @@ impl VirtioGpu {
         rutabaga: &mut Rutabaga,
         resource: VirtioGpuResource,
         output: &mut [u8],
+        width: u32,
+        height: u32,
     ) -> VirtioGpuResult {
+        // The scanout resource may be larger than the display: allocators pad
+        // buffers to tiling alignment (e.g. llvmpipe pads 1440x900 to
+        // 1472x960). Read only the configured crop, tightly packed into the
+        // destination, or the copy overruns the frame buffer.
         let transfer = Transfer3D {
             x: 0,
             y: 0,
             z: 0,
-            w: resource.width,
-            h: resource.height,
+            w: width.min(resource.width),
+            h: height.min(resource.height),
             d: 1,
             level: 0,
-            stride: resource.width * ResourceFormat::BYTES_PER_PIXEL as u32,
+            stride: width.min(resource.width) * ResourceFormat::BYTES_PER_PIXEL as u32,
             layer_stride: 0,
             offset: 0,
         };
@@ -802,8 +841,16 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         for scanout_id in resource.scanouts.iter_enabled() {
+            let (crop_w, crop_h) = self
+                .scanouts
+                .get(scanout_id as usize)
+                .and_then(|s| s.as_ref())
+                .map(|s| (s.width, s.height))
+                .unwrap_or((resource.width, resource.height));
             let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
-            if let Err(e) = Self::read_2d_resource(&mut self.rutabaga, resource, buffer) {
+            if let Err(e) =
+                Self::read_2d_resource(&mut self.rutabaga, resource, buffer, crop_w, crop_h)
+            {
                 log::error!("Failed to read resource {resource_id} for scanout {scanout_id}: {e}");
                 return Err(ErrUnspec);
             }

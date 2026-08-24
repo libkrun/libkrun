@@ -40,9 +40,7 @@ pub struct Worker {
     /// Cursor queue, drained and acked by the worker: cursor commands carry no
     /// response payload, but their descriptors must be returned or the guest's
     /// cursor ring runs out of free entries and atomic commits block forever.
-    #[cfg(target_os = "linux")]
     cursor_evt: EventFd,
-    #[cfg(target_os = "linux")]
     cursor_queue: Arc<Mutex<VirtQueue>>,
     mem: GuestMemoryMmap,
     interrupt: InterruptTransport,
@@ -77,8 +75,8 @@ impl Worker {
     pub fn new(
         control_queue: Arc<Mutex<VirtQueue>>,
         control_event: Arc<EventFd>,
-        #[cfg(target_os = "linux")] cursor_queue: Arc<Mutex<VirtQueue>>,
-        #[cfg(target_os = "linux")] cursor_event: Arc<EventFd>,
+        cursor_queue: Arc<Mutex<VirtQueue>>,
+        cursor_event: Arc<EventFd>,
         mem: GuestMemoryMmap,
         interrupt: InterruptTransport,
         shm_region: VirtioShmRegion,
@@ -96,7 +94,6 @@ impl Worker {
             OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).unwrap()) & !OFlag::O_NONBLOCK;
         fcntl(fd, FcntlArg::F_SETFL(flags)).unwrap();
 
-        #[cfg(target_os = "linux")]
         let cursor_evt = {
             let cursor_evt = cursor_event.try_clone().unwrap();
             // SAFETY: cursor_evt is valid for the duration of the fcntl calls.
@@ -110,9 +107,7 @@ impl Worker {
         Self {
             control_evt,
             control_queue,
-            #[cfg(target_os = "linux")]
             cursor_evt,
-            #[cfg(target_os = "linux")]
             cursor_queue,
             mem,
             interrupt,
@@ -342,16 +337,56 @@ impl Worker {
     /// Non-Linux GPU worker loop: blocks on the virtio control eventfd.
     /// Used on macOS where virglrenderer render-server polling is not needed.
     #[cfg(not(target_os = "linux"))]
+    /// Non-Linux worker loop. Mirrors the epoll loop's three duties: process
+    /// control-queue commands, drain-and-ack cursor-queue commands, and tick
+    /// `event_poll()` on idle so pending fences retire without new guest
+    /// traffic. Blocking solely on the control eventfd deadlocks a compositor
+    /// twice over: a cursor-plane commit waits on a fence only fence polling
+    /// can retire, and its cursor descriptor is never returned.
     fn work_loop_blocking(&mut self, virtio_gpu: &mut VirtioGpu) {
+        use nix::errno::Errno;
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
         loop {
-            if let Err(e) = self.control_evt.read() {
-                error!("Failed to read control_evt: {e:?}");
-                continue;
+            let (control_ready, cursor_ready) = {
+                // SAFETY: the raw fds outlive the poll call; self owns both
+                // eventfds for the lifetime of the loop.
+                let control_fd = unsafe { BorrowedFd::borrow_raw(self.control_evt.as_raw_fd()) };
+                let cursor_fd = unsafe { BorrowedFd::borrow_raw(self.cursor_evt.as_raw_fd()) };
+                let mut fds = [
+                    PollFd::new(control_fd, PollFlags::POLLIN),
+                    PollFd::new(cursor_fd, PollFlags::POLLIN),
+                ];
+                match poll(&mut fds, PollTimeout::from(1u8)) {
+                    Ok(0) => {
+                        virtio_gpu.event_poll();
+                        continue;
+                    }
+                    Ok(_) => (
+                        fds[0].revents().is_some_and(|r| !r.is_empty()),
+                        fds[1].revents().is_some_and(|r| !r.is_empty()),
+                    ),
+                    Err(Errno::EINTR) => continue,
+                    Err(e) => {
+                        error!("gpu worker: poll failed: {e:?}");
+                        continue;
+                    }
+                }
+            };
+            if control_ready {
+                if let Err(e) = self.control_evt.read() {
+                    error!("Failed to read control_evt: {e:?}");
+                }
+                if self.process_queue(virtio_gpu, &self.control_queue.clone())
+                    && let Err(e) = self.interrupt.try_signal_used_queue()
+                {
+                    error!("Error signaling queue: {e:?}");
+                }
             }
-            if self.process_queue(virtio_gpu, &self.control_queue.clone())
-                && let Err(e) = self.interrupt.try_signal_used_queue()
-            {
-                error!("Error signaling queue: {e:?}");
+            if cursor_ready {
+                if let Err(e) = self.cursor_evt.read() {
+                    error!("Failed to read cursor_evt: {e:?}");
+                }
+                self.process_cursor_queue();
             }
         }
     }
@@ -624,7 +659,6 @@ impl Worker {
     /// Drain and ack the cursor queue. Cursor commands carry no response
     /// payload, so returning the descriptors (len 0) and signaling is enough
     /// to keep the guest's cursor ring from running out of free entries.
-    #[cfg(target_os = "linux")]
     fn process_cursor_queue(&mut self) {
         let mem = self.mem.clone();
         let mut used_any = false;
@@ -694,6 +728,7 @@ impl Worker {
                     let mut ctx_id = 0;
                     let mut flags = 0;
                     let mut ring_idx = 0;
+                    let mut fence_created = false;
                     if let Some(_cmd) = gpu_cmd {
                         let ctrl_hdr = ctrl_hdr.unwrap();
                         if ctrl_hdr.flags & VIRTIO_GPU_FLAG_FENCE != 0 {
@@ -709,10 +744,25 @@ impl Worker {
                                 ring_idx,
                             };
                             gpu_response = match virtio_gpu.create_fence(fence) {
-                                Ok(_) => gpu_response,
+                                Ok(_) => {
+                                    fence_created = true;
+                                    gpu_response
+                                }
                                 Err(fence_resp) => {
-                                    warn!("create_fence {fence_id} -> {fence_resp:?}");
-                                    fence_resp
+                                    // No fence exists to retire, so the fenced
+                                    // command must complete immediately — a
+                                    // deferred descriptor would never be
+                                    // returned and the guest's dma-fence wait
+                                    // (e.g. a cursor-plane commit) would hang
+                                    // forever. Seen on macOS, where the Venus
+                                    // virglrenderer build rejects ctx0 fences.
+                                    static FENCE_ERR_ONCE: std::sync::Once = std::sync::Once::new();
+                                    FENCE_ERR_ONCE.call_once(|| {
+                                        warn!(
+                                            "create_fence failed; completing fenced commands immediately: {fence_resp:?}"
+                                        );
+                                    });
+                                    gpu_response
                                 }
                             };
                         }
@@ -725,7 +775,7 @@ impl Worker {
                         Err(e) => debug!("ctrl queue response encode error: {e:?}"),
                     }
 
-                    if flags & VIRTIO_GPU_FLAG_FENCE != 0 {
+                    if flags & VIRTIO_GPU_FLAG_FENCE != 0 && fence_created {
                         let ring = match flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
                             0 => VirtioGpuRing::Global,
                             _ => VirtioGpuRing::ContextSpecific { ctx_id, ring_idx },

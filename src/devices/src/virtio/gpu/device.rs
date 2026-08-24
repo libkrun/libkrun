@@ -271,15 +271,10 @@ impl VirtioDevice for Gpu {
         } = cursor_q;
         let cursor_queue = Arc::new(Mutex::new(cursor_queue));
         self.cursor_queue = Some(cursor_queue.clone());
-        #[cfg(not(target_os = "linux"))]
-        let _ = cursor_event;
-
         let worker = Worker::new(
             control_queue,
             control_event,
-            #[cfg(target_os = "linux")]
             cursor_queue,
-            #[cfg(target_os = "linux")]
             cursor_event,
             mem.clone(),
             interrupt.clone(),
