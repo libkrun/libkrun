@@ -78,7 +78,7 @@ impl InputConfig {
             }
             config_select::VIRTIO_INPUT_CFG_ABS_INFO => cfg
                 .query_abs_info(subsel, unsafe { &mut self.repr.payload.abs })
-                .map(|_| size_of::<InputDeviceIds>() as u8),
+                .map(|_| size_of::<InputAbsInfo>() as u8),
             select => {
                 error!("Invalid config selection select = {select}");
                 self.invalidate();
@@ -94,7 +94,17 @@ impl InputConfig {
             }
             Err(e) => {
                 error!("Failed to query config select={select}, subsel={subsel}: {e:?}");
-                self.invalidate();
+                // Keep the guest-written select/subsel and report size 0
+                // ("unsupported") instead of resetting to UNSET: the guest
+                // writes select and subsel as two separate config writes, so
+                // the first write pairs the new select with a stale subsel.
+                // Wiping the stored select here made that transient error
+                // permanent — the following subsel write recombined with
+                // UNSET and the real query never ran (observed as ABS_X
+                // getting no absinfo while ABS_Y did).
+                self.repr.size = 0;
+                self.repr.select = select;
+                self.repr.subsel = subsel;
             }
         };
     }
