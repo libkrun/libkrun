@@ -413,6 +413,15 @@ impl VirtioGpu {
         }
         let rutabaga_channels_opt = Some(rutabaga_channels);
 
+        // VIRGL_RENDERER_THREAD_SYNC | VIRGL_RENDERER_USE_ASYNC_FENCE_CB.
+        // Without these, virglrenderer only retires fences while processing
+        // new guest commands, so a client that submits work and then blocks
+        // on its final fence never gets it back. This device relies on the
+        // async callback path (see create_fence_handler), so the flags are a
+        // correctness requirement, not a tuning knob.
+        #[cfg(target_os = "linux")]
+        let virgl_flags = virgl_flags | (1 << 1) | (1 << 8);
+
         let builder = RutabagaBuilder::new(
             rutabaga_gfx::RutabagaComponentType::VirglRenderer,
             virgl_flags,
@@ -768,10 +777,15 @@ impl VirtioGpu {
             offset: 0,
         };
 
-        rutabaga
-            .transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
-            .map_err(|e| format!("{e}"))
-            .unwrap();
+        if let Err(e) =
+            rutabaga.transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
+        {
+            error!(
+                "read_2d_resource: transfer_read failed for resource {}: {e}",
+                resource.id
+            );
+            return Err(ErrUnspec);
+        }
 
         Ok(OkNoData)
     }
@@ -845,12 +859,19 @@ impl VirtioGpu {
     /// Can also be used to invalidate caches.
     pub fn transfer_read(
         &mut self,
-        _ctx_id: u32,
-        _resource_id: u32,
-        _transfer: Transfer3D,
-        _buf: Option<VolatileSlice>,
+        ctx_id: u32,
+        resource_id: u32,
+        transfer: Transfer3D,
+        buf: Option<VolatileSlice>,
     ) -> VirtioGpuResult {
-        panic!("virtio_gpu: transfer_read unimplemented");
+        // Reads into a caller-provided slice are not wired up; the only
+        // caller targets the resource's attached iovecs.
+        if buf.is_some() {
+            return Err(ErrUnspec);
+        }
+        self.rutabaga
+            .transfer_read(ctx_id, resource_id, transfer, None)?;
+        Ok(OkNoData)
     }
 
     /// Attaches backing memory to the given resource, represented by a `Vec` of `(address, size)`
@@ -989,7 +1010,8 @@ impl VirtioGpu {
         let mut rutabaga_iovecs = None;
 
         if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
-            panic!("GUEST_HANDLE unimplemented");
+            error!("resource_create_blob: GUEST_HANDLE unimplemented");
+            return Err(ErrUnspec);
         } else if resource_create_blob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D {
             rutabaga_iovecs =
                 Some(sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?);
@@ -1036,7 +1058,10 @@ impl VirtioGpu {
                     RUTABAGA_MAP_ACCESS_READ => libc::PROT_READ,
                     RUTABAGA_MAP_ACCESS_WRITE => libc::PROT_WRITE,
                     RUTABAGA_MAP_ACCESS_RW => libc::PROT_READ | libc::PROT_WRITE,
-                    _ => panic!("unexpected prot mode for mapping"),
+                    _ => {
+                        error!("resource_map_blob: unexpected prot mode {map_info:#x}");
+                        return Err(ErrUnspec);
+                    }
                 };
 
                 // A blob that does not fit the shm region must be rejected, not
@@ -1097,7 +1122,10 @@ impl VirtioGpu {
             RUTABAGA_MAP_ACCESS_READ => libc::PROT_READ,
             RUTABAGA_MAP_ACCESS_WRITE => libc::PROT_WRITE,
             RUTABAGA_MAP_ACCESS_RW => libc::PROT_READ | libc::PROT_WRITE,
-            _ => panic!("unexpected prot mode for mapping"),
+            _ => {
+                error!("resource_map_blob: unexpected prot mode {map_info:#x}");
+                return Err(ErrUnspec);
+            }
         };
 
         let end = offset.checked_add(resource.size).ok_or(ErrUnspec)?;
@@ -1148,6 +1176,18 @@ impl VirtioGpu {
                     libc::MAP_SHARED | libc::MAP_FIXED,
                 )?;
             }
+        } else {
+            // export_blob failing does not mean the resource is unmappable:
+            // classic virgl GL memory has no exportable fd. Let rutabaga map
+            // it (and propagate a real error if it cannot) instead of falling
+            // through and reporting success with the guest pages unmapped.
+            self.rutabaga.resource_map(
+                resource_id,
+                addr,
+                resource.size,
+                prot,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+            )?;
         }
 
         resource.shmem_offset = Some(offset);

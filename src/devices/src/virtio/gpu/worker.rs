@@ -37,6 +37,13 @@ use krun_display::Rect;
 pub struct Worker {
     control_evt: EventFd,
     control_queue: Arc<Mutex<VirtQueue>>,
+    /// Cursor queue, drained and acked by the worker: cursor commands carry no
+    /// response payload, but their descriptors must be returned or the guest's
+    /// cursor ring runs out of free entries and atomic commits block forever.
+    #[cfg(target_os = "linux")]
+    cursor_evt: EventFd,
+    #[cfg(target_os = "linux")]
+    cursor_queue: Arc<Mutex<VirtQueue>>,
     mem: GuestMemoryMmap,
     interrupt: InterruptTransport,
     shm_region: VirtioShmRegion,
@@ -70,6 +77,8 @@ impl Worker {
     pub fn new(
         control_queue: Arc<Mutex<VirtQueue>>,
         control_event: Arc<EventFd>,
+        #[cfg(target_os = "linux")] cursor_queue: Arc<Mutex<VirtQueue>>,
+        #[cfg(target_os = "linux")] cursor_event: Arc<EventFd>,
         mem: GuestMemoryMmap,
         interrupt: InterruptTransport,
         shm_region: VirtioShmRegion,
@@ -87,9 +96,24 @@ impl Worker {
             OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).unwrap()) & !OFlag::O_NONBLOCK;
         fcntl(fd, FcntlArg::F_SETFL(flags)).unwrap();
 
+        #[cfg(target_os = "linux")]
+        let cursor_evt = {
+            let cursor_evt = cursor_event.try_clone().unwrap();
+            // SAFETY: cursor_evt is valid for the duration of the fcntl calls.
+            let fd = unsafe { BorrowedFd::borrow_raw(cursor_evt.as_raw_fd()) };
+            let flags =
+                OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).unwrap()) & !OFlag::O_NONBLOCK;
+            fcntl(fd, FcntlArg::F_SETFL(flags)).unwrap();
+            cursor_evt
+        };
+
         Self {
             control_evt,
             control_queue,
+            #[cfg(target_os = "linux")]
+            cursor_evt,
+            #[cfg(target_os = "linux")]
+            cursor_queue,
             mem,
             interrupt,
             shm_region,
@@ -162,6 +186,7 @@ impl Worker {
 
         const TOKEN_CONTROL: u64 = 0;
         const TOKEN_RUTABAGA: u64 = 1;
+        const TOKEN_CURSOR: u64 = 2;
         // Per-context tokens: TOKEN_CONTEXT_BASE + ctx_id.  ctx_id values start
         // at 1, so TOKEN_CONTEXT_BASE = 16 leaves room for future global tokens.
         const TOKEN_CONTEXT_BASE: u64 = 16;
@@ -177,6 +202,22 @@ impl Worker {
         if ret != 0 {
             panic!(
                 "gpu worker: epoll_ctl ADD control fd failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // Register the cursor queue eventfd.
+        let cursor_raw = self.cursor_evt.as_raw_fd();
+        let mut cursor_ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: TOKEN_CURSOR,
+        };
+        // SAFETY: cursor_raw is valid for the lifetime of self.cursor_evt.
+        let ret =
+            unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, cursor_raw, &mut cursor_ev) };
+        if ret != 0 {
+            panic!(
+                "gpu worker: epoll_ctl ADD cursor fd failed: {}",
                 std::io::Error::last_os_error()
             );
         }
@@ -217,6 +258,14 @@ impl Worker {
                 continue;
             }
 
+            // Classic virgl exposes no global poll fd, so pending fences would
+            // otherwise only retire while new guest commands are processed —
+            // deadlocking any client blocked on its last fence. Poll on idle
+            // ticks so fences retire even with no incoming traffic.
+            if n == 0 {
+                virtio_gpu.event_poll();
+            }
+
             let mut process_queue = false;
             for event in events.iter().take(n as usize) {
                 // Copy the token out of the packed epoll_event field before
@@ -229,6 +278,12 @@ impl Worker {
                             error!("Failed to read control_evt: {e:?}");
                         }
                         process_queue = true;
+                    }
+                    TOKEN_CURSOR => {
+                        if let Err(e) = self.cursor_evt.read() {
+                            error!("Failed to read cursor_evt: {e:?}");
+                        }
+                        self.process_cursor_queue();
                     }
                     TOKEN_RUTABAGA => {
                         // Global poll fd fired (non-render-server mode): process events.
@@ -376,10 +431,12 @@ impl Worker {
             }
             GpuCommand::ResourceDetachBacking(info) => virtio_gpu.detach_backing(info.resource_id),
             GpuCommand::UpdateCursor(_info) => {
-                panic!("virtio_gpu: GpuCommand:UpdateCursor unimplemented");
+                error!("virtio_gpu: GpuCommand::UpdateCursor unimplemented");
+                Err(GpuResponse::ErrUnspec)
             }
             GpuCommand::MoveCursor(_info) => {
-                panic!("virtio_gpu: GpuCommand::MoveCursor unimplemented");
+                error!("virtio_gpu: GpuCommand::MoveCursor unimplemented");
+                Err(GpuResponse::ErrUnspec)
             }
             GpuCommand::ResourceAssignUuid(info) => {
                 let resource_id = info.resource_id;
@@ -549,7 +606,8 @@ impl Worker {
                 )
             }
             GpuCommand::SetScanoutBlob(_info) => {
-                panic!("virtio_gpu: GpuCommand::SetScanoutBlob unimplemented");
+                error!("virtio_gpu: GpuCommand::SetScanoutBlob unimplemented");
+                Err(GpuResponse::ErrUnspec)
             }
             GpuCommand::ResourceMapBlob(info) => {
                 let resource_id = info.resource_id;
@@ -560,6 +618,31 @@ impl Worker {
                 let resource_id = info.resource_id;
                 virtio_gpu.resource_unmap_blob(resource_id, &self.shm_region)
             }
+        }
+    }
+
+    /// Drain and ack the cursor queue. Cursor commands carry no response
+    /// payload, so returning the descriptors (len 0) and signaling is enough
+    /// to keep the guest's cursor ring from running out of free entries.
+    #[cfg(target_os = "linux")]
+    fn process_cursor_queue(&mut self) {
+        let mem = self.mem.clone();
+        let mut used_any = false;
+        loop {
+            let head = self.cursor_queue.lock().unwrap().pop(&mem);
+            let Some(head) = head else { break };
+            if let Err(e) = self
+                .cursor_queue
+                .lock()
+                .unwrap()
+                .add_used(&mem, head.index, 0)
+            {
+                error!("cursor queue add_used: {e:?}");
+            }
+            used_any = true;
+        }
+        if used_any && let Err(e) = self.interrupt.try_signal_used_queue() {
+            error!("cursor queue signal: {e:?}");
         }
     }
 

@@ -60,9 +60,10 @@ pub struct Gpu {
     /// Control queue, shared with the worker (an `Arc` clone). Read at snapshot
     /// time to capture ring state; the golden is paused so the worker is idle.
     control_queue: Option<Arc<Mutex<VirtQueue>>>,
-    /// Cursor queue ring state, captured at activate (the cursor queue is not
-    /// driven by the worker, so its state is stable after negotiation).
-    cursor_queue_state: Option<QueueState>,
+    /// Cursor queue, shared with the worker like the control queue: the worker
+    /// drains and acks cursor commands, so ring state must be read live at
+    /// snapshot time.
+    cursor_queue: Option<Arc<Mutex<VirtQueue>>>,
 }
 
 impl Gpu {
@@ -84,7 +85,7 @@ impl Gpu {
             displays,
             display_backend,
             control_queue: None,
-            cursor_queue_state: None,
+            cursor_queue: None,
         })
     }
 
@@ -96,9 +97,13 @@ impl Gpu {
             .control_queue
             .as_ref()
             .map(|q| q.lock().expect("gpu control queue poisoned").save_state());
+        let cursor = self
+            .cursor_queue
+            .as_ref()
+            .map(|q| q.lock().expect("gpu cursor queue poisoned").save_state());
         GpuState {
             acked_features: self.acked_features,
-            queues: vec![control, self.cursor_queue_state.clone()],
+            queues: vec![control, cursor],
         }
     }
 
@@ -252,21 +257,30 @@ impl VirtioDevice for Gpu {
             None => panic!("virtio_gpu: missing SHM region"),
         };
 
-        // Capture the cursor queue's ring state (the worker never drives it, so
-        // it is stable) for snapshot, then share the control queue with the
-        // worker via an `Arc` so it too can be read at snapshot time (for fork).
-        self.cursor_queue_state = Some(cursor_q.queue.save_state());
+        // Share both queues with the worker via `Arc` so their ring state can
+        // be read at snapshot time (for fork).
         let DeviceQueue {
             queue: control_queue,
             event: control_event,
         } = control_q;
         let control_queue = Arc::new(Mutex::new(control_queue));
         self.control_queue = Some(control_queue.clone());
+        let DeviceQueue {
+            queue: cursor_queue,
+            event: cursor_event,
+        } = cursor_q;
+        let cursor_queue = Arc::new(Mutex::new(cursor_queue));
+        self.cursor_queue = Some(cursor_queue.clone());
+        #[cfg(not(target_os = "linux"))]
+        let _ = cursor_event;
 
-        // cursor queue not used by worker
         let worker = Worker::new(
             control_queue,
             control_event,
+            #[cfg(target_os = "linux")]
+            cursor_queue,
+            #[cfg(target_os = "linux")]
+            cursor_event,
             mem.clone(),
             interrupt.clone(),
             shm_region,
