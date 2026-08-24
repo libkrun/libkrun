@@ -432,7 +432,7 @@ fn handle_dhcp_ack(nl_sock: libc::c_int, iface_index: i32, response: &[u8]) -> a
             }
             // Domain Name Server
             6 => {
-                for chunk in data.chunks_exact(4) {
+                for chunk in data.as_chunks::<4>().0 {
                     let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
                     let _ = writeln!(resolv_conf, "nameserver {ip}");
                 }
