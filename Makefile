@@ -198,7 +198,7 @@ clean-sysroot:
 # smolvm: canonical build target for use in smolvm.
 #
 # Always use `make smolvm` (or the top-level `make libkrun`) rather than
-# calling cargo directly — the required feature set (blk + net + gpu) and
+# calling cargo directly — the required feature set (blk + net + gpu + input) and
 # env vars (LIBCLANG_PATH, KRUN_INIT_BINARY_PATH) are enforced here.
 #
 # macOS requirements: brew install llvm virglrenderer
@@ -214,13 +214,13 @@ ifeq ($(OS),Darwin)
 		{ echo "Error: virglrenderer not found — brew install virglrenderer"; exit 1; }; \
 	LIBCLANG_PATH="$$LLVM_PREFIX/lib" \
 	KRUN_INIT_BINARY_PATH="$$(realpath init/init)" \
-		$(MAKE) BLK=1 NET=1 GPU=1
+		$(MAKE) BLK=1 NET=1 GPU=1 INPUT=1
 	cp $(LIBRARY_RELEASE_$(OS)) $(SMOLVM_DEST)
 	@echo "Installed: $(SMOLVM_DEST)"
 	@echo "Re-codesign smolvm: codesign --force --sign - --entitlements ../smolvm.entitlements ../target/release/smolvm"
 else
 	KRUN_INIT_BINARY_PATH="$$(realpath init/init)" \
-		$(MAKE) BLK=1 NET=1 GPU=1
+		$(MAKE) BLK=1 NET=1 GPU=1 INPUT=1
 	cp $(LIBRARY_RELEASE_$(OS)) $(SMOLVM_DEST)
 	@echo "Installed: $(SMOLVM_DEST)"
 endif
