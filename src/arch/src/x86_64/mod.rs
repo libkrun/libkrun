@@ -162,7 +162,7 @@ pub fn arch_memory_regions(
         // To be filled later using GuestMemory.
         guest_last_addr: 0,
         page_size,
-        initrd_addr: ram_last_addr - initrd_size,
+        initrd_addr: ram_last_addr.min(MMIO_MEM_START) - initrd_size,
         firmware_addr,
     };
     (info, regions)
@@ -398,6 +398,35 @@ mod tests {
             regions[1].0
         );
         assert_eq!(GuestAddress(1u64 << 32), regions[2].0);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    fn assert_initrd_in_low_ram(memory_size: usize, initrd_size: u64) {
+        let (info, regions) = arch_memory_regions(
+            memory_size,
+            Some(KERNEL_LOAD_ADDR),
+            KERNEL_SIZE,
+            initrd_size,
+            None,
+        );
+        let initrd_end = info.initrd_addr + initrd_size;
+
+        assert_eq!(info.initrd_addr, MMIO_MEM_START - initrd_size);
+        assert!(regions.iter().any(|(start, size)| {
+            let start = start.raw_value();
+            let end = start + *size as u64;
+
+            info.initrd_addr >= start && initrd_end <= end
+        }));
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn initrd_stays_in_low_ram_when_memory_crosses_mmio_gap() {
+        const INITRD_SIZE: u64 = 32 << 20;
+
+        assert_initrd_in_low_ram(3330usize << 20, INITRD_SIZE);
+        assert_initrd_in_low_ram(4096usize << 20, INITRD_SIZE);
     }
 
     #[test]
