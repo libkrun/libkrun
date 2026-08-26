@@ -91,6 +91,55 @@ pub fn read_guest_memory_into<R: Read>(
     Ok(())
 }
 
+/// Allocate guest memory with the captured physical layout and eagerly load a
+/// complete memory image into it.
+///
+/// This is the durable-checkpoint counterpart to the live CoW mapping helpers:
+/// the returned mapping owns all bytes and has no dependency on the process
+/// that produced the snapshot. The caller may later materialize it into
+/// file-backed memory when the restored VM is promoted to a fork source.
+pub fn load_guest_memory<R: Read>(
+    descs: &[MemoryRegionDesc],
+    inp: &mut R,
+) -> io::Result<GuestMemoryMmap> {
+    if descs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot contains no guest-memory regions",
+        ));
+    }
+    let ranges = descs
+        .iter()
+        .map(|desc| {
+            let len = usize::try_from(desc.len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "guest-memory region does not fit host address space",
+                )
+            })?;
+            if len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "zero-length guest-memory region",
+                ));
+            }
+            Ok((GuestAddress(desc.gpa), len))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let memory = GuestMemoryMmap::from_ranges(&ranges)
+        .map_err(|error| io::Error::other(format!("allocate guest memory: {error:?}")))?;
+    read_guest_memory_into(&memory, descs, inp)?;
+
+    let mut trailing = [0_u8; 1];
+    if inp.read(&mut trailing)? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "guest-memory image has trailing bytes",
+        ));
+    }
+    Ok(memory)
+}
+
 /// Total byte length of all regions in a descriptor list (the size of the
 /// memory image stream).
 pub fn memory_image_len(descs: &[MemoryRegionDesc]) -> u64 {
@@ -792,5 +841,38 @@ mod tests {
         let truncated = vec![0u8; size - 1];
         let err = read_guest_memory_into(&dst, &descs, &mut truncated.as_slice()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn test_load_guest_memory_roundtrip_and_exact_length() {
+        let descs = [
+            MemoryRegionDesc {
+                gpa: 0,
+                len: 0x2000,
+            },
+            MemoryRegionDesc {
+                gpa: 0x10_0000,
+                len: 0x1000,
+            },
+        ];
+        let image = (0..0x3000).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let memory = load_guest_memory(&descs, &mut image.as_slice()).unwrap();
+        let mut restored = vec![0_u8; image.len()];
+        memory
+            .read_slice(&mut restored[..0x2000], GuestAddress(0))
+            .unwrap();
+        memory
+            .read_slice(&mut restored[0x2000..], GuestAddress(0x10_0000))
+            .unwrap();
+        assert_eq!(restored, image);
+
+        let mut trailing = image.clone();
+        trailing.push(0);
+        assert_eq!(
+            load_guest_memory(&descs, &mut trailing.as_slice())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

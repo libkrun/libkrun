@@ -737,6 +737,50 @@ impl Vmm {
         ))
     }
 
+    /// Capture a durable checkpoint while keeping both vCPUs and device
+    /// workers frozen until the caller explicitly resumes the VM.
+    ///
+    /// This is the disk-consistent save variant: unlike [`Self::checkpoint`],
+    /// it does not re-arm device workers after serializing RAM. A caller can
+    /// therefore clone the block images at the exact same boundary and then
+    /// call [`Self::resume`], which re-arms devices before restarting vCPUs.
+    #[cfg(snapshot_supported)]
+    pub fn checkpoint_frozen<W: std::io::Write>(
+        &mut self,
+        mem_out: &mut W,
+    ) -> Result<(VmCheckpoint, Vec<snapshot::MemoryRegionDesc>)> {
+        self.pause()?;
+        self.quiesce_devices();
+        let capture = (|| {
+            let vcpu_states = self.save_vcpu_states()?;
+            let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+            let devices = self.snapshot_devices();
+            let mem_descs = snapshot::write_guest_memory(&self.guest_memory, mem_out)
+                .map_err(|e| Error::Snapshot(format!("guest-memory dump: {e}")))?;
+            #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+            let ioapic = self.intc.lock().unwrap().save_state();
+            #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+            let ioapic = None;
+            Ok((
+                VmCheckpoint {
+                    vm_state,
+                    vcpu_states,
+                    devices,
+                    ioapic,
+                },
+                mem_descs,
+            ))
+        })();
+
+        if capture.is_err() {
+            // Preserve the pre-SAVE behavior on capture errors: a failed
+            // persistence attempt must not strand a previously-running VM.
+            self.rearm_devices();
+            let _ = self.resume();
+        }
+        capture
+    }
+
     /// Restore a VM from a [`VmCheckpoint`] and its guest-memory image onto this
     /// (freshly-built, vCPU-paused) `Vmm`: load guest RAM, restore VM-level and
     /// device state, then load every vCPU's registers. The caller resumes the

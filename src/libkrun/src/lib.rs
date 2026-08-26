@@ -27,6 +27,8 @@ use std::ffi::CString;
 use std::ffi::{CStr, c_void};
 use std::fs::File;
 use std::io::IsTerminal;
+#[cfg(snapshot_supported)]
+use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -532,6 +534,169 @@ fn handle_restore(vmm: &Arc<Mutex<vmm::Vmm>>, id: &str) -> String {
     }
 }
 
+/// Magic for a self-contained durable snapshot manifest ("SMOLPORT").
+#[cfg(snapshot_supported)]
+const PORTABLE_MANIFEST_MAGIC: u64 = 0x534d4f4c504f5254;
+/// Durable snapshot manifest version.
+#[cfg(snapshot_supported)]
+const PORTABLE_MANIFEST_VERSION: u32 = 1;
+
+/// Serialize the layout of the eager guest-memory image. The VM/vCPU/device
+/// checkpoint is stored separately in `checkpoint.bin`; `memory.bin` contains
+/// region bytes in this descriptor order.
+#[cfg(snapshot_supported)]
+fn encode_portable_manifest(descs: &[vmm::snapshot::MemoryRegionDesc]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16 + descs.len() * 16);
+    buf.extend_from_slice(&PORTABLE_MANIFEST_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&PORTABLE_MANIFEST_VERSION.to_le_bytes());
+    buf.extend_from_slice(&(descs.len() as u32).to_le_bytes());
+    for desc in descs {
+        buf.extend_from_slice(&desc.gpa.to_le_bytes());
+        buf.extend_from_slice(&desc.len.to_le_bytes());
+    }
+    buf
+}
+
+#[cfg(snapshot_supported)]
+fn decode_portable_manifest(bytes: &[u8]) -> std::io::Result<Vec<vmm::snapshot::MemoryRegionDesc>> {
+    let invalid =
+        |message: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string());
+    let mut offset = 0_usize;
+    let take = |offset: &mut usize, len: usize| -> std::io::Result<&[u8]> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| invalid("portable manifest offset overflow"))?;
+        let value = bytes
+            .get(*offset..end)
+            .ok_or_else(|| invalid("portable manifest truncated"))?;
+        *offset = end;
+        Ok(value)
+    };
+    let magic = u64::from_le_bytes(take(&mut offset, 8)?.try_into().unwrap());
+    if magic != PORTABLE_MANIFEST_MAGIC {
+        return Err(invalid("bad portable manifest magic"));
+    }
+    let version = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap());
+    if version != PORTABLE_MANIFEST_VERSION {
+        return Err(invalid("unsupported portable manifest version"));
+    }
+    let region_count = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap()) as usize;
+    if region_count == 0 || region_count > 4096 {
+        return Err(invalid("invalid portable manifest region count"));
+    }
+    let mut descs = Vec::with_capacity(region_count);
+    let mut previous_end = 0_u64;
+    let mut total_len = 0_u64;
+    for _ in 0..region_count {
+        let gpa = u64::from_le_bytes(take(&mut offset, 8)?.try_into().unwrap());
+        let len = u64::from_le_bytes(take(&mut offset, 8)?.try_into().unwrap());
+        if len == 0 {
+            return Err(invalid("zero-length portable memory region"));
+        }
+        let end = gpa
+            .checked_add(len)
+            .ok_or_else(|| invalid("portable memory region address overflow"))?;
+        if !descs.is_empty() && gpa < previous_end {
+            return Err(invalid("overlapping or unsorted portable memory regions"));
+        }
+        total_len = total_len
+            .checked_add(len)
+            .ok_or_else(|| invalid("portable memory image length overflow"))?;
+        previous_end = end;
+        descs.push(vmm::snapshot::MemoryRegionDesc { gpa, len });
+    }
+    if offset != bytes.len() {
+        return Err(invalid("portable manifest has trailing bytes"));
+    }
+    Ok(descs)
+}
+
+/// Persist a self-contained VM checkpoint to a newly-created directory. The
+/// manifest is renamed into place last, so a reader never accepts a partial
+/// checkpoint. The VM remains paused on success to let the caller capture its
+/// disks at the same consistency boundary; failures resume it automatically.
+#[cfg(snapshot_supported)]
+fn handle_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
+    if dir.is_empty() {
+        return "ERR EINVAL snapshot dir required\n".to_string();
+    }
+    let dir = std::path::Path::new(dir);
+    if let Err(error) = std::fs::create_dir(dir) {
+        return format!("ERR EIO create {}: {error}\n", dir.display());
+    }
+
+    let memory_partial = dir.join("memory.bin.partial");
+    let checkpoint_partial = dir.join("checkpoint.bin.partial");
+    let manifest_partial = dir.join("manifest.bin.partial");
+    let result = (|| -> std::result::Result<(u64, usize), String> {
+        let mut memory = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&memory_partial)
+            .map_err(|error| format!("create memory image: {error}"))?;
+        let (checkpoint, descs) = vmm
+            .lock()
+            .unwrap()
+            .checkpoint_frozen(&mut memory)
+            .map_err(|error| format!("capture VM: {error}"))?;
+        memory
+            .sync_all()
+            .map_err(|error| format!("sync memory image: {error}"))?;
+
+        let checkpoint_bytes = checkpoint.serialize();
+        let checkpoint_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&checkpoint_partial)
+            .map_err(|error| format!("create checkpoint state: {error}"))?;
+        (&checkpoint_file)
+            .write_all(&checkpoint_bytes)
+            .map_err(|error| format!("write checkpoint state: {error}"))?;
+        checkpoint_file
+            .sync_all()
+            .map_err(|error| format!("sync checkpoint state: {error}"))?;
+
+        let manifest_bytes = encode_portable_manifest(&descs);
+        let manifest_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&manifest_partial)
+            .map_err(|error| format!("create snapshot manifest: {error}"))?;
+        (&manifest_file)
+            .write_all(&manifest_bytes)
+            .map_err(|error| format!("write snapshot manifest: {error}"))?;
+        manifest_file
+            .sync_all()
+            .map_err(|error| format!("sync snapshot manifest: {error}"))?;
+
+        std::fs::rename(&memory_partial, dir.join("memory.bin"))
+            .map_err(|error| format!("publish memory image: {error}"))?;
+        std::fs::rename(&checkpoint_partial, dir.join("checkpoint.bin"))
+            .map_err(|error| format!("publish checkpoint state: {error}"))?;
+        // Publish the manifest last: its presence is the completeness marker.
+        std::fs::rename(&manifest_partial, dir.join("manifest.bin"))
+            .map_err(|error| format!("publish snapshot manifest: {error}"))?;
+
+        Ok((vmm::snapshot::memory_image_len(&descs), descs.len()))
+    })();
+
+    match result {
+        Ok((bytes, regions)) => {
+            format!("OK saved ({bytes} bytes, {regions} regions, paused)\n")
+        }
+        Err(error) => {
+            let resume_error = vmm.lock().unwrap().resume().err();
+            let _ = std::fs::remove_dir_all(dir);
+            match resume_error {
+                Some(resume_error) => {
+                    format!("ERR EIO {error}; resume after failed save: {resume_error}\n")
+                }
+                None => format!("ERR EIO {error}\n"),
+            }
+        }
+    }
+}
+
 /// Magic for the fork manifest ("SMOLFORK").
 #[cfg(fork_supported)]
 const FORK_MANIFEST_MAGIC: u64 = 0x534d4f4c464f524b;
@@ -708,8 +873,42 @@ fn handle_rollback_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
 fn build_restore_ctx(
     dir: &std::path::Path,
 ) -> std::result::Result<vmm::builder::RestoreCtx, String> {
+    let manifest_path = dir.join("manifest.bin");
+    let manifest = std::fs::read(&manifest_path).map_err(|e| format!("manifest: {e}"))?;
+    let magic_bytes = manifest
+        .get(..8)
+        .ok_or_else(|| "manifest: truncated".to_string())?;
+    let magic = u64::from_le_bytes(magic_bytes.try_into().unwrap());
+    if magic == PORTABLE_MANIFEST_MAGIC {
+        let descs = decode_portable_manifest(&manifest).map_err(|e| format!("manifest: {e}"))?;
+        let checkpoint =
+            std::fs::read(dir.join("checkpoint.bin")).map_err(|e| format!("checkpoint: {e}"))?;
+        let memory_path = dir.join("memory.bin");
+        let memory_file = std::fs::File::open(&memory_path).map_err(|e| format!("memory: {e}"))?;
+        let actual_memory_len = memory_file
+            .metadata()
+            .map_err(|e| format!("memory metadata: {e}"))?
+            .len();
+        let expected_memory_len = vmm::snapshot::memory_image_len(&descs);
+        if actual_memory_len != expected_memory_len {
+            return Err(format!(
+                "memory: image length {actual_memory_len} does not match manifest {expected_memory_len}"
+            ));
+        }
+        let mut memory_reader = std::io::BufReader::new(memory_file);
+        let guest_memory = vmm::snapshot::load_guest_memory(&descs, &mut memory_reader)
+            .map_err(|e| format!("load guest memory: {e}"))?;
+        return Ok(vmm::builder::RestoreCtx {
+            guest_memory,
+            fork_backed_regions: vec![true; descs.len()],
+            checkpoint,
+        });
+    }
+    if magic != FORK_MANIFEST_MAGIC {
+        return Err("manifest: unrecognized snapshot format".to_string());
+    }
     let (_owner_pid, descs) =
-        read_fork_manifest(&dir.join("manifest.bin")).map_err(|e| format!("manifest: {e}"))?;
+        read_fork_manifest(&manifest_path).map_err(|e| format!("manifest: {e}"))?;
     let checkpoint =
         std::fs::read(dir.join("checkpoint.bin")).map_err(|e| format!("checkpoint: {e}"))?;
     #[cfg(target_os = "linux")]
@@ -812,6 +1011,11 @@ fn handle_control_stream<S: std::io::Read + std::io::Write>(
                 // stash (one-shot) since the captured state is moved into KVM.
                 #[cfg(snapshot_supported)]
                 "RESTORE" => handle_restore(vmm, _arg),
+                // SAVE <dir>: write a self-contained, process-independent VM
+                // checkpoint and leave the VM paused so the caller can capture
+                // disk state from the same boundary.
+                #[cfg(snapshot_supported)]
+                "SAVE" => handle_save(vmm, _arg),
                 // FORK <dir>: capture a fork checkpoint to <dir> (checkpoint.bin +
                 // manifest.bin) and leave this VM FROZEN as the CoW base. A clone
                 // process then boots from <dir> via krun_set_snapshot, mapping this
@@ -843,6 +1047,39 @@ mod control_command_tests {
         let oversized = vec![b'x'; MAX_CONTROL_COMMAND_BYTES + 1];
         let error = read_control_command(&mut oversized.as_slice()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(snapshot_supported)]
+    #[test]
+    fn portable_manifest_roundtrips_and_rejects_corruption() {
+        let descs = vec![
+            vmm::snapshot::MemoryRegionDesc {
+                gpa: 0x1000,
+                len: 0x2000,
+            },
+            vmm::snapshot::MemoryRegionDesc {
+                gpa: 0x1_0000_0000,
+                len: 0x4000,
+            },
+        ];
+        let encoded = encode_portable_manifest(&descs);
+        assert_eq!(decode_portable_manifest(&encoded).unwrap(), descs);
+
+        assert!(decode_portable_manifest(&encoded[..encoded.len() - 1]).is_err());
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(decode_portable_manifest(&trailing).is_err());
+        let mut wrong_version = encoded;
+        wrong_version[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        assert!(decode_portable_manifest(&wrong_version).is_err());
+
+        let mut overlapping = encode_portable_manifest(&descs);
+        overlapping[32..40].copy_from_slice(&0x2000_u64.to_le_bytes());
+        assert!(decode_portable_manifest(&overlapping).is_err());
+
+        let mut overflowing = encode_portable_manifest(&descs[..1]);
+        overflowing[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(decode_portable_manifest(&overflowing).is_err());
     }
 }
 
