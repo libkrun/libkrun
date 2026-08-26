@@ -593,6 +593,10 @@ pub struct RestoreCtx {
     /// Guest RAM for the clone — a CoW clone of the golden VM's memory (Linux
     /// `memfd` `MAP_PRIVATE`) / `vm_remap` (macOS), already holding the image.
     pub guest_memory: GuestMemoryMmap,
+    /// One entry per guest-memory region. `true` identifies RAM that was
+    /// file-backed by the source and must be materialized when this clone is
+    /// promoted; `false` preserves device SHM/GPU regions as anonymous.
+    pub fork_backed_regions: Vec<bool>,
     /// Serialized `VmCheckpoint` (VM + vCPU + device state).
     pub checkpoint: Vec<u8>,
 }
@@ -624,7 +628,9 @@ pub fn build_microvm(
             .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
         vm_resources,
         &payload,
-        restore.as_ref().map(|r| r.guest_memory.clone()),
+        restore
+            .as_ref()
+            .map(|r| (r.guest_memory.clone(), r.fork_backed_regions.clone())),
     )?;
     vmm_timing!("memory created");
 
@@ -1958,7 +1964,7 @@ pub fn create_guest_memory(
     // VM's RAM that already contains the running image) instead of allocating
     // fresh, and SKIP loading the kernel/firmware/initrd. The same memory layout
     // (config) must have produced it.
-    restore_mem: Option<GuestMemoryMmap>,
+    restore_mem: Option<(GuestMemoryMmap, Vec<bool>)>,
 ) -> std::result::Result<
     (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
     StartMicrovmError,
@@ -2045,7 +2051,23 @@ pub fn create_guest_memory(
 
     // Restore: the provided CoW-clone memory already holds the running image —
     // skip allocation + payload load entirely.
-    if let Some(guest_mem) = restore_mem {
+    if let Some((guest_mem, fork_backed_regions)) = restore_mem {
+        // A clone normally keeps its inherited raw MAP_PRIVATE mappings and is
+        // therefore a cheap leaf. When explicitly launched forkable, give it
+        // fresh file-backed memory containing its current state. This one-time
+        // materialization makes the restored machine a stable source for its
+        // own descendants without mutating the ancestor's backing files.
+        let guest_mem = if memfd_backed_ram_enabled() {
+            super::snapshot::materialize_guest_memory(&guest_mem, &fork_backed_regions).map_err(
+                |error| {
+                    StartMicrovmError::GuestMemoryMmap(format!(
+                        "materialize restored fork source: {error}"
+                    ))
+                },
+            )?
+        } else {
+            guest_mem
+        };
         let payload_config = PayloadConfig {
             entry_addr: GuestAddress(0),
             initrd_config: None,

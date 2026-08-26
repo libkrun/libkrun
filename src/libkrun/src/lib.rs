@@ -720,6 +720,10 @@ fn build_restore_ctx(
         .map_err(|e| format!("cow-map guest memory: {e}"))?;
     Ok(vmm::builder::RestoreCtx {
         guest_memory,
+        fork_backed_regions: descs
+            .iter()
+            .map(|desc| desc.fd >= 0 || !desc.path.is_empty())
+            .collect(),
         checkpoint,
     })
 }

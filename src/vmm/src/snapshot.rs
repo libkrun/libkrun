@@ -16,7 +16,7 @@
 
 use std::io::{self, Read, Write};
 
-use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryRegion};
+use vm_memory::{Address, FileOffset, GuestAddress, GuestMemory, GuestMemoryRegion};
 
 use crate::GuestMemoryMmap;
 
@@ -117,6 +117,50 @@ pub fn copy_guest_memory(src: &GuestMemoryMmap, dst: &GuestMemoryMmap) -> io::Re
         unsafe { std::ptr::copy_nonoverlapping(s as *const u8, d, len) };
     }
     Ok(())
+}
+
+/// Copy the current contents of a restored clone into fresh file-backed guest
+/// memory so that clone can become the source of another copy-on-write fork.
+///
+/// A restored clone is made from raw `MAP_PRIVATE` mappings. Those mappings
+/// deliberately do not retain [`FileOffset`] metadata, so they cannot be
+/// described by [`memfd_region_descs`] for another process. Promotion pays one
+/// eager copy of the mapped address space; subsequent descendants are ordinary
+/// cheap CoW mappings of these new backing files.
+pub fn materialize_guest_memory(
+    src: &GuestMemoryMmap,
+    fork_backed_regions: &[bool],
+) -> io::Result<GuestMemoryMmap> {
+    if src.num_regions() != fork_backed_regions.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "guest-memory region count {} does not match fork backing mask {}",
+                src.num_regions(),
+                fork_backed_regions.len()
+            ),
+        ));
+    }
+    let ranges = src
+        .iter()
+        .zip(fork_backed_regions.iter().copied())
+        .map(|(region, file_backed)| {
+            let size = region.len() as usize;
+            let file = if file_backed {
+                Some(FileOffset::new(
+                    crate::builder::create_guest_ram_memfd(size).map_err(io::Error::other)?,
+                    0,
+                ))
+            } else {
+                None
+            };
+            Ok((region.start_addr(), size, file))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let dst = GuestMemoryMmap::from_ranges_with_files(ranges)
+        .map_err(|error| io::Error::other(format!("materialize guest memory: {error:?}")))?;
+    copy_guest_memory(src, &dst)?;
+    Ok(dst)
 }
 
 /// Copy-on-write clone of a `memfd`-backed guest memory image — the core of
@@ -587,6 +631,50 @@ mod tests {
         dst.read_slice(&mut got_hi, GuestAddress(0x100000)).unwrap();
         assert_eq!(got_lo, vec![0xAB; 0x10000]);
         assert_eq!(got_hi, vec![0xCD; 0x8000]);
+    }
+
+    #[test]
+    fn materialized_clone_can_source_another_cow_fork() {
+        let regions = [
+            (GuestAddress(0), 0x10000usize),
+            (GuestAddress(0x20000), 0x8000usize),
+        ];
+        // Raw mappings mirror the metadata shape returned by the cross-process
+        // restore path: bytes are present, but there is no FileOffset to expose
+        // to a descendant process.
+        let restored = GuestMemoryMmap::from_ranges(&regions).unwrap();
+        restored
+            .write_slice(&[0xA5; 0x10000], GuestAddress(0))
+            .unwrap();
+        restored
+            .write_slice(&[0x5A; 0x8000], GuestAddress(0x20000))
+            .unwrap();
+        assert!(restored.iter().all(|region| region.file_offset().is_none()));
+
+        let promoted =
+            materialize_guest_memory(&restored, &[true, false]).expect("materialize clone");
+        let promoted_regions = promoted.iter().collect::<Vec<_>>();
+        assert!(promoted_regions[0].file_offset().is_some());
+        assert!(promoted_regions[1].file_offset().is_none());
+        let mut low = vec![0; 0x10000];
+        let mut high = vec![0; 0x8000];
+        promoted.read_slice(&mut low, GuestAddress(0)).unwrap();
+        promoted
+            .read_slice(&mut high, GuestAddress(0x20000))
+            .unwrap();
+        assert_eq!(low, vec![0xA5; 0x10000]);
+        assert_eq!(high, vec![0x5A; 0x8000]);
+
+        #[cfg(target_os = "linux")]
+        {
+            let child = cow_clone_guest_memory(&promoted).expect("descendant CoW clone");
+            child.write_slice(&[0x11; 16], GuestAddress(0)).unwrap();
+            let mut parent_bytes = [0; 16];
+            promoted
+                .read_slice(&mut parent_bytes, GuestAddress(0))
+                .unwrap();
+            assert_eq!(parent_bytes, [0xA5; 16]);
+        }
     }
 
     // The CoW fork primitive: a clone shares the parent's clean pages but is
