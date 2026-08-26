@@ -152,6 +152,15 @@ impl EgressPolicy {
             .is_some_and(|expires_at| *expires_at > Instant::now())
     }
 
+    /// Whether `addr` is named by a STATIC allow-list CIDR (`--allow-cidr`,
+    /// `--outbound-localhost-only`) — as opposed to a learned DNS answer. Used by
+    /// the muxer to let a deliberate allow-list entry re-open a floored
+    /// destination in the local (non-`Strict`) modes without letting DNS
+    /// rebinding do the same. Non-IP addresses are never explicitly allowed here.
+    pub(super) fn is_addr_explicitly_allowed(&self, addr: &VsockAddr) -> bool {
+        sockaddr_ip(addr).is_some_and(|ip| ip_matches_cidrs(ip, &self.allowed_cidrs))
+    }
+
     fn is_hostname_allowed(&self, hostname: &str) -> bool {
         let Some(allowed_hosts) = &self.allowed_hosts else {
             return true;
@@ -196,10 +205,18 @@ pub(super) enum FloorMode {
     /// Trusted single-tenant/local override (`SMOLVM_EGRESS_ALLOW_PRIVATE=1`):
     /// floor nothing — the guest reaches exactly what the host can.
     Off,
-    /// Local default: deny ONLY the cloud-metadata link-local range
-    /// (`169.254.0.0/16`, incl. `169.254.169.254`). The guest keeps reaching the
-    /// host's LAN/loopback, so local dev behavior is unchanged.
+    /// Loopback-permitted local mode (`SMOLVM_ALLOW_HOST_LOOPBACK=1`, e.g. the
+    /// `--allow-host-loopback` CLI flag): deny ONLY the cloud-metadata link-local
+    /// range, leaving the host's own loopback reachable so a developer can hit a
+    /// service on their host's `127.0.0.1` from the sandbox on purpose.
     MetadataOnly,
+    /// Local DEFAULT: deny the cloud-metadata link-local range AND the host's own
+    /// loopback (`127.0.0.0/8`, `::1`, `0.0.0.0`/`::`). A guest connecting to
+    /// `127.0.0.1` means "myself", but TSI would forward it to the HOST's
+    /// loopback — a confused-deputy path onto host debuggers, Docker, and local
+    /// databases. The host's LAN stays reachable (legitimate local dev), and an
+    /// explicit allow-list entry can also re-open loopback (see the muxer).
+    MetadataAndLoopback,
     /// Multi-tenant/fleet (`SMOLVM_PUBLISH_ADDR` set): the full floor — metadata,
     /// host/control internal subnets, loopback, link/unique-local, and the
     /// gateway CGNAT range — so a guest can't steal host credentials, pivot to
@@ -238,11 +255,21 @@ pub(super) fn floor_mode() -> FloorMode {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if allow_private {
-        FloorMode::Off
-    } else if std::env::var_os("SMOLVM_PUBLISH_ADDR").is_some() {
-        FloorMode::Strict
-    } else {
+        return FloorMode::Off;
+    }
+    // Fleet mode is absolute: `SMOLVM_ALLOW_HOST_LOOPBACK` only relaxes the LOCAL
+    // default, never Strict, so it can't re-expose the host loopback / control
+    // door on a multi-tenant node.
+    if std::env::var_os("SMOLVM_PUBLISH_ADDR").is_some() {
+        return FloorMode::Strict;
+    }
+    let allow_host_loopback = std::env::var("SMOLVM_ALLOW_HOST_LOOPBACK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if allow_host_loopback {
         FloorMode::MetadataOnly
+    } else {
+        FloorMode::MetadataAndLoopback
     }
 }
 
@@ -255,6 +282,24 @@ fn is_link_local(ip: IpAddr) -> bool {
         IpAddr::V6(v6) => {
             (v6.segments()[0] & 0xffc0) == 0xfe80
                 || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
+        }
+    }
+}
+
+/// The host's own loopback / unspecified addresses — what `127.0.0.1` and `::1`
+/// mean to the guest, but which TSI forwards to the HOST. Floored in every mode
+/// except `Off`; re-openable in the local modes only by an explicit static
+/// allow-list entry (never a learned DNS IP, so it can't be reached by
+/// rebinding). Covers the IPv4-mapped IPv6 form so it can't be smuggled past.
+pub(super) fn is_host_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
         }
     }
 }
@@ -276,6 +321,7 @@ fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
     match mode {
         FloorMode::Off => false,
         FloorMode::MetadataOnly => is_link_local(ip),
+        FloorMode::MetadataAndLoopback => is_link_local(ip) || is_host_loopback(ip),
         FloorMode::Strict => match ip {
             IpAddr::V4(v4) => is_reserved_v4(v4),
             IpAddr::V6(v6) => {
@@ -294,6 +340,13 @@ fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
 /// (e.g. unix sockets) are never floored.
 pub(super) fn is_addr_floored(addr: &VsockAddr, mode: FloorMode) -> bool {
     sockaddr_ip(addr).is_some_and(|ip| is_floored(ip, mode))
+}
+
+/// Whether `addr` is the host's own loopback / unspecified address — the only
+/// part of the floor an explicit allow-list may re-open in the local modes.
+/// Cloud-metadata and (under `Strict`) the internal ranges are never re-openable.
+pub(super) fn is_addr_host_loopback(addr: &VsockAddr) -> bool {
+    sockaddr_ip(addr).is_some_and(is_host_loopback)
 }
 
 /// Work item handed from the muxer thread to the DNS worker thread. Carries an
@@ -868,16 +921,44 @@ mod tests {
     }
 
     #[test]
-    fn metadata_floor_blocks_link_local_only() {
-        let meta = FloorMode::MetadataOnly;
+    fn default_floor_blocks_link_local_and_host_loopback() {
+        let meta = FloorMode::MetadataAndLoopback;
         // Cloud-metadata is denied even with no allow-list.
         assert!(is_addr_floored(&sockaddr_v4(169, 254, 169, 254, 80), meta));
         assert!(is_addr_floored(&sockaddr_v4(169, 254, 0, 1, 80), meta));
-        // Host LAN / loopback / public stay reachable in the local default.
-        assert!(!is_addr_floored(&sockaddr_v4(127, 0, 0, 1, 80), meta));
+        // Host loopback / unspecified are denied too: `127.0.0.1` means the guest
+        // itself, but TSI would forward it to the HOST's loopback services.
+        assert!(is_addr_floored(&sockaddr_v4(127, 0, 0, 1, 80), meta));
+        assert!(is_addr_floored(&sockaddr_v4(127, 1, 2, 3, 80), meta));
+        assert!(is_addr_floored(&sockaddr_v4(0, 0, 0, 0, 80), meta));
+        // Host LAN / public stay reachable in the local default.
         assert!(!is_addr_floored(&sockaddr_v4(192, 168, 1, 1, 80), meta));
         assert!(!is_addr_floored(&sockaddr_v4(10, 0, 0, 5, 80), meta));
         assert!(!is_addr_floored(&sockaddr_v4(1, 1, 1, 1, 443), meta));
+    }
+
+    #[test]
+    fn metadata_only_mode_allows_host_loopback() {
+        // The `--allow-host-loopback` mode floors cloud-metadata but lets a guest
+        // reach the host's own 127.0.0.1 on purpose.
+        let meta = FloorMode::MetadataOnly;
+        assert!(is_addr_floored(&sockaddr_v4(169, 254, 169, 254, 80), meta));
+        assert!(!is_addr_floored(&sockaddr_v4(127, 0, 0, 1, 80), meta));
+        assert!(!is_addr_floored(&sockaddr_v4(0, 0, 0, 0, 80), meta));
+    }
+
+    #[test]
+    fn default_floor_blocks_ipv6_and_mapped_loopback() {
+        let meta = FloorMode::MetadataAndLoopback;
+        // ::1 and the IPv4-mapped 127.x form must both be floored so loopback
+        // can't be smuggled past via the v6 encoding.
+        let v6_loopback = VsockAddr::Inet(
+            std::net::SocketAddrV6::new(std::net::Ipv6Addr::LOCALHOST, 80, 0, 0).into(),
+        );
+        assert!(is_addr_floored(&v6_loopback, meta));
+        let mapped = Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped();
+        let mapped_addr = VsockAddr::Inet(std::net::SocketAddrV6::new(mapped, 80, 0, 0).into());
+        assert!(is_addr_floored(&mapped_addr, meta));
     }
 
     #[test]
@@ -904,6 +985,37 @@ mod tests {
         assert!(!is_addr_floored(&sockaddr_v4(169, 254, 169, 254, 80), off));
         assert!(!is_addr_floored(&sockaddr_v4(10, 0, 0, 5, 80), off));
         assert!(!is_addr_floored(&sockaddr_v4(127, 0, 0, 1, 80), off));
+    }
+
+    #[test]
+    fn explicit_allow_recognizes_static_cidr_not_learned_ip() {
+        // `--allow-cidr 127.0.0.1/32` (or `--outbound-localhost-only`) marks
+        // loopback as explicitly allowed, so the muxer re-opens it in the local
+        // modes. A learned DNS answer for the same IP must NOT count — that path
+        // is how the floor also defeats DNS rebinding.
+        let mut policy = EgressPolicy::new(
+            Some(vec![(IpAddr::V4(Ipv4Addr::LOCALHOST), 32)]),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(policy.is_addr_explicitly_allowed(&sockaddr_v4(127, 0, 0, 1, 80)));
+        // A different loopback address is not covered by the /32.
+        assert!(!policy.is_addr_explicitly_allowed(&sockaddr_v4(127, 0, 0, 2, 80)));
+
+        // Only loopback/unspecified count as host-loopback for the re-open path;
+        // cloud-metadata is never re-openable even if allow-listed, so it must
+        // NOT be classified as host-loopback.
+        assert!(is_addr_host_loopback(&sockaddr_v4(127, 0, 0, 1, 80)));
+        assert!(is_addr_host_loopback(&sockaddr_v4(0, 0, 0, 0, 80)));
+        assert!(!is_addr_host_loopback(&sockaddr_v4(169, 254, 169, 254, 80)));
+        assert!(!is_addr_host_loopback(&sockaddr_v4(10, 0, 0, 5, 80)));
+
+        // Learn 127.0.0.2 via DNS: is_addr_allowed sees it, but the *explicit*
+        // check still rejects it, so it can never punch the floor.
+        policy.learn_ips(vec![(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 300)]);
+        assert!(policy.is_addr_allowed(&sockaddr_v4(127, 0, 0, 2, 80)));
+        assert!(!policy.is_addr_explicitly_allowed(&sockaddr_v4(127, 0, 0, 2, 80)));
     }
 
     #[test]

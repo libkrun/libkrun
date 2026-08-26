@@ -9,7 +9,8 @@ use super::VsockError;
 use super::defs;
 use super::defs::uapi;
 use super::dns_filter::{
-    DnsRequest, DnsWorker, EgressPolicy, FloorMode, floor_mode, is_addr_floored, sockaddr_port,
+    DnsRequest, DnsWorker, EgressPolicy, FloorMode, floor_mode, is_addr_floored,
+    is_addr_host_loopback, sockaddr_port,
 };
 use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::muxer_thread::MuxerThread;
@@ -181,6 +182,22 @@ impl VsockMuxer {
     /// allowed DNS answer. Fail-closed on a poisoned policy lock.
     fn is_ip_allowed(&self, addr: &VsockAddr) -> bool {
         if is_addr_floored(addr, self.floor) {
+            // Only host loopback, floored by the local default, may be
+            // deliberately re-opened by an EXPLICIT static allow-list entry
+            // (`--allow-cidr`, `--outbound-localhost-only`) — e.g. a dev reaching
+            // a server on the host's own 127.0.0.1. Cloud-metadata (link-local)
+            // and, under `Strict` (multi-tenant/fleet), the internal ranges stay
+            // absolute: no allow-list can re-expose the credential/control door.
+            // A learned DNS IP never qualifies (see `is_addr_explicitly_allowed`),
+            // so this is not a rebinding hole.
+            if self.floor != FloorMode::Strict && is_addr_host_loopback(addr) {
+                return self.egress_policy.as_ref().is_some_and(|policy| {
+                    policy
+                        .read()
+                        .map(|policy| policy.is_addr_explicitly_allowed(addr))
+                        .unwrap_or(false)
+                });
+            }
             return false;
         }
         let Some(policy) = &self.egress_policy else {

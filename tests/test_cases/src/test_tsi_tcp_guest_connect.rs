@@ -29,6 +29,10 @@ mod host {
 
     impl Test for TestTsiTcpGuestConnect {
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            // The guest connects to the host's own 127.0.0.1, which the default
+            // egress floor now blocks. Opt back in so this test exercises the TSI
+            // TCP connect path — and doubles as a check that the opt-in works.
+            unsafe { std::env::set_var("SMOLVM_ALLOW_HOST_LOOPBACK", "1") };
             let listener = self.tcp_tester.create_server_socket();
             thread::spawn(move || self.tcp_tester.run_server(listener));
             unsafe {
