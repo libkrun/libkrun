@@ -735,9 +735,26 @@ impl VirtioGpu {
         mem: &GuestMemoryMmap,
     ) -> VirtioGpuResult {
         let mut rutabaga_iovecs = None;
+        let mut handle = None;
 
         if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
-            panic!("GUEST_HANDLE unimplemented");
+            if let Some(driver) = &self.udmabuf_driver {
+                handle = driver
+                    .create_udmabuf(mem, &vecs)
+                    .inspect_err(|err| {
+                        warn!("Failed to create udmabuf: {err}");
+                    })
+                    .map(|fd| RutabagaHandle {
+                        os_handle: unsafe {
+                            RutabagaDescriptor::from_raw_descriptor(fd.into_raw_fd())
+                        },
+                        handle_type: RUTABAGA_MEM_HANDLE_TYPE_DMABUF,
+                    })
+                    .ok();
+            } else {
+                // Not expecting well-behaved guests to hit this path, as we don't set the feature flag without the driver
+                return Err(ErrUnspec);
+            }
         } else if resource_create_blob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D {
             rutabaga_iovecs =
                 Some(sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?);
@@ -748,7 +765,7 @@ impl VirtioGpu {
             resource_id,
             resource_create_blob,
             rutabaga_iovecs,
-            None,
+            handle,
         )?;
 
         let resource = VirtioGpuResource::new(resource_id, 0, 0, None, resource_create_blob.size);
