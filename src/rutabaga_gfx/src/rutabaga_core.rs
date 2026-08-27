@@ -733,9 +733,21 @@ impl Rutabaga {
             return Err(RutabagaError::InvalidResourceId);
         }
 
+        // Imported guest resources (from udmabuf or a passed-through real GPU) with host handles
+        // cannot have a `ctx_id` set, we need to pass them to the cross-domain *component* to
+        // make a RutabagaResource that simply wraps the handle.
+        let component_type = if ctx_id == 0
+            && resource_create_blob.blob_flags & RUTABAGA_BLOB_FLAG_CREATE_GUEST_HANDLE
+                == RUTABAGA_BLOB_FLAG_CREATE_GUEST_HANDLE
+        {
+            &RutabagaComponentType::CrossDomain
+        } else {
+            &self.default_component
+        };
+
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let mut context = None;
