@@ -5,12 +5,13 @@ edition = "2024"
 
 [dependencies]
 gtk_display = { path = "../krun_gtk_display" }
-krun-sys = { path = "../../krun-sys" }
+krun = { package = "krun-via-cdylib-weak", path = "../../src/libkrun-via-cdylib-weak" }
 krun-init = { package = "krun-init-blob-via-cdylib", path = "../../init/init-blob-via-cdylib" }
 krun_input = { path = "../../src/input", package = "krun-input" }
 anyhow = "1.0.98"
 clap = "4.5.39"
 clap_derive = "4.5.32"
+libloading = "0.8"
 log = "0.4.27"
 env_logger = "0.9.3"
 regex = "1.11.1"

@@ -20,36 +20,60 @@ impl TestTsiTcpGuestConnect {
 mod host {
     use super::*;
 
-    use crate::common::setup_fs_and_enter;
-    use crate::{Test, TestSetup};
-    use crate::{krun_call, krun_call_u32};
-    use krun_sys::*;
-    use std::os::fd::AsRawFd;
     use std::thread;
 
+    use crate::common::{init_krun, setup_standard_devices};
+    use crate::{ShouldRun, Test, TestSetup};
+
+    #[cfg(feature = "dynamic-linking")]
+    fn require_symbols() -> Result<(), libloading::Error> {
+        crate::common::require_vm_symbols()?;
+        krun::require(
+            None,
+            &[
+                krun::Symbol::KrunVsockDeviceNew,
+                krun::Symbol::KrunVsockDeviceDestroy,
+            ],
+        )
+    }
+
+    const TSI_HIJACK_INET: u32 = 1;
+
     impl Test for TestTsiTcpGuestConnect {
+        fn should_run(&self) -> ShouldRun {
+            #[cfg(feature = "dynamic-linking")]
+            if require_symbols().is_err() {
+                return ShouldRun::No("feature not enabled in this libkrun build");
+            }
+            ShouldRun::Yes
+        }
+
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             let listener = self.tcp_tester.create_server_socket();
             thread::spawn(move || self.tcp_tester.run_server(listener));
-            unsafe {
-                krun_call!(krun_init_log(
-                    KRUN_LOG_TARGET_DEFAULT,
-                    KRUN_LOG_LEVEL_TRACE,
-                    KRUN_LOG_STYLE_AUTO,
-                    0
-                ))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_add_vsock(ctx, KRUN_TSI_HIJACK_INET))?;
-                krun_call!(krun_set_vm_config(ctx, 1, 512))?;
-                krun_call!(krun_add_virtio_console_default(
-                    ctx,
-                    std::io::stdin().as_raw_fd(),
-                    std::io::stdout().as_raw_fd(),
-                    std::io::stderr().as_raw_fd(),
-                ))?;
-                setup_fs_and_enter(ctx, test_setup)?;
-            }
-            Ok(())
+
+            init_krun()?;
+            #[cfg(feature = "dynamic-linking")]
+            require_symbols().unwrap();
+
+            let (mut devices, payload) = setup_standard_devices(&test_setup, &[])?;
+            devices.add(
+                krun::VsockDevice::new(3, TSI_HIJACK_INET)
+                    .map_err(|e| anyhow::anyhow!("VsockDevice: {e:?}"))?,
+            );
+
+            let vmm = krun::VmmBuilder::new()
+                .vcpus(1)
+                .map_err(|e| anyhow::anyhow!("vcpus: {e:?}"))?
+                .ram_mib(512)
+                .map_err(|e| anyhow::anyhow!("ram_mib: {e:?}"))?
+                .payload(payload)
+                .devices(devices)
+                .build()
+                .map_err(|e| anyhow::anyhow!("build: {e:?}"))?;
+
+            vmm.run();
+            unreachable!()
         }
     }
 }

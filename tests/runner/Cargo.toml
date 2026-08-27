@@ -2,8 +2,13 @@
 name = "runner"
 edition = "2024"
 
+[features]
+default = ["static"]
+static = ["test_cases/static-linking"]
+ffi = ["test_cases/dynamic-linking"]
+
 [dependencies]
-test_cases = { path = "../test_cases", features = ["host"] }
+test_cases = { path = "../test_cases" }
 anyhow = "1.0.95"
 nix = { version = "0.29.0", features = ["resource", "fs", "signal", "process"] }
 macros = { path = "../macros" }

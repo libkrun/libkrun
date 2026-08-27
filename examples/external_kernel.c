@@ -23,6 +23,9 @@
 #define MAX_PATH 4096
 #endif
 
+// Net feature flags
+#define COMPAT_NET_FEATURES ((1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 14))
+
 enum net_mode
 {
     NET_MODE_PASST = 0,
@@ -34,6 +37,31 @@ enum net_mode
 #else
 #define KERNEL_FORMAT KRUN_KERNEL_FORMAT_RAW
 #endif
+
+static bool push_to_stderr(void *userdata, KrunStr s)
+{
+    (void)userdata;
+    fwrite(s.data, 1, s.len, stderr);
+    return true;
+}
+
+static KrunVtableHandle krun_stderr_writer = KRUN_VTABLE_HANDLE(
+    KRUN_PUSH_STR_TYPE_TAG,
+    ((KrunPushStrVtable){ .drop = NULL, .push = push_to_stderr }),
+    NULL);
+
+#define CHECK(call)                                                            \
+    krun_err = NULL;                                                           \
+    call;                                                                      \
+    if (krun_err) {                                                            \
+        flockfile(stderr);                                                     \
+        fprintf(stderr, "%s failed: ", #call);                                 \
+        krun_error_message(krun_err, &krun_stderr_writer);                     \
+        fputc('\n', stderr);                                                   \
+        funlockfile(stderr);                                                   \
+        krun_error_destroy(krun_err);                                          \
+        return -1;                                                             \
+    }
 
 static void print_help(char *const name)
 {
@@ -199,8 +227,7 @@ int start_passt()
 
 int main(int argc, char *const argv[])
 {
-    int ctx_id;
-    int err;
+    KrunError krun_err;
     pthread_t thread;
     struct cmdline cmdline;
 
@@ -218,109 +245,83 @@ int main(int argc, char *const argv[])
     }
 
     // Set the log level to "off".
-    err = krun_init_log(KRUN_LOG_TARGET_DEFAULT, KRUN_LOG_LEVEL_OFF, KRUN_LOG_STYLE_AUTO, 0);
-    if (err)
-    {
-        errno = -err;
-        perror("Error configuring log level");
-        return -1;
-    }
+    CHECK(krun_init_log(-1, KRUN_LOG_LEVEL_OFF, KRUN_LOG_STYLE_AUTO, 0, &krun_err));
 
-    // Create the configuration context.
-    ctx_id = krun_create_ctx();
-    if (ctx_id < 0)
-    {
-        errno = -ctx_id;
-        perror("Error creating configuration context");
-        return -1;
-    }
+    // Create the device manager.
+    KrunMmioDeviceManager devices = krun_mmio_device_manager_new();
 
-    // Configure the number of vCPUs (2) and the amount of RAM (2048 MiB).
-    if (err = krun_set_vm_config(ctx_id, 2, 2048))
+    // Configure the console.
     {
-        errno = -err;
-        perror("Error configuring the number of vCPUs and/or the amount of RAM");
-        return -1;
-    }
-
-    if (err = krun_add_virtio_console_default(ctx_id, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO))
-    {
-        errno = -err;
-        perror("Error configuring console");
-        return -1;
+        KrunConsoleBuilder cb = krun_console_device_builder();
+        CHECK(krun_console_builder_add_default_console(cb, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO, &krun_err));
+        KrunConsoleDevice console = krun_console_builder_build(cb, &krun_err);
+        krun_mmio_device_manager_add(devices, console);
     }
 
     if (cmdline.boot_disk)
     {
-        if (err = krun_add_disk(ctx_id, "boot", cmdline.boot_disk, 0))
-        {
-            errno = -err,
-            perror("Error configuring boot disk");
-            return -1;
-        }
+        CHECK(KrunBlockDevice blk = krun_block_device_new(KRUN_STR("boot"),
+            KRUN_STR(cmdline.boot_disk), KRUN_DISK_FORMAT_RAW, false, &krun_err));
+        krun_mmio_device_manager_add(devices, blk);
     }
     if (cmdline.data_disk)
     {
-        if (err = krun_add_disk(ctx_id, "data", cmdline.data_disk, 0))
-        {
-            errno = -err,
-            perror("Error configuring data disk");
-            return -1;
-        }
+        CHECK(KrunBlockDevice blk = krun_block_device_new(KRUN_STR("data"),
+            KRUN_STR(cmdline.data_disk), KRUN_DISK_FORMAT_RAW, false, &krun_err));
+        krun_mmio_device_manager_add(devices, blk);
     }
 
     if (cmdline.net_mode == NET_MODE_PASST)
     {
         uint8_t mac[] = {0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee};
+        KrunNetDevice net;
         if (cmdline.passt_socket_path != NULL) {
-            if (err = krun_add_net_unixstream(ctx_id, cmdline.passt_socket_path, -1, &mac[0], COMPAT_NET_FEATURES, 0)) {
-                errno = -err;
-                perror("Error configuring net mode");
-                return -1;
-            }
+            net = krun_net_device_new_unixstream_path(KRUN_STR("net0"),
+                KRUN_STR(cmdline.passt_socket_path), KRUN_BYTES(mac), COMPAT_NET_FEATURES, 0, &krun_err);
         } else {
             int passt_fd = start_passt();
-
             if (passt_fd < 0) {
                 return -1;
             }
-
-            if (err = krun_add_net_unixstream(ctx_id, NULL, passt_fd, &mac[0], COMPAT_NET_FEATURES, 0)) {
-                errno = -err;
-                perror("Error configuring net mode");
-                return -1;
-            }
+            net = krun_net_device_new_unixstream_fd(KRUN_STR("net0"),
+                passt_fd, KRUN_BYTES(mac), COMPAT_NET_FEATURES, 0, &krun_err);
         }
+        if (krun_err) {
+            fprintf(stderr, "Error configuring net mode\n");
+            krun_error_destroy(krun_err);
+            return -1;
+        }
+        krun_mmio_device_manager_add(devices, net);
     }
 
     fprintf(stderr, "kernel_path: %s\n", cmdline.kernel_path);
     fprintf(stderr, "kernel_cmdline: %s\n", cmdline.kernel_cmdline);
     fflush(stderr);
 
-    if (err = krun_set_kernel(ctx_id, cmdline.kernel_path, KERNEL_FORMAT,
-                              cmdline.initrd_path, cmdline.kernel_cmdline))
+    // Load the external kernel as the payload.
+    CHECK(KrunPayload payload = krun_payload_load_external(KRUN_STR(cmdline.kernel_path),
+        KERNEL_FORMAT, KRUN_STR(cmdline.initrd_path), KRUN_STR(cmdline.kernel_cmdline), &krun_err));
+
     {
-        errno = -err;
-        perror("Error configuring kernel");
-        return -1;
+        CHECK(KrunRngDevice rng = krun_rng_device_new(&krun_err));
+        krun_mmio_device_manager_add(devices, rng);
+
+        CHECK(KrunBalloonDevice balloon = krun_balloon_device_new(&krun_err));
+        krun_mmio_device_manager_add(devices, balloon);
     }
+
+    // Build the VM.
+    KrunVmmBuilder builder = krun_vmm_builder_new();
+    CHECK(krun_vmm_builder_vcpus(&builder, 2, &krun_err));
+    CHECK(krun_vmm_builder_ram_mib(&builder, 2048, &krun_err));
+    krun_vmm_builder_payload(&builder, payload);
+    krun_vmm_builder_devices(&builder, devices);
 
     fprintf(stderr, "nested=%d\n", cmdline.nested);
-    if (err = krun_set_nested_virt(ctx_id, cmdline.nested))
-    {
-        errno = -err;
-        perror("Error configuring nested virtualization");
-        return -1;
-    }
+    krun_vmm_builder_nested_virt(&builder, cmdline.nested);
 
-    // Start and enter the microVM. Unless there is some error while creating the microVM
-    // this function never returns.
-    if (err = krun_start_enter(ctx_id))
-    {
-        errno = -err;
-        perror("Error creating the microVM");
-        return -1;
-    }
+    CHECK(KrunVmm vmm = krun_vmm_builder_build(&builder, &krun_err));
+    krun_vmm_run(vmm); // never returns
 
     // Not reached.
     return 0;

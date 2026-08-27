@@ -5,10 +5,8 @@ pub struct TestPjdfstest;
 #[host]
 mod host {
     use super::*;
-    use crate::common::setup_fs_and_enter_with_env;
-    use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
-    use krun_sys::*;
-    use std::os::fd::AsRawFd;
+    use crate::common::setup_and_run_with_env;
+    use crate::{ShouldRun, Test, TestOutcome, TestSetup};
 
     use macros::env_or_default;
 
@@ -51,18 +49,7 @@ mod host {
                 "Linux"
             };
             let host_os_env = format!("PJDFSTEST_HOST_OS={host_os}");
-            unsafe {
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_set_vm_config(ctx, 2, 1024))?;
-                krun_call!(krun_add_virtio_console_default(
-                    ctx,
-                    std::io::stdin().as_raw_fd(),
-                    std::io::stdout().as_raw_fd(),
-                    std::io::stderr().as_raw_fd(),
-                ))?;
-                setup_fs_and_enter_with_env(ctx, test_setup, &[host_os_env.as_str()])?;
-            }
-            Ok(())
+            setup_and_run_with_env(2, 1024, test_setup, &[host_os_env.as_str()])
         }
 
         fn check(self: Box<Self>, stdout: Vec<u8>, _test_setup: TestSetup) -> TestOutcome {

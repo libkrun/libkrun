@@ -15,6 +15,12 @@ type Result<T> = std::result::Result<T, Error>;
 
 pub struct IntelTdx {}
 
+impl Default for IntelTdx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IntelTdx {
     pub fn new() -> Self {
         Self {}

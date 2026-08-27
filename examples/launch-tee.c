@@ -18,26 +18,40 @@
 #define MAX_PATH 4096
 #endif
 
+static bool push_to_stderr(void *userdata, KrunStr s)
+{
+    (void)userdata;
+    fwrite(s.data, 1, s.len, stderr);
+    return true;
+}
+
+static KrunVtableHandle krun_stderr_writer = KRUN_VTABLE_HANDLE(
+    KRUN_PUSH_STR_TYPE_TAG,
+    ((KrunPushStrVtable){ .drop = NULL, .push = push_to_stderr }),
+    NULL);
+
+#define CHECK(call)                                                            \
+    krun_err = NULL;                                                           \
+    call;                                                                      \
+    if (krun_err) {                                                            \
+        flockfile(stderr);                                                     \
+        fprintf(stderr, "%s failed: ", #call);                                 \
+        krun_error_message(krun_err, &krun_stderr_writer);                     \
+        fputc('\n', stderr);                                                   \
+        funlockfile(stderr);                                                   \
+        krun_error_destroy(krun_err);                                          \
+        return -1;                                                             \
+    }
+
 int main(int argc, char *const argv[])
 {
-    const char *const port_map[] =
-    {
-        "18000:8000",
-        0
-    };
     static const struct option long_opts[] = {
         { "td-shim", required_argument, 0, 's' },
         { 0, 0, 0, 0 }
     };
     const char *td_shim_path = NULL;
-    char current_path[MAX_PATH];
-    char volume_tail[] = ":/work\0";
-    char *volume;
-    int volume_len;
-    int ctx_id;
-    int err;
-    int i;
     int opt;
+    KrunError krun_err;
 
     while ((opt = getopt_long(argc, argv, "", long_opts, NULL)) != -1) {
         switch (opt) {
@@ -57,135 +71,54 @@ int main(int argc, char *const argv[])
     }
 
     // Set the log level to "error".
-    err = krun_init_log(KRUN_LOG_TARGET_DEFAULT, KRUN_LOG_LEVEL_ERROR, KRUN_LOG_STYLE_AUTO, 0);
-    if (err) {
-        errno = -err;
-        perror("Error configuring log level");
-        return -1;
-    }
+    CHECK(krun_init_log(-1, KRUN_LOG_LEVEL_ERROR, KRUN_LOG_STYLE_AUTO, 0, &krun_err));
 
-    // Create the configuration context.
-    ctx_id = krun_create_ctx();
-    if (ctx_id < 0) {
-        errno = -ctx_id;
-        perror("Error creating configuration context");
-        return -1;
-    }
+    // Create the device manager.
+    KrunMmioDeviceManager devices = krun_mmio_device_manager_new();
 
-    // Configure the number of vCPUs (1) and the amount of RAM (2 GiB).
-    if (err = krun_set_vm_config(ctx_id, 1, 2048)) {
-        errno = -err;
-        perror("Error configuring the number of vCPUs and/or the amount of RAM");
-        return -1;
+    // Configure the console.
+    {
+        KrunConsoleBuilder cb = krun_console_device_builder();
+        CHECK(krun_console_builder_add_default_console(cb, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO, &krun_err));
+        KrunConsoleDevice console = krun_console_builder_build(cb, &krun_err);
+        krun_mmio_device_manager_add(devices, console);
     }
 
     // Use the first positional argument as the disk image containing the root fs.
-    if (err = krun_add_disk2(ctx_id, "root", argv[optind], KRUN_DISK_FORMAT_RAW, false)) {
-        errno = -err;
-        perror("Error configuring root disk image");
-        return -1;
+    {
+        CHECK(KrunBlockDevice blk = krun_block_device_new(KRUN_STR("root"),
+            KRUN_STR(argv[optind]), KRUN_DISK_FORMAT_RAW, &krun_err));
+        krun_mmio_device_manager_add(devices, blk);
     }
 
-    // krun_start_enter() no longer defaults the kernel cmdline to
-    // "init=/init.krun"; the init binary is baked into the libkrunfw initrd
-    // bundle at that path, so we have to point the kernel at it explicitly.
-    if (err = krun_append_kernel_cmdline(ctx_id, "init=/init.krun")) {
-        errno = -err;
-        perror("Error configuring init path");
-        return -1;
+    {
+        CHECK(KrunBlockDevice blk = krun_block_device_new(KRUN_STR("data"),
+            KRUN_STR(argv[optind + 2]), KRUN_DISK_FORMAT_RAW, &krun_err));
+        krun_mmio_device_manager_add(devices, blk);
     }
 
-    if (getcwd(&current_path[0], MAX_PATH) == NULL) {
-        errno = -err;
-        perror("Error getting current directory");
-        return -1;
+    // Map port 18000 in the host to 8000 in the guest via TSI.
+    {
+        CHECK(KrunVsockDevice vsock = krun_vsock_device_new(3, 0, &krun_err));
+        CHECK(krun_vsock_device_add_port_forward(vsock, KRUN_STR("18000:8000"), &krun_err));
+        krun_mmio_device_manager_add(devices, vsock);
     }
 
-    volume_len = strlen(current_path) + strlen(volume_tail) + 1;
-    volume = malloc(volume_len);
-    if (volume == NULL) {
-        errno = -err;
-        perror("Error allocating memory for volume string");
-    }
+    // Load the TEE payload from the config file.
+    CHECK(KrunPayload payload = krun_payload_load_krunfw_tee(KRUN_STR(argv[optind + 1]), &krun_err));
+    krun_payload_append_cmdline(payload, KRUN_STR("init=/init.krun KRUN_RLIMITS=6=4096:8192 KRUN_WORKDIR=/"));
 
-    if (err = krun_add_vsock(ctx_id, KRUN_TSI_HIJACK_INET | KRUN_TSI_HIJACK_UNIX)) {
-        errno = -err;
-        perror("Error adding vsock device");
-        return -1;
-    }
+    // Build the VM.
+    KrunVmmBuilder builder = krun_vmm_builder_new();
+    CHECK(krun_vmm_builder_vcpus(&builder, 1, &krun_err));
+    CHECK(krun_vmm_builder_ram_mib(&builder, 2048, &krun_err));
+    krun_vmm_builder_payload(&builder, payload);
+    krun_vmm_builder_devices(&builder, devices);
+    krun_vmm_builder_add_serial_console(&builder, -1, STDOUT_FILENO);
+    CHECK(krun_vmm_builder_split_irqchip(&builder, true, &krun_err));
 
-    // Map port 18000 in the host to 8000 in the guest.
-    if (err = krun_set_port_map(ctx_id, &port_map[0])) {
-        errno = -err;
-        perror("Error configuring port map");
-        return -1;
-    }
-
-    // krun_set_rlimits()/krun_set_workdir() are unavailable for TEE guests;
-    // the kernel forwards unrecognized "NAME=value" cmdline arguments into
-    // init's environment, where the guest init applies them.
-
-    // Configure the rlimits that will be set in the guest (RLIMIT_NPROC = 6).
-    if (err = krun_append_kernel_cmdline(ctx_id, "KRUN_RLIMITS=6=4096:8192")) {
-        errno = -err;
-        perror("Error configuring rlimits");
-        return -1;
-    }
-
-    // Set the working directory to "/", just for the sake of completeness.
-    if (err = krun_append_kernel_cmdline(ctx_id, "KRUN_WORKDIR=/")) {
-        errno = -err;
-        perror("Error configuring \"/\" as working directory");
-        return -1;
-    }
-
-    if (err = krun_set_tee_config_file(ctx_id, argv[optind + 1])) {
-        errno = -err;
-        perror("Error setting the TEE config file");
-        return -1;
-    }
-
-    if (td_shim_path != NULL) {
-        if (err = krun_set_tee_firmware(ctx_id, KRUN_TEE_FW_TDSHIM, td_shim_path)) {
-            errno = -err;
-            perror("Error setting TD-Shim firmware path");
-            return -1;
-        }
-    }
-
-    if (err = krun_add_disk2(ctx_id, "data", argv[optind + 2], KRUN_DISK_FORMAT_RAW, false)) {
-        errno = -err;
-        perror("Error configuring the TEE config data disk");
-        return -1;
-    }
-
-    // Serial console (ttyS0) for kernel log output only (no stdin).
-    if (err = krun_add_serial_console_default(ctx_id, -1, STDOUT_FILENO)) {
-        errno = -err;
-        perror("Error adding serial console");
-        return -1;
-    }
-
-    // Virtio console (hvc0) for interactive shell I/O.
-    if (err = krun_add_virtio_console_default(ctx_id, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO)) {
-        errno = -err;
-        perror("Error adding virtio console");
-        return -1;
-    }
-
-    if (err = krun_split_irqchip(ctx_id, true)) {
-        errno = -err;
-        perror("Error setting split IRQCHIP property");
-        return -1;
-    }
-
-    // Start and enter the microVM. Unless there is some error while creating the microVM
-    // this function never returns.
-    if (err = krun_start_enter(ctx_id)) {
-        errno = -err;
-        perror("Error creating the microVM");
-        return -1;
-    }
+    CHECK(KrunVmm vmm = krun_vmm_builder_build(&builder, &krun_err));
+    krun_vmm_run(vmm); // never returns
 
     // Not reached.
     return 0;

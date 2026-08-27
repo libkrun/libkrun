@@ -17,52 +17,20 @@ use utils::windows::SendHandle;
 #[cfg(feature = "tee")]
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "blk")]
-use crate::vmm_config::block::{BlockBuilder, BlockConfigError, BlockDeviceConfig};
 use crate::vmm_config::external_kernel::ExternalKernel;
 use crate::vmm_config::firmware::FirmwareConfig;
 #[cfg(feature = "tdx")]
 use crate::vmm_config::firmware::TeeFirmwareConfig;
-#[cfg(not(feature = "tee"))]
-use crate::vmm_config::fs::*;
 #[cfg(feature = "tee")]
 use crate::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle, QbootBundleError};
 use crate::vmm_config::kernel_bundle::{KernelBundle, KernelBundleError};
 use crate::vmm_config::kernel_cmdline::{KernelCmdlineConfig, KernelCmdlineConfigError};
 use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
-#[cfg(feature = "net")]
-use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig, NetworkInterfaceError};
-use crate::vmm_config::vsock::*;
 use crate::vstate::VcpuConfig;
-#[cfg(any(feature = "gpu", feature = "vhost-user"))]
-use devices::display::DisplayInfo;
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
-#[cfg(feature = "gpu")]
-use krun_display::DisplayBackend;
 
 type Result<E> = std::result::Result<(), E>;
-
-// Re-export TsiFlags from devices crate
-pub use devices::virtio::TsiFlags;
-
-#[cfg(feature = "vhost-user")]
-/// Configuration for a vhost-user device.
-#[derive(Debug, Clone)]
-pub struct VhostUserDeviceConfig {
-    /// Virtio device type ID (e.g., 4 for RNG, 25 for sound, 36 for CAN)
-    pub device_type: u32,
-    /// Path to the vhost-user Unix domain socket
-    pub socket_path: String,
-    /// Device name for logging/debugging (None = auto-generate from type)
-    pub name: Option<String>,
-    /// Number of virtqueues (0 = use device default)
-    pub num_queues: u16,
-    /// Size of each queue (empty = use device defaults)
-    pub queue_sizes: Vec<u16>,
-    /// Size of the shared memory region (None = no SHMEM region)
-    pub shm_size: Option<usize>,
-}
 
 /// Errors encountered when configuring microVM resources.
 #[derive(Debug)]
@@ -79,8 +47,6 @@ pub enum Error {
     ParseTeeConfig(serde_json::Error),
     /// microVM vCpus or memory configuration error.
     VmConfig(VmConfigError),
-    /// Vsock device configuration error.
-    VsockDevice(VsockConfigError),
 }
 
 #[cfg(feature = "tee")]
@@ -120,61 +86,6 @@ pub struct SerialConsoleConfig {
     pub output_handle: SendHandle,
 }
 
-#[cfg(unix)]
-pub struct DefaultVirtioConsoleConfig {
-    pub input_fd: RawFd,
-    pub output_fd: RawFd,
-    pub err_fd: RawFd,
-}
-
-#[cfg(target_os = "windows")]
-pub struct DefaultVirtioConsoleConfig {
-    pub input_handle: SendHandle,
-    pub output_handle: SendHandle,
-    pub err_handle: SendHandle,
-}
-
-pub enum VirtioConsoleConfigMode {
-    Autoconfigure(DefaultVirtioConsoleConfig),
-    Explicit(Vec<PortConfig>),
-}
-
-#[cfg(unix)]
-pub enum PortConfig {
-    Tty {
-        name: String,
-        tty_fd: RawFd,
-    },
-    InOut {
-        name: String,
-        input_fd: RawFd,
-        output_fd: RawFd,
-    },
-}
-
-#[cfg(windows)]
-pub enum PortConfig {
-    Tty {
-        name: String,
-        tty_handle: SendHandle,
-    },
-    InOut {
-        name: String,
-        input_handle: SendHandle,
-        output_handle: SendHandle,
-    },
-}
-
-/// Configuration for the vsock device
-#[derive(Debug, Default, Clone, Eq, PartialEq)]
-pub enum VsockConfig {
-    /// No vsock device
-    #[default]
-    Disabled,
-    /// Explicit configuration with specified TSI features
-    Explicit { tsi_flags: TsiFlags },
-}
-
 /// A data structure that encapsulates the device configurations
 /// held in the Vmm.
 #[derive(Default)]
@@ -198,35 +109,9 @@ pub struct VmResources {
     /// User-provided TEE firmware configuration for TDX guests.
     #[cfg(feature = "tdx")]
     pub tee_firmware_config: Option<TeeFirmwareConfig>,
-    /// The fs device.
-    #[cfg(not(feature = "tee"))]
-    pub fs: Vec<FsDeviceConfig>,
-    /// The vsock device.
-    pub vsock: VsockBuilder,
-    /// The virtio-blk device.
-    #[cfg(feature = "blk")]
-    pub block: BlockBuilder,
-    /// The network devices builder.
-    #[cfg(feature = "net")]
-    pub net: NetBuilder,
     /// TEE configuration
     #[cfg(feature = "tee")]
     pub tee_config: TeeConfig,
-    /// Flags for the virtio-gpu device.
-    pub gpu_virgl_flags: Option<u32>,
-    pub gpu_shm_size: Option<usize>,
-    #[cfg(feature = "gpu")]
-    pub display_backend: Option<DisplayBackend<'static>>,
-    #[cfg(any(feature = "gpu", feature = "vhost-user"))]
-    pub displays: Vec<DisplayInfo>,
-    #[cfg(feature = "input")]
-    pub input_backends: Vec<(
-        krun_input::InputConfigBackend<'static>,
-        krun_input::InputEventProviderBackend<'static>,
-    )>,
-    #[cfg(feature = "vhost-user")]
-    /// Vhost-user device configurations
-    pub vhost_user_devices: Vec<VhostUserDeviceConfig>,
     /// SMBIOS OEM Strings
     pub smbios_oem_strings: Option<Vec<String>>,
     /// Whether to enable nested virtualization.
@@ -237,10 +122,6 @@ pub struct VmResources {
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
     pub serial_consoles: Vec<SerialConsoleConfig>,
-    /// Virtio consoles to attach to the guest
-    pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
-    /// Enable the embedded dhcp client in init.c
-    pub dhcp_client: bool,
 }
 
 impl VmResources {
@@ -374,38 +255,6 @@ impl VmResources {
         self.tee_firmware_config = Some(cfg);
     }
 
-    #[cfg(not(feature = "tee"))]
-    pub fn add_fs_device(&mut self, config: FsDeviceConfig) {
-        self.fs.push(config)
-    }
-
-    #[cfg(feature = "blk")]
-    pub fn add_block_device(&mut self, config: BlockDeviceConfig) -> Result<BlockConfigError> {
-        self.block.insert(config)
-    }
-
-    /// Sets a vsock device to be attached when the VM starts.
-    pub fn set_vsock_device(&mut self, config: VsockDeviceConfig) -> Result<VsockConfigError> {
-        self.vsock.insert(config)
-    }
-
-    pub fn set_gpu_virgl_flags(&mut self, virgl_flags: u32) {
-        self.gpu_virgl_flags = Some(virgl_flags);
-    }
-
-    pub fn set_gpu_shm_size(&mut self, shm_size: usize) {
-        self.gpu_shm_size = Some(shm_size);
-    }
-
-    /// Sets a network device to be attached when the VM starts.
-    #[cfg(feature = "net")]
-    pub fn add_network_interface(
-        &mut self,
-        config: NetworkInterfaceConfig,
-    ) -> Result<NetworkInterfaceError> {
-        self.net.insert(config)
-    }
-
     #[cfg(feature = "tee")]
     pub fn tee_config(&self) -> &TeeConfig {
         &self.tee_config
@@ -438,9 +287,7 @@ mod tests {
     use crate::resources::VmResources;
     use crate::vmm_config::kernel_cmdline::KernelCmdlineConfig;
     use crate::vmm_config::machine_config::{CpuFeaturesTemplate, VmConfig, VmConfigError};
-    use crate::vmm_config::vsock::tests::{TempSockFile, default_config};
     use crate::vstate::VcpuConfig;
-    use utils::tempfile::TempFile;
 
     fn default_kernel_cmdline() -> KernelCmdlineConfig {
         KernelCmdlineConfig {
@@ -457,29 +304,11 @@ mod tests {
             kernel_cmdline: default_kernel_cmdline(),
             kernel_bundle: Default::default(),
             external_kernel: None,
-            fs: Default::default(),
-            vsock: Default::default(),
-            #[cfg(feature = "blk")]
-            block: Default::default(),
-            #[cfg(feature = "net")]
-            net: Default::default(),
-            gpu_virgl_flags: None,
-            gpu_shm_size: None,
-            #[cfg(feature = "gpu")]
-            display_backend: None,
-            #[cfg(any(feature = "gpu", feature = "vhost-user"))]
-            displays: Vec::new(),
-            #[cfg(feature = "input")]
-            input_backends: Vec::new(),
-            #[cfg(feature = "vhost-user")]
-            vhost_user_devices: Vec::new(),
             smbios_oem_strings: None,
             nested_enabled: false,
             split_irqchip: false,
             serial_consoles: Vec::new(),
-            virtio_consoles: Vec::new(),
             kernel_console: None,
-            dhcp_client: false,
         }
     }
 
@@ -538,22 +367,6 @@ mod tests {
         assert_eq!(
             vm_resources.set_vm_config(&aux_vm_config),
             Err(VmConfigError::InvalidMemorySize)
-        );
-    }
-
-    #[test]
-    fn test_set_vsock_device() {
-        let mut vm_resources = default_vm_resources();
-        let tmp_sock_file = TempSockFile::new(TempFile::new().unwrap());
-        let new_vsock_cfg = default_config(&tmp_sock_file);
-        assert!(vm_resources.vsock.get().is_none());
-        vm_resources
-            .set_vsock_device(new_vsock_cfg.clone())
-            .unwrap();
-        let actual_vsock_cfg = vm_resources.vsock.get().unwrap();
-        assert_eq!(
-            actual_vsock_cfg.lock().unwrap().id(),
-            &new_vsock_cfg.vsock_id
         );
     }
 }

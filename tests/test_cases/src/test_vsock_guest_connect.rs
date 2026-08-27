@@ -35,16 +35,26 @@ const VSOCK_PORT: u32 = 1234;
 mod host {
     use super::*;
 
-    use crate::common::setup_fs_and_enter;
-    use crate::{Test, TestSetup};
-    use crate::{krun_call, krun_call_u32};
-    use krun_sys::*;
-    use std::ffi::CString;
     use std::io::Write;
-    use std::os::fd::AsRawFd;
+    use std::mem;
     use std::os::unix::net::UnixListener;
-    use std::os::unix::prelude::OsStrExt;
-    use std::{mem, thread};
+    use std::thread;
+
+    use crate::common::{init_krun, setup_standard_devices};
+    use crate::{ShouldRun, Test, TestSetup};
+
+    #[cfg(feature = "dynamic-linking")]
+    fn require_symbols() -> Result<(), libloading::Error> {
+        crate::common::require_vm_symbols()?;
+        krun::require(
+            None,
+            &[
+                krun::Symbol::KrunVsockDeviceNew,
+                krun::Symbol::KrunVsockDeviceDestroy,
+                krun::Symbol::KrunVsockDeviceAddUnixPort,
+            ],
+        )
+    }
 
     fn server(listener: UnixListener) {
         let (mut stream, _addr) = listener.accept().unwrap();
@@ -53,42 +63,45 @@ mod host {
         stream_expect_msg(&mut stream, b"pong!");
         stream_expect_wouldblock(&mut stream);
         stream.write_all(b"bye!").unwrap();
-        // Leak the socket fd, to make sure it is not closed early when we exit the thread
         mem::forget(stream);
     }
 
     impl Test for TestVsockGuestConnect {
-        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            let sock_path = test_setup.tmp_dir.join("test.sock");
-            let sock_path_cstr = CString::new(sock_path.as_os_str().as_bytes())?;
-
-            let listener = UnixListener::bind(&sock_path).unwrap();
-
-            thread::spawn(move || server(listener));
-            unsafe {
-                krun_call!(krun_init_log(
-                    KRUN_LOG_TARGET_DEFAULT,
-                    KRUN_LOG_LEVEL_TRACE,
-                    KRUN_LOG_STYLE_AUTO,
-                    0
-                ))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_add_vsock(ctx, 0))?;
-                krun_call!(krun_add_vsock_port(
-                    ctx,
-                    VSOCK_PORT,
-                    sock_path_cstr.as_ptr()
-                ))?;
-                krun_call!(krun_set_vm_config(ctx, 1, 1024))?;
-                krun_call!(krun_add_virtio_console_default(
-                    ctx,
-                    std::io::stdin().as_raw_fd(),
-                    std::io::stdout().as_raw_fd(),
-                    std::io::stderr().as_raw_fd(),
-                ))?;
-                setup_fs_and_enter(ctx, test_setup)?;
+        fn should_run(&self) -> ShouldRun {
+            #[cfg(feature = "dynamic-linking")]
+            if require_symbols().is_err() {
+                return ShouldRun::No("feature not enabled in this libkrun build");
             }
-            Ok(())
+            ShouldRun::Yes
+        }
+
+        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            init_krun()?;
+            #[cfg(feature = "dynamic-linking")]
+            require_symbols().unwrap();
+
+            let sock_path = test_setup.tmp_dir.join("test.sock");
+            let listener = UnixListener::bind(&sock_path).unwrap();
+            thread::spawn(move || server(listener));
+
+            let (mut devices, payload) = setup_standard_devices(&test_setup, &[])?;
+            let mut vsock =
+                krun::VsockDevice::new(3, 0).map_err(|e| anyhow::anyhow!("VsockDevice: {e:?}"))?;
+            vsock.add_unix_port(VSOCK_PORT, sock_path.to_str().unwrap(), false);
+            devices.add(vsock);
+
+            let vmm = krun::VmmBuilder::new()
+                .vcpus(1)
+                .map_err(|e| anyhow::anyhow!("vcpus: {e:?}"))?
+                .ram_mib(1024)
+                .map_err(|e| anyhow::anyhow!("ram_mib: {e:?}"))?
+                .payload(payload)
+                .devices(devices)
+                .build()
+                .map_err(|e| anyhow::anyhow!("build: {e:?}"))?;
+
+            vmm.run();
+            unreachable!()
         }
     }
 }

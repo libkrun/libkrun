@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
+#include <unistd.h>
 
 #define MAX_ARGS_LEN 4096
 #ifndef MAX_PATH
@@ -162,9 +163,35 @@ int start_passt()
     }
 }
 
+static bool push_to_stderr(void *userdata, KrunStr s)
+{
+    (void)userdata;
+    fwrite(s.data, 1, s.len, stderr);
+    return true;
+}
+
+static KrunVtableHandle krun_stderr_writer = KRUN_VTABLE_HANDLE(
+    KRUN_PUSH_STR_TYPE_TAG,
+    ((KrunPushStrVtable){ .drop = NULL, .push = push_to_stderr }),
+    NULL);
+
+#define CHECK(call)                                                            \
+    krun_err = NULL;                                                           \
+    call;                                                                      \
+    if (krun_err) {                                                            \
+        flockfile(stderr);                                                     \
+        fprintf(stderr, "%s failed: ", #call);                                 \
+        krun_error_message(krun_err, &krun_stderr_writer);                     \
+        fputc('\n', stderr);                                                   \
+        funlockfile(stderr);                                                   \
+        krun_error_destroy(krun_err);                                          \
+        return -1;                                                             \
+    }
+
 int main(int argc, char *const argv[])
 {
-    int ret, cid, ctx_id, err, passt_fd, log_level;
+    KrunError krun_err;
+    int passt_fd;
     struct cmdline cmdline;
 
     if (!parse_cmdline(argc, argv, &cmdline)) {
@@ -179,76 +206,40 @@ int main(int argc, char *const argv[])
     }
 
     // Enable debug output if configured.
-    log_level = (cmdline.debug) ? KRUN_LOG_LEVEL_DEBUG : KRUN_LOG_LEVEL_OFF;
-    err = krun_init_log(KRUN_LOG_TARGET_DEFAULT, log_level, KRUN_LOG_STYLE_AUTO, 0);
-    if (err) {
-        errno = -err;
-        perror("Error configuring log level");
-        return -1;
-    }
+    uint32_t log_level = (cmdline.debug) ? KRUN_LOG_LEVEL_DEBUG : KRUN_LOG_LEVEL_OFF;
+    CHECK(krun_init_log(-1, log_level, KRUN_LOG_STYLE_AUTO, 0, &krun_err));
 
-    // Create the configuration context.
-    ctx_id = krun_create_ctx();
-    if (ctx_id < 0) {
-        errno = -ctx_id;
-        perror("Error creating configuration context");
-        return -1;
-    }
-
-    // Configure the number of vCPUs and amount of RAM.
-    if (err = krun_set_vm_config(ctx_id, cmdline.nvcpus, cmdline.ram_mib)) {
-        errno = -err;
-        perror(
-            "Error configuring the number of vCPUs and/or the amount of RAM");
-        return -1;
-    }
-
-    if (err = krun_add_virtio_console_default(ctx_id, -1, STDOUT_FILENO, -1)) {
-        errno = -err;
-        perror("Error configuring the console");
-        return -1;
-    }
-
-    // Configure the enclave's rootfs.
-    if (err = krun_add_virtiofs3(ctx_id, KRUN_FS_ROOT_TAG, cmdline.new_root, 0, false)) {
-        errno = -err;
-        perror("Error configuring enclave rootfs");
-        return -1;
-    }
-
-    // Configure the enclave's execution environment.
-    if (err = krun_set_exec(ctx_id, default_argv[0], default_argv,
-                            default_envp)) {
-        errno = -err;
-        perror("Error configuring enclave execution path");
-        return -1;
-    }
+    // Build the NitroConfig with rootfs, exec path, args, env, and debug.
+    KrunNitroConfig nc = krun_nitro_config_new();
+    krun_nitro_config_rootfs(&nc, KRUN_STR(cmdline.new_root));
+    krun_nitro_config_exec_path(&nc, KRUN_STR(default_argv[0]));
+    for (int i = 0; default_argv[i]; i++)
+        krun_nitro_config_args(&nc, KRUN_STR(default_argv[i]));
+    for (int i = 0; default_envp[i]; i++)
+        krun_nitro_config_env(&nc, KRUN_STR(default_envp[i]));
+    krun_nitro_config_debug(&nc, cmdline.debug);
 
     if (cmdline.net) {
-        uint8_t mac[] = {0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee};
-
         passt_fd = start_passt();
         if (passt_fd < 0) {
             printf("unable to start passt socket pair\n");
             return -1;
         }
-
-        if (err = krun_add_net_unixstream(ctx_id, NULL, passt_fd, &mac[0],
-                                          COMPAT_NET_FEATURES, 0)) {
-            errno = -err;
-            perror("Error configuring net mode");
-            return -1;
-        }
+        krun_nitro_config_net_fd(&nc, passt_fd);
     }
 
-    /*
-     * Start and enter the microVM. In the libkrun-awsnitro flavor, a positive
-     * value returned by krun_start_enter() is the enclave's CID.
-     */
-    cid = krun_start_enter(ctx_id);
-    if (cid < 0) {
-        errno = -err;
-        perror("Error creating the microVM");
-        return -1;
-    }
+    // Wrap the NitroConfig in a Payload.
+    CHECK(KrunPayload payload = krun_payload_nitro_enclave(nc, &krun_err));
+
+    // Build the enclave.
+    KrunVmmBuilder builder = krun_vmm_builder_new();
+    CHECK(krun_vmm_builder_vcpus(&builder, cmdline.nvcpus, &krun_err));
+    CHECK(krun_vmm_builder_ram_mib(&builder, cmdline.ram_mib, &krun_err));
+    krun_vmm_builder_payload(&builder, payload);
+
+    CHECK(KrunVmm vmm = krun_vmm_builder_build(&builder, &krun_err));
+    krun_vmm_run(vmm);
+
+    // Not reached.
+    return 0;
 }

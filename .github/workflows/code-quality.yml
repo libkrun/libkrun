@@ -74,7 +74,7 @@ jobs:
         uses: ./.github/actions/setup-build-env
 
       - name: Install ffier-gen-c-header
-        run: cargo install --git https://github.com/mtjhrc/ffier.git --rev 9ee67e2 ffier-gen-c-header
+        run: cargo install --git https://github.com/mtjhrc/ffier.git --rev 289162e ffier-gen-c-header
 
       - name: Regenerate init-blob bindings
         run: make gen-init-blob-bindings

@@ -82,6 +82,22 @@
       },
       "bless": "vtable_handle"
     },
+    "FsOverlay": {
+      "kind": {
+        "foreign_handle": {
+          "foreign_crate": "krun_via_cdylib_weak",
+          "c_name": "KrunFsOverlay"
+        }
+      }
+    },
+    "Payload": {
+      "kind": {
+        "foreign_handle": {
+          "foreign_crate": "krun_via_cdylib_weak",
+          "c_name": "KrunPayload"
+        }
+      }
+    },
     "PushStr": {
       "kind": {
         "trait": {
@@ -151,25 +167,42 @@
         {
           "name": "apply",
           "doc": [
-            " Apply this init configuration to a libkrun VM context.",
+            " Apply this init configuration to a VM's filesystem overlay and payload.",
             "",
-            " Adds the init binary and associated configuration file(s) as",
-            " overlay files on the specified virtiofs device, and appends",
-            " the appropriate kernel command line argument to specify the",
-            " init binary.",
+            " Adds the init binary and associated configuration file(s) as overlay",
+            " files, and appends the init kernel command line argument to the payload.",
             "",
-            " `lib_handle` is the result of `dlopen(\"libkrun.so\")`. Pass NULL to",
-            " search the global symbol namespace (requires libkrun was linked or",
-            " opened with `RTLD_GLOBAL`).",
-            "",
-            " # Safety",
-            "",
-            " - If `lib_handle` is non-null it must be a valid handle returned by",
-            "   `dlopen` (or equivalent) that remains open for the duration of",
-            "   this call.",
-            " - The caller must keep this `Config` alive for the entire lifetime",
-            "   of the VM. `apply` passes data pointers to libkrun that remain",
-            "   borrowed until the VM exits."
+            " Symbols are loaded from the global namespace (`RTLD_DEFAULT`)."
+          ],
+          "receiver": "ref",
+          "params": [
+            {
+              "name": "overlay",
+              "param_kind": "regular",
+              "type": "FsOverlay",
+              "ref_kind": "mut"
+            },
+            {
+              "name": "payload",
+              "param_kind": "regular",
+              "type": "Payload",
+              "ref_kind": "mut"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "ApplyError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_init_config_apply",
+          "cfg": "feature = \"ffi-client\""
+        },
+        {
+          "name": "apply_in",
+          "doc": [
+            " Like [`apply`](Self::apply), but loads symbols from a specific library",
+            " handle (e.g. from `dlopen`). Pass null for `RTLD_DEFAULT`."
           ],
           "receiver": "ref",
           "params": [
@@ -179,15 +212,16 @@
               "type": "*mut core::ffi::c_void"
             },
             {
-              "name": "ctx_id",
+              "name": "overlay",
               "param_kind": "regular",
-              "type": "u32"
+              "type": "FsOverlay",
+              "ref_kind": "mut"
             },
             {
-              "name": "fs_tag",
+              "name": "payload",
               "param_kind": "regular",
-              "type": "str",
-              "ref_kind": "shared"
+              "type": "Payload",
+              "ref_kind": "mut"
             }
           ],
           "ret": {
@@ -196,7 +230,8 @@
             "err_type": "ApplyError",
             "c_convention": "out_param"
           },
-          "ffi_name": "krun_init_config_apply"
+          "ffi_name": "krun_init_config_apply_in",
+          "cfg": "feature = \"ffi-client\""
         }
       ]
     },
@@ -442,6 +477,59 @@
           "ffi_name": "krun_init_builder_rlimits"
         },
         {
+          "name": "dhcp",
+          "doc": [
+            " Enable DHCP client in the guest."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "enable",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_builder_dhcp"
+        },
+        {
+          "name": "set_root_disk_remount",
+          "doc": [
+            " Set the root disk to remount on boot."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "device",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "fstype",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared",
+              "optional": true
+            },
+            {
+              "name": "options",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared",
+              "optional": true
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_builder_set_root_disk_remount"
+        },
+        {
           "name": "build",
           "doc": [
             " Consume the builder, serialize the config, and return the",
@@ -488,28 +576,6 @@
             {
               "type": "str",
               "owned": true
-            }
-          ]
-        },
-        {
-          "name": "OverlayFile",
-          "c_name": "KRUN_INIT_ERROR_APPLY_OVERLAY_FILE",
-          "code": 2,
-          "message": "OverlayFile(...)",
-          "fields": [
-            {
-              "type": "i32"
-            }
-          ]
-        },
-        {
-          "name": "KernelCmdline",
-          "c_name": "KRUN_INIT_ERROR_APPLY_KERNEL_CMDLINE",
-          "code": 3,
-          "message": "KernelCmdline(...)",
-          "fields": [
-            {
-              "type": "i32"
             }
           ]
         }

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use devices::virtio::{
     Block, CacheType,
-    block::{ImageType, SyncMode},
+    block::{DiskFormat, SyncMode},
 };
 
 #[derive(Debug)]
@@ -29,7 +29,7 @@ pub struct BlockDeviceConfig {
     pub block_id: String,
     pub cache_type: CacheType,
     pub disk_image_path: String,
-    pub disk_image_format: ImageType,
+    pub disk_image_format: DiskFormat,
     pub is_disk_read_only: bool,
     pub direct_io: bool,
     pub sync_mode: SyncMode,

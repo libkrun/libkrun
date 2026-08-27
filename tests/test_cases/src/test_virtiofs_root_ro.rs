@@ -16,62 +16,43 @@ const EMPTY_DIR: &str = "empty-dir";
 mod host {
     use super::*;
 
-    use crate::common::setup_rootfs;
-    use crate::{Test, TestSetup};
-    use crate::{krun_call, krun_call_u32};
-    use krun_sys::*;
-    use std::ffi::CString;
     use std::fs;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
+
+    use crate::common::{build_and_run, build_init_config, init_krun, setup_rootfs};
+    use crate::{ShouldRun, Test, TestSetup};
 
     impl Test for TestVirtiofsRootRo {
-        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            let root_dir = setup_rootfs(&test_setup)?;
+        fn should_run(&self) -> ShouldRun {
+            #[cfg(feature = "dynamic-linking")]
+            if crate::common::require_vm_symbols().is_err() {
+                return ShouldRun::No("core VM symbols not available");
+            }
+            ShouldRun::Yes
+        }
 
-            // The guest init needs /dev, /proc, /sys as mount points. With a read-only
-            // root these must already exist in the host directory.
+        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            init_krun()?;
+
+            let root_dir = setup_rootfs(&test_setup)?;
             for dir in ["dev", "proc", "sys"] {
                 fs::create_dir(root_dir.join(dir))?;
             }
             fs::create_dir(root_dir.join(EMPTY_DIR))?;
             fs::write(root_dir.join(TEST_FILE), TEST_CONTENT)?;
-            let root_path = CString::new(root_dir.as_os_str().as_bytes())?;
-            let test_case = CString::new(test_setup.test_case)?;
 
-            unsafe {
-                krun_call!(krun_init_log(
-                    KRUN_LOG_TARGET_DEFAULT,
-                    KRUN_LOG_LEVEL_TRACE,
-                    KRUN_LOG_STYLE_AUTO,
-                    0
-                ))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_set_vm_config(ctx, 1, 512))?;
-                krun_call!(krun_add_virtio_console_default(
-                    ctx,
-                    std::io::stdin().as_raw_fd(),
-                    std::io::stdout().as_raw_fd(),
-                    std::io::stderr().as_raw_fd(),
-                ))?;
+            let mut rootfs = krun::FsDevice::new_read_only("/dev/root", root_dir.to_str().unwrap())
+                .map_err(|e| anyhow::anyhow!("FsDevice::new_read_only: {e:?}"))?;
 
-                // Use "/dev/root" tag (KRUN_FS_ROOT_TAG) with read_only=true
-                krun_call!(krun_add_virtiofs3(
-                    ctx,
-                    c"/dev/root".as_ptr(),
-                    root_path.as_ptr(),
-                    0,
-                    true,
-                ))?;
+            let init_config = build_init_config(&test_setup.test_case, &[]);
+            let mut payload =
+                krun::Payload::load_krunfw().map_err(|e| anyhow::anyhow!("load_krunfw: {e:?}"))?;
+            let mut overlay = krun::FsOverlay::new();
+            init_config
+                .apply(&mut overlay, &mut payload)
+                .map_err(|e| anyhow::anyhow!("Config::apply: {e}"))?;
+            rootfs.set_overlay(overlay);
 
-                let init_config =
-                    crate::common::build_init_config(test_case.to_str().unwrap(), &[]);
-                init_config
-                    .apply(std::ptr::null_mut(), ctx, "/dev/root")
-                    .expect("apply init config");
-                krun_call!(krun_start_enter(ctx))?;
-            }
-            Ok(())
+            build_and_run(1, 512, rootfs, payload)
         }
     }
 }

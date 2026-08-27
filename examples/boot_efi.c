@@ -23,6 +23,34 @@
 #define MAX_PATH 4096
 #endif
 
+// Net feature flags
+#define COMPAT_NET_FEATURES ((1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 14))
+
+static bool push_to_stderr(void *userdata, KrunStr s)
+{
+    (void)userdata;
+    fwrite(s.data, 1, s.len, stderr);
+    return true;
+}
+
+static KrunVtableHandle krun_stderr_writer = KRUN_VTABLE_HANDLE(
+    KRUN_PUSH_STR_TYPE_TAG,
+    ((KrunPushStrVtable){ .drop = NULL, .push = push_to_stderr }),
+    NULL);
+
+#define CHECK(call)                                                            \
+    krun_err = NULL;                                                           \
+    call;                                                                      \
+    if (krun_err) {                                                            \
+        flockfile(stderr);                                                     \
+        fprintf(stderr, "%s failed: ", #call);                                 \
+        krun_error_message(krun_err, &krun_stderr_writer);                     \
+        fputc('\n', stderr);                                                   \
+        funlockfile(stderr);                                                   \
+        krun_error_destroy(krun_err);                                          \
+        return -1;                                                             \
+    }
+
 static void print_help(char *const name)
 {
     fprintf(stderr,
@@ -99,9 +127,7 @@ bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
 void *listen_shutdown_request(void *opaque)
 {
     int server_sock, client_sock, len, ret;
-    int bytes_rec = 0;
-    int shutdown_efd = (int) opaque;
-    char buf[8];
+    KrunVmmHandle handle = (KrunVmmHandle) opaque;
     struct sockaddr_un server_sockaddr;
     struct sockaddr_un client_sockaddr;
     memset(&server_sockaddr, 0, sizeof(struct sockaddr_un));
@@ -141,9 +167,12 @@ void *listen_shutdown_request(void *opaque)
             exit(1);
         }
 
-        ret = write(shutdown_efd, &buf[0], 8);
-        if (ret < 0) {
-            perror("Error writing to eventfd");
+        // Signal the guest to shut down via the VMM handle.
+        KrunError krun_err = NULL;
+        krun_vmm_handle_shutdown(handle, &krun_err);
+        if (krun_err) {
+            fprintf(stderr, "Error sending shutdown signal\n");
+            krun_error_destroy(krun_err);
         }
 
         close(client_sock);
@@ -152,8 +181,7 @@ void *listen_shutdown_request(void *opaque)
 
 int main(int argc, char *const argv[])
 {
-    int ctx_id;
-    int err;
+    KrunError krun_err;
     pthread_t thread;
     struct cmdline cmdline;
 
@@ -169,70 +197,61 @@ int main(int argc, char *const argv[])
     }
 
     // Set the log level to "off".
-    err = krun_init_log(KRUN_LOG_TARGET_DEFAULT, KRUN_LOG_LEVEL_OFF, KRUN_LOG_STYLE_AUTO, 0);
-    if (err) {
-        errno = -err;
-        perror("Error configuring log level");
-        return -1;
+    CHECK(krun_init_log(-1, KRUN_LOG_LEVEL_OFF, KRUN_LOG_STYLE_AUTO, 0, &krun_err));
+
+    // Create the device manager.
+    KrunMmioDeviceManager devices = krun_mmio_device_manager_new();
+
+    // Configure the console.
+    {
+        KrunConsoleBuilder cb = krun_console_device_builder();
+        CHECK(krun_console_builder_add_default_console(cb, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO, &krun_err));
+        KrunConsoleDevice console = krun_console_builder_build(cb, &krun_err);
+        krun_mmio_device_manager_add(devices, console);
     }
 
-    // Create the configuration context.
-    ctx_id = krun_create_ctx();
-    if (ctx_id < 0) {
-        errno = -ctx_id;
-        perror("Error creating configuration context");
-        return -1;
+    // Load the EFI firmware as the payload.
+    CHECK(KrunPayload payload = krun_payload_load_firmware(KRUN_STR(cmdline.efi_fw), KRUN_STR(""), &krun_err));
+
+    {
+        CHECK(KrunBlockDevice blk = krun_block_device_new(KRUN_STR("root"),
+            KRUN_STR(cmdline.disk_image), KRUN_DISK_FORMAT_RAW, false, &krun_err));
+        krun_mmio_device_manager_add(devices, blk);
     }
 
-    // Configure the number of vCPUs (2) and the amount of RAM (1024 MiB).
-    if (err = krun_set_vm_config(ctx_id, 2, 1024)) {
-        errno = -err;
-        perror("Error configuring the number of vCPUs and/or the amount of RAM");
-        return -1;
+    {
+        uint8_t mac[] = {0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee};
+        CHECK(KrunNetDevice net = krun_net_device_new_unixgram_path(KRUN_STR("net0"),
+            KRUN_STR(cmdline.passt_socket_path), KRUN_BYTES(mac), COMPAT_NET_FEATURES,
+            KRUN_NET_FLAGS_VFKIT, &krun_err));
+        krun_mmio_device_manager_add(devices, net);
     }
 
-    if (err = krun_add_virtio_console_default(ctx_id, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO)) {
-        errno = -err;
-        perror("Error configuring console");
-        return -1;
+    {
+        CHECK(KrunRngDevice rng = krun_rng_device_new(&krun_err));
+        krun_mmio_device_manager_add(devices, rng);
+
+        CHECK(KrunBalloonDevice balloon = krun_balloon_device_new(&krun_err));
+        krun_mmio_device_manager_add(devices, balloon);
     }
 
-    if (err = krun_set_firmware(ctx_id, cmdline.efi_fw)) {
-        errno = -err;
-        perror("Error configuring EFI FW path");
-        return -1;
-    }
+    // Build the VM.
+    KrunVmmBuilder builder = krun_vmm_builder_new();
+    CHECK(krun_vmm_builder_vcpus(&builder, 2, &krun_err));
+    CHECK(krun_vmm_builder_ram_mib(&builder, 1024, &krun_err));
+    krun_vmm_builder_payload(&builder, payload);
+    krun_vmm_builder_devices(&builder, devices);
 
-    if (err = krun_add_disk(ctx_id, "root", cmdline.disk_image, false)) {
-        errno = -err;
-        perror("Error configuring disk image");
-        return -1;
-    }
+    CHECK(KrunVmm vmm = krun_vmm_builder_build(&builder, &krun_err));
 
-    uint8_t mac[] = {0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee};
-    if (err = krun_add_net_unixgram(ctx_id, cmdline.passt_socket_path, -1, &mac[0], COMPAT_NET_FEATURES, NET_FLAG_VFKIT)) {
-        errno = -err;
-        perror("Error configuring net mode");
-        return -1;
-    }
-
-    int efd = krun_get_shutdown_eventfd(ctx_id);
-    if (efd < 0) {
-        perror("Can't get shutdown eventfd");
-        return -1;
-    }
+    // Get the VMM handle for shutdown signalling, then spawn the listener thread.
+    CHECK(KrunVmmHandle handle = krun_vmm_handle(vmm, &krun_err));
 
     // Spawn a thread to listen on "/tmp/krun_shutdown.sock" for a request to send
     // a shutdown signal to the guest.
-    pthread_create(&thread, NULL, listen_shutdown_request, (void*) efd);
+    pthread_create(&thread, NULL, listen_shutdown_request, (void*) handle);
 
-    // Start and enter the microVM. Unless there is some error while creating the microVM
-    // this function never returns.
-    if (err = krun_start_enter(ctx_id)) {
-        errno = -err;
-        perror("Error creating the microVM");
-        return -1;
-    }
+    krun_vmm_run(vmm); // never returns
 
     // Not reached.
     return 0;

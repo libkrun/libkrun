@@ -1,15 +1,13 @@
 //! Gvproxy backend for virtio-net tests.
 
-use crate::test_net::get_krun_add_net_unixgram;
-use crate::{ShouldRun, TestSetup, krun_call};
 use anyhow::Context;
-use krun_sys::{COMPAT_NET_FEATURES, NET_FLAG_DHCP_CLIENT, NET_FLAG_VFKIT};
-use std::ffi::CString;
 use std::io::{self, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+
+use crate::{ShouldRun, TestSetup};
 
 /// Read gvproxy binary path from `KRUN_TEST_GVPROXY_PATH` (set by `tests/run.sh`).
 /// Returns `None` if the variable is unset or the referenced file doesn't exist.
@@ -136,11 +134,10 @@ pub(crate) fn should_run() -> ShouldRun {
 }
 
 fn setup_backend_with_socket(
-    ctx: u32,
     test_setup: &TestSetup,
     socket_name: &str,
     log_name: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<krun::NetDevice> {
     let tmp_dir = test_setup
         .tmp_dir
         .canonicalize()
@@ -159,30 +156,26 @@ fn setup_backend_with_socket(
         "gvproxy failed to create socket"
     );
 
-    let mut mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
-    let c_socket_path = CString::new(socket_path_str)?;
+    let mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
 
-    unsafe {
-        krun_call!(get_krun_add_net_unixgram()(
-            ctx,
-            c_socket_path.as_ptr(),
-            -1,
-            mac.as_mut_ptr(),
-            COMPAT_NET_FEATURES,
-            NET_FLAG_VFKIT | NET_FLAG_DHCP_CLIENT,
-        ))?;
-    }
-    Ok(())
+    krun::NetDevice::new_unixgram_path(
+        "net0",
+        socket_path_str,
+        &mac,
+        crate::test_net::COMPAT_NET_FEATURES,
+        krun::NetFlags::VFKIT,
+    )
+    .map_err(|e| anyhow::anyhow!("NetDevice: {e:?}"))
 }
 
-pub(crate) fn setup_backend(ctx: u32, test_setup: &TestSetup) -> anyhow::Result<()> {
-    setup_backend_with_socket(ctx, test_setup, "gvproxy.sock", "gvproxy.log")
+pub(crate) fn setup_backend(test_setup: &TestSetup) -> anyhow::Result<krun::NetDevice> {
+    setup_backend_with_socket(test_setup, "gvproxy.sock", "gvproxy.log")
 }
 
 /// Backend setup with a peer socket path long enough to have previously
 /// triggered ENAMETOOLONG on macOS when the local bind address was derived
 /// from the peer path by appending a suffix.
-pub(crate) fn setup_backend_long_path(ctx: u32, test_setup: &TestSetup) -> anyhow::Result<()> {
+pub(crate) fn setup_backend_long_path(test_setup: &TestSetup) -> anyhow::Result<krun::NetDevice> {
     // Build a peer socket filename so that the full path approaches the
     // 104-byte macOS unix socket limit. Use base_len measured at runtime so
     // the padding is correct regardless of the exact tmp_dir length.
@@ -202,5 +195,5 @@ pub(crate) fn setup_backend_long_path(ctx: u32, test_setup: &TestSetup) -> anyho
         .max(1);
     let socket_name = format!("{}{}{}", prefix, "x".repeat(pad_len), suffix);
 
-    setup_backend_with_socket(ctx, test_setup, &socket_name, "gvproxy-long-path.log")
+    setup_backend_with_socket(test_setup, &socket_name, "gvproxy-long-path.log")
 }

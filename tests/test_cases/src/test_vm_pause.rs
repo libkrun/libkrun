@@ -19,15 +19,15 @@
 //!   - With 2 vCPUs, the core not running the workload is parked in WFE at pause
 //!     time. It can only acknowledge the pause if the park point also watches the
 //!     pause channel -- otherwise `Vmm::pause` blocks forever awaiting its ack.
-//!   - The second `krun_vm_pause`/`krun_vm_resume` in each cycle is a no-op that
-//!     must return without re-signalling the (already parked) vCPUs; a missing
-//!     idempotency guard deadlocks the event loop.
+//!   - The second pause/resume in each cycle is a no-op that must return without
+//!     re-signalling the (already parked) vCPUs; a missing idempotency guard
+//!     deadlocks the event loop.
 //!   - A pause immediately followed by a resume reaches the event loop in a
 //!     single wakeup. Observing them out of order would no-op the resume and
 //!     leave the guest frozen.
 //!
 //! The process exits on guest poweroff, so host timing can't be measured around
-//! `krun_start_enter` (it never returns) -- hence the marker rather than a timer.
+//! `vmm.run()` (it never returns) -- hence the marker rather than a timer.
 
 use macros::{guest, host};
 
@@ -43,57 +43,58 @@ mod host {
     const NUM_CPUS: u8 = 2;
     const WORKLOAD_MS: u64 = WORKLOAD_ITERS as u64 * WORKLOAD_INTERVAL_MS;
     const CYCLES: u32 = 2;
-    // Each pause must outlast the guest's remaining run so the guest can't power
-    // off (and exit the process) before the post-resume marker is written.
     const SETTLE_MS: u64 = 1_500;
     const PAUSE_MS: u64 = 5_000;
     const GAP_MS: u64 = 1_500;
-    // Long enough that the doubled pause/resume below land as distinct event-loop
-    // wakeups rather than coalescing into one, so they exercise the no-op guard.
     const IDEM_GAP_MS: u64 = 200;
 
-    use crate::common::{build_init_config, setup_rootfs};
-    use crate::{ShouldRun, Test, TestOutcome, TestSetup};
-    use crate::{krun_call, krun_call_u32};
-    use krun_sys::*;
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::Path;
+    use std::io;
+    use std::os::fd::AsFd;
     use std::time::Duration;
+
+    use crate::common::{build_init_config, init_krun, setup_rootfs};
+    use crate::{ShouldRun, Test, TestOutcome, TestSetup};
+
+    // FIXME: remove once ffier marks generated handle wrappers as Send.
+    struct SendHandle(krun::VmmHandle);
+    unsafe impl Send for SendHandle {}
+    impl SendHandle {
+        fn pause(&self) -> Result<(), krun::Error> {
+            self.0.pause()
+        }
+        fn resume(&self) -> Result<(), krun::Error> {
+            self.0.resume()
+        }
+    }
+
+    #[cfg(feature = "dynamic-linking")]
+    fn require_symbols() -> Result<(), libloading::Error> {
+        crate::common::require_vm_symbols()?;
+        krun::require(
+            None,
+            &[
+                krun::Symbol::KrunVmmHandle,
+                krun::Symbol::KrunVmmHandleDestroy,
+                krun::Symbol::KrunVmmHandlePause,
+                krun::Symbol::KrunVmmHandleResume,
+            ],
+        )
+    }
 
     fn sleep_ms(ms: u64) {
         std::thread::sleep(Duration::from_millis(ms));
     }
 
-    unsafe fn configure_vm(ctx: u32, root: &Path) -> anyhow::Result<()> {
-        let root_cstr = CString::new(root.as_os_str().as_bytes())?;
-        unsafe {
-            krun_call!(krun_set_vm_config(ctx, NUM_CPUS, 512))?;
-            krun_call!(krun_add_virtio_console_default(
-                ctx,
-                std::io::stdin().as_raw_fd(),
-                std::io::stdout().as_raw_fd(),
-                std::io::stderr().as_raw_fd(),
-            ))?;
-            krun_call!(krun_add_virtiofs3(
-                ctx,
-                c"/dev/root".as_ptr(),
-                root_cstr.as_ptr(),
-                0,
-                false,
-            ))?;
-        }
-        Ok(())
-    }
-
     impl Test for TestVmPause {
         fn should_run(&self) -> ShouldRun {
-            if cfg!(target_os = "macos") {
-                ShouldRun::Yes
-            } else {
-                ShouldRun::No("pause/resume is macOS/HVF only")
+            if !cfg!(target_os = "macos") {
+                return ShouldRun::No("pause/resume is macOS/HVF only");
             }
+            #[cfg(feature = "dynamic-linking")]
+            if require_symbols().is_err() {
+                return ShouldRun::No("feature not enabled in this libkrun build");
+            }
+            ShouldRun::Yes
         }
 
         fn timeout_secs(&self) -> u64 {
@@ -101,60 +102,92 @@ mod host {
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            init_krun()?;
+            #[cfg(feature = "dynamic-linking")]
+            require_symbols().unwrap();
+
             let root_dir = setup_rootfs(&test_setup)?;
-            let ctx = unsafe { krun_call_u32!(krun_create_ctx())? };
-            unsafe { configure_vm(ctx, &root_dir)? };
-
-            // init_config must stay alive until krun_start_enter (which never
-            // returns): apply() passes data pointers into libkrun that remain
-            // borrowed for the VM lifetime.
             let init_config = build_init_config(&test_setup.test_case, &[]);
-            init_config
-                .apply(std::ptr::null_mut(), ctx, "/dev/root")
-                .expect("apply init config");
 
-            // Pause/resume the guest several times from another thread, each pause
-            // outlasting the guest's remaining run, then drop a marker. The control
-            // channel isn't registered until the VM's event loop starts, so retry
-            // the first pause past the initial -ENOENT.
+            let mut rootfs = krun::FsDevice::new("/dev/root", root_dir.to_str().unwrap())
+                .map_err(|e| anyhow::anyhow!("FsDevice::new: {e:?}"))?;
+            let mut payload =
+                krun::Payload::load_krunfw().map_err(|e| anyhow::anyhow!("load_krunfw: {e:?}"))?;
+            let mut overlay = krun::FsOverlay::new();
+            init_config
+                .apply(&mut overlay, &mut payload)
+                .map_err(|e| anyhow::anyhow!("Config::apply: {e}"))?;
+            rootfs.set_overlay(overlay);
+
+            let mut console_builder = krun::ConsoleDevice::builder();
+            console_builder
+                .add_default_console(
+                    Some(io::stdin().as_fd().try_clone_to_owned().expect("dup stdin")),
+                    Some(
+                        io::stdout()
+                            .as_fd()
+                            .try_clone_to_owned()
+                            .expect("dup stdout"),
+                    ),
+                    Some(
+                        io::stderr()
+                            .as_fd()
+                            .try_clone_to_owned()
+                            .expect("dup stderr"),
+                    ),
+                )
+                .map_err(|e| anyhow::anyhow!("add_default_console: {e:?}"))?;
+            let console = console_builder
+                .build()
+                .map_err(|e| anyhow::anyhow!("ConsoleDevice::build: {e:?}"))?;
+
+            let mut devices = krun::MmioDeviceManager::new();
+            devices.add(rootfs);
+            devices.add(console);
+
+            let vmm = krun::VmmBuilder::new()
+                .vcpus(NUM_CPUS)
+                .map_err(|e| anyhow::anyhow!("vcpus: {e:?}"))?
+                .ram_mib(512)
+                .map_err(|e| anyhow::anyhow!("ram_mib: {e:?}"))?
+                .payload(payload)
+                .devices(devices)
+                .build()
+                .map_err(|e| anyhow::anyhow!("VmmBuilder::build: {e:?}"))?;
+
+            let handle = SendHandle(
+                vmm.handle()
+                    .map_err(|e| anyhow::anyhow!("vmm.handle: {e:?}"))?,
+            );
+
             let marker = test_setup.tmp_dir.join("resumed");
             std::thread::spawn(move || {
                 sleep_ms(SETTLE_MS);
-                while unsafe { krun_vm_pause(ctx) } != 0 {
+                while handle.pause().is_err() {
                     sleep_ms(50);
                 }
-                // Resume with no sleep in between, so both requests reach the event
-                // loop in one wakeup: if it observed them out of order the guest
-                // would stay frozen and the runner would time out.
-                assert_eq!(unsafe { krun_vm_resume(ctx) }, 0, "tight resume");
+                handle.resume().expect("tight resume");
 
                 for cycle in 0..CYCLES {
-                    assert_eq!(unsafe { krun_vm_pause(ctx) }, 0, "pause");
-                    // Pausing an already-paused VM is a no-op; it deadlocks the
-                    // event loop if the idempotency guard is missing.
+                    handle.pause().expect("pause");
                     sleep_ms(IDEM_GAP_MS);
-                    assert_eq!(unsafe { krun_vm_pause(ctx) }, 0, "redundant pause");
+                    handle.pause().expect("redundant pause");
 
                     sleep_ms(PAUSE_MS);
 
-                    assert_eq!(unsafe { krun_vm_resume(ctx) }, 0, "resume");
+                    handle.resume().expect("resume");
                     sleep_ms(IDEM_GAP_MS);
-                    assert_eq!(unsafe { krun_vm_resume(ctx) }, 0, "redundant resume");
+                    handle.resume().expect("redundant resume");
 
                     if cycle + 1 < CYCLES {
                         sleep_ms(GAP_MS);
                     }
                 }
-                // Reached only if the guest was still alive after the last resume,
-                // i.e. the pauses actually held it; a no-op pause exits first.
                 let _ = std::fs::write(&marker, "1");
             });
 
-            let rc = unsafe { krun_start_enter(ctx) };
-            if rc < 0 {
-                anyhow::bail!("krun_start_enter failed: {rc}");
-            }
-            Ok(())
+            vmm.run();
+            unreachable!()
         }
 
         fn check(self: Box<Self>, stdout: Vec<u8>, test_setup: TestSetup) -> TestOutcome {
@@ -177,17 +210,12 @@ mod host {
                 ));
             }
 
-            // The guest's own clock must not have absorbed the host pauses: it
-            // should report roughly the workload length, not workload + pauses.
             if guest_done_ms > WORKLOAD_MS + PAUSE_MS / 2 {
                 return TestOutcome::Fail(format!(
                     "guest clock jumped across pause: {guest_done_ms}ms (workload ~{WORKLOAD_MS}ms)"
                 ));
             }
 
-            // The pause thread reaches the marker write only if the guest was
-            // still alive long after its natural completion -- i.e. the pauses
-            // really halted it. A no-op pause exits the process first.
             if !test_setup.tmp_dir.join("resumed").exists() {
                 return TestOutcome::Fail(
                     "no resume marker; pause did not hold the guest past its workload".into(),
@@ -209,8 +237,6 @@ mod guest {
             use std::io::Write;
             use std::time::Instant;
 
-            // Monotonic clock derives from the guest virtual counter, which the
-            // host freezes while paused — so this elapsed time excludes the pauses.
             let start = Instant::now();
             for i in 0..WORKLOAD_ITERS {
                 println!("HEARTBEAT {i}");

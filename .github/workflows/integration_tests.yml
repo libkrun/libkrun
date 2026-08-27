@@ -45,7 +45,7 @@ jobs:
       - name: Clippy (test_cases host)
         run: |
           cd tests
-          PKG_CONFIG_PATH="$(realpath ../test-prefix/lib64/pkgconfig/)" LD_LIBRARY_PATH="$(realpath ../test-prefix/lib64/)" cargo clippy --locked -p test_cases --features host -- -D warnings
+          PKG_CONFIG_PATH="$(realpath ../test-prefix/lib64/pkgconfig/)" LD_LIBRARY_PATH="$(realpath ../test-prefix/lib64/)" cargo clippy --locked -p test_cases --features dynamic-linking -- -D warnings
       
       - name: Clippy (runner)
         run: |
@@ -134,7 +134,7 @@ jobs:
       - name: Clippy (test_cases host)
         run: |
           cd tests
-          PKG_CONFIG_PATH="$(realpath ../test-prefix/lib64/pkgconfig/)" LD_LIBRARY_PATH="$(realpath ../test-prefix/lib64/)" cargo clippy --locked -p test_cases --features host -- -D warnings
+          PKG_CONFIG_PATH="$(realpath ../test-prefix/lib64/pkgconfig/)" LD_LIBRARY_PATH="$(realpath ../test-prefix/lib64/)" cargo clippy --locked -p test_cases --features dynamic-linking -- -D warnings
       
       - name: Clippy (runner)
         run: |

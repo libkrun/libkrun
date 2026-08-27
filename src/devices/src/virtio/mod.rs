@@ -15,7 +15,6 @@ pub mod balloon;
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
 pub mod bindings;
-#[cfg(feature = "blk")]
 pub mod block;
 pub mod console;
 pub mod descriptor_utils;

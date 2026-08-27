@@ -1,10 +1,19 @@
-#[cfg(feature = "host")]
-extern crate krun_init_blob_via_cdylib as krun_init;
+#[cfg(all(feature = "static-linking", feature = "dynamic-linking"))]
+compile_error!("Cannot enable both static-linking and dynamic-linking");
+
+#[cfg(feature = "dynamic-linking")]
+extern crate krun_cdylib as krun;
+#[cfg(feature = "static-linking")]
+extern crate krun_init_blob as krun_init;
+#[cfg(feature = "dynamic-linking")]
+extern crate krun_init_cdylib as krun_init;
 
 mod test_vm_config;
 use test_vm_config::TestVmConfig;
 
+#[cfg(any(feature = "guest", target_os = "macos"))]
 mod test_vm_pause;
+#[cfg(any(feature = "guest", target_os = "macos"))]
 use test_vm_pause::TestVmPause;
 
 #[cfg(any(feature = "host", target_os = "linux"))]
@@ -82,7 +91,6 @@ impl ShouldRun {
 }
 
 pub fn test_cases() -> Vec<TestCase> {
-    // Register your test here:
     vec![
         TestCase::new(
             "configure-vm-1cpu-256MiB",
@@ -98,6 +106,7 @@ pub fn test_cases() -> Vec<TestCase> {
                 ram_mib: 1024,
             }),
         ),
+        #[cfg(any(feature = "guest", target_os = "macos"))]
         TestCase::new("vm-pause", Box::new(TestVmPause)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("vsock-guest-connect", Box::new(TestVsockGuestConnect)),
@@ -206,9 +215,6 @@ mod common;
 
 #[cfg(feature = "host")]
 pub mod common_freebsd;
-
-#[cfg(feature = "host")]
-mod krun;
 
 #[cfg(feature = "host")]
 pub mod rootfs;

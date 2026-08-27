@@ -3,7 +3,7 @@ pub static INIT_BINARY: &[u8] = include_bytes!(env!("KRUN_INIT_BINARY_PATH"));
 pub mod config;
 pub(crate) mod init_schema;
 pub(crate) mod oci_schema;
-pub use config::{ApplyError, Builder, Config, ConfigError, INIT_PATH};
+pub use config::{ApplyError, Builder, Config, ConfigError, INIT_PATH, KERNEL_INIT_ARG};
 pub use init_schema::Mount;
 
 #[cfg(feature = "ffi")]

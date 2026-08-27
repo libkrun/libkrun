@@ -13,6 +13,8 @@ typedef void* KrunInitConfig;
 typedef void* KrunInitBuilder;
 typedef void* KrunInitError; /* KrunInitConfigError | KrunInitApplyError | KrunInitVtableError */
 typedef void* KrunInitPushStr; /* KrunInitVtablePushStr */
+typedef void* KrunFsOverlay;
+typedef void* KrunPayload;
 
 #ifndef KRUN_PRIMITIVES_DEFINED
 #define KRUN_PRIMITIVES_DEFINED
@@ -89,8 +91,6 @@ typedef void (*krun_init_free_object_array_fn)(KrunObjectArray a);
 /* ApplyError -------------------------------------------------------- */
 
 #define KRUN_INIT_ERROR_APPLY_SYMBOL_NOT_FOUND ((uint64_t)33554438 << 32 | 1)
-#define KRUN_INIT_ERROR_APPLY_OVERLAY_FILE ((uint64_t)33554438 << 32 | 2)
-#define KRUN_INIT_ERROR_APPLY_KERNEL_CMDLINE ((uint64_t)33554438 << 32 | 3)
 
 /* Config ------------------------------------------------------------ */
 
@@ -98,28 +98,21 @@ typedef void (*krun_init_free_object_array_fn)(KrunObjectArray a);
 KrunInitBuilder krun_init_config_builder();
 typedef KrunInitBuilder (*krun_init_config_builder_fn)();
 /**
- * Apply this init configuration to a libkrun VM context.
+ * Apply this init configuration to a VM's filesystem overlay and payload.
  *
- * Adds the init binary and associated configuration file(s) as
- * overlay files on the specified virtiofs device, and appends
- * the appropriate kernel command line argument to specify the
- * init binary.
+ * Adds the init binary and associated configuration file(s) as overlay
+ * files, and appends the init kernel command line argument to the payload.
  *
- * `lib_handle` is the result of `dlopen("libkrun.so")`. Pass NULL to
- * search the global symbol namespace (requires libkrun was linked or
- * opened with `RTLD_GLOBAL`).
- *
- * # Safety
- *
- * - If `lib_handle` is non-null it must be a valid handle returned by
- *   `dlopen` (or equivalent) that remains open for the duration of
- *   this call.
- * - The caller must keep this `Config` alive for the entire lifetime
- *   of the VM. `apply` passes data pointers to libkrun that remain
- *   borrowed until the VM exits.
+ * Symbols are loaded from the global namespace (`RTLD_DEFAULT`).
  */
-KrunResult krun_init_config_apply(KrunInitConfig handle, void* lib_handle, uint32_t ctx_id, KrunStr fs_tag, KrunInitError* err_out);
-typedef KrunResult (*krun_init_config_apply_fn)(KrunInitConfig handle, void* lib_handle, uint32_t ctx_id, KrunStr fs_tag, KrunInitError* err_out);
+KrunResult krun_init_config_apply(KrunInitConfig handle, KrunFsOverlay overlay, KrunPayload payload, KrunInitError* err_out);
+typedef KrunResult (*krun_init_config_apply_fn)(KrunInitConfig handle, KrunFsOverlay overlay, KrunPayload payload, KrunInitError* err_out);
+/**
+ * Like [`apply`](Self::apply), but loads symbols from a specific library
+ * handle (e.g. from `dlopen`). Pass null for `RTLD_DEFAULT`.
+ */
+KrunResult krun_init_config_apply_in(KrunInitConfig handle, void* lib_handle, KrunFsOverlay overlay, KrunPayload payload, KrunInitError* err_out);
+typedef KrunResult (*krun_init_config_apply_in_fn)(KrunInitConfig handle, void* lib_handle, KrunFsOverlay overlay, KrunPayload payload, KrunInitError* err_out);
 void krun_init_config_destroy(KrunInitConfig handle);
 typedef void (*krun_init_config_destroy_fn)(KrunInitConfig handle);
 
@@ -158,6 +151,12 @@ typedef void (*krun_init_builder_rlimit_fn)(KrunInitBuilder* handle, KrunStr lim
 /** Append multiple resource limits. */
 void krun_init_builder_rlimits(KrunInitBuilder* handle, const KrunStr* limits, size_t limits_len);
 typedef void (*krun_init_builder_rlimits_fn)(KrunInitBuilder* handle, const KrunStr* limits, size_t limits_len);
+/** Enable DHCP client in the guest. */
+void krun_init_builder_dhcp(KrunInitBuilder* handle, bool enable);
+typedef void (*krun_init_builder_dhcp_fn)(KrunInitBuilder* handle, bool enable);
+/** Set the root disk to remount on boot. */
+void krun_init_builder_set_root_disk_remount(KrunInitBuilder* handle, KrunStr device, KrunStr fstype, KrunStr options);
+typedef void (*krun_init_builder_set_root_disk_remount_fn)(KrunInitBuilder* handle, KrunStr device, KrunStr fstype, KrunStr options);
 /**
  * Consume the builder, serialize the config, and return the
  * finished [`Config`].

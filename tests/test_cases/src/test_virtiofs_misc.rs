@@ -12,47 +12,30 @@ const HOST_OWNED_FILE: &str = "host_owned_file";
 mod host {
     use super::*;
 
-    use crate::common::setup_fs_and_enter_with_env;
-    use crate::{Test, TestOutcome, TestSetup};
-    use crate::{krun_call, krun_call_u32};
-    use krun_sys::*;
+    use crate::common::setup_and_run_with_env;
+    use crate::{ShouldRun, Test, TestOutcome, TestSetup};
     use std::io::Read;
-    use std::os::fd::AsRawFd;
 
     impl Test for TestVirtioFsMisc {
+        fn should_run(&self) -> ShouldRun {
+            #[cfg(feature = "dynamic-linking")]
+            if crate::common::require_vm_symbols().is_err() {
+                return ShouldRun::No("core VM symbols not available");
+            }
+            ShouldRun::Yes
+        }
+
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             // Create a host-owned file in the rootfs before entering the VM.
-            // Inside the guest it must appear as root-owned: on Linux via user
-            // namespace mapping, on macOS via the EUID→0 mapping (PR #734).
             let root_dir = test_setup.tmp_dir.join("rootfs");
             std::fs::create_dir_all(&root_dir)?;
             std::fs::write(root_dir.join(HOST_OWNED_FILE), b"host-data")?;
 
-            unsafe {
-                krun_call!(krun_init_log(
-                    KRUN_LOG_TARGET_DEFAULT,
-                    KRUN_LOG_LEVEL_TRACE,
-                    KRUN_LOG_STYLE_AUTO,
-                    0
-                ))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_set_vm_config(ctx, 1, 1024))?;
-                krun_call!(krun_add_virtio_console_default(
-                    ctx,
-                    std::io::stdin().as_raw_fd(),
-                    std::io::stdout().as_raw_fd(),
-                    std::io::stderr().as_raw_fd(),
-                ))?;
-
-                // Forward KRUN_NO_UNSHARE to the guest so UID/GID mapping
-                // subtests can skip themselves when no user namespace is active.
-                let mut guest_env: Vec<&str> = Vec::new();
-                if std::env::var_os("KRUN_NO_UNSHARE").is_some() {
-                    guest_env.push("KRUN_NO_UNSHARE=1");
-                }
-                setup_fs_and_enter_with_env(ctx, test_setup, &guest_env)?;
+            let mut guest_env: Vec<&str> = Vec::new();
+            if std::env::var_os("KRUN_NO_UNSHARE").is_some() {
+                guest_env.push("KRUN_NO_UNSHARE=1");
             }
-            Ok(())
+            setup_and_run_with_env(1, 1024, test_setup, &guest_env)
         }
 
         fn check(self: Box<Self>, stdout: Vec<u8>, test_setup: TestSetup) -> TestOutcome {

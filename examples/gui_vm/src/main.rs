@@ -5,31 +5,21 @@ use gtk_display::{
     TouchScreenOptions,
 };
 
-use krun_sys::{
-    KRUN_LOG_LEVEL_TRACE, KRUN_LOG_LEVEL_WARN, KRUN_LOG_STYLE_ALWAYS, KRUN_LOG_TARGET_DEFAULT,
-    VIRGLRENDERER_RENDER_SERVER, VIRGLRENDERER_THREAD_SYNC, VIRGLRENDERER_USE_ASYNC_FENCE_CB,
-    VIRGLRENDERER_USE_EGL, VIRGLRENDERER_VENUS, krun_add_display, krun_add_input_device,
-    krun_add_input_device_fd, krun_add_virtio_console_default, krun_add_virtiofs3, krun_create_ctx,
-    krun_display_set_dpi, krun_display_set_physical_size, krun_display_set_refresh_rate,
-    krun_init_log, krun_set_display_backend, krun_set_gpu_options2, krun_set_vm_config,
-    krun_start_enter,
-};
 use log::LevelFilter;
 use regex::{Captures, Regex};
-use std::ffi::{CString, c_void};
+use std::ffi::CString;
 use std::fmt::Display;
-use std::fs::{File, OpenOptions};
-use std::mem::size_of_val;
-
-use anyhow::Context;
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::fs::File;
+use std::io;
+use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::thread;
 
-mod krun_utils;
+use anyhow::Context;
+use krun::VirglRendererFlags;
 
 #[derive(Debug, Copy, Clone)]
 pub enum PhysicalSize {
@@ -119,120 +109,191 @@ struct Args {
     input: Vec<PathBuf>,
 }
 
+/// Load libkrun (dlopen) and resolve the symbols this example needs.
+fn load_krun() -> anyhow::Result<()> {
+    let name = if cfg!(target_os = "macos") {
+        "libkrun.dylib"
+    } else {
+        "libkrun.so"
+    };
+    unsafe {
+        libloading::os::unix::Library::open(
+            Some(name),
+            libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_GLOBAL,
+        )
+    }
+    .with_context(|| format!("failed to dlopen {name}"))?;
+
+    use krun::Symbol::*;
+    krun::require(
+        None,
+        &[
+            KrunInitLog,
+            KrunMmioDeviceManagerNew,
+            KrunMmioDeviceManagerAdd,
+            KrunFsDeviceNew,
+            KrunFsOverlayNew,
+            KrunConsoleDeviceBuilder,
+            KrunConsoleBuilderAddDefaultConsole,
+            KrunConsoleBuilderBuild,
+            KrunPayloadLoadKrunfw,
+            KrunDisplayBackendNew,
+            KrunDisplayInfoBuilderNew,
+            KrunDisplayInfoBuilderDpi,
+            KrunDisplayInfoBuilderPhysicalSize,
+            KrunDisplayInfoBuilderRefreshRate,
+            KrunGpuDeviceNew,
+            KrunInputDeviceNew,
+            KrunInputDeviceNewFromFd,
+            KrunVmmBuilderNew,
+            KrunVmmBuilderVcpus,
+            KrunVmmBuilderRamMib,
+            KrunVmmBuilderPayload,
+            KrunVmmBuilderDevices,
+            KrunVmmBuilderBuild,
+            KrunVmmRun,
+        ],
+    )
+    .context("failed to load libkrun symbols")?;
+
+    Ok(())
+}
+
 fn krun_thread(
     args: &Args,
     display_backend_handle: DisplayBackendHandle,
     input_device_handles: Vec<InputBackendHandle>,
 ) -> anyhow::Result<()> {
-    unsafe {
-        if let Some(path) = &args.color_log {
-            krun_call!(krun_init_log(
-                OpenOptions::new()
-                    .write(true)
-                    .open(path)
-                    .context("Failed to open log output")?
-                    .into_raw_fd(),
-                KRUN_LOG_LEVEL_TRACE,
-                KRUN_LOG_STYLE_ALWAYS,
-                0
-            ))?;
-        } else {
-            krun_call!(krun_init_log(
-                KRUN_LOG_TARGET_DEFAULT,
-                KRUN_LOG_LEVEL_WARN,
-                0,
-                0,
-            ))?;
+    load_krun()?;
+
+    krun::init_log(
+        None,
+        krun::LogLevel::Warn,
+        krun::LogStyle::Auto,
+        krun::LogOptions::empty(),
+    )
+    .map_err(|e| anyhow::anyhow!("init_log: {e}"))?;
+
+    let root_dir = args
+        .root_dir
+        .to_str()
+        .context("root_dir must be valid UTF-8")?;
+    let mut rootfs = krun::FsDevice::new("/dev/root", root_dir)
+        .map_err(|e| anyhow::anyhow!("FsDevice::new: {e}"))?;
+
+    let mut payload =
+        krun::Payload::load_krunfw().map_err(|e| anyhow::anyhow!("load_krunfw: {e}"))?;
+
+    // Build init configuration.
+    let exec = args.executable.as_ref().unwrap().to_str().unwrap();
+    let argv_strs: Vec<&str> = args.argv.iter().map(|a| a.to_str().unwrap()).collect();
+    let mut full_argv: Vec<&str> = vec![exec];
+    full_argv.extend_from_slice(&argv_strs);
+    let init_config = krun_init::Config::builder().args(&full_argv).build();
+    let mut overlay = krun::FsOverlay::new();
+    init_config
+        .apply(&mut overlay, &mut payload)
+        .map_err(|e| anyhow::anyhow!("Config::apply: {e}"))?;
+    rootfs.set_overlay(overlay);
+
+    let mut console_builder = krun::ConsoleDevice::builder();
+    console_builder
+        .add_default_console(
+            Some(
+                io::stdin()
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .context("dup stdin")?,
+            ),
+            Some(
+                io::stdout()
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .context("dup stdout")?,
+            ),
+            Some(
+                io::stderr()
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .context("dup stderr")?,
+            ),
+        )
+        .map_err(|e| anyhow::anyhow!("add_default_console: {e}"))?;
+    let console = console_builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("ConsoleDevice::build: {e}"))?;
+
+    let display_backend_vtable = display_backend_handle.get();
+    let mut display_backend = krun::DisplayBackend::new(
+        &raw const display_backend_vtable as *const std::ffi::c_void,
+        std::mem::size_of_val(&display_backend_vtable),
+    )
+    .map_err(|e| anyhow::anyhow!("DisplayBackend::new: {e}"))?;
+
+    for display in &args.display {
+        let mut display_builder = krun::DisplayInfoBuilder::new(display.width, display.height);
+        if let Some(refresh_rate) = display.refresh_rate {
+            display_builder = display_builder.refresh_rate(refresh_rate);
         }
-
-        let ctx = krun_call_u32!(krun_create_ctx())?;
-
-        krun_call!(krun_set_vm_config(ctx, 4, 4096))?;
-
-        krun_call!(krun_add_virtio_console_default(
-            ctx,
-            std::io::stdin().as_raw_fd(),
-            std::io::stdout().as_raw_fd(),
-            std::io::stderr().as_raw_fd(),
-        ))?;
-
-        krun_call!(krun_set_gpu_options2(
-            ctx,
-            VIRGLRENDERER_USE_EGL
-                | VIRGLRENDERER_VENUS
-                | VIRGLRENDERER_RENDER_SERVER
-                | VIRGLRENDERER_THREAD_SYNC
-                | VIRGLRENDERER_USE_ASYNC_FENCE_CB,
-            4096
-        ))?;
-
-        krun_call!(krun_add_virtiofs3(
-            ctx,
-            c"/dev/root".as_ptr(),
-            args.root_dir.as_ptr(),
-            0,
-            false
-        ))?;
-
-        // Build init configuration.
-        let exec = args.executable.as_ref().unwrap().to_str().unwrap();
-        let argv_strs: Vec<&str> = args.argv.iter().map(|a| a.to_str().unwrap()).collect();
-        let mut full_argv: Vec<&str> = vec![exec];
-        full_argv.extend_from_slice(&argv_strs);
-        let init_config = krun_init::Config::builder().args(&full_argv).build();
-        init_config
-            .apply(std::ptr::null_mut(), ctx, "/dev/root")
-            .expect("apply init config");
-
-        for display in &args.display {
-            let display_id = krun_call_u32!(krun_add_display(ctx, display.width, display.height))?;
-            if let Some(refresh_rate) = display.refresh_rate {
-                krun_call!(krun_display_set_refresh_rate(ctx, display_id, refresh_rate))?;
+        display_builder = match display.physical_size {
+            None => display_builder,
+            Some(PhysicalSize::Dpi(dpi)) => display_builder.dpi(dpi),
+            Some(PhysicalSize::DimensionsMillimeters(width_mm, height_mm)) => {
+                display_builder.physical_size(width_mm, height_mm)
             }
-            match display.physical_size {
-                None => (),
-                Some(PhysicalSize::Dpi(dpi)) => {
-                    krun_call!(krun_display_set_dpi(ctx, display_id, dpi))?;
-                }
-                Some(PhysicalSize::DimensionsMillimeters(width_mm, height_mm)) => {
-                    krun_call!(krun_display_set_physical_size(
-                        ctx, display_id, width_mm, height_mm
-                    ))?;
-                }
-            };
-        }
-        let display_backend = display_backend_handle.get();
-        krun_call!(krun_set_display_backend(
-            ctx,
-            &raw const display_backend as *const c_void,
-            size_of_val(&display_backend),
-        ))?;
+        };
+        display_backend.add_display(display_builder);
+    }
 
-        for input in &args.input {
-            let fd = File::open(input)
-                .with_context(|| format!("Failed to open input device {input:?}"))?
-                .into_raw_fd();
-            krun_call!(krun_add_input_device_fd(ctx, fd))
-                .context("Failed to attach input device")?;
-        }
+    let gpu = krun::GpuDevice::new(
+        VirglRendererFlags::USE_EGL
+            | VirglRendererFlags::VENUS
+            | VirglRendererFlags::RENDER_SERVER
+            | VirglRendererFlags::THREAD_SYNC
+            | VirglRendererFlags::USE_ASYNC_FENCE_CB,
+        display_backend,
+    );
 
-        // Configure all input devices
-        for handle in &input_device_handles {
-            let config_backend = handle.get_config();
-            let event_provider_backend = handle.get_events();
+    let mut devices = krun::MmioDeviceManager::new();
+    devices.add(rootfs);
+    devices.add(console);
+    devices.add(gpu);
 
-            krun_call!(krun_add_input_device(
-                ctx,
-                &raw const config_backend as *const c_void,
-                size_of_val(&config_backend),
-                &raw const event_provider_backend as *const c_void,
-                size_of_val(&event_provider_backend),
-            ))?;
-        }
+    for input in &args.input {
+        let file =
+            File::open(input).with_context(|| format!("Failed to open input device {input:?}"))?;
+        let input_device = krun::InputDevice::new_from_fd(file.as_fd())
+            .map_err(|e| anyhow::anyhow!("InputDevice::new_from_fd: {e}"))?;
+        devices.add(input_device);
+    }
 
-        krun_call!(krun_start_enter(ctx))?;
-    };
-    Ok(())
+    // Configure all input devices
+    for handle in &input_device_handles {
+        let config_backend = handle.get_config();
+        let event_provider_backend = handle.get_events();
+
+        let input_device = krun::InputDevice::new(
+            &raw const config_backend as *const std::ffi::c_void,
+            std::mem::size_of_val(&config_backend),
+            &raw const event_provider_backend as *const std::ffi::c_void,
+            std::mem::size_of_val(&event_provider_backend),
+        )
+        .map_err(|e| anyhow::anyhow!("InputDevice::new: {e}"))?;
+        devices.add(input_device);
+    }
+
+    let vmm = krun::VmmBuilder::new()
+        .vcpus(4)
+        .map_err(|e| anyhow::anyhow!("vcpus: {e}"))?
+        .ram_mib(4096)
+        .map_err(|e| anyhow::anyhow!("ram_mib: {e}"))?
+        .payload(payload)
+        .devices(devices)
+        .build()
+        .map_err(|e| anyhow::anyhow!("VmmBuilder::build: {e}"))?;
+
+    vmm.run();
+    unreachable!("libkrun's VmmBuilder::run() should never return");
 }
 
 fn main() -> anyhow::Result<()> {

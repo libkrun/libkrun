@@ -1,9 +1,12 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(feature = "blk")]
 pub mod device;
+#[cfg(feature = "blk")]
 mod worker;
 
+#[cfg(feature = "blk")]
 pub use self::device::{Block, CacheType};
 
 use vm_memory::GuestMemoryError;
@@ -36,21 +39,25 @@ pub enum Error {
 }
 
 /// Supported disk image formats
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ImageType {
-    Raw,
-    Qcow2,
-    Vmdk,
+#[cfg_attr(feature = "ffi", ffier::export)]
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskFormat {
+    Raw = 0,
+    Qcow2 = 1,
+    Vmdk = 2,
 }
 
-impl TryFrom<u32> for ImageType {
+pub type ImageType = DiskFormat;
+
+impl TryFrom<u32> for DiskFormat {
     type Error = ();
 
     fn try_from(disk_format: u32) -> Result<Self, Self::Error> {
         match disk_format {
-            0 => Ok(ImageType::Raw),
-            1 => Ok(ImageType::Qcow2),
-            2 => Ok(ImageType::Vmdk),
+            0 => Ok(DiskFormat::Raw),
+            1 => Ok(DiskFormat::Qcow2),
+            2 => Ok(DiskFormat::Vmdk),
             _ => {
                 // Do not continue if the user cannot specify a valid disk format
                 Err(())
@@ -59,12 +66,25 @@ impl TryFrom<u32> for ImageType {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Supported synchronization modes for disk flushes.
+#[cfg_attr(feature = "ffi", ffier::export)]
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SyncMode {
-    None,
-    Relaxed,
+    /// Ignore VIRTIO_BLK_F_FLUSH.
+    ///
+    /// WARNING: may lead to loss of data.
+    None = 0,
+    /// Honor VIRTIO_BLK_F_FLUSH requests, but relax strict hardware syncing on macOS.
+    /// This is the recommended mode.
+    ///
+    /// On macOS this flushes OS buffers, but does not ask the drive to flush
+    /// its buffered data, which significantly improves performance.
+    /// On Linux this is the same as full sync.
     #[default]
-    Full,
+    Relaxed = 1,
+    /// Honor VIRTIO_BLK_F_FLUSH, strictly flushing buffers to physical disk.
+    Full = 2,
 }
 
 impl TryFrom<u32> for SyncMode {

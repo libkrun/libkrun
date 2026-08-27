@@ -41,7 +41,12 @@ if [ "$OS" = "Darwin" ]; then
 fi
 
 cargo build --target=$GUEST_TARGET -p guest-agent
-cargo build -p runner
+
+RUNNER_FEATURES=""
+if [ "${KRUN_TEST_FFI}" = "1" ]; then
+	RUNNER_FEATURES="--no-default-features --features ffi"
+fi
+cargo build -p runner $RUNNER_FEATURES
 
 # On macOS, the runner needs entitlements to use Hypervisor.framework
 if [ "$OS" = "Darwin" ]; then

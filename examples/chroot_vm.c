@@ -26,6 +26,24 @@
 #define MAX_PATH 4096
 #endif
 
+// Virtio device type IDs (for vhost-user)
+#define VIRTIO_DEVICE_CONSOLE 3
+#define VIRTIO_DEVICE_RNG     4
+#define VIRTIO_DEVICE_GPU     16
+#define VIRTIO_DEVICE_RTC     17
+#define VIRTIO_DEVICE_INPUT   18
+#define VIRTIO_DEVICE_VSOCK   19
+#define VIRTIO_DEVICE_SND     25
+#define VIRTIO_DEVICE_CAN     36
+#define VIRTIO_DEVICE_MEDIA   45
+
+// TSI flags
+#define TSI_HIJACK_INET (1 << 0)
+#define TSI_HIJACK_UNIX (1 << 1)
+
+// Net feature flags
+#define COMPAT_NET_FEATURES ((1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 14))
+
 enum net_mode {
     NET_MODE_PASST = 0,
     NET_MODE_TSI,
@@ -65,12 +83,13 @@ static bool push_to_stderr(void *userdata, KrunStr s)
     return true;
 }
 
+// CHECK_INIT macro for init-blob errors (KrunInitError)
 static KrunVtableHandle stderr_writer = KRUN_VTABLE_HANDLE(
     KRUN_INIT_PUSH_STR_TYPE_TAG,
     ((KrunInitPushStrVtable){ .drop = NULL, .push = push_to_stderr }),
     NULL);
 
-#define TRY(call)                                                              \
+#define CHECK_INIT(call)                                                       \
     err = NULL;                                                                \
     call;                                                                      \
     if (err) {                                                                 \
@@ -83,15 +102,24 @@ static KrunVtableHandle stderr_writer = KRUN_VTABLE_HANDLE(
         return -1;                                                             \
     }
 
-static bool check_krun_error(int err, const char *msg)
-{
-    if (err) {
-        errno = -err;
-        perror(msg);
-        return false;
+// CHECK macro for libkrun errors (KrunError)
+static KrunVtableHandle krun_stderr_writer = KRUN_VTABLE_HANDLE(
+    KRUN_PUSH_STR_TYPE_TAG,
+    ((KrunPushStrVtable){ .drop = NULL, .push = push_to_stderr }),
+    NULL);
+
+#define CHECK(call)                                                            \
+    krun_err = NULL;                                                           \
+    call;                                                                      \
+    if (krun_err) {                                                            \
+        flockfile(stderr);                                                     \
+        fprintf(stderr, "%s failed: ", #call);                                 \
+        krun_error_message(krun_err, &krun_stderr_writer);                     \
+        fputc('\n', stderr);                                                   \
+        funlockfile(stderr);                                                   \
+        krun_error_destroy(krun_err);                                          \
+        return -1;                                                             \
     }
-    return true;
-}
 
 static const struct option long_options[] = {
     { "help", no_argument, NULL, 'h' },
@@ -163,7 +191,7 @@ bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
         .vhost_user_media_socket = NULL,
         .new_root = NULL,
         .guest_argv = NULL,
-        .log_target = KRUN_LOG_TARGET_DEFAULT,
+        .log_target = -1,
         .log_style = KRUN_LOG_STYLE_AUTO
     };
 
@@ -297,20 +325,13 @@ int main(int argc, char *const argv[])
         "TEST=works",
         0
     };
-    const char *const port_map[] =
-    {
-        "18000:8000",
-        0
-    };
     const char *const rlimits[] =
     {
         // RLIMIT_NPROC = 6
         "6=4096:8192",
         0
     };
-    int ctx_id;
-    int err;
-    int i;
+    KrunError krun_err;
     struct cmdline cmdline;
     struct rlimit rlim;
 
@@ -326,205 +347,16 @@ int main(int argc, char *const argv[])
     }
 
     // Set the log level to "warn".
-    err = krun_init_log(cmdline.log_target, KRUN_LOG_LEVEL_WARN, cmdline.log_style, 0);
-    if (err) {
-        errno = -err;
-        perror("Error configuring log level");
+    CHECK(krun_init_log(cmdline.log_target, KRUN_LOG_LEVEL_WARN, cmdline.log_style, 0, &krun_err));
+
+    // Create the filesystem overlay for init-blob injection.
+    KrunFsOverlay overlay = krun_fs_overlay_new();
+
+    // Create the krunfw payload (embedded kernel + init).
+    KrunPayload payload = krun_payload_load_krunfw(&krun_err);
+    if (!payload) {
+        fprintf(stderr, "Error loading krunfw payload\n");
         return -1;
-    }
-
-    // Create the configuration context.
-    ctx_id = krun_create_ctx();
-    if (ctx_id < 0) {
-        errno = -ctx_id;
-        perror("Error creating configuration context");
-        return -1;
-    }
-
-    // Configure the number of vCPUs (1) and the amount of RAM (512 MiB).
-    if (err = krun_set_vm_config(ctx_id, 4, 4096)) {
-        errno = -err;
-        perror("Error configuring the number of vCPUs and/or the amount of RAM");
-        return -1;
-    }
-
-    if (err = krun_add_virtio_console_default(ctx_id, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO)) {
-        errno = -err;
-        perror("Error configuring console");
-        return -1;
-    }
-
-    // Configure vhost-user RNG if requested
-    if (cmdline.vhost_user_rng_socket != NULL) {
-        // Test sentinel-terminated array: auto-detect queue count, use custom size
-        uint16_t custom_sizes[] = {512, 0};  // 0 = sentinel terminator
-
-        if (!check_krun_error(krun_add_vhost_user_device(ctx_id, KRUN_VIRTIO_DEVICE_RNG,
-                                                          cmdline.vhost_user_rng_socket, NULL, 0, custom_sizes, 0),
-                              "Error adding vhost-user RNG device")) {
-            return -1;
-        }
-        printf("Using vhost-user RNG backend at %s (custom queue size: 512)\n", cmdline.vhost_user_rng_socket);
-    }
-
-    // Configure vhost-user RTC if requested
-    if (cmdline.vhost_user_rtc_socket != NULL) {
-        if (!check_krun_error(krun_add_vhost_user_device(ctx_id, KRUN_VIRTIO_DEVICE_RTC,
-                                                          cmdline.vhost_user_rtc_socket, NULL,
-                                                          KRUN_VHOST_USER_RTC_NUM_QUEUES,
-                                                          KRUN_VHOST_USER_RTC_QUEUE_SIZES, 0),
-                              "Error adding vhost-user RTC device")) {
-            return -1;
-        }
-        printf("Using vhost-user RTC backend at %s (available as /dev/ptp* and /dev/rtc* in guest)\n", cmdline.vhost_user_rtc_socket);
-    }
-
-    // Configure vhost-user input if requested
-    if (cmdline.vhost_user_input_socket != NULL) {
-        if (!check_krun_error(krun_add_vhost_user_device(ctx_id, KRUN_VIRTIO_DEVICE_INPUT,
-                                                          cmdline.vhost_user_input_socket, NULL,
-                                                          KRUN_VHOST_USER_INPUT_NUM_QUEUES,
-                                                          KRUN_VHOST_USER_INPUT_QUEUE_SIZES, 0),
-                              "Error adding vhost-user input device")) {
-            return -1;
-        }
-        printf("Using vhost-user input backend at %s\n", cmdline.vhost_user_input_socket);
-    }
-
-    // Configure vhost-user GPU if requested
-    if (cmdline.vhost_user_gpu_socket != NULL) {
-        if (!check_krun_error(krun_add_vhost_user_device(ctx_id, KRUN_VIRTIO_DEVICE_GPU,
-                                                          cmdline.vhost_user_gpu_socket, NULL,
-                                                          KRUN_VHOST_USER_GPU_NUM_QUEUES,
-                                                          KRUN_VHOST_USER_GPU_QUEUE_SIZES,
-                                                          KRUN_VHOST_USER_GPU_SHM_SIZE),
-                              "Error adding vhost-user GPU device")) {
-            return -1;
-        }
-        printf("Using vhost-user GPU backend at %s (built-in GPU disabled)\n", cmdline.vhost_user_gpu_socket);
-    }
-
-    // Configure vhost-user sound if requested
-    if (cmdline.vhost_user_snd_socket != NULL) {
-        if (!check_krun_error(krun_add_vhost_user_device(ctx_id, KRUN_VIRTIO_DEVICE_SND,
-                                                          cmdline.vhost_user_snd_socket, NULL,
-                                                          KRUN_VHOST_USER_SND_NUM_QUEUES,
-                                                          KRUN_VHOST_USER_SND_QUEUE_SIZES, 0),
-                              "Error adding vhost-user sound device")) {
-            return -1;
-        }
-        printf("Using vhost-user sound backend at %s\n", cmdline.vhost_user_snd_socket);
-    }
-
-    // Configure vsock: either vhost-user or built-in with TSI
-    if (cmdline.vhost_user_vsock_socket != NULL) {
-        if (!check_krun_error(krun_add_vhost_user_device(ctx_id, KRUN_VIRTIO_DEVICE_VSOCK,
-                                                          cmdline.vhost_user_vsock_socket, NULL,
-                                                          KRUN_VHOST_USER_VSOCK_NUM_QUEUES,
-                                                          KRUN_VHOST_USER_VSOCK_QUEUE_SIZES, 0),
-                              "Error adding vhost-user vsock device")) {
-            return -1;
-        }
-        printf("Using vhost-user vsock backend at %s\n", cmdline.vhost_user_vsock_socket);
-    }
-
-    // Configure vhost-user CAN if requested
-    if (cmdline.vhost_user_can_socket != NULL) {
-        if (!check_krun_error(krun_add_vhost_user_device(ctx_id, KRUN_VIRTIO_DEVICE_CAN,
-                                                          cmdline.vhost_user_can_socket, NULL,
-                                                          KRUN_VHOST_USER_CAN_NUM_QUEUES,
-                                                          KRUN_VHOST_USER_CAN_QUEUE_SIZES, 0),
-                              "Error adding vhost-user CAN device")) {
-            return -1;
-        }
-        printf("Using vhost-user CAN backend at %s\n", cmdline.vhost_user_can_socket);
-    }
-
-    // Configure vhost-user console if requested
-    if (cmdline.vhost_user_console_socket != NULL) {
-        if (!check_krun_error(krun_add_vhost_user_device(ctx_id, KRUN_VIRTIO_DEVICE_CONSOLE,
-                                                          cmdline.vhost_user_console_socket, NULL,
-                                                          KRUN_VHOST_USER_CONSOLE_NUM_QUEUES,
-                                                          KRUN_VHOST_USER_CONSOLE_QUEUE_SIZES, 0),
-                              "Error adding vhost-user console device")) {
-            return -1;
-        }
-        printf("Using vhost-user console backend at %s (available as /dev/hvc1 in guest)\n", cmdline.vhost_user_console_socket);
-        printf("Test with: echo 'hello' > /dev/hvc1\n");
-    }
-
-    // Configure vhost-user media if requested
-    if (cmdline.vhost_user_media_socket != NULL) {
-        if (!check_krun_error(krun_add_vhost_user_device(ctx_id, KRUN_VIRTIO_DEVICE_MEDIA,
-                                                          cmdline.vhost_user_media_socket, NULL,
-                                                          KRUN_VHOST_USER_MEDIA_NUM_QUEUES,
-                                                          KRUN_VHOST_USER_MEDIA_QUEUE_SIZES,
-                                                          KRUN_VHOST_USER_MEDIA_SHM_SIZE),
-                              "Error adding vhost-user media device")) {
-            return -1;
-        }
-        printf("Using vhost-user media backend at %s\n", cmdline.vhost_user_media_socket);
-    }
-
-    // Raise RLIMIT_NOFILE to the maximum allowed to create some room for virtio-fs
-    getrlimit(RLIMIT_NOFILE, &rlim);
-    rlim.rlim_cur = rlim.rlim_max;
-    setrlimit(RLIMIT_NOFILE, &rlim);
-
-    if (err = krun_add_virtiofs3(ctx_id, KRUN_FS_ROOT_TAG, cmdline.new_root, 0, false)) {
-        errno = -err;
-        perror("Error configuring root path");
-        return -1;
-    }
-
-    // Only enable built-in GPU if not using vhost-user GPU
-    if (cmdline.vhost_user_gpu_socket == NULL) {
-        uint32_t virgl_flags = VIRGLRENDERER_USE_EGL | VIRGLRENDERER_DRM |
-            VIRGLRENDERER_THREAD_SYNC | VIRGLRENDERER_USE_ASYNC_FENCE_CB;
-        if (err = krun_set_gpu_options(ctx_id, virgl_flags)) {
-            errno = -err;
-            perror("Error configuring gpu");
-            return -1;
-        }
-    }
-
-    // Add built-in vsock with TSI when not using vhost-user-vsock
-    if (cmdline.vhost_user_vsock_socket == NULL) {
-        if (err = krun_add_vsock(ctx_id, KRUN_TSI_HIJACK_INET | KRUN_TSI_HIJACK_UNIX)) {
-            errno = -err;
-            perror("Error configuring vsock");
-            return -1;
-        }
-    }
-
-    // Map port 18000 in the host to 8000 in the guest (if networking uses TSI)
-    if (cmdline.net_mode == NET_MODE_TSI && cmdline.vhost_user_vsock_socket == NULL) {
-        if (err = krun_set_port_map(ctx_id, &port_map[0])) {
-            errno = -err;
-            perror("Error configuring port map");
-            return -1;
-        }
-    } else {
-        uint8_t mac[] = {0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee};
-        if (cmdline.passt_socket_path != NULL) {
-            if (err = krun_add_net_unixstream(ctx_id, cmdline.passt_socket_path, -1, &mac[0], COMPAT_NET_FEATURES, 0)) {
-                errno = -err;
-                perror("Error configuring net mode");
-                return -1;
-            }
-        } else {
-            int passt_fd = start_passt();
-
-            if (passt_fd < 0) {
-                return -1;
-            }
-
-            if (err = krun_add_net_unixstream(ctx_id, NULL, passt_fd, &mac[0], COMPAT_NET_FEATURES, 0)) {
-                errno = -err;
-                perror("Error configuring net mode");
-                return -1;
-            }
-        }
     }
 
     // Build the init configuration (executable, args, env, workdir, rlimits).
@@ -541,23 +373,163 @@ int main(int argc, char *const argv[])
         krun_init_builder_workdir(&builder, KRUN_STR("/"));
 
         KrunInitConfig config = krun_init_builder_build(&builder);
-        TRY(krun_init_config_apply(config, NULL, ctx_id,
-                                   KRUN_STR("/dev/root"), &err));
+        CHECK_INIT(krun_init_config_apply(config, overlay, payload, &err));
     }
 
-    if (err = krun_split_irqchip(ctx_id, false)) {
-        errno = -err;
-        perror("Error setting split IRQCHIP property");
-        return -1;
+    // Create the device manager.
+    KrunMmioDeviceManager devices = krun_mmio_device_manager_new();
+
+    // Configure the console.
+    {
+        KrunConsoleBuilder cb = krun_console_device_builder();
+        CHECK(krun_console_builder_add_default_console(cb, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO, &krun_err));
+        KrunConsoleDevice console = krun_console_builder_build(cb, &krun_err);
+        krun_mmio_device_manager_add(devices, console);
     }
 
-    // Start and enter the microVM. Unless there is some error while creating the microVM
-    // this function never returns.
-    if (err = krun_start_enter(ctx_id)) {
-        errno = -err;
-        perror("Error creating the microVM");
-        return -1;
+    // Configure vhost-user RNG if requested
+    if (cmdline.vhost_user_rng_socket != NULL) {
+        // Auto-detect queue count; use custom queue size of 512
+        uint16_t custom_sizes[] = {512};
+        CHECK(KrunVhostUserDevice rng = krun_vhost_user_device_new(VIRTIO_DEVICE_RNG,
+            KRUN_STR(cmdline.vhost_user_rng_socket), KRUN_STR(""), 0, custom_sizes, 1, &krun_err));
+        krun_mmio_device_manager_add(devices, rng);
+        printf("Using vhost-user RNG backend at %s (custom queue size: 512)\n", cmdline.vhost_user_rng_socket);
     }
+
+    // Configure vhost-user RTC if requested
+    if (cmdline.vhost_user_rtc_socket != NULL) {
+        CHECK(KrunVhostUserDevice rtc = krun_vhost_user_device_new(VIRTIO_DEVICE_RTC,
+            KRUN_STR(cmdline.vhost_user_rtc_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
+        krun_mmio_device_manager_add(devices, rtc);
+        printf("Using vhost-user RTC backend at %s (available as /dev/ptp* and /dev/rtc* in guest)\n", cmdline.vhost_user_rtc_socket);
+    }
+
+    // Configure vhost-user input if requested
+    if (cmdline.vhost_user_input_socket != NULL) {
+        CHECK(KrunVhostUserDevice input = krun_vhost_user_device_new(VIRTIO_DEVICE_INPUT,
+            KRUN_STR(cmdline.vhost_user_input_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
+        krun_mmio_device_manager_add(devices, input);
+        printf("Using vhost-user input backend at %s\n", cmdline.vhost_user_input_socket);
+    }
+
+    // Configure vhost-user GPU if requested.
+    // NOTE: The built-in GPU (krun_set_gpu_options) has been removed — v2 requires a
+    // DisplayBackend vtable handle which can't be constructed from C without a display
+    // backend implementation. Use vhost-user GPU as the only GPU path from C.
+    if (cmdline.vhost_user_gpu_socket != NULL) {
+        CHECK(KrunVhostUserDevice gpu = krun_vhost_user_device_new(VIRTIO_DEVICE_GPU,
+            KRUN_STR(cmdline.vhost_user_gpu_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
+        krun_mmio_device_manager_add(devices, gpu);
+        printf("Using vhost-user GPU backend at %s\n", cmdline.vhost_user_gpu_socket);
+    }
+
+    // Configure vhost-user sound if requested
+    if (cmdline.vhost_user_snd_socket != NULL) {
+        CHECK(KrunVhostUserDevice snd = krun_vhost_user_device_new(VIRTIO_DEVICE_SND,
+            KRUN_STR(cmdline.vhost_user_snd_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
+        krun_mmio_device_manager_add(devices, snd);
+        printf("Using vhost-user sound backend at %s\n", cmdline.vhost_user_snd_socket);
+    }
+
+    // Configure vsock: either vhost-user or built-in with TSI
+    if (cmdline.vhost_user_vsock_socket != NULL) {
+        CHECK(KrunVhostUserDevice vsock_vu = krun_vhost_user_device_new(VIRTIO_DEVICE_VSOCK,
+            KRUN_STR(cmdline.vhost_user_vsock_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
+        krun_mmio_device_manager_add(devices, vsock_vu);
+        printf("Using vhost-user vsock backend at %s\n", cmdline.vhost_user_vsock_socket);
+    }
+
+    // Configure vhost-user CAN if requested
+    if (cmdline.vhost_user_can_socket != NULL) {
+        CHECK(KrunVhostUserDevice can = krun_vhost_user_device_new(VIRTIO_DEVICE_CAN,
+            KRUN_STR(cmdline.vhost_user_can_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
+        krun_mmio_device_manager_add(devices, can);
+        printf("Using vhost-user CAN backend at %s\n", cmdline.vhost_user_can_socket);
+    }
+
+    // Configure vhost-user console if requested
+    if (cmdline.vhost_user_console_socket != NULL) {
+        CHECK(KrunVhostUserDevice vu_console = krun_vhost_user_device_new(VIRTIO_DEVICE_CONSOLE,
+            KRUN_STR(cmdline.vhost_user_console_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
+        krun_mmio_device_manager_add(devices, vu_console);
+        printf("Using vhost-user console backend at %s (available as /dev/hvc1 in guest)\n", cmdline.vhost_user_console_socket);
+        printf("Test with: echo 'hello' > /dev/hvc1\n");
+    }
+
+    // Configure vhost-user media if requested
+    if (cmdline.vhost_user_media_socket != NULL) {
+        CHECK(KrunVhostUserDevice media = krun_vhost_user_device_new(VIRTIO_DEVICE_MEDIA,
+            KRUN_STR(cmdline.vhost_user_media_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
+        krun_mmio_device_manager_add(devices, media);
+        printf("Using vhost-user media backend at %s\n", cmdline.vhost_user_media_socket);
+    }
+
+    // Raise RLIMIT_NOFILE to the maximum allowed to create some room for virtio-fs
+    getrlimit(RLIMIT_NOFILE, &rlim);
+    rlim.rlim_cur = rlim.rlim_max;
+    setrlimit(RLIMIT_NOFILE, &rlim);
+
+    // Configure the root filesystem via virtiofs.
+    {
+        CHECK(KrunFsDevice rootfs = krun_fs_device_new(KRUN_STR("/dev/root"), KRUN_STR(cmdline.new_root), &krun_err));
+        krun_fs_device_set_overlay(rootfs, overlay);
+        krun_mmio_device_manager_add(devices, rootfs);
+    }
+
+    // Add built-in vsock with TSI when not using vhost-user-vsock
+    if (cmdline.vhost_user_vsock_socket == NULL) {
+        CHECK(KrunVsockDevice vsock = krun_vsock_device_new(3, TSI_HIJACK_INET | TSI_HIJACK_UNIX, &krun_err));
+
+        // Map port 18000 in the host to 8000 in the guest (if networking uses TSI)
+        if (cmdline.net_mode == NET_MODE_TSI) {
+            CHECK(krun_vsock_device_add_port_forward(vsock, KRUN_STR("18000:8000"), &krun_err));
+        }
+
+        krun_mmio_device_manager_add(devices, vsock);
+    }
+
+    // Configure network
+    if (cmdline.net_mode == NET_MODE_PASST || cmdline.vhost_user_vsock_socket != NULL) {
+        uint8_t mac[] = {0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee};
+        KrunNetDevice net;
+        if (cmdline.passt_socket_path != NULL) {
+            net = krun_net_device_new_unixstream_path(KRUN_STR("net0"),
+                KRUN_STR(cmdline.passt_socket_path), KRUN_BYTES(mac), COMPAT_NET_FEATURES, 0, &krun_err);
+        } else {
+            int passt_fd = start_passt();
+            if (passt_fd < 0) {
+                return -1;
+            }
+            net = krun_net_device_new_unixstream_fd(KRUN_STR("net0"),
+                passt_fd, KRUN_BYTES(mac), COMPAT_NET_FEATURES, 0, &krun_err);
+        }
+        if (krun_err) {
+            fprintf(stderr, "Error configuring net mode\n");
+            krun_error_destroy(krun_err);
+            return -1;
+        }
+        krun_mmio_device_manager_add(devices, net);
+    }
+
+    {
+        CHECK(KrunRngDevice rng = krun_rng_device_new(&krun_err));
+        krun_mmio_device_manager_add(devices, rng);
+
+        CHECK(KrunBalloonDevice balloon = krun_balloon_device_new(&krun_err));
+        krun_mmio_device_manager_add(devices, balloon);
+    }
+
+    // Build the VM.
+    KrunVmmBuilder builder = krun_vmm_builder_new();
+    CHECK(krun_vmm_builder_vcpus(&builder, 4, &krun_err));
+    CHECK(krun_vmm_builder_ram_mib(&builder, 4096, &krun_err));
+    krun_vmm_builder_payload(&builder, payload);
+    krun_vmm_builder_devices(&builder, devices);
+    CHECK(krun_vmm_builder_split_irqchip(&builder, false, &krun_err));
+
+    CHECK(KrunVmm vmm = krun_vmm_builder_build(&builder, &krun_err));
+    krun_vmm_run(vmm); // never returns
 
     // Not reached.
     return 0;

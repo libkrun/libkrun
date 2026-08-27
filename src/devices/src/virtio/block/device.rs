@@ -46,7 +46,7 @@ use super::{
 
 use crate::virtio::{
     ActivateError, InterruptTransport,
-    block::{ImageType, SyncMode},
+    block::{DiskFormat, SyncMode},
 };
 
 /// Configuration options for disk caching.
@@ -270,7 +270,7 @@ impl Block {
         partuuid: Option<String>,
         cache_type: CacheType,
         disk_image_path: String,
-        disk_image_format: ImageType,
+        disk_image_format: DiskFormat,
         is_disk_read_only: bool,
         direct_io: bool,
         sync_mode: SyncMode,
@@ -293,7 +293,7 @@ impl Block {
         let discard_alignment = file.discard_align();
 
         let disk_image = match disk_image_format {
-            ImageType::Qcow2 => {
+            DiskFormat::Qcow2 => {
                 let mut qcow2 =
                     Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image_sync(
                         Box::new(file),
@@ -302,14 +302,14 @@ impl Block {
                 qcow2.open_implicit_dependencies_sync()?;
                 SyncFormatAccess::new(qcow2)?
             }
-            ImageType::Raw => {
+            DiskFormat::Raw => {
                 let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(
                     Box::new(file),
                     !is_disk_read_only,
                 )?;
                 SyncFormatAccess::new(raw)?
             }
-            ImageType::Vmdk => {
+            DiskFormat::Vmdk => {
                 let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
                     Box::new(file),
                 )

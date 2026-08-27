@@ -6,9 +6,11 @@ pub struct TestFreeBsdBoot;
 mod host {
     use super::*;
 
+    use crate::common::init_krun;
+    #[cfg(feature = "dynamic-linking")]
+    use crate::common_freebsd::require_freebsd_symbols;
     use crate::common_freebsd::{freebsd_assets, normalize_serial_output, setup_kernel_and_enter};
-    use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
-    use krun_sys::*;
+    use crate::{ShouldRun, Test, TestOutcome, TestSetup};
 
     impl Test for TestFreeBsdBoot {
         fn check(self: Box<Self>, stdout: Vec<u8>, _test_setup: TestSetup) -> TestOutcome {
@@ -25,21 +27,17 @@ mod host {
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             let assets = freebsd_assets().expect("FreeBSD assets must be present when test runs");
-            unsafe {
-                krun_call!(krun_init_log(
-                    KRUN_LOG_TARGET_DEFAULT,
-                    KRUN_LOG_LEVEL_TRACE,
-                    KRUN_LOG_STYLE_AUTO,
-                    0
-                ))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_set_vm_config(ctx, 1, 512))?;
-                setup_kernel_and_enter(ctx, test_setup, assets)?;
-            }
-            Ok(())
+            init_krun()?;
+            #[cfg(feature = "dynamic-linking")]
+            require_freebsd_symbols().unwrap();
+            setup_kernel_and_enter(test_setup, assets, None)
         }
 
         fn should_run(&self) -> ShouldRun {
+            #[cfg(feature = "dynamic-linking")]
+            if require_freebsd_symbols().is_err() {
+                return ShouldRun::No("feature not enabled in this libkrun build");
+            }
             match freebsd_assets() {
                 Some(_) => ShouldRun::Yes,
                 None => ShouldRun::No("freebsd assets missing"),
