@@ -1900,14 +1900,19 @@ pub fn create_guest_memory(
     #[cfg(not(all(feature = "vhost-user", target_os = "linux")))]
     let use_vhost_user = false;
 
+    #[cfg(all(feature = "gpu", target_os = "linux"))]
+    let use_gpu_udmabuf = vm_resources.gpu_virgl_flags.is_some();
+    #[cfg(not(all(feature = "gpu", target_os = "linux")))]
+    let use_gpu_udmabuf = false;
+
     // Add SHM regions before creating guest memory
     arch_mem_regions.extend(shm_manager.regions());
 
-    let guest_mem = if use_vhost_user {
-        #[cfg(all(feature = "vhost-user", target_os = "linux"))]
+    let guest_mem = if use_vhost_user || use_gpu_udmabuf {
+        #[cfg(all(any(feature = "gpu", feature = "vhost-user"), target_os = "linux"))]
         {
             debug!(
-                "Creating file-backed memory for vhost-user (regions: {})",
+                "Creating file-backed memory for gpu or vhost-user (regions: {})",
                 arch_mem_regions.len()
             );
             // Create file-backed memory regions using memfd
