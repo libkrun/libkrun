@@ -1926,7 +1926,10 @@ pub fn create_guest_memory(
                     // SAFETY: memfd_create is called with a valid null-terminated C string and valid flags.
                     // File descriptor ownership is transferred to File::from_raw_fd below.
                     let memfd = unsafe {
-                        let fd = libc::memfd_create(c"guest_mem".as_ptr(), libc::MFD_CLOEXEC);
+                        let fd = libc::memfd_create(
+                            c"guest_mem".as_ptr(),
+                            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+                        );
                         if fd < 0 {
                             error!("Failed to create memfd: {:?}", io::Error::last_os_error());
                             return Err(io::Error::last_os_error());
@@ -1936,6 +1939,16 @@ pub fn create_guest_memory(
                                 "Failed to ftruncate memfd: {:?}",
                                 io::Error::last_os_error()
                             );
+                            libc::close(fd);
+                            return Err(io::Error::last_os_error());
+                        }
+                        if libc::fcntl(
+                            fd,
+                            libc::F_ADD_SEALS,
+                            libc::F_SEAL_GROW | libc::F_SEAL_SHRINK,
+                        ) < 0
+                        {
+                            error!("Failed to seal memfd: {:?}", io::Error::last_os_error());
                             libc::close(fd);
                             return Err(io::Error::last_os_error());
                         }
