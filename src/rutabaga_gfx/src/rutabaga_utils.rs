@@ -75,6 +75,7 @@ pub const RUTABAGA_BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
 pub const RUTABAGA_BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
 pub const RUTABAGA_BLOB_FLAG_USE_SHAREABLE: u32 = 0x0002;
 pub const RUTABAGA_BLOB_FLAG_USE_CROSS_DEVICE: u32 = 0x0004;
+pub const RUTABAGA_BLOB_FLAG_CREATE_GUEST_HANDLE: u32 = 0x0008;
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct ResourceCreateBlob {

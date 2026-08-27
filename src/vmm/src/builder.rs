@@ -117,7 +117,7 @@ use vm_memory::Bytes;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
 use vm_memory::FileOffset;
 #[cfg(not(feature = "aws-nitro"))]
-use vm_memory::GuestMemory;
+use vm_memory::GuestMemoryBackend;
 #[cfg(feature = "tdx")]
 use vm_memory::GuestMemoryRegion;
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
@@ -224,7 +224,7 @@ pub enum StartMicrovmError {
     RegisterConsoleDevice(device_manager::mmio::Error),
     /// Cannot register SIGWINCH event file descriptor.
     #[cfg(target_os = "linux")]
-    RegisterFsSigwinch(kvm_ioctls::Error),
+    RegisterFsSigwinch(vmm_sys_util::errno::Error),
     /// Cannot initialize a MMIO Gpu device or add a device to the MMIO Bus.
     RegisterGpuDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Input device or add a device to the MMIO Bus.
@@ -1900,14 +1900,19 @@ pub fn create_guest_memory(
     #[cfg(not(all(feature = "vhost-user", target_os = "linux")))]
     let use_vhost_user = false;
 
+    #[cfg(all(feature = "gpu", target_os = "linux"))]
+    let use_gpu_udmabuf = vm_resources.gpu_virgl_flags.is_some();
+    #[cfg(not(all(feature = "gpu", target_os = "linux")))]
+    let use_gpu_udmabuf = false;
+
     // Add SHM regions before creating guest memory
     arch_mem_regions.extend(shm_manager.regions());
 
-    let guest_mem = if use_vhost_user {
-        #[cfg(all(feature = "vhost-user", target_os = "linux"))]
+    let guest_mem = if use_vhost_user || use_gpu_udmabuf {
+        #[cfg(all(any(feature = "gpu", feature = "vhost-user"), target_os = "linux"))]
         {
             debug!(
-                "Creating file-backed memory for vhost-user (regions: {})",
+                "Creating file-backed memory for gpu or vhost-user (regions: {})",
                 arch_mem_regions.len()
             );
             // Create file-backed memory regions using memfd
@@ -1921,7 +1926,10 @@ pub fn create_guest_memory(
                     // SAFETY: memfd_create is called with a valid null-terminated C string and valid flags.
                     // File descriptor ownership is transferred to File::from_raw_fd below.
                     let memfd = unsafe {
-                        let fd = libc::memfd_create(c"guest_mem".as_ptr(), libc::MFD_CLOEXEC);
+                        let fd = libc::memfd_create(
+                            c"guest_mem".as_ptr(),
+                            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+                        );
                         if fd < 0 {
                             error!("Failed to create memfd: {:?}", io::Error::last_os_error());
                             return Err(io::Error::last_os_error());
@@ -1931,6 +1939,16 @@ pub fn create_guest_memory(
                                 "Failed to ftruncate memfd: {:?}",
                                 io::Error::last_os_error()
                             );
+                            libc::close(fd);
+                            return Err(io::Error::last_os_error());
+                        }
+                        if libc::fcntl(
+                            fd,
+                            libc::F_ADD_SEALS,
+                            libc::F_SEAL_GROW | libc::F_SEAL_SHRINK,
+                        ) < 0
+                        {
+                            error!("Failed to seal memfd: {:?}", io::Error::last_os_error());
                             libc::close(fd);
                             return Err(io::Error::last_os_error());
                         }

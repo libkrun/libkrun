@@ -1307,23 +1307,13 @@ impl RutabagaContext for CrossDomainContext {
     }
 
     fn attach(&mut self, resource: &mut RutabagaResource) {
-        if resource.blob_mem == RUTABAGA_BLOB_MEM_GUEST {
-            self.context_resources.lock().unwrap().insert(
-                resource.resource_id,
-                CrossDomainResource {
-                    handle: None,
-                    backing_iovecs: resource.backing_iovecs.take(),
-                },
-            );
-        } else if let Some(ref handle) = resource.handle {
-            self.context_resources.lock().unwrap().insert(
-                resource.resource_id,
-                CrossDomainResource {
-                    handle: Some(handle.clone()),
-                    backing_iovecs: None,
-                },
-            );
-        }
+        self.context_resources.lock().unwrap().insert(
+            resource.resource_id,
+            CrossDomainResource {
+                handle: resource.handle.clone(),
+                backing_iovecs: resource.backing_iovecs.take(),
+            },
+        );
     }
 
     fn detach(&mut self, resource: &RutabagaResource) {
@@ -1384,19 +1374,31 @@ impl RutabagaComponent for CrossDomain {
         resource_id: u32,
         resource_create_blob: ResourceCreateBlob,
         iovec_opt: Option<Vec<RutabagaIovec>>,
-        _handle_opt: Option<RutabagaHandle>,
+        handle_opt: Option<RutabagaHandle>,
     ) -> RutabagaResult<RutabagaResource> {
-        if resource_create_blob.blob_mem != RUTABAGA_BLOB_MEM_GUEST
-            && resource_create_blob.blob_flags != RUTABAGA_BLOB_FLAG_USE_MAPPABLE
-        {
+        if resource_create_blob.blob_mem != RUTABAGA_BLOB_MEM_GUEST {
             return Err(RutabagaError::SpecViolation(
                 "expected only guest memory blobs",
             ));
         }
 
+        if resource_create_blob.blob_flags & RUTABAGA_BLOB_FLAG_CREATE_GUEST_HANDLE
+            == RUTABAGA_BLOB_FLAG_CREATE_GUEST_HANDLE
+        {
+            if handle_opt.is_none() {
+                return Err(RutabagaError::SpecViolation(
+                    "expected a handle when using CREATE_GUEST_HANDLE",
+                ));
+            }
+        } else if resource_create_blob.blob_flags != RUTABAGA_BLOB_FLAG_USE_MAPPABLE {
+            return Err(RutabagaError::SpecViolation(
+                "expected only create-handle or mappable guest memory blobs",
+            ));
+        }
+
         Ok(RutabagaResource {
             resource_id,
-            handle: None,
+            handle: handle_opt.map(Arc::new),
             blob: true,
             blob_mem: resource_create_blob.blob_mem,
             blob_flags: resource_create_blob.blob_flags,

@@ -15,6 +15,8 @@ use super::worker::Worker;
 use crate::display::DisplayInfo;
 use crate::virtio::InterruptTransport;
 use krun_display::DisplayBackend;
+#[cfg(target_os = "linux")]
+use utils::linux::udmabuf::UdmabufDriver;
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 
@@ -38,6 +40,8 @@ pub struct Gpu {
     virgl_flags: u32,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
+    #[cfg(target_os = "linux")]
+    udmabuf_driver: Option<UdmabufDriver>,
     export_table: Option<ExportTable>,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
@@ -50,14 +54,33 @@ impl Gpu {
         display_backend: DisplayBackend<'static>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
     ) -> super::Result<Gpu> {
+        #[cfg(target_os = "linux")]
+        let udmabuf_driver = UdmabufDriver::new()
+            .inspect_err(|err| {
+                warn!("Could not open udmabuf device: {err}");
+            })
+            .ok();
+
+        #[cfg(target_os = "linux")]
+        let avail_features = AVAIL_FEATURES
+            | if udmabuf_driver.is_some() {
+                1u64 << uapi::VIRTIO_GPU_F_CREATE_GUEST_HANDLE
+            } else {
+                0
+            };
+        #[cfg(not(target_os = "linux"))]
+        let avail_features = AVAIL_FEATURES;
+
         Ok(Gpu {
-            avail_features: AVAIL_FEATURES,
+            avail_features,
             acked_features: 0,
             device_state: DeviceState::Inactive,
             shm_region: None,
             virgl_flags,
             #[cfg(target_os = "macos")]
             map_sender,
+            #[cfg(target_os = "linux")]
+            udmabuf_driver,
             export_table: None,
             displays,
             display_backend,
@@ -215,6 +238,8 @@ impl VirtioDevice for Gpu {
             self.virgl_flags,
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
+            #[cfg(target_os = "linux")]
+            self.udmabuf_driver.take(),
             self.export_table.take(),
             self.displays.clone(),
             self.display_backend,

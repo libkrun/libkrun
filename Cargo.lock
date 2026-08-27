@@ -80,17 +80,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "async-trait"
-version = "0.1.89"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -551,21 +540,20 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
 name = "imago"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae7cfee876c698a1a2ed9c705ab18f21acbed82110f19b51cc458de73426fe2c"
+checksum = "404f567d70cd6d288e43f95ea8f2d6e8fe6156dd07df7da955cb9b147c4ab2a5"
 dependencies = [
- "async-trait",
  "bincode",
  "cfg-if",
  "libc",
+ "maybe-async",
  "miniz_oxide",
  "nix 0.30.1",
  "page_size",
  "rustc_version",
- "tokio",
  "tracing",
- "vm-memory 0.17.1",
+ "vm-memory",
  "windows-sys",
 ]
 
@@ -680,7 +668,7 @@ dependencies = [
  "libc",
  "linux-loader",
  "tdx",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vmm-sys-util",
  "windows-sys",
 ]
@@ -740,7 +728,7 @@ dependencies = [
  "vhost",
  "virtio-bindings",
  "vm-fdt",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vmm-sys-util",
  "windows-sys",
  "zerocopy",
@@ -816,7 +804,7 @@ name = "krun-kernel"
 version = "0.1.0-2.0.0-dev"
 dependencies = [
  "krun-utils",
- "vm-memory 0.17.1",
+ "vm-memory",
 ]
 
 [[package]]
@@ -848,7 +836,7 @@ dependencies = [
 name = "krun-smbios"
 version = "0.1.0-2.0.0-dev"
 dependencies = [
- "vm-memory 0.17.1",
+ "vm-memory",
 ]
 
 [[package]]
@@ -895,7 +883,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tdx",
- "vm-memory 0.17.1",
+ "vm-memory",
  "vmm-sys-util",
  "windows-sys",
  "zstd",
@@ -911,18 +899,18 @@ dependencies = [
 
 [[package]]
 name = "kvm-bindings"
-version = "0.14.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b3c06ff73c7ce03e780887ec2389d62d2a2a9ddf471ab05c2ff69207cd3f3b4"
+checksum = "11cf0ca75d59e9d298647c59cf6c5286fa048120caa77972a7a504a0824d234f"
 dependencies = [
  "vmm-sys-util",
 ]
 
 [[package]]
 name = "kvm-ioctls"
-version = "0.24.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "333f77a20344a448f3f70664918135fddeb804e938f28a99d685bd92926e0b19"
+checksum = "06ac372c120eb893b086d1a12027669cf2b478d1f71204021ffa7adf57948d63"
 dependencies = [
  "bitflags 2.11.0",
  "kvm-bindings",
@@ -963,7 +951,7 @@ dependencies = [
  "log",
  "nitro-enclaves 0.5.0",
  "once_cell",
- "vm-memory 0.17.1",
+ "vm-memory",
  "windows-sys",
 ]
 
@@ -991,11 +979,11 @@ dependencies = [
 
 [[package]]
 name = "linux-loader"
-version = "0.13.2"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de72cb02c55ecffcf75fe78295926f872eb6eb0a58d629c58a8c324dc26380f6"
+checksum = "d54207cb617cd75b10c57ad20235c914ab62b180ceeff2ef3111983670d3b321"
 dependencies = [
- "vm-memory 0.17.1",
+ "vm-memory",
 ]
 
 [[package]]
@@ -1017,6 +1005,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1dc47f592c06f33f8e3aea9591776ec7c9f9e4124778ff8a3c3b87159f7e593"
 dependencies = [
  "hashbrown 0.16.1",
+]
+
+[[package]]
+name = "maybe-async"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "746873a384ad60adc5db74471dfaba74bd278afbdcfd81db93fafcdfc8b5ca0c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -1524,9 +1523,9 @@ dependencies = [
 
 [[package]]
 name = "tdx"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83943e37cf46979f711ad11489c641fa058fd0fae92c122d1fc26a664e82acab"
+checksum = "820ee90f5e642ed0a36b8e80cf9b4d2e074a14a03ec9b4c5f26f92bd9efe69b8"
 dependencies = [
  "bitflags 2.11.0",
  "iocuddle",
@@ -1575,15 +1574,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "tokio"
-version = "1.50.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27ad5e34374e03cfffefc301becb44e9dc3c17584f414349ebe29ed26661822d"
-dependencies = [
- "pin-project-lite",
 ]
 
 [[package]]
@@ -1674,7 +1664,7 @@ dependencies = [
  "bitflags 2.11.0",
  "libc",
  "uuid",
- "vm-memory 0.18.0",
+ "vm-memory",
  "vmm-sys-util",
 ]
 
@@ -1695,17 +1685,6 @@ name = "vm-fdt"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e21282841a059bb62627ce8441c491f09603622cd5a21c43bfedc85a2952f23"
-
-[[package]]
-name = "vm-memory"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f39348a049689cabd3377cdd9182bf526ec76a6f823b79903896452e9d7a7380"
-dependencies = [
- "libc",
- "thiserror 2.0.18",
- "winapi",
-]
 
 [[package]]
 name = "vm-memory"

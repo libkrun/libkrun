@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::io::IoSliceMut;
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -20,7 +20,7 @@ use krun_display::{
 use libc::c_void;
 #[cfg(target_os = "macos")]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_APPLE;
-#[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_DMABUF;
 #[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
@@ -30,15 +30,18 @@ use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
 use rutabaga_gfx::{
     RUTABAGA_CHANNEL_TYPE_PW, RUTABAGA_CHANNEL_TYPE_X11, RUTABAGA_MAP_ACCESS_MASK,
     RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW, RUTABAGA_MAP_ACCESS_WRITE,
+    RutabagaDescriptor, RutabagaFromRawDescriptor, RutabagaHandle,
 };
 use rutabaga_gfx::{
     RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_MAP_CACHE_MASK, ResourceCreate3D, ResourceCreateBlob,
     Rutabaga, RutabagaBuilder, RutabagaChannel, RutabagaFence, RutabagaFenceHandler, RutabagaIovec,
     Transfer3D,
 };
+#[cfg(target_os = "linux")]
+use utils::linux::udmabuf::UdmabufDriver;
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
+use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap, VolatileSlice};
 
 use super::{GpuError, Result};
 use crate::display::DisplayInfo;
@@ -153,6 +156,8 @@ pub struct VirtioGpu {
     fence_state: Arc<Mutex<FenceState>>,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
+    #[cfg(target_os = "linux")]
+    udmabuf_driver: Option<UdmabufDriver>,
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackendInstance,
@@ -306,6 +311,7 @@ impl VirtioGpu {
         interrupt: InterruptTransport,
         virgl_flags: u32,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
+        #[cfg(target_os = "linux")] udmabuf_driver: Option<UdmabufDriver>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend,
@@ -348,6 +354,8 @@ impl VirtioGpu {
             display_backend,
             #[cfg(target_os = "macos")]
             map_sender,
+            #[cfg(target_os = "linux")]
+            udmabuf_driver,
         }
     }
 
@@ -727,9 +735,26 @@ impl VirtioGpu {
         mem: &GuestMemoryMmap,
     ) -> VirtioGpuResult {
         let mut rutabaga_iovecs = None;
+        let mut handle = None;
 
         if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
-            panic!("GUEST_HANDLE unimplemented");
+            if let Some(driver) = &self.udmabuf_driver {
+                handle = driver
+                    .create_udmabuf(mem, &vecs)
+                    .inspect_err(|err| {
+                        warn!("Failed to create udmabuf: {err}");
+                    })
+                    .map(|fd| RutabagaHandle {
+                        os_handle: unsafe {
+                            RutabagaDescriptor::from_raw_descriptor(fd.into_raw_fd())
+                        },
+                        handle_type: RUTABAGA_MEM_HANDLE_TYPE_DMABUF,
+                    })
+                    .ok();
+            } else {
+                // Not expecting well-behaved guests to hit this path, as we don't set the feature flag without the driver
+                return Err(ErrUnspec);
+            }
         } else if resource_create_blob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D {
             rutabaga_iovecs =
                 Some(sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?);
@@ -740,7 +765,7 @@ impl VirtioGpu {
             resource_id,
             resource_create_blob,
             rutabaga_iovecs,
-            None,
+            handle,
         )?;
 
         let resource = VirtioGpuResource::new(resource_id, 0, 0, None, resource_create_blob.size);

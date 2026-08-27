@@ -23,9 +23,9 @@ vhost-user = ["devices/vhost-user"]
 crossbeam-channel = ">=0.5.15"
 flate2 = "1.0.35"
 libc = ">=0.2.39"
-linux-loader = { version = "0.13.2", features = ["bzimage", "elf", "pe"] }
+linux-loader = { version = "0.14.0", features = ["bzimage", "elf", "pe"] }
 log = "0.4.0"
-vm-memory = { version = "0.17.0", default-features = false, features = ["backend-mmap"] }
+vm-memory = { version = "0.18.0", default-features = false, features = ["backend-mmap"] }
 vmm-sys-util = "0.15"
 krun_display = { package = "krun-display", version = "0.1.0", path = "../display", optional = true, features = ["bindgen_clang_runtime"] }
 krun_input = { package = "krun-input", version = "0.1.0", path = "../input", optional = true, features = ["bindgen_clang_runtime"] }
@@ -54,9 +54,9 @@ zstd = "0.13"
 nix = { version = "0.30.1", features = ["fs", "term"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tdx = { version = "0.1.1", optional = true }
-kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
-kvm-ioctls = "0.24"
+tdx = { version = "0.1.2", optional = true }
+kvm-bindings = { version = "0.14.1", features = ["fam-wrappers"] }
+kvm-ioctls = "0.25"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }

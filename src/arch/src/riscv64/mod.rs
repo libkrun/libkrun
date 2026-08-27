@@ -12,7 +12,7 @@ pub use self::linux::*;
 use std::fmt::Debug;
 
 use crate::{ArchMemoryInfo, riscv64::layout::FIRMWARE_START};
-use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap};
+use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 use vmm_sys_util::align_upwards;
 
 /// Errors thrown while configuring riscv64 system.

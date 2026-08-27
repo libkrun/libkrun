@@ -12,7 +12,7 @@ use std::ffi::CString;
 use std::fmt;
 
 use super::cmdline::Error as CmdlineError;
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Error {
