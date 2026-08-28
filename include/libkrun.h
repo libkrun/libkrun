@@ -79,6 +79,18 @@ int32_t krun_free_ctx(uint32_t ctx_id);
  */
 int32_t krun_set_vm_config(uint32_t ctx_id, uint8_t num_vcpus, uint32_t ram_mib);
 
+/* Stable Intel CPU baseline used by migratable live checkpoints. */
+#define KRUN_CPU_TEMPLATE_PORTABLE_V1 1
+
+/**
+ * Selects a stable virtual CPU feature contract before the VM starts.
+ *
+ * This currently supports KRUN_CPU_TEMPLATE_PORTABLE_V1 on Linux/x86_64.
+ * The profile removes host-generation-specific extended CPU state so a live
+ * checkpoint can be restored on another compatible Intel KVM host.
+ */
+int32_t krun_set_cpu_template(uint32_t ctx_id, uint32_t cpu_template);
+
 /**
  * The virtiofs tag used for the root filesystem. Can be used with krun_add_virtiofs*
  * for more control over root filesystem parameters (e.g. read-only, DAX window size).
@@ -1392,6 +1404,15 @@ int32_t krun_set_root_disk_remount(uint32_t ctx_id, const char *device, const ch
  *  -EINVAL - The VMM has detected an error in the microVM configuration.
  */
 int32_t krun_start_enter(uint32_t ctx_id);
+
+/**
+ * Returns a description of the most recent libkrun failure on this thread.
+ *
+ * The returned pointer is owned by libkrun, remains valid until another
+ * libkrun call updates it on the same thread, and must not be freed. Returns
+ * NULL when no detailed error is available.
+ */
+const char *krun_get_last_error(void);
 
 /**
  * Retrieves the guest RAM regions for a running context, so a caller sharing

@@ -60,6 +60,11 @@ use kvm_bindings::{
 use kvm_bindings::{KVM_API_VERSION, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 #[cfg(feature = "tee")]
 use kvm_bindings::{KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_EXIT_FLAG_PRIVATE, kvm_enable_cap};
+#[cfg(target_arch = "x86_64")]
+use kvm_bindings::{
+    KVM_CLOCK_HOST_TSC, KVM_CLOCK_REALTIME, KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, KVMIO,
+    kvm_device_attr,
+};
 #[cfg(all(feature = "tee", target_arch = "x86_64"))]
 use kvm_bindings::{
     KVM_MEM_GUEST_MEMFD, KVM_MEMORY_ATTRIBUTE_PRIVATE, kvm_create_guest_memfd,
@@ -77,6 +82,13 @@ use vm_memory::{
     Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
     GuestRegionMmap,
 };
+#[cfg(target_arch = "x86_64")]
+use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref};
+
+#[cfg(target_arch = "x86_64")]
+vmm_sys_util::ioctl_iow_nr!(KVM_GET_VCPU_DEVICE_ATTR, KVMIO, 0xe2, kvm_device_attr);
+#[cfg(target_arch = "x86_64")]
+vmm_sys_util::ioctl_iow_nr!(KVM_SET_VCPU_DEVICE_ATTR, KVMIO, 0xe1, kvm_device_attr);
 
 #[cfg(feature = "amd-sev")]
 use super::tee::amdsnp::launch as snp;
@@ -217,6 +229,12 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     /// Failed to get KVM vcpu xsave.
     VcpuGetXsave(kvm_ioctls::Error),
+    #[cfg(target_arch = "x86_64")]
+    /// Failed to get the virtual TSC frequency.
+    VcpuGetTscKhz(kvm_ioctls::Error),
+    #[cfg(target_arch = "x86_64")]
+    /// Failed to get the virtual TSC offset used for live migration.
+    VcpuGetTscOffset(io::Error),
     /// Cannot run the VCPUs.
     VcpuRun(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
@@ -235,6 +253,9 @@ pub enum Error {
     /// Failed to set KVM vcpu msrs.
     VcpuSetMsrs(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
+    /// KVM accepted only a prefix of the checkpoint's MSR state.
+    VcpuSetMsrsIncomplete { expected: usize, actual: usize },
+    #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu regs.
     VcpuSetRegs(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
@@ -249,6 +270,15 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu xsave.
     VcpuSetXsave(kvm_ioctls::Error),
+    #[cfg(target_arch = "x86_64")]
+    /// Failed to restore the source virtual TSC frequency.
+    VcpuSetTscKhz(kvm_ioctls::Error),
+    #[cfg(target_arch = "x86_64")]
+    /// Failed to restore the rebased virtual TSC offset.
+    VcpuSetTscOffset(io::Error),
+    #[cfg(target_arch = "x86_64")]
+    /// Host KVM did not expose the clock data needed for portable migration.
+    VmClockMigration(String),
     /// Cannot spawn a new vCPU thread.
     VcpuSpawn(io::Error),
     /// Cannot cleanly initialize vcpu TLS.
@@ -417,6 +447,10 @@ impl Display for Error {
             #[cfg(target_arch = "x86_64")]
             VcpuGetXsave(e) => write!(f, "Failed to get KVM vcpu xsave: {e}"),
             #[cfg(target_arch = "x86_64")]
+            VcpuGetTscKhz(e) => write!(f, "Failed to get KVM vcpu TSC frequency: {e}"),
+            #[cfg(target_arch = "x86_64")]
+            VcpuGetTscOffset(e) => write!(f, "Failed to get KVM vcpu TSC offset: {e}"),
+            #[cfg(target_arch = "x86_64")]
             VcpuSetCpuid(e) => write!(f, "Failed to set KVM vcpu cpuid: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetDebugRegs(e) => write!(f, "Failed to set KVM vcpu debug regs: {e}"),
@@ -427,6 +461,11 @@ impl Display for Error {
             #[cfg(target_arch = "x86_64")]
             VcpuSetMsrs(e) => write!(f, "Failed to set KVM vcpu msrs: {e}"),
             #[cfg(target_arch = "x86_64")]
+            VcpuSetMsrsIncomplete { expected, actual } => write!(
+                f,
+                "KVM restored only {actual} of {expected} checkpoint MSRs"
+            ),
+            #[cfg(target_arch = "x86_64")]
             VcpuSetRegs(e) => write!(f, "Failed to set KVM vcpu regs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetSregs(e) => write!(f, "Failed to set KVM vcpu sregs: {e}"),
@@ -436,6 +475,12 @@ impl Display for Error {
             VcpuSetXcrs(e) => write!(f, "Failed to set KVM vcpu xcrs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetXsave(e) => write!(f, "Failed to set KVM vcpu xsave: {e}"),
+            #[cfg(target_arch = "x86_64")]
+            VcpuSetTscKhz(e) => write!(f, "Failed to set KVM vcpu TSC frequency: {e}"),
+            #[cfg(target_arch = "x86_64")]
+            VcpuSetTscOffset(e) => write!(f, "Failed to set KVM vcpu TSC offset: {e}"),
+            #[cfg(target_arch = "x86_64")]
+            VmClockMigration(e) => write!(f, "KVM live-migration clock state is unavailable: {e}"),
             VcpuSpawn(e) => write!(f, "Cannot spawn a new vCPU thread: {e}"),
             VcpuTlsInit => write!(f, "Cannot clean init vcpu TLS"),
             VcpuTlsNotPresent => write!(f, "Vcpu not present in TLS"),
@@ -1025,6 +1070,80 @@ impl Vm {
         })
     }
 
+    #[cfg(target_arch = "x86_64")]
+    /// Refuse a portable checkpoint unless KVM supplied every clock field
+    /// needed to preserve guest time across hosts. A checkpoint that cannot be
+    /// restored is worse than a capture-time error while the source is intact.
+    pub fn validate_migration_clock(
+        &self,
+        state: &VmState,
+        vcpu_states: &[VcpuState],
+    ) -> Result<()> {
+        if !vcpu_states
+            .iter()
+            .any(|state| state.tsc_migration.is_some())
+        {
+            return Ok(());
+        }
+        validate_migration_clock_flags(&state.clock, "source")
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    /// Rebase every saved vCPU TSC offset after the source kvmclock was applied
+    /// to this destination VM. This is the KVM live-migration relationship:
+    ///
+    /// `ofs_dst = ofs_src - (guest_src - guest_dst) * freq + (tsc_src - tsc_dst)`
+    ///
+    /// where guest clock values are nanoseconds and `freq` is in kHz.
+    pub fn rebase_vcpu_tsc(&self, source: &VmState, vcpu_states: &mut [VcpuState]) -> Result<()> {
+        if !vcpu_states
+            .iter()
+            .any(|state| state.tsc_migration.is_some())
+        {
+            return Ok(());
+        }
+
+        validate_migration_clock_flags(&source.clock, "source")?;
+        let destination = self.fd.get_clock().map_err(Error::VmGetClock)?;
+
+        for state in vcpu_states {
+            if let Some(tsc) = &mut state.tsc_migration {
+                if destination.flags & KVM_CLOCK_HOST_TSC != 0 {
+                    tsc.offset = rebased_tsc_offset(
+                        tsc.offset,
+                        tsc.khz,
+                        source.clock.clock,
+                        destination.clock,
+                        source.clock.host_tsc,
+                        destination.host_tsc,
+                    );
+                    tsc.apply_offset = true;
+                } else {
+                    // Nested/older KVM can restore realtime kvmclock while
+                    // withholding its internal host-TSC sample. A userspace
+                    // RDTSC is not equivalent under nested virtualization.
+                    // Advance the captured guest TSC by the same kvmclock
+                    // delta and let KVM_SET_MSRS derive the destination offset.
+                    let guest_delta_ns =
+                        i128::from(destination.clock) - i128::from(source.clock.clock);
+                    let tsc_entry = state
+                        .msrs
+                        .as_mut_slice()
+                        .iter_mut()
+                        .find(|entry| entry.index == 0x10)
+                        .ok_or_else(|| {
+                            Error::VmClockMigration(
+                                "portable vCPU state is missing IA32_TSC".to_string(),
+                            )
+                        })?;
+                    tsc_entry.data = advance_tsc(tsc_entry.data, guest_delta_ns, tsc.khz);
+                    tsc.apply_offset = false;
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
     /// Restores the Kvm Vm state.
@@ -1084,6 +1203,51 @@ impl Vm {
             }
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn validate_migration_clock_flags(clock: &kvm_clock_data, host: &str) -> Result<()> {
+    let required = KVM_CLOCK_REALTIME | KVM_CLOCK_HOST_TSC;
+    if clock.flags & required != required {
+        return Err(Error::VmClockMigration(format!(
+            "{host} KVM clock flags {:#x} do not include KVM_CLOCK_REALTIME and KVM_CLOCK_HOST_TSC",
+            clock.flags
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn rebased_tsc_offset(
+    source_offset: u64,
+    khz: u32,
+    source_guest_ns: u64,
+    destination_guest_ns: u64,
+    source_host_tsc: u64,
+    destination_host_tsc: u64,
+) -> u64 {
+    let guest_delta_ns = i128::from(source_guest_ns) - i128::from(destination_guest_ns);
+    let guest_delta_ticks = guest_delta_ns * i128::from(khz) / 1_000_000;
+    let guest_delta_ticks_mod = guest_delta_ticks.rem_euclid(1_i128 << 64) as u64;
+    source_offset
+        .wrapping_sub(guest_delta_ticks_mod)
+        .wrapping_add(source_host_tsc.wrapping_sub(destination_host_tsc))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn advance_tsc(source_tsc: u64, guest_delta_ns: i128, khz: u32) -> u64 {
+    let delta_ticks = guest_delta_ns * i128::from(khz) / 1_000_000;
+    source_tsc.wrapping_add(delta_ticks.rem_euclid(1_i128 << 64) as u64)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn portable_msr_should_serialize(index: u32) -> bool {
+    // PortableV1 masks MPX and Debug Store/LBR in CPUID. Their corresponding
+    // MSRs are nevertheless present in KVM_GET_MSR_INDEX_LIST on some bare
+    // metal hosts and absent from nested or newer KVM implementations. They
+    // are not guest-visible under this CPU contract and must not leak into the
+    // checkpoint's required restore state.
+    !matches!(index, 0x0d90 | 0x01d9..=0x01de)
 }
 
 #[allow(unused)]
@@ -1671,6 +1835,8 @@ pub struct Vcpu {
     kernel_first_run_delay: bool,
     #[cfg(target_arch = "x86_64")]
     kernel_enomem_retries: u8,
+    #[cfg(target_arch = "x86_64")]
+    portable_cpu: bool,
 
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
@@ -1837,6 +2003,7 @@ impl Vcpu {
             kernel_enomem_workaround,
             kernel_first_run_delay,
             kernel_enomem_retries,
+            portable_cpu: false,
             event_receiver,
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
@@ -1954,7 +2121,16 @@ impl Vcpu {
                 CpuFeaturesTemplate::C3 => {
                     c3::set_cpuid_entries(&mut self.cpuid, &cpuid_vm_spec).map_err(Error::CpuId)?
                 }
+                // The existing T2 mask is a conservative Haswell-era Intel
+                // contract: it removes host-specific extended state (MPX,
+                // AVX-512, PKU, and XSAVE extensions) that cannot safely cross
+                // CPU generations in a live checkpoint while retaining the
+                // broadly available AVX2 baseline.
+                CpuFeaturesTemplate::PortableV1 => {
+                    t2::set_cpuid_entries(&mut self.cpuid, &cpuid_vm_spec).map_err(Error::CpuId)?
+                }
             }
+            self.portable_cpu = template == CpuFeaturesTemplate::PortableV1;
         }
 
         self.fd
@@ -2093,13 +2269,19 @@ impl Vcpu {
          */
 
         // Build the list of MSRs we want to save.
-        let num_msrs = self.msr_list.as_fam_struct_ref().nmsrs as usize;
+        let msr_indices = self
+            .msr_list
+            .as_slice()
+            .iter()
+            .copied()
+            .filter(|index| !self.portable_cpu || portable_msr_should_serialize(*index))
+            .collect::<Vec<_>>();
+        let num_msrs = msr_indices.len();
         let mut msrs = Msrs::new(num_msrs).unwrap();
         {
-            let indices = self.msr_list.as_slice();
             let msr_entries = msrs.as_mut_slice();
-            assert_eq!(indices.len(), msr_entries.len());
-            for (pos, index) in indices.iter().enumerate() {
+            assert_eq!(msr_indices.len(), msr_entries.len());
+            for (pos, index) in msr_indices.iter().enumerate() {
                 msr_entries[pos].index = *index;
             }
         }
@@ -2107,6 +2289,15 @@ impl Vcpu {
         let regs = self.fd.get_regs().map_err(Error::VcpuGetRegs)?;
         let sregs = self.fd.get_sregs().map_err(Error::VcpuGetSregs)?;
         let xsave = self.fd.get_xsave().map_err(Error::VcpuGetXsave)?;
+        let tsc_migration = if self.portable_cpu {
+            Some(TscMigrationState {
+                khz: self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)?,
+                offset: self.get_tsc_offset()?,
+                apply_offset: true,
+            })
+        } else {
+            None
+        };
         let xcrs = self.fd.get_xcrs().map_err(Error::VcpuGetXcrs)?;
         let debug_regs = self.fd.get_debug_regs().map_err(Error::VcpuGetDebugRegs)?;
         let lapic = self.fd.get_lapic().map_err(Error::VcpuGetLapic)?;
@@ -2127,6 +2318,7 @@ impl Vcpu {
             vcpu_events,
             xcrs,
             xsave,
+            tsc_migration,
         })
     }
 
@@ -2155,6 +2347,12 @@ impl Vcpu {
          * SET_LAPIC must come before SET_MSRS, because the TSC deadline MSR
          * only restores successfully, when the LAPIC is correctly configured.
          */
+        // Guest clock conversion state was initialized against the source
+        // virtual TSC rate. Program that same rate before restoring TSC/MSRs;
+        // otherwise a cross-host resume can make guest timers stall or jump.
+        if let Some(tsc) = state.tsc_migration {
+            self.fd.set_tsc_khz(tsc.khz).map_err(Error::VcpuSetTscKhz)?;
+        }
         self.fd
             .set_cpuid2(&state.cpuid)
             .map_err(Error::VcpuSetCpuid)?;
@@ -2177,10 +2375,56 @@ impl Vcpu {
         self.fd
             .set_lapic(&state.lapic)
             .map_err(Error::VcpuSetLapic)?;
-        self.fd.set_msrs(&state.msrs).map_err(Error::VcpuSetMsrs)?;
+        let expected_msrs = state.msrs.as_slice().len();
+        let restored_msrs = self.fd.set_msrs(&state.msrs).map_err(Error::VcpuSetMsrs)?;
+        if restored_msrs != expected_msrs {
+            return Err(Error::VcpuSetMsrsIncomplete {
+                expected: expected_msrs,
+                actual: restored_msrs,
+            });
+        }
+        // SET_MSRS includes IA32_TSC and therefore changes KVM's offset. Apply
+        // the migration-corrected offset afterwards so the guest's TSC and
+        // kvmclock retain their source relationship on the destination host.
+        if let Some(tsc) = state.tsc_migration
+            && tsc.apply_offset
+        {
+            self.set_tsc_offset(tsc.offset)?;
+        }
         self.fd
             .set_vcpu_events(&state.vcpu_events)
             .map_err(Error::VcpuSetVcpuEvents)?;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn get_tsc_offset(&self) -> Result<u64> {
+        let mut offset = 0_u64;
+        let mut attr = kvm_device_attr {
+            group: KVM_VCPU_TSC_CTRL,
+            attr: u64::from(KVM_VCPU_TSC_OFFSET),
+            addr: (&mut offset as *mut u64) as u64,
+            flags: 0,
+        };
+        let result = unsafe { ioctl_with_mut_ref(&self.fd, KVM_GET_VCPU_DEVICE_ATTR(), &mut attr) };
+        if result < 0 {
+            return Err(Error::VcpuGetTscOffset(io::Error::last_os_error()));
+        }
+        Ok(offset)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_tsc_offset(&self, offset: u64) -> Result<()> {
+        let attr = kvm_device_attr {
+            group: KVM_VCPU_TSC_CTRL,
+            attr: u64::from(KVM_VCPU_TSC_OFFSET),
+            addr: (&offset as *const u64) as u64,
+            flags: 0,
+        };
+        let result = unsafe { ioctl_with_ref(&self.fd, KVM_SET_VCPU_DEVICE_ATTR(), &attr) };
+        if result < 0 {
+            return Err(Error::VcpuSetTscOffset(io::Error::last_os_error()));
+        }
         Ok(())
     }
 
@@ -2564,7 +2808,11 @@ impl Vcpu {
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             Ok(VcpuEvent::RestoreState(state)) => {
                 if let Err(e) = self.restore_state(*state) {
-                    error!("failed to restore vcpu state: {e:?}");
+                    let message = e.to_string();
+                    error!("failed to restore vcpu state: {message}");
+                    let _ = self
+                        .response_sender
+                        .send(VcpuResponse::RestoreFailed(message));
                     return self.exit(FC_EXIT_CODE_GENERIC_ERROR);
                 }
                 self.response_sender
@@ -2585,9 +2833,15 @@ impl Vcpu {
     #[cfg(not(test))]
     // Transition to the exited state.
     fn exit(&mut self, exit_code: u8) -> StateMachine<Self> {
-        self.response_sender
+        // Restore may already have returned an error and dropped the receiver;
+        // exiting must not turn that original error into a secondary panic.
+        if self
+            .response_sender
             .send(VcpuResponse::Exited(exit_code))
-            .expect("failed to send Exited status");
+            .is_err()
+        {
+            debug!("vCPU response receiver closed before Exited status");
+        }
 
         if let Err(e) = self.exit_evt.write(1) {
             error!("Failed signaling vcpu exit event: {e}");
@@ -2652,6 +2906,15 @@ pub struct VcpuState {
     vcpu_events: kvm_vcpu_events,
     xcrs: kvm_xcrs,
     xsave: kvm_xsave,
+    tsc_migration: Option<TscMigrationState>,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct TscMigrationState {
+    khz: u32,
+    offset: u64,
+    apply_offset: bool,
 }
 
 // --- Binary (de)serialization for checkpoint-to-file ---------------------------
@@ -2712,6 +2975,14 @@ impl VcpuState {
         let mut out = Vec::new();
         ser_fam(&mut out, self.cpuid.as_slice());
         ser_fam(&mut out, self.msrs.as_slice());
+        match self.tsc_migration {
+            Some(tsc) => {
+                out.push(1);
+                ser_pod(&mut out, &tsc.khz);
+                ser_pod(&mut out, &tsc.offset);
+            }
+            None => out.push(0),
+        }
         ser_pod(&mut out, &self.debug_regs);
         ser_pod(&mut out, &self.lapic);
         ser_pod(&mut out, &self.mp_state);
@@ -2731,9 +3002,22 @@ impl VcpuState {
         let cpuid =
             CpuId::from_entries(&cpuid_entries).map_err(|e| format!("rebuild CpuId: {e:?}"))?;
         let msrs = Msrs::from_entries(&msr_entries).map_err(|e| format!("rebuild Msrs: {e:?}"))?;
+        let has_tsc_migration: u8 = de_pod(bytes, &mut pos)?;
+        let tsc_migration = match has_tsc_migration {
+            0 => None,
+            1 => Some(TscMigrationState {
+                khz: de_pod(bytes, &mut pos)?,
+                offset: de_pod(bytes, &mut pos)?,
+                apply_offset: true,
+            }),
+            marker => {
+                return Err(format!("invalid vCPU TSC migration-state marker {marker}"));
+            }
+        };
         let state = VcpuState {
             cpuid,
             msrs,
+            tsc_migration,
             debug_regs: de_pod(bytes, &mut pos)?,
             lapic: de_pod(bytes, &mut pos)?,
             mp_state: de_pod(bytes, &mut pos)?,
@@ -2863,6 +3147,9 @@ pub enum VcpuResponse {
     /// Acknowledges a [`VcpuEvent::RestoreState`].
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     RestoredState,
+    /// The vCPU rejected checkpoint state and cannot safely resume.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    RestoreFailed(String),
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
@@ -3033,6 +3320,14 @@ mod tests {
             vcpu.configure_x86_64(&vm_mem, GuestAddress(0), &vcpu_config, true, false)
                 .is_ok()
         );
+
+        // PortableV1 must select the state contract used by checkpoint capture.
+        vcpu_config.cpu_template = Some(CpuFeaturesTemplate::PortableV1);
+        assert!(
+            vcpu.configure_x86_64(&vm_mem, GuestAddress(0), &vcpu_config, true, false)
+                .is_ok()
+        );
+        assert!(vcpu.portable_cpu);
 
         // Test configure while using the T2 template.
         vcpu_config.cpu_template = Some(CpuFeaturesTemplate::T2);
@@ -3213,5 +3508,57 @@ mod tests {
             VcpuResponse::RestoredState => {}
             other => panic!("expected RestoredState, got {other:?}"),
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_rebased_tsc_offset_preserves_epoch() {
+        let source_offset = 10_000_u64;
+        let khz = 2_400_000_u32;
+        let source_guest_ns = 5_000_000_000_u64;
+        let destination_guest_ns = 5_250_000_000_u64;
+        let source_host_tsc = 20_000_000_000_u64;
+        let destination_host_tsc = 31_000_000_000_u64;
+
+        let destination_offset = rebased_tsc_offset(
+            source_offset,
+            khz,
+            source_guest_ns,
+            destination_guest_ns,
+            source_host_tsc,
+            destination_host_tsc,
+        );
+
+        let source_epoch = source_offset
+            .wrapping_add(source_host_tsc)
+            .wrapping_sub(source_guest_ns.wrapping_mul(u64::from(khz)) / 1_000_000);
+        let destination_epoch = destination_offset
+            .wrapping_add(destination_host_tsc)
+            .wrapping_sub(destination_guest_ns.wrapping_mul(u64::from(khz)) / 1_000_000);
+        assert_eq!(destination_epoch, source_epoch);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_rebased_tsc_offset_is_unchanged_for_same_clock_sample() {
+        assert_eq!(rebased_tsc_offset(42, 3_000_000, 100, 100, 200, 200), 42);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_advance_tsc_uses_guest_frequency() {
+        assert_eq!(advance_tsc(100, 250_000_000, 2_400_000), 600_000_100);
+        assert_eq!(advance_tsc(600_000_100, -250_000_000, 2_400_000), 100);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_portable_msr_filter_matches_masked_cpu_features() {
+        assert!(!portable_msr_should_serialize(0x0d90));
+        for index in 0x01d9..=0x01de {
+            assert!(!portable_msr_should_serialize(index));
+        }
+        assert!(portable_msr_should_serialize(0x10));
+        assert!(portable_msr_should_serialize(0x4b56_4d01));
     }
 }

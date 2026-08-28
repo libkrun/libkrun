@@ -279,7 +279,7 @@ pub struct HvfVcpuState {
     /// Writable EL1 system registers as (hv_sys_reg_t, value) pairs.
     pub sys: Vec<(u16, u64)>,
     /// This vCPU's GIC redistributor registers (SGI/PPI group/enable/priority/
-    /// config) as (hv_gic_redistributor_reg_t, value) pairs.
+    /// config/pending/active) as (hv_gic_redistributor_reg_t, value) pairs.
     pub gic_redist: Vec<(u32, u64)>,
     /// This vCPU's GIC CPU-interface (ICC) registers (PMR/BPR/CTLR/SRE/IGRPEN…)
     /// as (hv_gic_icc_reg_t, value) pairs. Without these the restored vCPU's
@@ -300,13 +300,15 @@ pub struct HvfVcpuState {
 }
 
 /// GIC redistributor registers captured per-vCPU (offsets == `hv_gic_redistributor_reg_t`).
-/// Config (group/priority/cfg) is restored before the set-enable register.
+/// Config (group/priority/cfg) is restored before enable/pending/active state.
 #[cfg(target_arch = "aarch64")]
 const GIC_REDIST_REGS: &[u32] = &[
     65664, // GICR_IGROUPR0
     66560, 66564, 66568, 66572, 66576, 66580, 66584, 66588, // GICR_IPRIORITYR0..7
     68608, 68612, // GICR_ICFGR0..1
-    65792, // GICR_ISENABLER0  (enable LAST)
+    65792, // GICR_ISENABLER0
+    66048, // GICR_ISPENDR0
+    66304, // GICR_ISACTIVER0
 ];
 
 /// Runtime-resolved GIC register accessors. The Hypervisor framework does not
@@ -675,7 +677,8 @@ pub fn vcpu_restore_state(vcpuid: u64, state: &HvfVcpuState) -> Result<(), Error
 }
 
 /// Capture the global GIC distributor state (interrupt group/priority/config,
-/// SPI routing, and set-enables) for fork. Returns (reg-offset, value) pairs;
+/// SPI routing, enable, pending, and active bits) for fork. Returns
+/// (reg-offset, value) pairs;
 /// `gic_restore_distributor` replays them with `GICD_CTLR` written last. The
 /// distributor is global (not per-vCPU), so this may run on any thread.
 #[cfg(target_arch = "aarch64")]
@@ -725,8 +728,10 @@ pub fn gic_restore_distributor(regs: &[(u32, u64)]) -> Result<(), Error> {
 /// GIC distributor register offsets to snapshot (offset == `hv_gic_distributor_reg_t`),
 /// bounded to the `num_irqs` the GIC implements (per-IRQ ranges past that fault):
 /// GICD_CTLR, IGROUPR, IPRIORITYR, ICFGR, IROUTER (64-bit SPI routing, SPIs 32+),
-/// ISENABLER. Read-only (TYPER/PIDR2) and clear/transient registers (IC*,
-/// IS/ICPENDR, IS/ICACTIVER) are intentionally excluded.
+/// ISENABLER, ISPENDR, and ISACTIVER. The set variants are replayed onto a reset
+/// GIC so the saved state is installed exactly; this is required when a vCPU is
+/// checkpointed inside an interrupt handler and later resumes by writing EOIR.
+/// Read-only (TYPER/PIDR2) and clear registers (IC*) are excluded.
 #[cfg(target_arch = "aarch64")]
 fn gic_distributor_regs(num_irqs: u32) -> Vec<u32> {
     let n32 = num_irqs / 32; // 1 bit per IRQ  (IGROUPR / ISENABLER)
@@ -738,7 +743,31 @@ fn gic_distributor_regs(num_irqs: u32) -> Vec<u32> {
     regs.extend((0..n16).map(|i| 0xC00 + i * 4)); // ICFGR
     regs.extend((32..num_irqs).map(|i| 0x6000 + i * 8)); // IROUTER (SPIs only, 64-bit)
     regs.extend((0..n32).map(|i| 0x100 + i * 4)); // ISENABLER
+    regs.extend((0..n32).map(|i| 0x200 + i * 4)); // ISPENDR
+    regs.extend((0..n32).map(|i| 0x300 + i * 4)); // ISACTIVER
     regs
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod gic_snapshot_tests {
+    use super::gic_distributor_regs;
+
+    #[test]
+    fn distributor_snapshot_includes_pending_and_active_state() {
+        let regs = gic_distributor_regs(96);
+
+        for offset in [0x200, 0x204, 0x208, 0x300, 0x304, 0x308] {
+            assert!(regs.contains(&offset), "missing GIC register 0x{offset:x}");
+        }
+        assert!(
+            regs.iter().position(|reg| *reg == 0x108).unwrap()
+                < regs.iter().position(|reg| *reg == 0x200).unwrap()
+        );
+        assert!(
+            regs.iter().position(|reg| *reg == 0x208).unwrap()
+                < regs.iter().position(|reg| *reg == 0x300).unwrap()
+        );
+    }
 }
 
 /// Checks if Nested Virtualization is supported on the current system. Only

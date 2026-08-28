@@ -473,9 +473,14 @@ impl Vmm {
     /// from saved queue state, and load the vCPU registers. The caller resumes
     /// (e.g. [`Self::resume`]) to start the clone running.
     #[cfg(snapshot_supported)]
-    pub fn apply_restore(&mut self, checkpoint: VmCheckpoint) -> Result<()> {
+    #[allow(unused_mut)] // mutable only on Linux/x86 TSC rebasing
+    pub fn apply_restore(&mut self, mut checkpoint: VmCheckpoint) -> Result<()> {
         self.vm
             .restore_state(&checkpoint.vm_state)
+            .map_err(Error::Vm)?;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        self.vm
+            .rebase_vcpu_tsc(&checkpoint.vm_state, &mut checkpoint.vcpu_states)
             .map_err(Error::Vm)?;
         // Restore the userspace IRQ chip (WHP software IOAPIC) before devices
         // re-activate: a fresh chip has every redirection entry masked, so an
@@ -686,8 +691,33 @@ impl Vmm {
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         for handle in self.vcpus_handles.iter() {
-            Self::wait_for_vcpu_response(handle, VcpuResponse::RestoredState, deadline)
-                .map_err(|_| Error::VcpuSnapshot("vCPU restore not acknowledged".to_string()))?;
+            loop {
+                let remaining =
+                    deadline
+                        .checked_duration_since(Instant::now())
+                        .ok_or_else(|| {
+                            Error::VcpuSnapshot("timed out restoring vCPU state".to_string())
+                        })?;
+                match handle.response_receiver().recv_timeout(remaining) {
+                    Ok(VcpuResponse::RestoredState) => break,
+                    Ok(VcpuResponse::RestoreFailed(message)) => {
+                        return Err(Error::VcpuSnapshot(format!(
+                            "vCPU rejected checkpoint state: {message}"
+                        )));
+                    }
+                    Ok(VcpuResponse::Exited(code)) => {
+                        return Err(Error::VcpuSnapshot(format!(
+                            "vCPU exited with code {code} while restoring checkpoint state"
+                        )));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        return Err(Error::VcpuSnapshot(format!(
+                            "vCPU restore response channel failed: {error}"
+                        )));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -717,6 +747,10 @@ impl Vmm {
         self.quiesce_devices();
         let vcpu_states = self.save_vcpu_states()?;
         let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        self.vm
+            .validate_migration_clock(&vm_state, &vcpu_states)
+            .map_err(Error::Vm)?;
         let devices = self.snapshot_devices();
         let mem_descs = snapshot::write_guest_memory(&self.guest_memory, mem_out)
             .map_err(|e| Error::Snapshot(format!("guest-memory dump: {e}")))?;
@@ -749,13 +783,37 @@ impl Vmm {
         &mut self,
         mem_out: &mut W,
     ) -> Result<(VmCheckpoint, Vec<snapshot::MemoryRegionDesc>)> {
+        self.checkpoint_frozen_with(|memory| snapshot::write_guest_memory(memory, mem_out))
+    }
+
+    /// Durable checkpoint variant that preserves sparse guest-RAM extents.
+    #[cfg(all(snapshot_supported, unix))]
+    pub fn checkpoint_frozen_sparse(
+        &mut self,
+        mem_out: &mut std::fs::File,
+    ) -> Result<(VmCheckpoint, Vec<snapshot::MemoryRegionDesc>)> {
+        self.checkpoint_frozen_with(|memory| snapshot::write_guest_memory_sparse(memory, mem_out))
+    }
+
+    #[cfg(snapshot_supported)]
+    fn checkpoint_frozen_with<F>(
+        &mut self,
+        dump_memory: F,
+    ) -> Result<(VmCheckpoint, Vec<snapshot::MemoryRegionDesc>)>
+    where
+        F: FnOnce(&GuestMemoryMmap) -> std::io::Result<Vec<snapshot::MemoryRegionDesc>>,
+    {
         self.pause()?;
         self.quiesce_devices();
         let capture = (|| {
             let vcpu_states = self.save_vcpu_states()?;
             let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            self.vm
+                .validate_migration_clock(&vm_state, &vcpu_states)
+                .map_err(Error::Vm)?;
             let devices = self.snapshot_devices();
-            let mem_descs = snapshot::write_guest_memory(&self.guest_memory, mem_out)
+            let mem_descs = dump_memory(&self.guest_memory)
                 .map_err(|e| Error::Snapshot(format!("guest-memory dump: {e}")))?;
             #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
             let ioapic = self.intc.lock().unwrap().save_state();
@@ -789,9 +847,10 @@ impl Vmm {
     /// `self` must have been built with the same VM config as the checkpoint
     /// (vCPU count, memory layout, device set) so the layout matches.
     #[cfg(snapshot_supported)]
+    #[allow(unused_mut)] // mutable only on Linux/x86 TSC rebasing
     pub fn restore<R: std::io::Read>(
         &mut self,
-        checkpoint: VmCheckpoint,
+        mut checkpoint: VmCheckpoint,
         mem_descs: &[snapshot::MemoryRegionDesc],
         mem_in: &mut R,
     ) -> Result<()> {
@@ -808,6 +867,10 @@ impl Vmm {
             .map_err(|e| Error::Snapshot(format!("guest-memory load: {e}")))?;
         self.vm
             .restore_state(&checkpoint.vm_state)
+            .map_err(Error::Vm)?;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        self.vm
+            .rebase_vcpu_tsc(&checkpoint.vm_state, &mut checkpoint.vcpu_states)
             .map_err(Error::Vm)?;
         // See apply_restore: the WHP software IOAPIC must be restored before
         // devices signal or their IRQs hit an all-masked redirection table.
@@ -840,6 +903,9 @@ impl Vmm {
         self.quiesce_devices();
         let vcpu_states = self.save_vcpu_states()?;
         let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+        self.vm
+            .validate_migration_clock(&vm_state, &vcpu_states)
+            .map_err(Error::Vm)?;
         let devices = self.snapshot_devices();
         let mem_clone = snapshot::cow_clone_guest_memory(&self.guest_memory)
             .map_err(|e| Error::Snapshot(format!("cow-clone guest memory: {e}")))?;
@@ -865,7 +931,7 @@ impl Vmm {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub fn restore_cow(
         &mut self,
-        checkpoint: VmCheckpoint,
+        mut checkpoint: VmCheckpoint,
         mem_clone: &GuestMemoryMmap,
     ) -> Result<()> {
         if self.run_state != VmmRunState::Paused {
@@ -878,6 +944,9 @@ impl Vmm {
             .map_err(|e| Error::Snapshot(format!("guest-memory restore copy: {e}")))?;
         self.vm
             .restore_state(&checkpoint.vm_state)
+            .map_err(Error::Vm)?;
+        self.vm
+            .rebase_vcpu_tsc(&checkpoint.vm_state, &mut checkpoint.vcpu_states)
             .map_err(Error::Vm)?;
         self.restore_devices(&checkpoint.devices)
             .map_err(Error::Snapshot)?;
@@ -908,6 +977,10 @@ impl Vmm {
         let checkpoint = (|| {
             let vcpu_states = self.save_vcpu_states()?;
             let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            self.vm
+                .validate_migration_clock(&vm_state, &vcpu_states)
+                .map_err(Error::Vm)?;
             let devices = self.snapshot_devices();
             #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
             let ioapic = self.intc.lock().unwrap().save_state();
@@ -947,14 +1020,19 @@ impl Vmm {
             ));
         }
 
+        #[allow(unused_mut)] // mutable only on Linux/x86 TSC rebasing
         let VmCheckpoint {
             vm_state,
-            vcpu_states,
+            mut vcpu_states,
             devices,
             ioapic,
         } = checkpoint;
         let restore = (|| {
             self.vm.restore_state(&vm_state).map_err(Error::Vm)?;
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            self.vm
+                .rebase_vcpu_tsc(&vm_state, &mut vcpu_states)
+                .map_err(Error::Vm)?;
             #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
             if let Some(bytes) = &ioapic {
                 self.intc.lock().unwrap().restore_state(bytes);

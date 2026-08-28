@@ -637,7 +637,11 @@ impl Vcpu {
                 #[cfg(target_arch = "aarch64")]
                 Ok(VcpuEvent::RestoreState(state)) => {
                     if let Err(e) = hvf::vcpu_restore_state(hvf_vcpuid, &state) {
-                        error!("failed to restore HVF vcpu state: {e:?}");
+                        let message = format!("{e:?}");
+                        error!("failed to restore HVF vcpu state: {message}");
+                        let _ = self
+                            .response_sender
+                            .send(VcpuResponse::RestoreFailed(message));
                         return false;
                     }
                     self.response_sender
@@ -794,6 +798,9 @@ pub enum VcpuResponse {
     /// Acknowledges a [`VcpuEvent::RestoreState`].
     #[cfg(target_arch = "aarch64")]
     RestoredState,
+    /// The vCPU rejected checkpoint state and cannot safely resume.
+    #[cfg(target_arch = "aarch64")]
+    RestoreFailed(String),
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.

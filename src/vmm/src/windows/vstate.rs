@@ -462,7 +462,11 @@ impl Vcpu {
                 },
                 Ok(VcpuEvent::RestoreState(state)) => {
                     if let Err(e) = self.whp_vcpu.restore_state(&state.0) {
-                        error!("failed to restore WHP vcpu state: {e}");
+                        let message = e.to_string();
+                        error!("failed to restore WHP vcpu state: {message}");
+                        let _ = self
+                            .response_sender
+                            .send(VcpuResponse::RestoreFailed(message));
                         return false;
                     }
                     let _ = self.response_sender.send(VcpuResponse::RestoredState);
@@ -565,6 +569,8 @@ pub enum VcpuResponse {
     SavedState(Box<VcpuState>),
     /// Acknowledges a [`VcpuEvent::RestoreState`].
     RestoredState,
+    /// The vCPU rejected checkpoint state and cannot safely resume.
+    RestoreFailed(String),
 }
 
 /// Wrapper over the vCPU thread that hides the channel interactions, and (on

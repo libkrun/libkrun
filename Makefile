@@ -199,7 +199,9 @@ clean-sysroot:
 #
 # Always use `make smolvm` (or the top-level `make libkrun`) rather than
 # calling cargo directly — the required feature set (blk + net + gpu + input) and
-# env vars (LIBCLANG_PATH, KRUN_INIT_BINARY_PATH) are enforced here.
+# feature flags and the macOS LIBCLANG_PATH are enforced here. libkrun 2.x's
+# init_blob build script builds and embeds the Rust guest init; do not point
+# KRUN_INIT_BINARY_PATH at the intentional zero-byte compatibility placeholder.
 #
 # macOS requirements: brew install llvm virglrenderer
 SMOLVM_DEST ?= ../lib/libkrun.dylib
@@ -213,14 +215,17 @@ ifeq ($(OS),Darwin)
 	brew --prefix virglrenderer >/dev/null 2>&1 || \
 		{ echo "Error: virglrenderer not found — brew install virglrenderer"; exit 1; }; \
 	LIBCLANG_PATH="$$LLVM_PREFIX/lib" \
-	KRUN_INIT_BINARY_PATH="$$(realpath init/init)" \
 		$(MAKE) BLK=1 NET=1 GPU=1 INPUT=1
 	cp $(LIBRARY_RELEASE_$(OS)) $(SMOLVM_DEST)
+	@EPOXY_DYLIB="$$(brew --prefix libepoxy)/lib/libepoxy.0.dylib"; \
+	VIRGL_DYLIB="$$(brew --prefix virglrenderer)/lib/libvirglrenderer.1.dylib"; \
+	install_name_tool -change "$$EPOXY_DYLIB" @loader_path/libepoxy.0.dylib $(SMOLVM_DEST); \
+	install_name_tool -change "$$VIRGL_DYLIB" @loader_path/libvirglrenderer.1.dylib $(SMOLVM_DEST); \
+	codesign --force --sign - $(SMOLVM_DEST)
 	@echo "Installed: $(SMOLVM_DEST)"
 	@echo "Re-codesign smolvm: codesign --force --sign - --entitlements ../smolvm.entitlements ../target/release/smolvm"
 else
-	KRUN_INIT_BINARY_PATH="$$(realpath init/init)" \
-		$(MAKE) BLK=1 NET=1 GPU=1 INPUT=1
+	$(MAKE) BLK=1 NET=1 GPU=1 INPUT=1
 	cp $(LIBRARY_RELEASE_$(OS)) $(SMOLVM_DEST)
 	@echo "Installed: $(SMOLVM_DEST)"
 endif

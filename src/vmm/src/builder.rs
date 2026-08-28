@@ -618,6 +618,20 @@ pub fn build_microvm(
         };
     }
 
+    // Consume the restore context up front. A forkable clone may promote its
+    // inherited MAP_PRIVATE memory into fresh file-backed RAM below; retaining
+    // a cloned RestoreCtx until vCPU restore would otherwise keep the complete
+    // inherited mapping resident alongside the promoted copy (2x guest RAM).
+    let restoring = restore.is_some();
+    let (restore_mem, restore_checkpoint) = match restore {
+        Some(RestoreCtx {
+            guest_memory,
+            fork_backed_regions,
+            checkpoint,
+        }) => (Some((guest_memory, fork_backed_regions)), Some(checkpoint)),
+        None => (None, None),
+    };
+
     let payload = choose_payload(vm_resources)?;
     vmm_timing!("payload selected");
 
@@ -628,9 +642,7 @@ pub fn build_microvm(
             .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
         vm_resources,
         &payload,
-        restore
-            .as_ref()
-            .map(|r| (r.guest_memory.clone(), r.fork_backed_regions.clone())),
+        restore_mem,
     )?;
     vmm_timing!("memory created");
 
@@ -910,7 +922,7 @@ pub fn build_microvm(
         // `setup_sregs` and would corrupt the cloned running-state RAM. The vCPU
         // registers are loaded from the checkpoint by `restore_vcpu_states`.
         let kernel_boot =
-            restore.is_none() && vm_resources.firmware_config.is_none() && !cfg!(feature = "tee");
+            !restoring && vm_resources.firmware_config.is_none() && !cfg!(feature = "tee");
 
         vcpus = create_vcpus_x86_64(
             &vm,
@@ -1223,7 +1235,7 @@ pub fn build_microvm(
     // Boot-time system configuration (cmdline, zero-page/FDT, boot regs) is
     // SKIPPED when restoring — the clone's guest RAM + restored vCPU/device
     // state already encode a running guest past boot.
-    if restore.is_none() {
+    if !restoring {
         // Write the kernel command line to guest memory. This is x86_64 specific, since on
         // aarch64 the command line will be specified through the FDT.
         #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
@@ -1274,19 +1286,19 @@ pub fn build_microvm(
         println!("Starting TEE/microVM.");
     }
 
-    match restore {
+    match restore_checkpoint {
         None => {
             vmm.start_vcpus(vcpus)
                 .map_err(StartMicrovmError::Internal)?;
             vmm_timing!("vcpus running");
         }
-        Some(_ctx) => {
+        Some(checkpoint_bytes) => {
             // Restore-into-a-fresh-clone: start vCPUs paused, apply the
             // checkpoint (VM + device re-activation + vCPU registers), then
             // resume so the clone runs from the checkpoint instruction.
             #[cfg(fork_supported)]
             {
-                let checkpoint = super::VmCheckpoint::deserialize(&_ctx.checkpoint)
+                let checkpoint = super::VmCheckpoint::deserialize(&checkpoint_bytes)
                     .map_err(StartMicrovmError::GuestMemoryMmap)?;
                 vmm.start_vcpus_paused(vcpus)
                     .map_err(StartMicrovmError::Internal)?;
@@ -2057,14 +2069,27 @@ pub fn create_guest_memory(
         // fresh file-backed memory containing its current state. This one-time
         // materialization makes the restored machine a stable source for its
         // own descendants without mutating the ancestor's backing files.
-        let guest_mem = if memfd_backed_ram_enabled() {
-            super::snapshot::materialize_guest_memory(&guest_mem, &fork_backed_regions).map_err(
-                |error| {
-                    StartMicrovmError::GuestMemoryMmap(format!(
-                        "materialize restored fork source: {error}"
-                    ))
-                },
-            )?
+        // A portable checkpoint is already backed by its private sparse memory
+        // image. Keep that mapping: Linux descendants reach its open fd through
+        // `/proc/<pid>/fd`, while macOS retains the file path for descendants.
+        // Other restored mappings still need promotion into fork backing.
+        let needs_fork_backing = guest_mem
+            .iter()
+            .zip(fork_backed_regions.iter())
+            .any(|(region, backed)| *backed && region.file_offset().is_none());
+        let guest_mem = if memfd_backed_ram_enabled() && needs_fork_backing {
+            let promoted =
+                super::snapshot::materialize_guest_memory(&guest_mem, &fork_backed_regions)
+                    .map_err(|error| {
+                        StartMicrovmError::GuestMemoryMmap(format!(
+                            "materialize restored fork source: {error}"
+                        ))
+                    })?;
+            // `guest_mem` shadows the returned value below. Drop the source
+            // mapping explicitly after the copy rather than retaining a full
+            // second guest-RAM mapping until this function returns.
+            drop(guest_mem);
+            promoted
         } else {
             guest_mem
         };

@@ -378,11 +378,12 @@ impl VirglRenderer {
 
     #[cfg(target_os = "macos")]
     fn map_ptr(&self, resource_id: u32) -> RutabagaResult<u64> {
-        let mut map_ptr = 0;
-        let ret = unsafe { virgl_renderer_resource_get_map_ptr(resource_id, &mut map_ptr) };
+        let mut map_ptr: *mut c_void = null_mut();
+        let mut size = 0;
+        let ret = unsafe { virgl_renderer_resource_map(resource_id, &mut map_ptr, &mut size) };
         ret_to_res(ret)?;
 
-        Ok(map_ptr)
+        Ok(map_ptr as u64)
     }
 
     fn query(&self, resource_id: u32) -> RutabagaResult<Resource3DInfo> {

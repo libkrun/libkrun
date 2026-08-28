@@ -99,11 +99,16 @@ pub struct FuseServerState {
     pub dax_maps: Vec<FuseDaxMapSnap>,
 }
 
-/// One FUSE inode: the guest's nodeid mapped to an absolute host path (recovered
-/// via `/proc/self/fd`) plus its lookup refcount.
+/// One FUSE inode: the guest's nodeid mapped to its source-host identity and,
+/// for portable snapshots, to a path relative to the export root.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FuseInodeSnap {
     pub nodeid: u64,
+    /// Path relative to this virtio-fs export's root. New snapshots populate
+    /// this so a portable checkpoint can rebuild the inode beneath a different
+    /// host rootfs location. `path` remains for same-host legacy snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
     pub path: String,
     pub refcount: u64,
 }

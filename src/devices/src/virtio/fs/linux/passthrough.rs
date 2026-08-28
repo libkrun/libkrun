@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io;
 use std::mem::{self, MaybeUninit, size_of};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -416,6 +417,51 @@ enum FileOrLink {
 }
 
 impl PassthroughFs {
+    fn safe_relative_path(path: &Path) -> bool {
+        !path.as_os_str().is_empty()
+            && path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+    }
+
+    fn relative_snapshot_path(root: &Path, path: &Path) -> Option<String> {
+        let relative = path.strip_prefix(root).ok()?;
+        Self::safe_relative_path(relative).then(|| relative.to_string_lossy().into_owned())
+    }
+
+    fn restore_inode_path(&self, snap: &FuseInodeSnap) -> Option<PathBuf> {
+        let root = std::fs::canonicalize(&self.cfg.root_dir)
+            .unwrap_or_else(|_| PathBuf::from(&self.cfg.root_dir));
+        if let Some(relative) = snap.relative_path.as_deref() {
+            let relative = Path::new(relative);
+            if Self::safe_relative_path(relative) {
+                return Some(root.join(relative));
+            }
+            warn!("fs restore: rejecting unsafe relative inode path {relative:?}");
+            return None;
+        }
+
+        // Before relative paths were recorded, a snapshot could only be safely
+        // restored when its absolute paths already belonged to this export.
+        // Never let an imported checkpoint make the VMM open an arbitrary host
+        // path outside the configured root.
+        let legacy = PathBuf::from(&snap.path);
+        match legacy.strip_prefix(&root) {
+            Ok(relative)
+                if relative.as_os_str().is_empty() || Self::safe_relative_path(relative) =>
+            {
+                Some(legacy)
+            }
+            _ => {
+                warn!(
+                    "fs restore: refusing legacy inode path outside export root: {}",
+                    snap.path
+                );
+                None
+            }
+        }
+    }
+
     pub fn new(cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<PassthroughFs> {
         let fd = if let Some(fd) = cfg.proc_sfd_rawfd {
             fd
@@ -543,6 +589,9 @@ impl PassthroughFs {
         let mut inode_snaps = Vec::new();
         {
             let inodes = self.inodes.read().unwrap();
+            let root_path = inodes.get(&fuse::ROOT_ID).and_then(|root| {
+                std::fs::read_link(format!("/proc/self/fd/{}", root.file.as_raw_fd())).ok()
+            });
             for (nodeid, data) in inodes.iter() {
                 if *nodeid == fuse::ROOT_ID {
                     continue;
@@ -551,6 +600,9 @@ impl PassthroughFs {
                 match std::fs::read_link(&link) {
                     Ok(p) => inode_snaps.push(FuseInodeSnap {
                         nodeid: *nodeid,
+                        relative_path: root_path
+                            .as_deref()
+                            .and_then(|root| Self::relative_snapshot_path(root, &p)),
                         path: p.to_string_lossy().into_owned(),
                         refcount: data.refcount.load(Ordering::Relaxed),
                     }),
@@ -597,7 +649,10 @@ impl PassthroughFs {
         {
             let mut inodes = self.inodes.write().unwrap();
             for snap in &state.inodes {
-                let cpath = match CString::new(snap.path.as_bytes()) {
+                let Some(path) = self.restore_inode_path(snap) else {
+                    continue;
+                };
+                let cpath = match CString::new(path.as_os_str().as_encoded_bytes()) {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
@@ -615,7 +670,7 @@ impl PassthroughFs {
                 if fd < 0 {
                     warn!(
                         "fs restore: reopen {} failed: {}",
-                        snap.path,
+                        path.display(),
                         io::Error::last_os_error()
                     );
                     continue;
@@ -625,7 +680,7 @@ impl PassthroughFs {
                 let (st, mnt_id) = match statx(&f) {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!("fs restore: statx {} failed: {e}", snap.path);
+                        warn!("fs restore: statx {} failed: {e}", path.display());
                         continue;
                     }
                 };
@@ -2405,6 +2460,8 @@ impl FileSystem for PassthroughFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     // A non-zero uid the server can be made to run as, plus a guest
     // uid distinct from it and from root. Both must be mappable when
@@ -2413,6 +2470,96 @@ mod tests {
     const SERVER_UID: libc::uid_t = 1;
     const SERVER_GID: libc::gid_t = 1;
     const GUEST_UID: libc::uid_t = 1000;
+
+    #[test]
+    fn snapshot_inode_paths_relocate_beneath_a_new_export_root() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let test_root = std::env::temp_dir().join(format!(
+            "libkrun-portable-fs-{}-{nonce}",
+            std::process::id()
+        ));
+        let source_root = test_root.join("source");
+        let destination_root = test_root.join("destination");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&destination_root).unwrap();
+        fs::write(source_root.join("tool"), b"source").unwrap();
+        fs::write(destination_root.join("tool"), b"destination").unwrap();
+
+        let source = PassthroughFs::new(
+            Config {
+                root_dir: source_root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        let name = CString::new("tool").unwrap();
+        let entry = FileSystem::lookup(
+            &source,
+            Context {
+                uid: 0,
+                gid: 0,
+                pid: 0,
+            },
+            fuse::ROOT_ID,
+            &name,
+        )
+        .unwrap();
+        let state = source.snapshot();
+        let snap = state
+            .inodes
+            .iter()
+            .find(|snap| snap.nodeid == entry.inode)
+            .unwrap();
+        assert_eq!(snap.relative_path.as_deref(), Some("tool"));
+
+        let destination = PassthroughFs::new(
+            Config {
+                root_dir: destination_root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        destination.restore(&state).unwrap();
+        let restored = destination
+            .inodes
+            .read()
+            .unwrap()
+            .get(&entry.inode)
+            .cloned()
+            .unwrap();
+        let restored_path =
+            fs::read_link(format!("/proc/self/fd/{}", restored.file.as_raw_fd())).unwrap();
+        assert_eq!(restored_path, destination_root.join("tool"));
+
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
+    fn restored_relative_inode_paths_cannot_escape_the_export() {
+        let root = std::env::temp_dir();
+        let fs = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        for path in ["../outside", "/etc/passwd", "nested/../../outside", ""] {
+            let snap = FuseInodeSnap {
+                nodeid: 2,
+                relative_path: Some(path.to_string()),
+                path: String::new(),
+                refcount: 1,
+            };
+            assert!(fs.restore_inode_path(&snap).is_none(), "accepted {path:?}");
+        }
+    }
 
     /// Regression test for the `scoped_cred` credential restore.
     ///

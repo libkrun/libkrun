@@ -78,6 +78,8 @@ impl fmt::Display for VmConfig {
 pub enum CpuFeaturesTemplate {
     /// C3 Template.
     C3,
+    /// Stable Intel feature baseline for portable live checkpoints.
+    PortableV1,
     /// T2 Template.
     T2,
 }
@@ -86,6 +88,7 @@ impl fmt::Display for CpuFeaturesTemplate {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             CpuFeaturesTemplate::C3 => write!(f, "C3"),
+            CpuFeaturesTemplate::PortableV1 => write!(f, "PortableV1"),
             CpuFeaturesTemplate::T2 => write!(f, "T2"),
         }
     }
@@ -99,6 +102,10 @@ mod tests {
     fn test_display_cpu_features_template() {
         assert_eq!(CpuFeaturesTemplate::C3.to_string(), "C3".to_string());
         assert_eq!(CpuFeaturesTemplate::T2.to_string(), "T2".to_string());
+        assert_eq!(
+            CpuFeaturesTemplate::PortableV1.to_string(),
+            "PortableV1".to_string()
+        );
     }
 
     #[test]

@@ -5,11 +5,13 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::btree_map;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::path::{Component, Path, PathBuf};
 use std::ptr::null_mut;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
@@ -572,6 +574,76 @@ pub struct PassthroughFs {
 }
 
 impl PassthroughFs {
+    fn safe_relative_path(path: &Path) -> bool {
+        !path.as_os_str().is_empty()
+            && path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+    }
+
+    fn relative_snapshot_path(root: &Path, path: &Path) -> Option<String> {
+        let relative = path.strip_prefix(root).ok()?;
+        Self::safe_relative_path(relative).then(|| relative.to_string_lossy().into_owned())
+    }
+
+    fn host_path_for_inode(data: &InodeData) -> io::Result<PathBuf> {
+        let volfs =
+            CString::new(format!("/.vol/{}/{}", data.dev, data.ino)).map_err(|_| einval())?;
+        let st = lstat(&volfs, false)?;
+        let mut flags = libc::O_RDONLY | libc::O_CLOEXEC;
+        if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            flags |= libc::O_SYMLINK;
+        }
+        // SAFETY: `volfs` is NUL-terminated and the return value is checked.
+        let fd = unsafe { libc::open(volfs.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor was opened above and is uniquely owned here.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let mut buf = vec![0_u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf` for a valid fd.
+        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful F_GETPATH always writes a NUL-terminated path.
+        let path = unsafe { CStr::from_ptr(buf.as_ptr().cast()) };
+        Ok(PathBuf::from(OsStr::from_bytes(path.to_bytes())))
+    }
+
+    fn restore_inode_identity(&self, snap: &FuseInodeSnap) -> Option<(i32, u64)> {
+        if let Some(relative) = snap.relative_path.as_deref() {
+            let relative = Path::new(relative);
+            if !Self::safe_relative_path(relative) {
+                warn!("fs restore: rejecting unsafe relative inode path {relative:?}");
+                return None;
+            }
+            let root = std::fs::canonicalize(&self.cfg.root_dir)
+                .unwrap_or_else(|_| PathBuf::from(&self.cfg.root_dir));
+            let path = root.join(relative);
+            let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
+            let st = match lstat(&cpath, false) {
+                Ok(st) => st,
+                Err(error) => {
+                    warn!("fs restore: lstat {} failed: {error}", path.display());
+                    return None;
+                }
+            };
+            return Some((st.st_dev, st.st_ino));
+        }
+
+        // Same-host compatibility for snapshots created before relative paths.
+        let rest = snap.path.strip_prefix("/.vol/").unwrap_or(&snap.path);
+        match rest.split_once('/') {
+            Some((dev, inode)) => match (dev.parse::<i32>(), inode.parse::<u64>()) {
+                (Ok(dev), Ok(inode)) => Some((dev, inode)),
+                _ => None,
+            },
+            None => None,
+        }
+    }
+
     pub fn new(cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<PassthroughFs> {
         let root = CString::new(cfg.root_dir.as_str()).expect("CString::new failed");
 
@@ -656,12 +728,18 @@ impl PassthroughFs {
         let mut inode_snaps = Vec::new();
         {
             let inodes = self.inodes.read().unwrap();
+            let root = std::fs::canonicalize(&self.cfg.root_dir).ok();
             for (nodeid, data) in inodes.iter() {
                 if *nodeid == fuse::ROOT_ID {
                     continue;
                 }
                 inode_snaps.push(FuseInodeSnap {
                     nodeid: *nodeid,
+                    relative_path: root.as_deref().and_then(|root| {
+                        Self::host_path_for_inode(data)
+                            .ok()
+                            .and_then(|path| Self::relative_snapshot_path(root, &path))
+                    }),
                     // Encode the volfs identity this passthrough already uses;
                     // `restore` parses (dev, ino) back out of it.
                     path: format!("/.vol/{}/{}", data.dev, data.ino),
@@ -709,14 +787,8 @@ impl PassthroughFs {
         {
             let mut inodes = self.inodes.write().unwrap();
             for snap in &state.inodes {
-                // `path` is "/.vol/{dev}/{ino}" (see `snapshot`); recover (dev, ino).
-                let rest = snap.path.strip_prefix("/.vol/").unwrap_or(&snap.path);
-                let (dev, ino) = match rest.split_once('/') {
-                    Some((d, i)) => match (d.parse::<i32>(), i.parse::<u64>()) {
-                        (Ok(d), Ok(i)) => (d, i),
-                        _ => continue,
-                    },
-                    None => continue,
+                let Some((dev, ino)) = self.restore_inode_identity(snap) else {
+                    continue;
                 };
                 inodes.insert(
                     snap.nodeid,

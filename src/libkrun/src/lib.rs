@@ -19,6 +19,7 @@ use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualE
 use libc::{c_char, c_int, size_t};
 use once_cell::sync::Lazy;
 use polly::event_manager::EventManager;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::convert::TryInto;
@@ -83,6 +84,35 @@ use krun_input::{InputConfigBackend, InputEventProviderBackend};
 const KRUN_SUCCESS: i32 = 0;
 // Maximum number of arguments/environment variables we allow
 const MAX_ARGS: usize = 4096;
+
+thread_local! {
+    // `krun_start_enter` and its error consumer run on the same thread. A
+    // thread-local buffer avoids cross-talk when several VMs start in parallel.
+    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+}
+
+fn set_last_error(message: impl Into<String>) {
+    let message = message.into();
+    let value = CString::new(message)
+        .unwrap_or_else(|_| CString::new("libkrun error contained an interior NUL byte").unwrap());
+    LAST_ERROR.with(|slot| *slot.borrow_mut() = Some(value));
+}
+
+fn clear_last_error() {
+    LAST_ERROR.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Returns a thread-local description of the most recent libkrun failure.
+/// The pointer remains valid until the next libkrun call that updates it on
+/// this thread and must not be freed by the caller.
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_get_last_error() -> *const c_char {
+    LAST_ERROR.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map_or(std::ptr::null(), |message| message.as_ptr())
+    })
+}
 /// Maximum number of virtqueues allowed by virtio spec (16-bit queue index: 0-65535)
 #[cfg(feature = "vhost-user")]
 const VIRTIO_MAX_QUEUES: usize = 65536;
@@ -634,6 +664,13 @@ fn handle_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
             .create_new(true)
             .open(&memory_partial)
             .map_err(|error| format!("create memory image: {error}"))?;
+        #[cfg(unix)]
+        let (checkpoint, descs) = vmm
+            .lock()
+            .unwrap()
+            .checkpoint_frozen_sparse(&mut memory)
+            .map_err(|error| format!("capture VM: {error}"))?;
+        #[cfg(not(unix))]
         let (checkpoint, descs) = vmm
             .lock()
             .unwrap()
@@ -884,7 +921,11 @@ fn build_restore_ctx(
         let checkpoint =
             std::fs::read(dir.join("checkpoint.bin")).map_err(|e| format!("checkpoint: {e}"))?;
         let memory_path = dir.join("memory.bin");
-        let memory_file = std::fs::File::open(&memory_path).map_err(|e| format!("memory: {e}"))?;
+        let memory_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&memory_path)
+            .map_err(|e| format!("memory: {e}"))?;
         let actual_memory_len = memory_file
             .metadata()
             .map_err(|e| format!("memory metadata: {e}"))?
@@ -895,9 +936,18 @@ fn build_restore_ctx(
                 "memory: image length {actual_memory_len} does not match manifest {expected_memory_len}"
             ));
         }
-        let mut memory_reader = std::io::BufReader::new(memory_file);
-        let guest_memory = vmm::snapshot::load_guest_memory(&descs, &mut memory_reader)
-            .map_err(|e| format!("load guest memory: {e}"))?;
+        #[cfg(unix)]
+        let guest_memory = vmm::snapshot::map_guest_memory_file(&descs, &memory_file)
+            .map_err(|e| format!("map guest memory: {e}"))?;
+        // Windows cannot unlink a live file mapping when smolvm consumes the
+        // one-shot checkpoint after restore, so retain the eager owned-memory
+        // fallback there.
+        #[cfg(windows)]
+        let guest_memory = {
+            let mut memory_reader = std::io::BufReader::new(memory_file);
+            vmm::snapshot::load_guest_memory(&descs, &mut memory_reader)
+                .map_err(|e| format!("load guest memory: {e}"))?
+        };
         return Ok(vmm::builder::RestoreCtx {
             guest_memory,
             fork_backed_regions: vec![true; descs.len()],
@@ -1037,6 +1087,17 @@ fn handle_control_stream<S: std::io::Read + std::io::Write>(
 #[cfg(test)]
 mod control_command_tests {
     use super::*;
+
+    #[test]
+    fn last_error_is_thread_local_and_copied_as_c_string() {
+        clear_last_error();
+        assert!(krun_get_last_error().is_null());
+        set_last_error("checkpoint restore failed");
+        let message = unsafe { CStr::from_ptr(krun_get_last_error()) };
+        assert_eq!(message.to_bytes(), b"checkpoint restore failed");
+        clear_last_error();
+        assert!(krun_get_last_error().is_null());
+    }
 
     #[test]
     fn control_commands_are_complete_and_bounded() {
@@ -1282,6 +1343,59 @@ pub extern "C" fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -
     }
 
     KRUN_SUCCESS
+}
+
+/// Select a stable virtual CPU contract for live migration.
+///
+/// This is deliberately explicit instead of changing libkrun's host-feature
+/// default for every embedder. Callers that need portable checkpoints opt the
+/// VM into the stable profile before `krun_start_enter`.
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_set_cpu_template(ctx_id: u32, cpu_template: u32) -> i32 {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let template = match cpu_template {
+        1 => vmm::vmm_config::machine_config::CpuFeaturesTemplate::PortableV1,
+        _ => return -libc::EINVAL,
+    };
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        // PortableV1 is an Intel architectural contract. Applying its model
+        // and MSR expectations to AMD would make a checkpoint look portable
+        // when it is not; leave those VMs on libkrun's host CPU contract.
+        let leaf = std::arch::x86_64::__cpuid(0);
+        let mut vendor = [0_u8; 12];
+        vendor[..4].copy_from_slice(&leaf.ebx.to_le_bytes());
+        vendor[4..8].copy_from_slice(&leaf.edx.to_le_bytes());
+        vendor[8..].copy_from_slice(&leaf.ecx.to_le_bytes());
+        if &vendor != b"GenuineIntel" {
+            return -libc::ENOTSUP;
+        }
+    }
+
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let _ = (ctx_id, cpu_template);
+        -libc::ENOTSUP
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let current = ctx_cfg.get().vmr.vm_config();
+            let vm_config = VmConfig {
+                vcpu_count: current.vcpu_count,
+                mem_size_mib: current.mem_size_mib,
+                ht_enabled: current.ht_enabled,
+                cpu_template: Some(template),
+            };
+            if ctx_cfg.get_mut().vmr.set_vm_config(&vm_config).is_err() {
+                return -libc::EINVAL;
+            }
+            KRUN_SUCCESS
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -3852,6 +3966,7 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
 #[unsafe(no_mangle)]
 #[allow(unreachable_code)]
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+    clear_last_error();
     #[cfg(target_os = "linux")]
     {
         let prname = match env::var("HOSTNAME") {
@@ -3883,6 +3998,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         Ok(em) => em,
         Err(e) => {
             error!("Unable to create EventManager: {e:?}");
+            set_last_error(format!("unable to create event manager: {e:?}"));
             return -libc::EINVAL;
         }
     };
@@ -4006,6 +4122,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             Ok(rc) => Some(rc),
             Err(e) => {
                 error!("fork restore from {}: {e}", dir.display());
+                set_last_error(format!("restore checkpoint from {}: {e}", dir.display()));
                 return -libc::EINVAL;
             }
         },
@@ -4025,6 +4142,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         Ok(vmm) => vmm,
         Err(e) => {
             error!("Building the microVM failed: {e:?}");
+            set_last_error(format!("build microVM: {e}"));
             return -libc::EINVAL;
         }
     };

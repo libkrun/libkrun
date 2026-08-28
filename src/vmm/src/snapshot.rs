@@ -14,7 +14,15 @@
 //! paused-vCPU register state (`vstate` save_state), and the virtio device
 //! state (`devices::virtio::persist`). See [`SnapshotManifest`] for the layout.
 
+#[cfg(unix)]
+use std::fs::File;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::{Seek, SeekFrom};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::FileExt;
 
 use vm_memory::{Address, FileOffset, GuestAddress, GuestMemory, GuestMemoryRegion};
 
@@ -36,6 +44,93 @@ pub struct MemoryRegionDesc {
     pub gpa: u64,
     /// Region length in bytes.
     pub len: u64,
+}
+
+/// A file writer that preserves zero guest-memory pages as filesystem holes.
+///
+/// Durable checkpoints have a fixed logical memory layout, so restore still
+/// sees the exact byte stream described by [`MemoryRegionDesc`]. Avoiding
+/// physical writes for zero pages keeps the intermediate image sparse and lets
+/// the tar/zstd packer skip those pages instead of compressing configured RAM
+/// that the guest never touched.
+#[cfg(unix)]
+pub struct SparseFileWriter<'a> {
+    file: &'a mut File,
+    logical_offset: u64,
+}
+
+#[cfg(unix)]
+impl<'a> SparseFileWriter<'a> {
+    const PAGE_SIZE: usize = 4096;
+
+    /// Wrap a newly-created or otherwise positionable memory image.
+    pub fn new(file: &'a mut File) -> io::Result<Self> {
+        let logical_offset = file.stream_position()?;
+        Ok(Self {
+            file,
+            logical_offset,
+        })
+    }
+
+    /// Publish the final logical length, including a trailing run of holes.
+    pub fn finish(self) -> io::Result<()> {
+        self.file.set_len(self.logical_offset)
+    }
+
+    fn page_end(base_offset: u64, index: usize, len: usize) -> usize {
+        let absolute = base_offset + index as u64;
+        let remaining_in_page = Self::PAGE_SIZE - absolute as usize % Self::PAGE_SIZE;
+        index.saturating_add(remaining_in_page).min(len)
+    }
+
+    fn is_zero(bytes: &[u8]) -> bool {
+        static ZERO_PAGE: [u8; SparseFileWriter::PAGE_SIZE] = [0; SparseFileWriter::PAGE_SIZE];
+        debug_assert!(bytes.len() <= ZERO_PAGE.len());
+        bytes == &ZERO_PAGE[..bytes.len()]
+    }
+}
+
+#[cfg(unix)]
+impl Write for SparseFileWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let base_offset = self.logical_offset;
+        let final_offset = base_offset
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memory image too large"))?;
+        let mut index = 0;
+
+        while index < bytes.len() {
+            let zero =
+                Self::is_zero(&bytes[index..Self::page_end(base_offset, index, bytes.len())]);
+            let run_start = index;
+            index = Self::page_end(base_offset, index, bytes.len());
+
+            while index < bytes.len() {
+                let page_end = Self::page_end(base_offset, index, bytes.len());
+                if Self::is_zero(&bytes[index..page_end]) != zero {
+                    break;
+                }
+                index = page_end;
+            }
+
+            let run = &bytes[run_start..index];
+            if zero {
+                let distance = i64::try_from(run.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "memory hole too large")
+                })?;
+                self.file.seek(SeekFrom::Current(distance))?;
+            } else {
+                self.file.write_all(run)?;
+            }
+        }
+
+        self.logical_offset = final_offset;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
 }
 
 /// Serialize all guest-memory regions to `out`, returning the region layout the
@@ -66,6 +161,147 @@ pub fn write_guest_memory<W: Write>(
         });
     }
     Ok(descs)
+}
+
+/// Serialize guest memory into a sparse file using backing-file extents when
+/// they are available.
+///
+/// Forkable RAM is already backed by a sparse file. Reading only its allocated
+/// extents avoids scanning untouched logical RAM while the VM is paused. An
+/// anonymous region, or a filesystem without sparse-seek support, falls back to
+/// the page-aware content writer so the output format remains identical.
+#[cfg(unix)]
+pub fn write_guest_memory_sparse(
+    mem: &GuestMemoryMmap,
+    out: &mut File,
+) -> io::Result<Vec<MemoryRegionDesc>> {
+    let mut descs = Vec::new();
+    let mut output_offset = out.stream_position()?;
+
+    for region in mem.iter() {
+        let gpa = region.start_addr();
+        let len = region.len();
+        let copied_from_backing = copy_region_backing_extents(region, out, output_offset)?;
+        if !copied_from_backing {
+            out.seek(SeekFrom::Start(output_offset))?;
+            let host = mem
+                .get_host_address(gpa)
+                .map_err(|e| io::Error::other(format!("get_host_address: {e:?}")))?;
+            // Safety: identical to `write_guest_memory`: this region owns `len`
+            // stable bytes and the caller has frozen the VM.
+            let bytes = unsafe { std::slice::from_raw_parts(host as *const u8, len as usize) };
+            let mut sparse = SparseFileWriter::new(out)?;
+            sparse.write_all(bytes)?;
+            sparse.finish()?;
+        }
+        descs.push(MemoryRegionDesc {
+            gpa: gpa.raw_value(),
+            len,
+        });
+        output_offset = output_offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memory image too large"))?;
+    }
+
+    out.set_len(output_offset)?;
+    out.seek(SeekFrom::Start(output_offset))?;
+    Ok(descs)
+}
+
+#[cfg(target_os = "linux")]
+fn copy_region_backing_extents<R: GuestMemoryRegion>(
+    region: &R,
+    out: &mut File,
+    output_offset: u64,
+) -> io::Result<bool> {
+    let Some(file_offset) = region.file_offset() else {
+        return Ok(false);
+    };
+    let backing = file_offset.file();
+    let backing_start = file_offset.start();
+    let backing_end = backing_start
+        .checked_add(region.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memory region too large"))?;
+    let mut cursor = backing_start;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+
+    while cursor < backing_end {
+        let seek_offset = i64::try_from(cursor).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "memory backing offset exceeds the host off_t range",
+            )
+        })?;
+        // Safety: the fd remains owned by the live guest-memory region and the
+        // converted offset fits the platform off_t.
+        let data_offset = unsafe { libc::lseek(backing.as_raw_fd(), seek_offset, libc::SEEK_DATA) };
+        if data_offset < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            if error.raw_os_error() == Some(libc::EINVAL)
+                || error.raw_os_error() == Some(libc::ENOTSUP)
+            {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        let data = data_offset as u64;
+        if data >= backing_end {
+            break;
+        }
+        if data < cursor {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "memory backing data extent moved backwards",
+            ));
+        }
+
+        // Safety: `data` came from lseek and is therefore a valid off_t.
+        let hole = unsafe { libc::lseek(backing.as_raw_fd(), data_offset, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let extent_end = (hole as u64).min(backing_end);
+        if extent_end <= data {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "memory backing extent did not advance",
+            ));
+        }
+
+        let relative = data - backing_start;
+        let destination = output_offset.checked_add(relative).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "memory image offset overflow")
+        })?;
+        out.seek(SeekFrom::Start(destination))?;
+        let mut source_offset = data;
+        while source_offset < extent_end {
+            let wanted = (extent_end - source_offset).min(buffer.len() as u64) as usize;
+            let read = backing.read_at(&mut buffer[..wanted], source_offset)?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "memory backing changed during checkpoint",
+                ));
+            }
+            out.write_all(&buffer[..read])?;
+            source_offset += read as u64;
+        }
+        cursor = extent_end;
+    }
+
+    Ok(true)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn copy_region_backing_extents<R: GuestMemoryRegion>(
+    _region: &R,
+    _out: &mut File,
+    _output_offset: u64,
+) -> io::Result<bool> {
+    Ok(false)
 }
 
 /// Load guest-memory bytes from `inp` back into `mem`, using the region layout
@@ -138,6 +374,60 @@ pub fn load_guest_memory<R: Read>(
         ));
     }
     Ok(memory)
+}
+
+/// Map a complete memory image as the writable backing for guest RAM.
+///
+/// Unlike [`load_guest_memory`], this does not touch every configured byte at
+/// restore time. Sparse holes remain holes and pages enter the host working set
+/// only when the resumed guest accesses them. Each region retains a
+/// [`FileOffset`], allowing a Linux restore to become a fork source without an
+/// additional full-RAM materialization pass.
+#[cfg(unix)]
+pub fn map_guest_memory_file(
+    descs: &[MemoryRegionDesc],
+    file: &File,
+) -> io::Result<GuestMemoryMmap> {
+    if descs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot contains no guest-memory regions",
+        ));
+    }
+
+    let mut offset = 0_u64;
+    let ranges = descs
+        .iter()
+        .map(|desc| {
+            let len = usize::try_from(desc.len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "guest-memory region does not fit host address space",
+                )
+            })?;
+            if len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "zero-length guest-memory region",
+                ));
+            }
+            let region_offset = offset;
+            offset = offset.checked_add(desc.len).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "guest-memory image offset overflow",
+                )
+            })?;
+            Ok((
+                GuestAddress(desc.gpa),
+                len,
+                Some(FileOffset::new(file.try_clone()?, region_offset)),
+            ))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    GuestMemoryMmap::from_ranges_with_files(ranges)
+        .map_err(|error| io::Error::other(format!("map guest memory image: {error:?}")))
 }
 
 /// Total byte length of all regions in a descriptor list (the size of the
@@ -278,7 +568,7 @@ pub fn cow_clone_guest_memory(parent: &GuestMemoryMmap) -> std::io::Result<Guest
 
         // Safety: `ptr` is a live mapping of `size` bytes we just created; the
         // resulting MmapRegion takes ownership and munmaps it on drop.
-        let mmap_region = unsafe { MmapRegion::build_raw(ptr as *mut u8, size, prot, flags) }
+        let mmap_region = unsafe { MmapRegion::build_raw_owned(ptr as *mut u8, size, prot, flags) }
             .map_err(|e| io_err(format!("build_raw: {e:?}")))?;
         let guest_region = GuestRegionMmap::new(mmap_region, gpa)
             .ok_or_else(|| io_err("guest region address overflow".to_string()))?;
@@ -418,7 +708,7 @@ pub fn open_cow_memory_from_pid(
         if ptr == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        let mmap_region = unsafe { MmapRegion::build_raw(ptr as *mut u8, size, prot, flags) }
+        let mmap_region = unsafe { MmapRegion::build_raw_owned(ptr as *mut u8, size, prot, flags) }
             .map_err(|e| io_err(format!("build_raw: {e:?}")))?;
         let guest_region = GuestRegionMmap::new(mmap_region, GuestAddress(d.gpa))
             .ok_or_else(|| io_err("guest region address overflow".to_string()))?;
@@ -473,7 +763,7 @@ pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<Guest
         if ptr == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        let mmap_region = unsafe { MmapRegion::build_raw(ptr as *mut u8, size, prot, flags) }
+        let mmap_region = unsafe { MmapRegion::build_raw_owned(ptr as *mut u8, size, prot, flags) }
             .map_err(|e| io_err(format!("build_raw: {e:?}")))?;
         let guest_region = GuestRegionMmap::new(mmap_region, GuestAddress(d.gpa))
             .ok_or_else(|| io_err("guest region address overflow".to_string()))?;
@@ -625,7 +915,162 @@ pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<Guest
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::fs::{self, OpenOptions};
+    #[cfg(unix)]
+    use std::io::SeekFrom;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+    #[cfg(unix)]
+    #[test]
+    fn sparse_file_snapshot_preserves_multi_region_bytes_and_holes() {
+        const REGION_SIZE: usize = 2 * 1024 * 1024;
+        let regions = [
+            (GuestAddress(0), REGION_SIZE),
+            (GuestAddress(0x40_0000), REGION_SIZE),
+        ];
+        let src = GuestMemoryMmap::from_ranges(&regions).unwrap();
+        src.write_slice(&[0xA5; 4096], GuestAddress(4096)).unwrap();
+        src.write_slice(&[0x5A; 4096], GuestAddress(0x18_0000))
+            .unwrap();
+
+        let mut expected = Vec::new();
+        let expected_descs = write_guest_memory(&src, &mut expected).unwrap();
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "libkrun-sparse-memory-{}-{nonce}",
+            std::process::id()
+        ));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let descs = {
+            let mut writer = SparseFileWriter::new(&mut file).unwrap();
+            let descs = write_guest_memory(&src, &mut writer).unwrap();
+            writer.finish().unwrap();
+            descs
+        };
+        file.sync_all().unwrap();
+
+        assert_eq!(descs, expected_descs);
+        let metadata = file.metadata().unwrap();
+        assert_eq!(metadata.len(), expected.len() as u64);
+        assert!(
+            metadata.blocks() * 512 < metadata.len() / 4,
+            "sparse memory image allocated {} bytes for {} logical bytes",
+            metadata.blocks() * 512,
+            metadata.len()
+        );
+
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut actual = Vec::new();
+        file.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+
+        let restored = GuestMemoryMmap::from_ranges(&regions).unwrap();
+        read_guest_memory_into(&restored, &descs, &mut actual.as_slice()).unwrap();
+        let mut low = vec![0; REGION_SIZE];
+        let mut high = vec![0; REGION_SIZE];
+        restored.read_slice(&mut low, GuestAddress(0)).unwrap();
+        restored
+            .read_slice(&mut high, GuestAddress(0x40_0000))
+            .unwrap();
+        assert_eq!(&low[4096..8192], &[0xA5; 4096]);
+        assert_eq!(&low[0x18_0000..0x18_1000], &[0x5A; 4096]);
+        assert!(high.iter().all(|byte| *byte == 0));
+
+        drop(file);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_snapshot_uses_file_backing_extents_and_anonymous_fallback() {
+        use crate::builder::create_guest_ram_memfd;
+
+        const FILE_REGION_SIZE: usize = 64 * 1024 * 1024;
+        const ANON_REGION_SIZE: usize = 2 * 1024 * 1024;
+        const ANON_GPA: u64 = 0x0800_0000;
+        let backing = create_guest_ram_memfd(FILE_REGION_SIZE).unwrap();
+        let memory = GuestMemoryMmap::from_ranges_with_files(&[
+            (
+                GuestAddress(0),
+                FILE_REGION_SIZE,
+                Some(FileOffset::new(backing, 0)),
+            ),
+            (GuestAddress(ANON_GPA), ANON_REGION_SIZE, None),
+        ])
+        .unwrap();
+        memory
+            .write_slice(&[0xA5; 4096], GuestAddress(4096))
+            .unwrap();
+        memory
+            .write_slice(&[0x5A; 4096], GuestAddress(32 * 1024 * 1024))
+            .unwrap();
+        memory
+            .write_slice(&[0xC3; 4096], GuestAddress(ANON_GPA + 8192))
+            .unwrap();
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "libkrun-sparse-extents-{}-{nonce}",
+            std::process::id()
+        ));
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let descs = write_guest_memory_sparse(&memory, &mut output).unwrap();
+        output.sync_all().unwrap();
+
+        assert_eq!(descs.len(), 2);
+        let metadata = output.metadata().unwrap();
+        assert_eq!(metadata.len(), (FILE_REGION_SIZE + ANON_REGION_SIZE) as u64);
+        assert!(
+            metadata.blocks() * 512 < metadata.len() / 4,
+            "extent copy allocated {} bytes for {} logical bytes",
+            metadata.blocks() * 512,
+            metadata.len()
+        );
+
+        output.seek(SeekFrom::Start(0)).unwrap();
+        let restored = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), FILE_REGION_SIZE),
+            (GuestAddress(ANON_GPA), ANON_REGION_SIZE),
+        ])
+        .unwrap();
+        read_guest_memory_into(&restored, &descs, &mut output).unwrap();
+        let mut page = [0_u8; 4096];
+        restored.read_slice(&mut page, GuestAddress(4096)).unwrap();
+        assert_eq!(page, [0xA5; 4096]);
+        restored
+            .read_slice(&mut page, GuestAddress(32 * 1024 * 1024))
+            .unwrap();
+        assert_eq!(page, [0x5A; 4096]);
+        restored
+            .read_slice(&mut page, GuestAddress(ANON_GPA + 8192))
+            .unwrap();
+        assert_eq!(page, [0xC3; 4096]);
+
+        drop(output);
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn test_guest_memory_snapshot_roundtrip_single_region() {
@@ -874,5 +1319,54 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_memory_image_is_file_backed_and_forkable() {
+        use crate::builder::create_guest_ram_memfd;
+        use std::os::unix::fs::FileExt;
+
+        let descs = [
+            MemoryRegionDesc {
+                gpa: 0,
+                len: 0x2000,
+            },
+            MemoryRegionDesc {
+                gpa: 0x10_0000,
+                len: 0x1000,
+            },
+        ];
+        let file = create_guest_ram_memfd(0x3000).expect("memory image");
+        file.write_all_at(&[0xA5; 0x2000], 0).unwrap();
+        file.write_all_at(&[0x5A; 0x1000], 0x2000).unwrap();
+
+        let memory = map_guest_memory_file(&descs, &file).expect("map memory image");
+        let regions = memory.iter().collect::<Vec<_>>();
+        assert_eq!(regions[0].file_offset().unwrap().start(), 0);
+        assert_eq!(regions[1].file_offset().unwrap().start(), 0x2000);
+
+        let mut low = [0_u8; 16];
+        let mut high = [0_u8; 16];
+        memory.read_slice(&mut low, GuestAddress(0)).unwrap();
+        memory
+            .read_slice(&mut high, GuestAddress(0x10_0000))
+            .unwrap();
+        assert_eq!(low, [0xA5; 16]);
+        assert_eq!(high, [0x5A; 16]);
+
+        memory.write_slice(&[0x11; 16], GuestAddress(0)).unwrap();
+        let mut backing = [0_u8; 16];
+        file.read_exact_at(&mut backing, 0).unwrap();
+        assert_eq!(backing, [0x11; 16]);
+
+        let child = cow_clone_guest_memory(&memory).expect("CoW child");
+        child.read_slice(&mut low, GuestAddress(0)).unwrap();
+        assert_eq!(low, [0x11; 16]);
+        child.write_slice(&[0x22; 16], GuestAddress(0)).unwrap();
+        memory.read_slice(&mut low, GuestAddress(0)).unwrap();
+        assert_eq!(low, [0x11; 16]);
+        file.read_exact_at(&mut backing, 0).unwrap();
+        assert_eq!(backing, [0x11; 16]);
     }
 }

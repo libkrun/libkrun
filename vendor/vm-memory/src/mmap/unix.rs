@@ -306,6 +306,24 @@ impl<B: NewBitmap> MmapRegion<B> {
             .with_mmap_flags(flags)
             .build()
     }
+
+    /// Creates an `MmapRegion` from an existing mapping and takes ownership of
+    /// it, so dropping the region calls `munmap`.
+    ///
+    /// # Safety
+    ///
+    /// `addr` and `size` must describe a live, page-aligned mapping created by
+    /// the caller. No other owner may unmap it after ownership is transferred.
+    pub unsafe fn build_raw_owned(
+        addr: *mut u8,
+        size: usize,
+        prot: i32,
+        flags: i32,
+    ) -> Result<Self> {
+        let mut region = unsafe { Self::build_raw(addr, size, prot, flags)? };
+        region.owned = true;
+        Ok(region)
+    }
 }
 
 impl<B: Bitmap> MmapRegion<B> {
@@ -615,6 +633,21 @@ mod tests {
         assert_eq!(r.prot(), libc::PROT_READ | libc::PROT_WRITE);
         assert_eq!(r.flags(), libc::MAP_NORESERVE | libc::MAP_PRIVATE);
         assert!(!r.owned());
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn test_mmap_region_build_raw_owned() {
+        let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let prot = libc::PROT_READ | libc::PROT_WRITE;
+        let flags = libc::MAP_ANONYMOUS | libc::MAP_PRIVATE;
+        let addr = unsafe { libc::mmap(std::ptr::null_mut(), size, prot, flags, -1, 0) };
+        assert_ne!(addr, libc::MAP_FAILED);
+
+        let region = unsafe {
+            MmapRegion::build_raw_owned(addr as *mut u8, size, prot, flags).unwrap()
+        };
+        assert!(region.owned());
     }
 
     #[test]
