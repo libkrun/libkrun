@@ -159,6 +159,7 @@ pub struct VirtioGpu {
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackendInstance,
+    last_presented: BTreeMap<u32, Vec<u8>>,
 }
 
 impl VirtioGpu {
@@ -583,6 +584,7 @@ impl VirtioGpu {
             scanouts: Default::default(),
             displays,
             display_backend,
+            last_presented: BTreeMap::new(),
             #[cfg(target_os = "macos")]
             map_sender,
         }
@@ -786,10 +788,31 @@ impl VirtioGpu {
             log::error!("Failed to read resource {resource_id} for scanout {scanout_id}: {e}");
             return Err(ErrUnspec);
         }
-        self.display_backend
-            .present_frame(scanout_id, frame_id, None)?;
+        // The flip presents too (a page-flipping compositor may never send a
+        // RESOURCE_FLUSH), so it needs the same stale-buffer guard or the
+        // frame dropped by the flush path still reaches the display here.
+        if !Self::frame_is_stale(&mut self.last_presented, resource_id, buffer) {
+            self.display_backend
+                .present_frame(scanout_id, frame_id, None)?;
+        }
 
         Ok(OkNoData)
+    }
+
+    /// True when this resource holds exactly the bytes it held at its last
+    /// present, meaning the guest submitted a buffer it never rendered into.
+    fn frame_is_stale(seen: &mut BTreeMap<u32, Vec<u8>>, resource_id: u32, buffer: &[u8]) -> bool {
+        match seen.get_mut(&resource_id) {
+            Some(prev) if prev == buffer => return true,
+            Some(prev) => {
+                prev.clear();
+                prev.extend_from_slice(buffer);
+            }
+            None => {
+                seen.insert(resource_id, buffer.to_vec());
+            }
+        }
+        false
     }
 
     fn read_2d_resource(
@@ -853,6 +876,17 @@ impl VirtioGpu {
             {
                 log::error!("Failed to read resource {resource_id} for scanout {scanout_id}: {e}");
                 return Err(ErrUnspec);
+            }
+            // A compositor here can run a whole page-flip cycle -- transfer,
+            // set_scanout, flush -- for a buffer it never rendered into. That
+            // buffer still holds its previous frame, which with a 3-deep
+            // swapchain is three frames old, so presenting it walks the display
+            // backwards and the next real frame snaps it forward again.
+            // Re-reading the resource later returns the same bytes, so the
+            // pixels are not merely late: there is nothing to wait for and
+            // nothing new to show.
+            if Self::frame_is_stale(&mut self.last_presented, resource_id, buffer) {
+                continue;
             }
             self.display_backend
                 .present_frame(scanout_id, frame_id, Some(&rect))?
