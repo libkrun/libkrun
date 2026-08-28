@@ -261,7 +261,7 @@ struct RutabagaCapsetInfo {
     pub name: &'static str,
 }
 
-const RUTABAGA_CAPSETS: [RutabagaCapsetInfo; 9] = [
+const RUTABAGA_CAPSETS: [RutabagaCapsetInfo; 10] = [
     RutabagaCapsetInfo {
         capset_id: RUTABAGA_CAPSET_VIRGL,
         component: RutabagaComponentType::VirglRenderer,
@@ -306,6 +306,11 @@ const RUTABAGA_CAPSETS: [RutabagaCapsetInfo; 9] = [
         capset_id: RUTABAGA_CAPSET_GFXSTREAM_COMPOSER,
         component: RutabagaComponentType::Gfxstream,
         name: "gfxstream-composer",
+    },
+    RutabagaCapsetInfo {
+        capset_id: RUTABAGA_CAPSET_APIR,
+        component: RutabagaComponentType::VirglRenderer,
+        name: "apir",
     },
 ];
 
@@ -1273,6 +1278,7 @@ impl RutabagaBuilder {
                 push_capset(RUTABAGA_CAPSET_VIRGL2);
                 push_capset(RUTABAGA_CAPSET_VENUS);
                 push_capset(RUTABAGA_CAPSET_DRM);
+                push_capset(RUTABAGA_CAPSET_APIR);
             }
 
             #[cfg(feature = "gfxstream")]

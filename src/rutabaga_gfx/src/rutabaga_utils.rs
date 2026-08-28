@@ -174,6 +174,7 @@ pub const RUTABAGA_CAPSET_DRM: u32 = 6;
 pub const RUTABAGA_CAPSET_GFXSTREAM_MAGMA: u32 = 7;
 pub const RUTABAGA_CAPSET_GFXSTREAM_GLES: u32 = 8;
 pub const RUTABAGA_CAPSET_GFXSTREAM_COMPOSER: u32 = 9;
+pub const RUTABAGA_CAPSET_APIR: u32 = 10;
 
 /// An error generated while using this crate.
 #[sorted]
