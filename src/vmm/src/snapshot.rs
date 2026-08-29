@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::io::{Seek, SeekFrom};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::FileExt;
@@ -985,6 +985,345 @@ pub fn start_fork_generation_copy(parent: &GuestMemoryMmap) -> io::Result<ForkGe
     })
 }
 
+/// A point-in-time macOS guest-RAM generation being written after the source
+/// VM has resumed. `mach_vm_remap(copy = TRUE)` creates each immutable COW
+/// alias while the VM is quiesced; the worker only materializes those aliases
+/// into files that independent clone processes can map.
+#[cfg(target_os = "macos")]
+pub struct MacForkGenerationCopy {
+    worker: Option<std::thread::JoinHandle<io::Result<MacGenerationOutput>>>,
+}
+
+#[cfg(target_os = "macos")]
+struct MacGenerationOutput {
+    descs: Vec<MemfdRegionDesc>,
+    paths: Vec<std::path::PathBuf>,
+}
+
+/// Files owned by one in-progress macOS generation. Keeping cleanup in a
+/// drop guard covers construction failures, thread-spawn failures, partial
+/// publication, and worker failures without ever unlinking a pre-existing
+/// path.
+#[cfg(target_os = "macos")]
+struct MacGenerationArtifacts {
+    paths: Vec<std::path::PathBuf>,
+    keep: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl MacGenerationArtifacts {
+    fn new() -> Self {
+        Self {
+            paths: Vec::new(),
+            keep: false,
+        }
+    }
+
+    fn own(&mut self, path: std::path::PathBuf) {
+        self.paths.push(path);
+    }
+
+    fn renamed(&mut self, old: &std::path::Path, new: std::path::PathBuf) {
+        let path = self
+            .paths
+            .iter_mut()
+            .find(|path| path.as_path() == old)
+            .expect("published macOS generation file must be owned");
+        *path = new;
+    }
+
+    fn commit(&mut self) {
+        self.keep = true;
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacGenerationArtifacts {
+    fn drop(&mut self) {
+        if !self.keep {
+            for path in &self.paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MacForkGenerationCopy {
+    pub fn finish(mut self) -> io::Result<Vec<MemfdRegionDesc>> {
+        let worker = self
+            .worker
+            .take()
+            .ok_or_else(|| io::Error::other("macOS RAM generation worker already consumed"))?;
+        let output = worker
+            .join()
+            .map_err(|_| io::Error::other("macOS RAM generation worker panicked"))??;
+        Ok(output.descs)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacForkGenerationCopy {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take()
+            && let Ok(Ok(output)) = worker.join()
+        {
+            for path in output.paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct MachCowAlias {
+    address: u64,
+    len: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MachCowAlias {
+    fn drop(&mut self) {
+        const KERN_SUCCESS: i32 = 0;
+        let result = unsafe {
+            mach_vm_deallocate(
+                mach_task_self_,
+                self.address,
+                u64::try_from(self.len).unwrap_or(u64::MAX),
+            )
+        };
+        debug_assert_eq!(result, KERN_SUCCESS, "mach_vm_deallocate failed: {result}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    static mach_task_self_: u32;
+    fn mach_vm_remap(
+        target_task: u32,
+        target_address: *mut u64,
+        size: u64,
+        mask: u64,
+        flags: i32,
+        source_task: u32,
+        source_address: u64,
+        copy: i32,
+        current_protection: *mut i32,
+        maximum_protection: *mut i32,
+        inheritance: i32,
+    ) -> i32;
+    fn mach_vm_deallocate(target_task: u32, address: u64, size: u64) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+fn macos_cow_alias(source: *mut u8, len: usize) -> io::Result<MachCowAlias> {
+    const KERN_SUCCESS: i32 = 0;
+    const VM_FLAGS_ANYWHERE: i32 = 1;
+    const VM_INHERIT_NONE: i32 = 2;
+    let mut address = 0_u64;
+    let mut current_protection = 0_i32;
+    let mut maximum_protection = 0_i32;
+    let result = unsafe {
+        mach_vm_remap(
+            mach_task_self_,
+            &mut address,
+            len as u64,
+            0,
+            VM_FLAGS_ANYWHERE,
+            mach_task_self_,
+            source as u64,
+            1,
+            &mut current_protection,
+            &mut maximum_protection,
+            VM_INHERIT_NONE,
+        )
+    };
+    if result != KERN_SUCCESS {
+        return Err(io::Error::other(format!(
+            "mach_vm_remap(copy=TRUE) failed with kern_return_t {result}"
+        )));
+    }
+    if current_protection & libc::PROT_READ == 0 {
+        unsafe {
+            mach_vm_deallocate(mach_task_self_, address, len as u64);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "macOS RAM generation alias is not readable",
+        ));
+    }
+    Ok(MachCowAlias { address, len })
+}
+
+/// Capture all file-backed guest RAM as immutable Mach COW aliases and begin
+/// materializing those aliases into the snapshot directory. Anonymous device
+/// SHM retains the established fork behavior and is represented as anonymous
+/// clone memory; ordinary guest RAM is always file-backed for a forkable VM.
+#[cfg(target_os = "macos")]
+pub fn start_macos_fork_generation_copy(
+    parent: &GuestMemoryMmap,
+    generation_dir: &std::path::Path,
+) -> io::Result<MacForkGenerationCopy> {
+    struct CopyRegion {
+        alias: MachCowAlias,
+        file: File,
+        partial_path: std::path::PathBuf,
+        final_path: std::path::PathBuf,
+        desc: MemfdRegionDesc,
+    }
+
+    let generation_dir = generation_dir.canonicalize()?;
+    let mut copies = Vec::new();
+    let mut anonymous = Vec::new();
+    let mut artifacts = MacGenerationArtifacts::new();
+    for (index, region) in parent.iter().enumerate() {
+        let gpa = region.start_addr();
+        let len = region.len() as usize;
+        if region.file_offset().is_none() {
+            anonymous.push(MemfdRegionDesc {
+                gpa: gpa.raw_value(),
+                len: region.len(),
+                fd: -1,
+                offset: 0,
+                path: String::new(),
+            });
+            continue;
+        }
+        let source = parent
+            .get_host_address(gpa)
+            .map_err(|error| io::Error::other(format!("guest RAM host address: {error:?}")))?;
+        let alias = macos_cow_alias(source, len)?;
+        let final_path = generation_dir.join(format!("memory-{index}.bin"));
+        let partial_path = generation_dir.join(format!("memory-{index}.bin.partial"));
+        match std::fs::metadata(&final_path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "macOS RAM generation already exists: {}",
+                        final_path.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&partial_path)?;
+        artifacts.own(partial_path.clone());
+        file.set_len(region.len())?;
+        let path = final_path
+            .to_str()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "macOS RAM generation path is not UTF-8",
+                )
+            })?
+            .to_string();
+        copies.push(CopyRegion {
+            alias,
+            file,
+            partial_path,
+            final_path,
+            desc: MemfdRegionDesc {
+                gpa: gpa.raw_value(),
+                len: region.len(),
+                fd: 0,
+                offset: 0,
+                path,
+            },
+        });
+    }
+    if copies.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "guest RAM has no file-backed regions",
+        ));
+    }
+
+    let worker = std::thread::Builder::new()
+        .name("smolvm-macos-ram-generation".to_string())
+        .spawn(move || {
+            const PAGE_SIZE: usize = 16 * 1024;
+            const COPY_CHUNK: usize = 16 * 1024 * 1024;
+            (|| {
+                for copy in &copies {
+                    let source = copy.alias.address as *const u8;
+                    let mut offset = 0_usize;
+                    while offset < copy.alias.len {
+                        let page_len = (copy.alias.len - offset).min(PAGE_SIZE);
+                        let page =
+                            unsafe { std::slice::from_raw_parts(source.add(offset), page_len) };
+                        if page.iter().all(|byte| *byte == 0) {
+                            offset += page_len;
+                            continue;
+                        }
+                        let run_start = offset;
+                        offset += page_len;
+                        while offset < copy.alias.len && offset - run_start < COPY_CHUNK {
+                            let page_len = (copy.alias.len - offset).min(PAGE_SIZE);
+                            let page =
+                                unsafe { std::slice::from_raw_parts(source.add(offset), page_len) };
+                            if page.iter().all(|byte| *byte == 0) {
+                                break;
+                            }
+                            offset += page_len;
+                        }
+                        let mut written = 0_usize;
+                        let wanted = offset - run_start;
+                        while written < wanted {
+                            let count = unsafe {
+                                libc::pwrite(
+                                    copy.file.as_raw_fd(),
+                                    source.add(run_start + written).cast(),
+                                    wanted - written,
+                                    (run_start + written) as libc::off_t,
+                                )
+                            };
+                            if count < 0 {
+                                let error = io::Error::last_os_error();
+                                if error.kind() == io::ErrorKind::Interrupted {
+                                    continue;
+                                }
+                                return Err(error);
+                            }
+                            if count == 0 {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::WriteZero,
+                                    "macOS RAM generation write returned zero",
+                                ));
+                            }
+                            written += count as usize;
+                        }
+                    }
+                    copy.file.sync_all()?;
+                }
+                for copy in &copies {
+                    std::fs::rename(&copy.partial_path, &copy.final_path)?;
+                    artifacts.renamed(&copy.partial_path, copy.final_path.clone());
+                }
+                File::open(&generation_dir)?.sync_all()?;
+                let mut descs = copies
+                    .iter()
+                    .map(|copy| copy.desc.clone())
+                    .collect::<Vec<_>>();
+                descs.extend(anonymous);
+                descs.sort_by_key(|desc| desc.gpa);
+                let paths = copies.iter().map(|copy| copy.final_path.clone()).collect();
+                artifacts.commit();
+                Ok(MacGenerationOutput { descs, paths })
+            })()
+        })?;
+    Ok(MacForkGenerationCopy {
+        worker: Some(worker),
+    })
+}
+
 /// Describes one guest-RAM region for cross-process CoW fork: its guest address,
 /// length, and (for memfd-backed RAM) the owner process's fd number + offset so a
 /// clone can open `/proc/<pid>/fd/<fd>` and `mmap(MAP_PRIVATE)` it. `fd < 0` marks
@@ -1331,6 +1670,126 @@ mod tests {
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mach_cow_worker_materializes_the_capture_boundary_after_source_writes() {
+        const REGION_SIZE: usize = 4 * 1024 * 1024;
+        let backing = crate::builder::create_guest_ram_memfd(REGION_SIZE).unwrap();
+        let memory = GuestMemoryMmap::from_ranges_with_files(&[(
+            GuestAddress(0),
+            REGION_SIZE,
+            Some(FileOffset::new(backing, 0)),
+        )])
+        .unwrap();
+        memory
+            .write_slice(&[0x11; 16 * 1024], GuestAddress(0x4000))
+            .unwrap();
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "libkrun-macos-generation-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let generation = start_macos_fork_generation_copy(&memory, &directory).unwrap();
+        memory
+            .write_slice(&[0xAA; 16 * 1024], GuestAddress(0x4000))
+            .unwrap();
+
+        let descs = generation.finish().unwrap();
+        let clone = open_cow_memory_from_paths(&descs).unwrap();
+        let mut page = [0_u8; 16 * 1024];
+        clone.read_slice(&mut page, GuestAddress(0x4000)).unwrap();
+        assert_eq!(page, [0x11; 16 * 1024]);
+        clone
+            .write_slice(&[0x44; 16 * 1024], GuestAddress(0x4000))
+            .unwrap();
+        memory.read_slice(&mut page, GuestAddress(0x4000)).unwrap();
+        assert_eq!(page, [0xAA; 16 * 1024]);
+
+        drop(clone);
+        drop(memory);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mach_cow_setup_failure_removes_only_generation_files_it_created() {
+        const REGION_SIZE: usize = 4 * 1024 * 1024;
+        let first = crate::builder::create_guest_ram_memfd(REGION_SIZE).unwrap();
+        let second = crate::builder::create_guest_ram_memfd(REGION_SIZE).unwrap();
+        let memory = GuestMemoryMmap::from_ranges_with_files(&[
+            (
+                GuestAddress(0),
+                REGION_SIZE,
+                Some(FileOffset::new(first, 0)),
+            ),
+            (
+                GuestAddress(REGION_SIZE as u64),
+                REGION_SIZE,
+                Some(FileOffset::new(second, 0)),
+            ),
+        ])
+        .unwrap();
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "libkrun-macos-generation-failure-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let collision = directory.join("memory-1.bin");
+        fs::write(&collision, b"existing").unwrap();
+
+        let error = start_macos_fork_generation_copy(&memory, &directory)
+            .err()
+            .expect("the second region must collide");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!directory.join("memory-0.bin.partial").exists());
+        assert_eq!(fs::read(&collision).unwrap(), b"existing");
+
+        drop(memory);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dropping_mach_cow_generation_removes_materialized_files() {
+        const REGION_SIZE: usize = 4 * 1024 * 1024;
+        let backing = crate::builder::create_guest_ram_memfd(REGION_SIZE).unwrap();
+        let memory = GuestMemoryMmap::from_ranges_with_files(&[(
+            GuestAddress(0),
+            REGION_SIZE,
+            Some(FileOffset::new(backing, 0)),
+        )])
+        .unwrap();
+        memory.write_obj(0xAA_u8, GuestAddress(0)).unwrap();
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "libkrun-macos-generation-drop-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+
+        let generation = start_macos_fork_generation_copy(&memory, &directory).unwrap();
+        drop(generation);
+        assert!(!directory.join("memory-0.bin").exists());
+        assert!(!directory.join("memory-0.bin.partial").exists());
+
+        drop(memory);
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]

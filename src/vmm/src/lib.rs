@@ -48,7 +48,10 @@ use windows::vstate;
 
 use std::fmt::{Display, Formatter};
 use std::io;
-#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "blk"))]
+#[cfg(all(
+    feature = "blk",
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+))]
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -352,15 +355,22 @@ pub struct Vmm {
 }
 
 /// RAM ownership returned by a fork-and-continue capture.
-#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "blk"))]
+#[cfg(all(
+    feature = "blk",
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+))]
 pub enum ForkContinueRamGeneration {
-    /// A directly CoW-mappable immutable memfd generation.
-    Memfd(Vec<snapshot::MemfdRegionDesc>),
+    /// A directly CoW-mappable immutable RAM generation.
+    Mapped(Vec<snapshot::MemfdRegionDesc>),
     /// A kernel-COW guardian serving the exact captured address space.
+    #[cfg(target_os = "linux")]
     Guardian(generation_guardian::GenerationGuardian),
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "blk"))]
+#[cfg(all(
+    feature = "blk",
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+))]
 fn publish_generation_commit_marker(path: &std::path::Path) -> io::Result<()> {
     if path.exists() {
         return Err(io::Error::new(
@@ -1225,11 +1235,123 @@ impl Vmm {
                 Error::Snapshot(format!("finish RAM generation worker: {error}"))
             })?;
             self.retained_generation_files = files;
-            ForkContinueRamGeneration::Memfd(descs)
+            ForkContinueRamGeneration::Mapped(descs)
         } else {
-            ForkContinueRamGeneration::Memfd(source_descs)
+            ForkContinueRamGeneration::Mapped(source_descs)
         };
         Ok((checkpoint, generation))
+    }
+
+    /// Capture one immutable macOS RAM + disk generation and immediately
+    /// resume the source. Mach creates point-in-time COW aliases while the VM
+    /// is quiesced; their file materialization proceeds after resume.
+    #[cfg(all(target_os = "macos", feature = "blk"))]
+    pub fn checkpoint_for_fork_continue(
+        &mut self,
+        block_pivots: &[(String, String)],
+        _guardian_socket: Option<&std::path::Path>,
+        commit_marker: &std::path::Path,
+    ) -> Result<(VmCheckpoint, ForkContinueRamGeneration)> {
+        let generation_dir = commit_marker.parent().ok_or_else(|| {
+            Error::Snapshot("fork generation commit marker has no parent".to_string())
+        })?;
+        let source_descs = snapshot::memfd_region_descs(&self.guest_memory);
+        if !has_memfd_backed_memory(&source_descs) {
+            return Err(Error::ForkRequiresMemfd);
+        }
+
+        self.pause()?;
+        self.quiesce_devices();
+        let capture = (|| {
+            let vcpu_states = self.save_vcpu_states()?;
+            let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+            let devices = self.snapshot_devices();
+            let generation_copy =
+                snapshot::start_macos_fork_generation_copy(&self.guest_memory, generation_dir)
+                    .map_err(|error| {
+                        Error::Snapshot(format!("capture macOS RAM generation: {error}"))
+                    })?;
+            let pivot_specs = block_pivots
+                .iter()
+                .map(|(id, path)| device_manager::mmio::BlockPivotSpec {
+                    id: id.clone(),
+                    path: path.clone(),
+                    format: devices::virtio::block::ImageType::Qcow2,
+                })
+                .collect::<Vec<_>>();
+            let disk_rollback = self
+                .mmio_device_manager
+                .pivot_block_devices(&pivot_specs)
+                .map_err(|error| Error::Snapshot(format!("pivot source disks: {error}")))?;
+            Ok((
+                VmCheckpoint {
+                    vm_state,
+                    vcpu_states,
+                    devices,
+                    ioapic: None,
+                },
+                generation_copy,
+                disk_rollback,
+            ))
+        })();
+
+        let (checkpoint, generation_copy, disk_rollback) = match capture {
+            Ok(capture) => capture,
+            Err(capture_error) => {
+                return match self.resume() {
+                    Ok(()) => Err(capture_error),
+                    Err(resume_error) => Err(Error::Snapshot(format!(
+                        "RAM generation capture failed ({capture_error}); source resume failed ({resume_error})"
+                    ))),
+                };
+            }
+        };
+        if let Err(marker_error) = publish_generation_commit_marker(commit_marker) {
+            drop(generation_copy);
+            let rollback_error = self
+                .mmio_device_manager
+                .rollback_block_pivots(disk_rollback)
+                .err();
+            let resume_error = self.resume().err();
+            return Err(Error::Snapshot(format!(
+                "publish fork generation: {marker_error}{}{}",
+                rollback_error
+                    .map(|error| format!("; disk pivot rollback failed: {error}"))
+                    .unwrap_or_default(),
+                resume_error
+                    .map(|error| format!("; source resume failed: {error}"))
+                    .unwrap_or_default()
+            )));
+        }
+        if let Err(resume_error) = self.resume() {
+            drop(generation_copy);
+            let rollback_error = self
+                .mmio_device_manager
+                .rollback_block_pivots(disk_rollback)
+                .err();
+            let marker_cleanup_error = std::fs::remove_file(commit_marker)
+                .err()
+                .filter(|error| error.kind() != io::ErrorKind::NotFound);
+            return Err(match rollback_error {
+                Some(rollback_error) => Error::Snapshot(format!(
+                    "source resume failed ({resume_error}); disk pivot rollback failed ({rollback_error}){}",
+                    marker_cleanup_error
+                        .map(|error| format!("; commit marker cleanup failed: {error}"))
+                        .unwrap_or_default()
+                )),
+                None if marker_cleanup_error.is_none() => resume_error,
+                None => Error::Snapshot(format!(
+                    "source resume failed ({resume_error}); commit marker cleanup failed: {}",
+                    marker_cleanup_error.unwrap()
+                )),
+            });
+        }
+        drop(disk_rollback);
+
+        let descs = generation_copy
+            .finish()
+            .map_err(|error| Error::Snapshot(format!("finish macOS RAM generation: {error}")))?;
+        Ok((checkpoint, ForkContinueRamGeneration::Mapped(descs)))
     }
 
     /// Reapply a successful fork checkpoint and resume the original VM.

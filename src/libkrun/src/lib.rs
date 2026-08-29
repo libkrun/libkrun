@@ -1041,8 +1041,7 @@ fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
 
 #[cfg(all(
     fork_supported,
-    target_os = "linux",
-    target_arch = "x86_64",
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"),
     feature = "blk"
 ))]
 fn read_fork_block_pivots(dir: &std::path::Path) -> std::io::Result<Vec<(String, String)>> {
@@ -1073,12 +1072,11 @@ fn read_fork_block_pivots(dir: &std::path::Path) -> std::io::Result<Vec<(String,
     Ok(pivots)
 }
 
-/// Create an immutable Linux RAM + disk generation while the same source VMM
+/// Create an immutable RAM + disk generation while the same source VMM
 /// continues on private writable layers.
 #[cfg(all(
     fork_supported,
-    target_os = "linux",
-    target_arch = "x86_64",
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"),
     feature = "blk"
 ))]
 fn handle_fork_continue(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
@@ -1100,11 +1098,12 @@ fn handle_fork_continue_paged(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
 
 #[cfg(all(
     fork_supported,
-    target_os = "linux",
-    target_arch = "x86_64",
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"),
     feature = "blk"
 ))]
 fn handle_fork_continue_inner(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, demand_paged: bool) -> String {
+    #[cfg(target_os = "macos")]
+    let _ = demand_paged;
     if dir.is_empty() {
         return "ERR EINVAL fork snapshot dir required\n".to_string();
     }
@@ -1116,7 +1115,10 @@ fn handle_fork_continue_inner(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, demand_page
         Ok(pivots) => pivots,
         Err(error) => return format!("ERR EINVAL read block pivots: {error}\n"),
     };
+    #[cfg(target_os = "linux")]
     let guardian_socket = demand_paged.then(|| dir.join("ram-guardian.sock"));
+    #[cfg(target_os = "macos")]
+    let guardian_socket: Option<std::path::PathBuf> = None;
     let commit_marker = dir.join("source-continues-v1");
     let (checkpoint, generation) = match vmm.lock().unwrap().checkpoint_for_fork_continue(
         &block_pivots,
@@ -1134,7 +1136,7 @@ fn handle_fork_continue_inner(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, demand_page
         return format!("ERR EIO write checkpoint: {error}; source already resumed\n");
     }
     match generation {
-        vmm::ForkContinueRamGeneration::Memfd(descs) => {
+        vmm::ForkContinueRamGeneration::Mapped(descs) => {
             let pid = std::process::id() as i32;
             if let Err(error) = write_fork_manifest(&dir.join("manifest.bin"), pid, &descs) {
                 let _ = std::fs::remove_file(dir.join("checkpoint.bin"));
@@ -1146,6 +1148,7 @@ fn handle_fork_continue_inner(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, demand_page
                 block_pivots.len()
             )
         }
+        #[cfg(target_os = "linux")]
         vmm::ForkContinueRamGeneration::Guardian(guardian) => {
             let desc = guardian.description();
             if let Err(error) = write_guardian_manifest(&dir.join("manifest.bin"), desc) {
@@ -1405,8 +1408,7 @@ fn handle_control_stream<S: std::io::Read + std::io::Write>(
                 "FORK" => handle_fork(vmm, _arg),
                 #[cfg(all(
                     fork_supported,
-                    target_os = "linux",
-                    target_arch = "x86_64",
+                    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"),
                     feature = "blk"
                 ))]
                 "FORK_CONTINUE" => handle_fork_continue(vmm, _arg),
@@ -3273,7 +3275,7 @@ pub unsafe extern "C" fn krun_set_control_socket(ctx_id: u32, c_socket_path: *co
 /// restores VM/device/vCPU state instead of cold-booting. The rest of the
 /// context (rootfs, vsock socket, mem/cpu config) must be configured to match
 /// the golden VM, with fresh host-side resources (a new vsock socket, etc.).
-/// Linux/x86_64 only.
+/// Supported on hosts where libkrun enables VM forking.
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn krun_set_snapshot(ctx_id: u32, c_snapshot_dir: *const c_char) -> i32 {
