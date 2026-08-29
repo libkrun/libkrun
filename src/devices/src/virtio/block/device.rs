@@ -236,6 +236,8 @@ pub struct Block {
     cache_type: CacheType,
     disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
+    direct_io: bool,
+    sync_mode: SyncMode,
     worker_thread: Option<JoinHandle<BlockWorker>>,
     worker_stopfd: EventFd,
     /// A worker reclaimed by [`Self::quiesce_for_snapshot`] (stopped, drained):
@@ -254,6 +256,21 @@ pub struct Block {
     // Implementation specific fields.
     pub(crate) id: String,
     pub(crate) partuuid: Option<String>,
+}
+
+/// A replacement backing image opened and validated before a live block pivot.
+///
+/// This is intentionally opaque outside the block implementation. Preparing
+/// every device first lets the VMM fail without changing any running device.
+pub struct PreparedDiskPivot {
+    disk: DiskProperties,
+    disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+}
+
+/// The previous backing retained until a live block pivot is committed.
+pub struct DiskPivotRollback {
+    disk: DiskProperties,
+    disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
 }
 
 /// Open `path` as the given image format, returning the format accessor together
@@ -429,6 +446,8 @@ impl Block {
             cache_type,
             disk_image,
             disk_image_id,
+            direct_io,
+            sync_mode,
             avail_features,
             acked_features: 0u64,
             device_state: DeviceState::Inactive,
@@ -451,6 +470,93 @@ impl Block {
     /// Specifies if this block device is read only.
     pub fn is_read_only(&self) -> bool {
         self.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0
+    }
+
+    /// Open and validate a writable replacement image for a running device.
+    ///
+    /// The device must already be quiesced. No device state changes until
+    /// [`Self::apply_live_disk_pivot`] is called.
+    pub fn prepare_live_disk_pivot(
+        &self,
+        path: &str,
+        format: ImageType,
+    ) -> io::Result<PreparedDiskPivot> {
+        if self.is_read_only() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("block '{}' is read-only", self.id),
+            ));
+        }
+        if !self.device_state.is_activated()
+            || self.worker_thread.is_some()
+            || self.quiesced_worker.is_none()
+        {
+            return Err(io::Error::other(format!(
+                "block '{}' must be activated and quiesced before a live pivot",
+                self.id
+            )));
+        }
+
+        let relaxed_sync = self.sync_mode == SyncMode::Relaxed;
+        let (disk_image, _discard_alignment) =
+            open_disk_format(path, format, true, self.direct_io, relaxed_sync)?;
+        let disk_image = Arc::new(Mutex::new(disk_image));
+        let disk = DiskProperties::new(
+            Arc::clone(&disk_image),
+            self.disk_image_id.clone(),
+            self.cache_type,
+        )?;
+        let expected_sectors = self.config.capacity;
+        if disk.nsectors() != expected_sectors {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "block '{}' replacement has {} sectors, expected {}",
+                    self.id,
+                    disk.nsectors(),
+                    expected_sectors
+                ),
+            ));
+        }
+        Ok(PreparedDiskPivot { disk, disk_image })
+    }
+
+    /// Atomically replace this quiesced device's backing image.
+    pub fn apply_live_disk_pivot(
+        &mut self,
+        prepared: PreparedDiskPivot,
+    ) -> io::Result<DiskPivotRollback> {
+        if self.worker_thread.is_some() {
+            return Err(io::Error::other(format!(
+                "block '{}' worker is still running",
+                self.id
+            )));
+        }
+        let worker = self.quiesced_worker.as_mut().ok_or_else(|| {
+            io::Error::other(format!("block '{}' has no quiesced worker", self.id))
+        })?;
+        let old_disk = worker.replace_disk(prepared.disk);
+        let old_disk_image = std::mem::replace(&mut self.disk_image, prepared.disk_image);
+        Ok(DiskPivotRollback {
+            disk: old_disk,
+            disk_image: old_disk_image,
+        })
+    }
+
+    /// Restore a backing retained by [`Self::apply_live_disk_pivot`].
+    pub fn rollback_live_disk_pivot(&mut self, rollback: DiskPivotRollback) -> io::Result<()> {
+        if self.worker_thread.is_some() {
+            return Err(io::Error::other(format!(
+                "block '{}' worker is running during pivot rollback",
+                self.id
+            )));
+        }
+        let worker = self.quiesced_worker.as_mut().ok_or_else(|| {
+            io::Error::other(format!("block '{}' has no quiesced worker", self.id))
+        })?;
+        let _discarded_new_disk = worker.replace_disk(rollback.disk);
+        self.disk_image = rollback.disk_image;
+        Ok(())
     }
 }
 
@@ -629,8 +735,8 @@ impl VirtioDevice for Block {
         self.quiesce_worker();
         // Force buffered writes durable so a fork clone's copy-on-write overlay
         // sees a consistent backing image. `DiskProperties::Drop` already does
-        // this, but a forked golden stays frozen (never dropped) while clones
-        // attach overlays over its disk, so it must happen here too.
+        // this, but snapshot quiescence may retain the device or rotate it onto
+        // a new writable layer without dropping it, so it must happen here too.
         if self.cache_type == CacheType::Writeback {
             let img = self.disk_image.lock().unwrap();
             if img.flush().is_err() {

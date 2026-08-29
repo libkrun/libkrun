@@ -590,6 +590,9 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
 /// is the serialized [`VmCheckpoint`] blob (so this type needs no per-arch cfg),
 /// deserialized only on platforms that support restore.
 pub struct RestoreCtx {
+    /// Fault handler for guardian-backed RAM. It must outlive `guest_memory`.
+    #[cfg(target_os = "linux")]
+    pub demand_pager: Option<super::demand_paging::DemandPager>,
     /// Guest RAM for the clone — a CoW clone of the golden VM's memory (Linux
     /// `memfd` `MAP_PRIVATE`) / `vm_remap` (macOS), already holding the image.
     pub guest_memory: GuestMemoryMmap,
@@ -599,6 +602,10 @@ pub struct RestoreCtx {
     pub fork_backed_regions: Vec<bool>,
     /// Serialized `VmCheckpoint` (VM + vCPU + device state).
     pub checkpoint: Vec<u8>,
+    /// Whether restore requires the full portable KVM clock contract. Local
+    /// fork manifests use a same-host compatibility path on KVM versions that
+    /// do not expose realtime/host-TSC samples.
+    pub portable_clock: bool,
 }
 
 pub fn build_microvm(
@@ -623,13 +630,36 @@ pub fn build_microvm(
     // a cloned RestoreCtx until vCPU restore would otherwise keep the complete
     // inherited mapping resident alongside the promoted copy (2x guest RAM).
     let restoring = restore.is_some();
-    let (restore_mem, restore_checkpoint) = match restore {
+    #[cfg(target_os = "linux")]
+    let (restore_mem, restore_checkpoint, restore_demand_pager, restore_portable_clock) =
+        match restore {
+            Some(RestoreCtx {
+                demand_pager,
+                guest_memory,
+                fork_backed_regions,
+                checkpoint,
+                portable_clock,
+            }) => (
+                Some((guest_memory, fork_backed_regions)),
+                Some(checkpoint),
+                demand_pager,
+                portable_clock,
+            ),
+            None => (None, None, None, false),
+        };
+    #[cfg(not(target_os = "linux"))]
+    let (restore_mem, restore_checkpoint, restore_portable_clock) = match restore {
         Some(RestoreCtx {
             guest_memory,
             fork_backed_regions,
             checkpoint,
-        }) => (Some((guest_memory, fork_backed_regions)), Some(checkpoint)),
-        None => (None, None),
+            portable_clock,
+        }) => (
+            Some((guest_memory, fork_backed_regions)),
+            Some(checkpoint),
+            portable_clock,
+        ),
+        None => (None, None, false),
     };
 
     let payload = choose_payload(vm_resources)?;
@@ -1091,7 +1121,20 @@ pub fn build_microvm(
     // We use this atomic to record the exit code set by init/init.c in the VM.
     let exit_code = Arc::new(AtomicI32::new(i32::MAX));
 
+    #[cfg(target_os = "linux")]
+    if let Some(pager) = &restore_demand_pager {
+        pager.install_failure_notifier(
+            exit_evt
+                .try_clone()
+                .map_err(Error::EventFd)
+                .map_err(StartMicrovmError::Internal)?,
+            exit_code.clone(),
+        );
+    }
+
     let mut vmm = Vmm {
+        #[cfg(target_os = "linux")]
+        demand_pager: restore_demand_pager,
         guest_memory,
         arch_memory_info,
         kernel_cmdline,
@@ -1102,6 +1145,8 @@ pub fn build_microvm(
         exit_evt,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "blk"))]
+        retained_generation_files: Vec::new(),
         vm,
         mmio_device_manager,
         #[cfg(not(feature = "tee"))]
@@ -1302,7 +1347,7 @@ pub fn build_microvm(
                     .map_err(StartMicrovmError::GuestMemoryMmap)?;
                 vmm.start_vcpus_paused(vcpus)
                     .map_err(StartMicrovmError::Internal)?;
-                vmm.apply_restore(checkpoint)
+                vmm.apply_restore(checkpoint, restore_portable_clock)
                     .map_err(StartMicrovmError::Internal)?;
                 // Device re-activation signals each device's activate eventfd; the
                 // event manager must process those (registering the RX/TX queue
@@ -1809,7 +1854,8 @@ pub(crate) fn create_guest_ram_memfd(size: usize) -> std::result::Result<File, S
     use std::os::fd::FromRawFd;
     let name = std::ffi::CString::new("smolvm-guest-ram").expect("static name");
     // Safety: passing a valid C string and flags; the returned fd is owned.
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    let fd =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if fd < 0 {
         return Err(format!("memfd_create: {}", std::io::Error::last_os_error()));
     }

@@ -1105,41 +1105,76 @@ impl Vm {
 
         validate_migration_clock_flags(&source.clock, "source")?;
         let destination = self.fd.get_clock().map_err(Error::VmGetClock)?;
+        validate_migration_clock_flags(&destination, "destination")?;
 
         for state in vcpu_states {
             if let Some(tsc) = &mut state.tsc_migration {
-                if destination.flags & KVM_CLOCK_HOST_TSC != 0 {
-                    tsc.offset = rebased_tsc_offset(
-                        tsc.offset,
-                        tsc.khz,
-                        source.clock.clock,
-                        destination.clock,
-                        source.clock.host_tsc,
-                        destination.host_tsc,
-                    );
-                    tsc.apply_offset = true;
-                } else {
-                    // Nested/older KVM can restore realtime kvmclock while
-                    // withholding its internal host-TSC sample. A userspace
-                    // RDTSC is not equivalent under nested virtualization.
-                    // Advance the captured guest TSC by the same kvmclock
-                    // delta and let KVM_SET_MSRS derive the destination offset.
-                    let guest_delta_ns =
-                        i128::from(destination.clock) - i128::from(source.clock.clock);
-                    let tsc_entry = state
-                        .msrs
-                        .as_mut_slice()
-                        .iter_mut()
-                        .find(|entry| entry.index == 0x10)
-                        .ok_or_else(|| {
-                            Error::VmClockMigration(
-                                "portable vCPU state is missing IA32_TSC".to_string(),
-                            )
-                        })?;
-                    tsc_entry.data = advance_tsc(tsc_entry.data, guest_delta_ns, tsc.khz);
-                    tsc.apply_offset = false;
-                }
+                tsc.offset = rebased_tsc_offset(
+                    tsc.offset,
+                    tsc.khz,
+                    source.clock.clock,
+                    destination.clock,
+                    source.clock.host_tsc,
+                    destination.host_tsc,
+                );
+                tsc.apply_offset = true;
             }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    /// Restore clock/TSC state for a same-host checkpoint or fork. Older and
+    /// nested KVM implementations can provide a usable `KVM_GET_CLOCK` value
+    /// while advertising neither `KVM_CLOCK_REALTIME` nor
+    /// `KVM_CLOCK_HOST_TSC`. That is insufficient for portable migration, but
+    /// it is sufficient on the same host: install the captured kvmclock, then
+    /// advance the saved IA32_TSC by the observed guest-clock delta and let
+    /// KVM derive its local TSC offset from the MSR write.
+    pub fn rebase_vcpu_tsc_same_host(
+        &self,
+        source: &VmState,
+        vcpu_states: &mut [VcpuState],
+    ) -> Result<()> {
+        if !vcpu_states
+            .iter()
+            .any(|state| state.tsc_migration.is_some())
+        {
+            return Ok(());
+        }
+
+        let destination = self.fd.get_clock().map_err(Error::VmGetClock)?;
+        let has_full_samples = source.clock.flags & KVM_CLOCK_HOST_TSC != 0
+            && destination.flags & KVM_CLOCK_HOST_TSC != 0;
+
+        for state in vcpu_states {
+            let Some(tsc) = &mut state.tsc_migration else {
+                continue;
+            };
+            if has_full_samples {
+                tsc.offset = rebased_tsc_offset(
+                    tsc.offset,
+                    tsc.khz,
+                    source.clock.clock,
+                    destination.clock,
+                    source.clock.host_tsc,
+                    destination.host_tsc,
+                );
+                tsc.apply_offset = true;
+                continue;
+            }
+
+            let guest_delta_ns = i128::from(destination.clock) - i128::from(source.clock.clock);
+            let tsc_entry = state
+                .msrs
+                .as_mut_slice()
+                .iter_mut()
+                .find(|entry| entry.index == 0x10)
+                .ok_or_else(|| {
+                    Error::VmClockMigration("same-host vCPU state is missing IA32_TSC".to_string())
+                })?;
+            tsc_entry.data = advance_tsc(tsc_entry.data, guest_delta_ns, tsc.khz);
+            tsc.apply_offset = false;
         }
         Ok(())
     }
@@ -2642,6 +2677,12 @@ impl Vcpu {
                         Ok(VcpuEmulation::Handled)
                     }
                     _ => {
+                        #[cfg(target_arch = "x86_64")]
+                        if e.errno() == libc::ENOMEM {
+                            eprintln!(
+                                "ERROR KVM_RUN repeatedly returned ENOMEM after the bounded retry window"
+                            );
+                        }
                         error!("Failure during vcpu run: {e}");
                         Err(Error::VcpuUnhandledKvmExit)
                     }

@@ -578,6 +578,413 @@ pub fn cow_clone_guest_memory(parent: &GuestMemoryMmap) -> std::io::Result<Guest
     GuestMemoryMmap::from_regions(regions).map_err(|e| io_err(format!("from_regions: {e:?}")))
 }
 
+/// Turn the live Linux guest-RAM mappings into private views of their current
+/// memfd contents, then seal those memfds as an immutable fork generation.
+///
+/// The mapping addresses do not change. KVM and every quiesced virtio worker
+/// therefore keep referring to the same host virtual addresses, while future
+/// guest writes are private CoW faults and cannot modify the generation that
+/// restored clones map from `/proc/<pid>/fd/<fd>`.
+///
+/// The VM must be paused and all device workers must be quiesced. Callers must
+/// treat a failure after rebasing begins as non-retryable for that generation;
+/// the source mapping remains valid, but the complete immutable boundary was
+/// not published.
+#[cfg(target_os = "linux")]
+pub fn rebase_guest_memory_private(parent: &GuestMemoryMmap) -> io::Result<()> {
+    struct Backing {
+        host_address: *mut libc::c_void,
+        len: usize,
+        fd: libc::c_int,
+        offset: libc::off_t,
+    }
+
+    let mut backings = Vec::new();
+    for region in parent.iter() {
+        let Some(file_offset) = region.file_offset() else {
+            continue;
+        };
+        let host_address = parent
+            .get_host_address(region.start_addr())
+            .map_err(|error| io::Error::other(format!("guest RAM host address: {error:?}")))?
+            .cast();
+        backings.push(Backing {
+            host_address,
+            len: region.len() as usize,
+            fd: file_offset.file().as_raw_fd(),
+            offset: file_offset.start() as libc::off_t,
+        });
+    }
+    if backings.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "guest RAM has no file-backed regions",
+        ));
+    }
+
+    // Reject old/non-sealable backing before changing any mapping. Forkable
+    // RAM created by current libkrun uses MFD_ALLOW_SEALING.
+    for backing in &backings {
+        let seals = unsafe { libc::fcntl(backing.fd, libc::F_GET_SEALS) };
+        if seals < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if seals & libc::F_SEAL_SEAL != 0 && seals & libc::F_SEAL_WRITE == 0 {
+            return Err(io::Error::other(
+                "guest RAM memfd is sealed against adding the required write seal",
+            ));
+        }
+    }
+
+    // Prevent any new writable shared mapping or write(2) before removing the
+    // source's existing MAP_SHARED views. Existing mappings remain writable
+    // until the MAP_FIXED replacement immediately below.
+    for backing in &backings {
+        let seals = unsafe { libc::fcntl(backing.fd, libc::F_GET_SEALS) };
+        if seals & libc::F_SEAL_FUTURE_WRITE == 0 {
+            let result =
+                unsafe { libc::fcntl(backing.fd, libc::F_ADD_SEALS, libc::F_SEAL_FUTURE_WRITE) };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+
+    for backing in &backings {
+        let mapped = unsafe {
+            libc::mmap(
+                backing.host_address,
+                backing.len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED,
+                backing.fd,
+                backing.offset,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        if mapped != backing.host_address {
+            return Err(io::Error::other(
+                "MAP_FIXED guest RAM rebase returned a different address",
+            ));
+        }
+    }
+
+    // No writable shared mapping remains. Make the fork generation immutable
+    // even to accidental host-side pwrite/ftruncate calls.
+    let immutable_seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+    for backing in &backings {
+        let seals = unsafe { libc::fcntl(backing.fd, libc::F_GET_SEALS) };
+        let missing = immutable_seals & !seals;
+        if missing != 0 {
+            let result = unsafe { libc::fcntl(backing.fd, libc::F_ADD_SEALS, missing) };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    for backing in &backings {
+        let seals = unsafe { libc::fcntl(backing.fd, libc::F_GET_SEALS) };
+        if seals & libc::F_SEAL_SEAL == 0 {
+            let result = unsafe { libc::fcntl(backing.fd, libc::F_ADD_SEALS, libc::F_SEAL_SEAL) };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Return whether every file-backed RAM region is already an immutable fork
+/// generation. This distinguishes the first zero-copy rebase from later
+/// snapshots of the source's private COW view.
+#[cfg(target_os = "linux")]
+pub fn guest_memory_backing_is_immutable(parent: &GuestMemoryMmap) -> io::Result<bool> {
+    let mut found = false;
+    for region in parent.iter() {
+        let Some(file_offset) = region.file_offset() else {
+            continue;
+        };
+        found = true;
+        let seals = unsafe { libc::fcntl(file_offset.file().as_raw_fd(), libc::F_GET_SEALS) };
+        if seals < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if seals & libc::F_SEAL_WRITE == 0 {
+            return Ok(false);
+        }
+    }
+    if !found {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "guest RAM has no file-backed regions",
+        ));
+    }
+    Ok(true)
+}
+
+/// An exact RAM generation being materialized by a short-lived fork child.
+///
+/// The VMM starts this only while vCPUs and device workers are quiesced. The
+/// child inherits that exact address-space boundary through Linux COW and uses
+/// only async-signal-safe syscalls to copy bytes into fresh memfds. The parent
+/// can resume immediately, then wait for [`Self::finish`] without extending the
+/// guest-visible pause.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub struct ForkGenerationCopy {
+    child_pid: libc::pid_t,
+    status_fd: libc::c_int,
+    files: Vec<File>,
+    descs: Vec<MemfdRegionDesc>,
+    finished: bool,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl ForkGenerationCopy {
+    pub fn finish(mut self) -> io::Result<(Vec<MemfdRegionDesc>, Vec<File>)> {
+        let mut child_errno = 0_i32;
+        let mut read = 0_usize;
+        while read < std::mem::size_of::<i32>() {
+            let result = unsafe {
+                libc::read(
+                    self.status_fd,
+                    (&mut child_errno as *mut i32)
+                        .cast::<libc::c_void>()
+                        .add(read),
+                    std::mem::size_of::<i32>() - read,
+                )
+            };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if result == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "RAM generation worker exited without status",
+                ));
+            }
+            read += result as usize;
+        }
+        unsafe { libc::close(self.status_fd) };
+        self.status_fd = -1;
+
+        let mut status = 0;
+        loop {
+            let result = unsafe { libc::waitpid(self.child_pid, &mut status, 0) };
+            if result == self.child_pid {
+                break;
+            }
+            if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(io::Error::last_os_error());
+        }
+        self.child_pid = -1;
+        if child_errno != 0 || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+            return Err(if child_errno != 0 {
+                io::Error::from_raw_os_error(child_errno)
+            } else {
+                io::Error::other("RAM generation worker failed")
+            });
+        }
+
+        let immutable =
+            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        for file in &self.files {
+            let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, immutable) };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        self.finished = true;
+        Ok((
+            std::mem::take(&mut self.descs),
+            std::mem::take(&mut self.files),
+        ))
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl Drop for ForkGenerationCopy {
+    fn drop(&mut self) {
+        if self.status_fd >= 0 {
+            unsafe { libc::close(self.status_fd) };
+            self.status_fd = -1;
+        }
+        if !self.finished && self.child_pid > 0 {
+            unsafe {
+                libc::kill(self.child_pid, libc::SIGKILL);
+                libc::waitpid(self.child_pid, std::ptr::null_mut(), 0);
+            }
+            self.child_pid = -1;
+        }
+    }
+}
+
+/// Begin materializing the source's current private RAM into a fresh immutable
+/// generation. Call only at a fully quiesced snapshot boundary.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn start_fork_generation_copy(parent: &GuestMemoryMmap) -> io::Result<ForkGenerationCopy> {
+    struct CopyRegion {
+        source: *const u8,
+        len: usize,
+        destination_fd: libc::c_int,
+    }
+
+    unsafe fn is_zero(source: *const u8, len: usize) -> bool {
+        let mut offset = 0_usize;
+        while offset + std::mem::size_of::<u64>() <= len {
+            if unsafe { std::ptr::read_unaligned(source.add(offset).cast::<u64>()) } != 0 {
+                return false;
+            }
+            offset += std::mem::size_of::<u64>();
+        }
+        while offset < len {
+            if unsafe { *source.add(offset) } != 0 {
+                return false;
+            }
+            offset += 1;
+        }
+        true
+    }
+
+    let mut files = Vec::new();
+    let mut descs = Vec::new();
+    let mut copies = Vec::new();
+    for region in parent.iter() {
+        let len = region.len() as usize;
+        let source = parent
+            .get_host_address(region.start_addr())
+            .map_err(|error| io::Error::other(format!("guest RAM host address: {error:?}")))?;
+        let file = crate::builder::create_guest_ram_memfd(len).map_err(io::Error::other)?;
+        descs.push(MemfdRegionDesc {
+            gpa: region.start_addr().raw_value(),
+            len: region.len(),
+            fd: file.as_raw_fd(),
+            offset: 0,
+            path: String::new(),
+        });
+        copies.push(CopyRegion {
+            source: source.cast_const(),
+            len,
+            destination_fd: file.as_raw_fd(),
+        });
+        files.push(file);
+    }
+    if copies.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "guest RAM has no regions",
+        ));
+    }
+
+    let mut status_pipe = [-1; 2];
+    if unsafe { libc::pipe2(status_pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Bypass pthread_atfork handlers: this multithreaded VMM deliberately uses
+    // a syscall-only child, so inherited allocator/library locks are never
+    // touched. Registered atfork callbacks would add unrelated deadlock risk.
+    let child_pid = unsafe { libc::syscall(libc::SYS_fork) as libc::pid_t };
+    if child_pid < 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(status_pipe[0]);
+            libc::close(status_pipe[1]);
+        }
+        return Err(error);
+    }
+    if child_pid == 0 {
+        unsafe { libc::close(status_pipe[0]) };
+        let mut child_errno = 0_i32;
+        const PAGE_SIZE: usize = 4096;
+        const COPY_CHUNK: usize = 16 * 1024 * 1024;
+        'regions: for copy in &copies {
+            let mut offset = 0_usize;
+            while offset < copy.len {
+                let page_len = (copy.len - offset).min(PAGE_SIZE);
+                if unsafe { is_zero(copy.source.add(offset), page_len) } {
+                    offset += page_len;
+                    continue;
+                }
+
+                let run_start = offset;
+                offset += page_len;
+                while offset < copy.len && offset - run_start < COPY_CHUNK {
+                    let page_len = (copy.len - offset).min(PAGE_SIZE);
+                    if unsafe { is_zero(copy.source.add(offset), page_len) } {
+                        break;
+                    }
+                    offset += page_len;
+                }
+                let mut written = 0_usize;
+                let wanted = offset - run_start;
+                while written < wanted {
+                    let result = unsafe {
+                        libc::pwrite(
+                            copy.destination_fd,
+                            copy.source.add(run_start + written).cast::<libc::c_void>(),
+                            wanted - written,
+                            (run_start + written) as libc::off_t,
+                        )
+                    };
+                    if result < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        child_errno = error.raw_os_error().unwrap_or(libc::EIO);
+                        break 'regions;
+                    }
+                    if result == 0 {
+                        child_errno = libc::EIO;
+                        break 'regions;
+                    }
+                    written += result as usize;
+                }
+            }
+        }
+        let status = child_errno.to_ne_bytes();
+        let mut written = 0_usize;
+        while written < status.len() {
+            let result = unsafe {
+                libc::write(
+                    status_pipe[1],
+                    status.as_ptr().add(written).cast::<libc::c_void>(),
+                    status.len() - written,
+                )
+            };
+            if result < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if result == 0 {
+                break;
+            }
+            written += result as usize;
+        }
+        unsafe { libc::_exit(i32::from(child_errno != 0)) };
+    }
+
+    unsafe { libc::close(status_pipe[1]) };
+    Ok(ForkGenerationCopy {
+        child_pid,
+        status_fd: status_pipe[0],
+        files,
+        descs,
+        finished: false,
+    })
+}
+
 /// Describes one guest-RAM region for cross-process CoW fork: its guest address,
 /// length, and (for memfd-backed RAM) the owner process's fd number + offset so a
 /// clone can open `/proc/<pid>/fd/<fd>` and `mmap(MAP_PRIVATE)` it. `fd < 0` marks
@@ -925,6 +1332,55 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn fork_worker_materializes_an_exact_immutable_generation() {
+        const REGION_SIZE: usize = 2 * 1024 * 1024;
+        const HIGH_GPA: u64 = 0x40_0000;
+        let memory = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), REGION_SIZE),
+            (GuestAddress(HIGH_GPA), REGION_SIZE),
+        ])
+        .unwrap();
+        memory
+            .write_slice(&[0x11; 4096], GuestAddress(0x1000))
+            .unwrap();
+        memory
+            .write_slice(&[0x22; 4096], GuestAddress(HIGH_GPA + 0x2000))
+            .unwrap();
+
+        let generation = start_fork_generation_copy(&memory).unwrap();
+        memory
+            .write_slice(&[0xAA; 4096], GuestAddress(0x1000))
+            .unwrap();
+        memory
+            .write_slice(&[0xBB; 4096], GuestAddress(HIGH_GPA + 0x2000))
+            .unwrap();
+
+        let (descs, files) = generation.finish().unwrap();
+        let clone = open_cow_memory_from_pid(std::process::id() as i32, &descs).unwrap();
+        let mut page = [0_u8; 4096];
+        clone.read_slice(&mut page, GuestAddress(0x1000)).unwrap();
+        assert_eq!(page, [0x11; 4096]);
+        clone
+            .read_slice(&mut page, GuestAddress(HIGH_GPA + 0x2000))
+            .unwrap();
+        assert_eq!(page, [0x22; 4096]);
+
+        clone
+            .write_slice(&[0x44; 4096], GuestAddress(0x1000))
+            .unwrap();
+        memory.read_slice(&mut page, GuestAddress(0x1000)).unwrap();
+        assert_eq!(page, [0xAA; 4096]);
+        for file in files {
+            let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+            assert_eq!(
+                seals & (libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK),
+                libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn sparse_file_snapshot_preserves_multi_region_bytes_and_holes() {
@@ -1219,6 +1675,61 @@ mod tests {
             vec![0xBB; 16],
             "clone isolated from later parent writes"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rebased_parent_can_continue_without_mutating_fork_generation() {
+        use crate::builder::create_guest_ram_memfd;
+        use std::os::unix::fs::FileExt;
+        use vm_memory::FileOffset;
+
+        const PAGE: usize = 4096;
+        let size = 4 * PAGE;
+        let memfd = create_guest_ram_memfd(size).expect("sealable memfd");
+        let inspect_fd = memfd.try_clone().expect("inspection fd");
+        let parent = GuestMemoryMmap::from_ranges_with_files([(
+            GuestAddress(0),
+            size,
+            Some(FileOffset::new(memfd, 0)),
+        )])
+        .expect("memfd-backed parent");
+        parent.write_slice(&[0x11; PAGE], GuestAddress(0)).unwrap();
+        parent
+            .write_slice(&[0x22; PAGE], GuestAddress(PAGE as u64))
+            .unwrap();
+
+        rebase_guest_memory_private(&parent).expect("private source rebase");
+        let generation = cow_clone_guest_memory(&parent).expect("generation clone");
+
+        // Continuing source writes must fault private pages instead of changing
+        // either the immutable memfd generation or an untouched clone mapping.
+        parent.write_slice(&[0xA1; PAGE], GuestAddress(0)).unwrap();
+        parent
+            .write_slice(&[0xA2; PAGE], GuestAddress(PAGE as u64))
+            .unwrap();
+
+        let mut bytes = [0_u8; 16];
+        generation.read_slice(&mut bytes, GuestAddress(0)).unwrap();
+        assert_eq!(bytes, [0x11; 16]);
+        generation
+            .read_slice(&mut bytes, GuestAddress(PAGE as u64))
+            .unwrap();
+        assert_eq!(bytes, [0x22; 16]);
+        inspect_fd.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, [0x11; 16]);
+
+        // Clone writes remain private in the other direction as well.
+        generation
+            .write_slice(&[0xC1; 16], GuestAddress(0))
+            .unwrap();
+        parent.read_slice(&mut bytes, GuestAddress(0)).unwrap();
+        assert_eq!(bytes, [0xA1; 16]);
+
+        let write_error = inspect_fd.write_all_at(&[0xFF], 0).unwrap_err();
+        assert_eq!(write_error.raw_os_error(), Some(libc::EPERM));
+        let truncate_error = inspect_fd.set_len(PAGE as u64).unwrap_err();
+        assert_eq!(truncate_error.raw_os_error(), Some(libc::EPERM));
     }
 
     // Pool density: N CoW clones of a faulted-in base must cost only the pages

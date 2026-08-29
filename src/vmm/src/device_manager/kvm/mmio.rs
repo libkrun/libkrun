@@ -20,6 +20,21 @@ use kvm_ioctls::{IoEventAddress, VmFd};
 #[cfg(target_arch = "aarch64")]
 use utils::eventfd::EventFd;
 
+#[cfg(all(feature = "blk", target_arch = "x86_64"))]
+pub(crate) struct BlockPivotSpec {
+    pub id: String,
+    pub path: String,
+    pub format: devices::virtio::block::ImageType,
+}
+
+#[cfg(all(feature = "blk", target_arch = "x86_64"))]
+pub(crate) struct BlockPivotsRollback {
+    pivots: Vec<(
+        Arc<Mutex<dyn devices::virtio::VirtioDevice>>,
+        devices::virtio::block::device::DiskPivotRollback,
+    )>,
+}
+
 /// Errors for MMIO device manager.
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
@@ -389,6 +404,94 @@ impl MMIODeviceManager {
             dev.lock()
                 .expect("poisoned virtio device lock")
                 .rearm_after_snapshot();
+        }
+    }
+
+    /// Replace every requested quiesced block device as one transaction.
+    ///
+    /// All images are opened and validated before the first device changes.
+    /// The returned old backings stay live until the caller either drops the
+    /// token after committing the RAM generation or explicitly rolls back.
+    #[cfg(all(feature = "blk", target_arch = "x86_64"))]
+    pub(crate) fn pivot_block_devices(
+        &self,
+        specs: &[BlockPivotSpec],
+    ) -> std::result::Result<BlockPivotsRollback, String> {
+        use std::collections::HashSet;
+
+        let mut requested = HashSet::with_capacity(specs.len());
+        let mut prepared = Vec::with_capacity(specs.len());
+        for spec in specs {
+            if !requested.insert(spec.id.as_str()) {
+                return Err(format!("duplicate block pivot id '{}'", spec.id));
+            }
+            let mut matched = None;
+            for device in &self.virtio_devices {
+                let guard = device.lock().expect("poisoned virtio device lock");
+                let Some(block) = guard.as_any().downcast_ref::<devices::virtio::Block>() else {
+                    continue;
+                };
+                if block.id() != &spec.id {
+                    continue;
+                }
+                if matched.is_some() {
+                    return Err(format!("multiple block devices have id '{}'", spec.id));
+                }
+                let pivot = block
+                    .prepare_live_disk_pivot(&spec.path, spec.format)
+                    .map_err(|error| format!("prepare block '{}': {error}", spec.id))?;
+                matched = Some((Arc::clone(device), pivot));
+            }
+            prepared.push(matched.ok_or_else(|| format!("block '{}' not found", spec.id))?);
+        }
+
+        let mut applied = Vec::with_capacity(prepared.len());
+        for (device, prepared) in prepared {
+            let apply = {
+                let mut guard = device.lock().expect("poisoned virtio device lock");
+                let block = guard
+                    .as_mut_any()
+                    .downcast_mut::<devices::virtio::Block>()
+                    .expect("prepared block device changed type");
+                block.apply_live_disk_pivot(prepared)
+            };
+            match apply {
+                Ok(rollback) => applied.push((device, rollback)),
+                Err(error) => {
+                    let rollback = BlockPivotsRollback { pivots: applied };
+                    let rollback_error = self.rollback_block_pivots(rollback).err();
+                    return Err(match rollback_error {
+                        Some(rollback_error) => {
+                            format!("apply block pivot: {error}; rollback: {rollback_error}")
+                        }
+                        None => format!("apply block pivot: {error}"),
+                    });
+                }
+            }
+        }
+        Ok(BlockPivotsRollback { pivots: applied })
+    }
+
+    #[cfg(all(feature = "blk", target_arch = "x86_64"))]
+    pub(crate) fn rollback_block_pivots(
+        &self,
+        rollback: BlockPivotsRollback,
+    ) -> std::result::Result<(), String> {
+        let mut errors = Vec::new();
+        for (device, rollback) in rollback.pivots.into_iter().rev() {
+            let mut guard = device.lock().expect("poisoned virtio device lock");
+            let block = guard
+                .as_mut_any()
+                .downcast_mut::<devices::virtio::Block>()
+                .expect("pivoted block device changed type");
+            if let Err(error) = block.rollback_live_disk_pivot(rollback) {
+                errors.push(format!("block '{}': {error}", block.id()));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join(", "))
         }
     }
 

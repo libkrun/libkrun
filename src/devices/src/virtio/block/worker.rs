@@ -97,6 +97,15 @@ impl BlockWorker {
         self.device_queue.queue.restore_state(state)
     }
 
+    /// Replace the backing disk while this worker is reclaimed and stopped.
+    ///
+    /// `Block` owns the quiesce/re-arm lifecycle; keeping the swap here makes
+    /// it impossible for an active worker thread to observe a half-pivoted
+    /// device.
+    pub(crate) fn replace_disk(&mut self, disk: DiskProperties) -> DiskProperties {
+        std::mem::replace(&mut self.disk, disk)
+    }
+
     /// Spawn the worker thread. On stop (a write to `stop_fd`) the thread drains
     /// any pending requests and **returns the `BlockWorker`**, so the device can
     /// reclaim the virtqueue (to snapshot its indices) and later re-arm the

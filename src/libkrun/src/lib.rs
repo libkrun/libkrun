@@ -738,6 +738,46 @@ fn handle_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
 #[cfg(fork_supported)]
 const FORK_MANIFEST_MAGIC: u64 = 0x534d4f4c464f524b;
 
+/// Magic for a guardian-backed fork manifest ("SMOLGRDN").
+#[cfg(all(fork_supported, target_os = "linux"))]
+const GUARDIAN_MANIFEST_MAGIC: u64 = 0x534d4f4c4752444e;
+#[cfg(all(fork_supported, target_os = "linux"))]
+const GUARDIAN_MANIFEST_VERSION: u32 = 1;
+
+#[cfg(fork_supported)]
+fn atomic_write_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "output path has no file name",
+        )
+    })?;
+    let partial = path.with_file_name(format!("{}.partial", file_name.to_string_lossy()));
+    let mut published = false;
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::hard_link(&partial, path)?;
+        published = true;
+        let _ = std::fs::remove_file(&partial);
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        if published {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_file(&partial);
+    }
+    result
+}
+
 /// Serialize the fork manifest: owner pid + guest-RAM region descriptors
 /// (gpa/len/memfd-fd/offset + backing-file path) so a clone can reach the
 /// backing RAM — via `/proc/<pid>/fd` on Linux, or the file path on macOS.
@@ -760,7 +800,7 @@ fn write_fork_manifest(
         buf.extend_from_slice(&(pb.len() as u32).to_le_bytes());
         buf.extend_from_slice(pb);
     }
-    std::fs::write(path, buf)
+    atomic_write_file(path, &buf)
 }
 
 /// Parse a manifest written by [`write_fork_manifest`].
@@ -806,6 +846,128 @@ fn read_fork_manifest(
         });
     }
     Ok((owner_pid, descs))
+}
+
+#[cfg(all(
+    fork_supported,
+    target_os = "linux",
+    any(test, all(target_arch = "x86_64", feature = "blk"))
+))]
+fn write_guardian_manifest(
+    path: &std::path::Path,
+    desc: &vmm::generation_guardian::GuardianGenerationDesc,
+) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let socket = desc.socket_path.as_os_str().as_bytes();
+    let socket_len = u32::try_from(socket.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "guardian socket path is too long",
+        )
+    })?;
+    let region_count = u32::try_from(desc.regions.len()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "too many RAM regions")
+    })?;
+    let mut bytes = Vec::with_capacity(72 + socket.len() + desc.regions.len() * 16);
+    bytes.extend_from_slice(&GUARDIAN_MANIFEST_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&GUARDIAN_MANIFEST_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&desc.guardian_pid.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&desc.guardian_start_time.to_le_bytes());
+    bytes.extend_from_slice(&socket_len.to_le_bytes());
+    bytes.extend_from_slice(&region_count.to_le_bytes());
+    bytes.extend_from_slice(&desc.token);
+    bytes.extend_from_slice(socket);
+    for region in &desc.regions {
+        bytes.extend_from_slice(&region.gpa.to_le_bytes());
+        bytes.extend_from_slice(&region.len.to_le_bytes());
+    }
+    atomic_write_file(path, &bytes)
+}
+
+#[cfg(all(fork_supported, target_os = "linux"))]
+fn read_guardian_manifest(
+    path: &std::path::Path,
+) -> std::io::Result<vmm::generation_guardian::GuardianGenerationDesc> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let bytes = std::fs::read(path)?;
+    let invalid =
+        |message: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string());
+    let mut offset = 0_usize;
+    let take = |offset: &mut usize, length: usize| -> std::io::Result<&[u8]> {
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| invalid("guardian manifest offset overflow"))?;
+        let value = bytes
+            .get(*offset..end)
+            .ok_or_else(|| invalid("guardian manifest is truncated"))?;
+        *offset = end;
+        Ok(value)
+    };
+    let magic = u64::from_le_bytes(take(&mut offset, 8)?.try_into().unwrap());
+    if magic != GUARDIAN_MANIFEST_MAGIC {
+        return Err(invalid("bad guardian manifest magic"));
+    }
+    let version = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap());
+    if version != GUARDIAN_MANIFEST_VERSION {
+        return Err(invalid("unsupported guardian manifest version"));
+    }
+    let flags = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap());
+    if flags != 0 {
+        return Err(invalid("guardian manifest has unsupported flags"));
+    }
+    let guardian_pid = i32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap());
+    let reserved = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap());
+    if guardian_pid <= 0 || reserved != 0 {
+        return Err(invalid("guardian manifest has invalid process metadata"));
+    }
+    let guardian_start_time = u64::from_le_bytes(take(&mut offset, 8)?.try_into().unwrap());
+    if guardian_start_time == 0 {
+        return Err(invalid("guardian manifest has zero process start time"));
+    }
+    let socket_len = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap()) as usize;
+    let region_count = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap()) as usize;
+    if socket_len == 0 || socket_len > 100 || region_count == 0 || region_count > 256 {
+        return Err(invalid("guardian manifest has invalid dimensions"));
+    }
+    let mut token = [0_u8; 32];
+    token.copy_from_slice(take(&mut offset, 32)?);
+    if token.iter().all(|byte| *byte == 0) {
+        return Err(invalid("guardian manifest has an empty token"));
+    }
+    let socket_path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+        take(&mut offset, socket_len)?.to_vec(),
+    ));
+    if !socket_path.is_absolute() {
+        return Err(invalid("guardian socket path must be absolute"));
+    }
+    let mut regions = Vec::with_capacity(region_count);
+    let mut previous_end = 0_u64;
+    for index in 0..region_count {
+        let gpa = u64::from_le_bytes(take(&mut offset, 8)?.try_into().unwrap());
+        let len = u64::from_le_bytes(take(&mut offset, 8)?.try_into().unwrap());
+        let end = gpa
+            .checked_add(len)
+            .ok_or_else(|| invalid("guardian RAM region address overflow"))?;
+        if len == 0 || len % 4096 != 0 || (index > 0 && gpa < previous_end) {
+            return Err(invalid("guardian RAM regions are invalid or overlapping"));
+        }
+        regions.push(vmm::demand_paging::DemandPageRegion { gpa, len });
+        previous_end = end;
+    }
+    if offset != bytes.len() {
+        return Err(invalid("guardian manifest has trailing bytes"));
+    }
+    Ok(vmm::generation_guardian::GuardianGenerationDesc {
+        guardian_pid,
+        guardian_start_time,
+        socket_path,
+        token,
+        regions,
+    })
 }
 
 #[cfg(fork_supported)]
@@ -875,6 +1037,132 @@ fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
         "OK forked (frozen base, pid {pid}, {} regions)\n",
         descs.len()
     )
+}
+
+#[cfg(all(
+    fork_supported,
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "blk"
+))]
+fn read_fork_block_pivots(dir: &std::path::Path) -> std::io::Result<Vec<(String, String)>> {
+    let contents = std::fs::read_to_string(dir.join("block-pivots.tsv"))?;
+    let mut pivots = Vec::new();
+    for (line_number, line) in contents.lines().enumerate() {
+        let (id, path) = line.split_once('\t').ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("block pivot line {} needs id<TAB>path", line_number + 1),
+            )
+        })?;
+        if id.is_empty() || path.is_empty() || path.contains('\0') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid block pivot line {}", line_number + 1),
+            ));
+        }
+        let path = std::path::Path::new(path).canonicalize()?;
+        pivots.push((id.to_string(), path.to_string_lossy().into_owned()));
+    }
+    if pivots.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "at least one block pivot is required",
+        ));
+    }
+    Ok(pivots)
+}
+
+/// Create an immutable Linux RAM + disk generation while the same source VMM
+/// continues on private writable layers.
+#[cfg(all(
+    fork_supported,
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "blk"
+))]
+fn handle_fork_continue(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
+    handle_fork_continue_inner(vmm, dir, false)
+}
+
+/// Guardian-backed variant. The first generation can still use the source's
+/// immutable memfd directly; later generations retain the exact private source
+/// view in a kernel-COW guardian and can be demand-paged by clones.
+#[cfg(all(
+    fork_supported,
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "blk"
+))]
+fn handle_fork_continue_paged(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
+    handle_fork_continue_inner(vmm, dir, true)
+}
+
+#[cfg(all(
+    fork_supported,
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "blk"
+))]
+fn handle_fork_continue_inner(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str, demand_paged: bool) -> String {
+    if dir.is_empty() {
+        return "ERR EINVAL fork snapshot dir required\n".to_string();
+    }
+    let dir = std::path::Path::new(dir);
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        return format!("ERR EIO create {}: {error}\n", dir.display());
+    }
+    let block_pivots = match read_fork_block_pivots(dir) {
+        Ok(pivots) => pivots,
+        Err(error) => return format!("ERR EINVAL read block pivots: {error}\n"),
+    };
+    let guardian_socket = demand_paged.then(|| dir.join("ram-guardian.sock"));
+    let commit_marker = dir.join("source-continues-v1");
+    let (checkpoint, generation) = match vmm.lock().unwrap().checkpoint_for_fork_continue(
+        &block_pivots,
+        guardian_socket.as_deref(),
+        &commit_marker,
+    ) {
+        Ok(value) => value,
+        Err(vmm::Error::ForkRequiresMemfd) => {
+            return "ERR EINVAL no memfd-backed RAM (start the VM with SMOLVM_FORKABLE=1)\n"
+                .to_string();
+        }
+        Err(error) => return format!("ERR EIO fork-continue checkpoint failed: {error}\n"),
+    };
+    if let Err(error) = atomic_write_file(&dir.join("checkpoint.bin"), &checkpoint.serialize()) {
+        return format!("ERR EIO write checkpoint: {error}; source already resumed\n");
+    }
+    match generation {
+        vmm::ForkContinueRamGeneration::Memfd(descs) => {
+            let pid = std::process::id() as i32;
+            if let Err(error) = write_fork_manifest(&dir.join("manifest.bin"), pid, &descs) {
+                let _ = std::fs::remove_file(dir.join("checkpoint.bin"));
+                return format!("ERR EIO write manifest: {error}; source already resumed\n");
+            }
+            format!(
+                "OK forked generation (running source, memfd pid {pid}, {} regions, {} disks)\n",
+                descs.len(),
+                block_pivots.len()
+            )
+        }
+        vmm::ForkContinueRamGeneration::Guardian(guardian) => {
+            let desc = guardian.description();
+            if let Err(error) = write_guardian_manifest(&dir.join("manifest.bin"), desc) {
+                let _ = std::fs::remove_file(dir.join("checkpoint.bin"));
+                return format!(
+                    "ERR EIO write guardian manifest: {error}; source already resumed\n"
+                );
+            }
+            let region_count = desc.regions.len();
+            let guardian_pid = desc.guardian_pid;
+            guardian.disarm();
+            format!(
+                "OK forked generation (running source, guardian pid {guardian_pid}, {region_count} regions, {} disks)\n",
+                block_pivots.len()
+            )
+        }
+    }
 }
 
 #[cfg(fork_supported)]
@@ -949,9 +1237,40 @@ fn build_restore_ctx(
                 .map_err(|e| format!("load guest memory: {e}"))?
         };
         return Ok(vmm::builder::RestoreCtx {
+            #[cfg(target_os = "linux")]
+            demand_pager: None,
             guest_memory,
             fork_backed_regions: vec![true; descs.len()],
             checkpoint,
+            portable_clock: true,
+        });
+    }
+    #[cfg(target_os = "linux")]
+    if magic == GUARDIAN_MANIFEST_MAGIC {
+        let desc = read_guardian_manifest(&manifest_path)
+            .map_err(|error| format!("guardian manifest: {error}"))?;
+        let checkpoint =
+            std::fs::read(dir.join("checkpoint.bin")).map_err(|e| format!("checkpoint: {e}"))?;
+        let source = vmm::generation_guardian::GuardianPageSource::connect(&desc)
+            .map_err(|error| format!("connect RAM guardian: {error}"))?;
+        let demand = vmm::demand_paging::create_demand_paged_memory(
+            &desc.regions,
+            Box::new(source),
+            vmm::demand_paging::UserfaultfdMode::KernelFaults,
+        )
+        .map_err(|error| format!("create demand-paged guest RAM: {error}"))?;
+        return Ok(vmm::builder::RestoreCtx {
+            demand_pager: Some(demand.pager),
+            guest_memory: demand.memory,
+            // A leaf can keep these anonymous demand-paged mappings. An
+            // explicitly forkable child must materialize them into fresh
+            // memfds during boot: userfaultfd missing-page ownership is not
+            // inherited by a later raw fork, so directly guardian-forking an
+            // incompletely faulted descendant could silently turn untouched
+            // parent pages into zero pages.
+            fork_backed_regions: vec![true; desc.regions.len()],
+            checkpoint,
+            portable_clock: false,
         });
     }
     if magic != FORK_MANIFEST_MAGIC {
@@ -968,12 +1287,15 @@ fn build_restore_ctx(
     let guest_memory = vmm::snapshot::open_cow_memory_from_paths(&descs)
         .map_err(|e| format!("cow-map guest memory: {e}"))?;
     Ok(vmm::builder::RestoreCtx {
+        #[cfg(target_os = "linux")]
+        demand_pager: None,
         guest_memory,
         fork_backed_regions: descs
             .iter()
             .map(|desc| desc.fd >= 0 || !desc.path.is_empty())
             .collect(),
         checkpoint,
+        portable_clock: false,
     })
 }
 
@@ -1024,8 +1346,16 @@ fn handle_control_stream<S: std::io::Read + std::io::Write>(
                     Err(e) => format!("ERR EIO {e}\n"),
                 },
                 "STATUS" => {
-                    let state = vmm.lock().unwrap().run_state();
-                    format!("OK {state}\n")
+                    let vmm = vmm.lock().unwrap();
+                    #[cfg(target_os = "linux")]
+                    {
+                        match vmm.demand_pager_failure() {
+                            Some(error) => format!("ERR EIO RAM pager failed: {error}\n"),
+                            None => format!("OK {}\n", vmm.run_state()),
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    format!("OK {}\n", vmm.run_state())
                 }
                 // BALLOON <mib>: ask the guest to inflate its balloon to <mib>
                 // MiB (0 deflates fully); the freed pages are reclaimed by the
@@ -1073,6 +1403,20 @@ fn handle_control_stream<S: std::io::Read + std::io::Write>(
                 // (SMOLVM_FORKABLE=1).
                 #[cfg(fork_supported)]
                 "FORK" => handle_fork(vmm, _arg),
+                #[cfg(all(
+                    fork_supported,
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    feature = "blk"
+                ))]
+                "FORK_CONTINUE" => handle_fork_continue(vmm, _arg),
+                #[cfg(all(
+                    fork_supported,
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    feature = "blk"
+                ))]
+                "FORK_CONTINUE_PAGED" => handle_fork_continue_paged(vmm, _arg),
                 #[cfg(fork_supported)]
                 "ROLLBACK_FORK" => handle_rollback_fork(vmm, _arg),
                 _ => "ERR EINVAL unknown command\n".to_string(),
@@ -1141,6 +1485,70 @@ mod control_command_tests {
         let mut overflowing = encode_portable_manifest(&descs[..1]);
         overflowing[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(decode_portable_manifest(&overflowing).is_err());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn guardian_manifest_builds_an_exact_demand_paged_restore() {
+        use vm_memory::{Bytes, GuestAddress};
+
+        let dir = std::env::temp_dir().join(format!(
+            "libkrun-guardian-restore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let size = 256 * 1024;
+        let memory = vmm::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), size)]).unwrap();
+        memory
+            .write_slice(&vec![0x5d_u8; size], GuestAddress(0))
+            .unwrap();
+        let guardian = vmm::generation_guardian::GenerationGuardian::start(
+            &memory,
+            &dir.join("ram-guardian.sock"),
+        )
+        .unwrap();
+        atomic_write_file(&dir.join("checkpoint.bin"), b"checkpoint").unwrap();
+        write_guardian_manifest(&dir.join("manifest.bin"), guardian.description()).unwrap();
+        memory
+            .write_slice(&vec![0xe2_u8; size], GuestAddress(0))
+            .unwrap();
+
+        // The host test policy disables kernel-originated faults. Supply the
+        // same pre-opened descriptor path used by a privileged boot process,
+        // but create it in user-mode-only form for this userspace read test.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_userfaultfd,
+                libc::O_CLOEXEC | libc::O_NONBLOCK | 1,
+            ) as libc::c_int
+        };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        assert!(
+            unsafe {
+                libc::dup3(
+                    fd,
+                    vmm::demand_paging::PREOPENED_USERFAULTFD_FD,
+                    libc::O_CLOEXEC,
+                )
+            } >= 0
+        );
+        unsafe { libc::close(fd) };
+
+        let restore = build_restore_ctx(&dir).expect("build guardian restore");
+        let mut actual = vec![0_u8; size];
+        restore
+            .guest_memory
+            .read_slice(&mut actual, GuestAddress(0))
+            .unwrap();
+        assert!(actual.iter().all(|byte| *byte == 0x5d));
+        assert!(restore.demand_pager.as_ref().unwrap().failure().is_none());
+        drop(restore);
+        drop(guardian);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

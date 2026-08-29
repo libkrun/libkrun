@@ -15,7 +15,11 @@ extern crate log;
 
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
+#[cfg(target_os = "linux")]
+pub mod demand_paging;
 pub(crate) mod device_manager;
+#[cfg(target_os = "linux")]
+pub mod generation_guardian;
 /// Resource store for configured microVM resources.
 pub mod resources;
 /// Signal handling utilities.
@@ -44,6 +48,8 @@ use windows::vstate;
 
 use std::fmt::{Display, Formatter};
 use std::io;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "blk"))]
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -310,6 +316,9 @@ impl VmCheckpoint {
 /// Contains the state and associated methods required for the Firecracker VMM.
 pub struct Vmm {
     // Guest VM core resources.
+    // Must drop before `guest_memory`: the handler can reference its mappings.
+    #[cfg(target_os = "linux")]
+    demand_pager: Option<demand_paging::DemandPager>,
     guest_memory: GuestMemoryMmap,
     arch_memory_info: ArchMemoryInfo,
 
@@ -323,6 +332,11 @@ pub struct Vmm {
     vm: Vm,
     exit_observers: Vec<Arc<Mutex<dyn VmmExitObserver>>>,
     exit_code: Arc<AtomicI32>,
+    /// Fresh memfds owned by the latest asynchronously materialized running
+    /// generation. Existing clones retain their own mapping references when a
+    /// newer generation replaces these handles.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "blk"))]
+    retained_generation_files: Vec<std::fs::File>,
 
     // Guest VM devices.
     mmio_device_manager: MMIODeviceManager,
@@ -335,6 +349,49 @@ pub struct Vmm {
     /// chips (the WHP software IOAPIC — see [`VmCheckpoint::ioapic`]).
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
     intc: devices::legacy::IrqChip,
+}
+
+/// RAM ownership returned by a fork-and-continue capture.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "blk"))]
+pub enum ForkContinueRamGeneration {
+    /// A directly CoW-mappable immutable memfd generation.
+    Memfd(Vec<snapshot::MemfdRegionDesc>),
+    /// A kernel-COW guardian serving the exact captured address space.
+    Guardian(generation_guardian::GenerationGuardian),
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "blk"))]
+fn publish_generation_commit_marker(path: &std::path::Path) -> io::Result<()> {
+    if path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "fork generation commit marker already exists",
+        ));
+    }
+    let partial = path.with_extension("partial");
+    let mut published = false;
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&partial)?;
+        file.write_all(b"source-continues-v1\n")?;
+        file.sync_all()?;
+        std::fs::hard_link(&partial, path)?;
+        published = true;
+        let _ = std::fs::remove_file(&partial);
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "marker has no parent"))?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        if published {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_file(partial);
+    }
+    result
 }
 
 #[cfg(fork_supported)]
@@ -474,14 +531,26 @@ impl Vmm {
     /// (e.g. [`Self::resume`]) to start the clone running.
     #[cfg(snapshot_supported)]
     #[allow(unused_mut)] // mutable only on Linux/x86 TSC rebasing
-    pub fn apply_restore(&mut self, mut checkpoint: VmCheckpoint) -> Result<()> {
+    pub fn apply_restore(
+        &mut self,
+        mut checkpoint: VmCheckpoint,
+        portable_clock: bool,
+    ) -> Result<()> {
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        let _ = portable_clock;
         self.vm
             .restore_state(&checkpoint.vm_state)
             .map_err(Error::Vm)?;
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        self.vm
-            .rebase_vcpu_tsc(&checkpoint.vm_state, &mut checkpoint.vcpu_states)
-            .map_err(Error::Vm)?;
+        if portable_clock {
+            self.vm
+                .rebase_vcpu_tsc(&checkpoint.vm_state, &mut checkpoint.vcpu_states)
+                .map_err(Error::Vm)?;
+        } else {
+            self.vm
+                .rebase_vcpu_tsc_same_host(&checkpoint.vm_state, &mut checkpoint.vcpu_states)
+                .map_err(Error::Vm)?;
+        }
         // Restore the userspace IRQ chip (WHP software IOAPIC) before devices
         // re-activate: a fresh chip has every redirection entry masked, so an
         // IRQ raised earlier than this would be dropped and the clone's vsock
@@ -870,7 +939,7 @@ impl Vmm {
             .map_err(Error::Vm)?;
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         self.vm
-            .rebase_vcpu_tsc(&checkpoint.vm_state, &mut checkpoint.vcpu_states)
+            .rebase_vcpu_tsc_same_host(&checkpoint.vm_state, &mut checkpoint.vcpu_states)
             .map_err(Error::Vm)?;
         // See apply_restore: the WHP software IOAPIC must be restored before
         // devices signal or their IRQs hit an all-masked redirection table.
@@ -903,9 +972,6 @@ impl Vmm {
         self.quiesce_devices();
         let vcpu_states = self.save_vcpu_states()?;
         let vm_state = self.vm.save_state().map_err(Error::Vm)?;
-        self.vm
-            .validate_migration_clock(&vm_state, &vcpu_states)
-            .map_err(Error::Vm)?;
         let devices = self.snapshot_devices();
         let mem_clone = snapshot::cow_clone_guest_memory(&self.guest_memory)
             .map_err(|e| Error::Snapshot(format!("cow-clone guest memory: {e}")))?;
@@ -946,7 +1012,7 @@ impl Vmm {
             .restore_state(&checkpoint.vm_state)
             .map_err(Error::Vm)?;
         self.vm
-            .rebase_vcpu_tsc(&checkpoint.vm_state, &mut checkpoint.vcpu_states)
+            .rebase_vcpu_tsc_same_host(&checkpoint.vm_state, &mut checkpoint.vcpu_states)
             .map_err(Error::Vm)?;
         self.restore_devices(&checkpoint.devices)
             .map_err(Error::Snapshot)?;
@@ -977,10 +1043,6 @@ impl Vmm {
         let checkpoint = (|| {
             let vcpu_states = self.save_vcpu_states()?;
             let vm_state = self.vm.save_state().map_err(Error::Vm)?;
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            self.vm
-                .validate_migration_clock(&vm_state, &vcpu_states)
-                .map_err(Error::Vm)?;
             let devices = self.snapshot_devices();
             #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
             let ioapic = self.intc.lock().unwrap().save_state();
@@ -1007,6 +1069,169 @@ impl Vmm {
         }
     }
 
+    /// Capture one immutable Linux RAM + disk generation and immediately
+    /// resume the same source VMM on private RAM mappings and new writable
+    /// qcow2 disk layers.
+    ///
+    /// Every replacement disk is pre-opened before the first block worker is
+    /// changed. If RAM generation capture fails, all disks are rolled back
+    /// before the source resumes.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "blk"))]
+    pub fn checkpoint_for_fork_continue(
+        &mut self,
+        block_pivots: &[(String, String)],
+        guardian_socket: Option<&std::path::Path>,
+        commit_marker: &std::path::Path,
+    ) -> Result<(VmCheckpoint, ForkContinueRamGeneration)> {
+        let source_descs = snapshot::memfd_region_descs(&self.guest_memory);
+        let has_memfd_backing = has_memfd_backed_memory(&source_descs);
+        if !has_memfd_backing && guardian_socket.is_none() {
+            return Err(Error::ForkRequiresMemfd);
+        }
+        let needs_materialization = if has_memfd_backing {
+            snapshot::guest_memory_backing_is_immutable(&self.guest_memory).map_err(|error| {
+                Error::Snapshot(format!("inspect guest RAM generation: {error}"))
+            })?
+        } else {
+            true
+        };
+
+        self.pause()?;
+        self.quiesce_devices();
+        let capture = (|| {
+            let vcpu_states = self.save_vcpu_states()?;
+            let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+            let devices = self.snapshot_devices();
+            let generation_guardian = if needs_materialization {
+                guardian_socket
+                    .map(|path| {
+                        generation_guardian::GenerationGuardian::start(&self.guest_memory, path)
+                            .map_err(|error| {
+                                Error::Snapshot(format!("start RAM generation guardian: {error}"))
+                            })
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            let generation_copy = if needs_materialization && generation_guardian.is_none() {
+                Some(
+                    snapshot::start_fork_generation_copy(&self.guest_memory).map_err(|error| {
+                        Error::Snapshot(format!("start RAM generation worker: {error}"))
+                    })?,
+                )
+            } else {
+                None
+            };
+            let pivot_specs = block_pivots
+                .iter()
+                .map(|(id, path)| device_manager::mmio::BlockPivotSpec {
+                    id: id.clone(),
+                    path: path.clone(),
+                    format: devices::virtio::block::ImageType::Qcow2,
+                })
+                .collect::<Vec<_>>();
+            let disk_rollback = self
+                .mmio_device_manager
+                .pivot_block_devices(&pivot_specs)
+                .map_err(|error| Error::Snapshot(format!("pivot source disks: {error}")))?;
+            if !needs_materialization
+                && let Err(error) = snapshot::rebase_guest_memory_private(&self.guest_memory)
+            {
+                let rollback = self
+                    .mmio_device_manager
+                    .rollback_block_pivots(disk_rollback);
+                return Err(Error::Snapshot(match rollback {
+                    Ok(()) => format!("rebase guest RAM: {error}"),
+                    Err(rollback_error) => format!(
+                        "rebase guest RAM: {error}; disk pivot rollback failed: {rollback_error}"
+                    ),
+                }));
+            }
+            Ok((
+                VmCheckpoint {
+                    vm_state,
+                    vcpu_states,
+                    devices,
+                    ioapic: None,
+                },
+                generation_copy,
+                generation_guardian,
+                disk_rollback,
+            ))
+        })();
+
+        let (checkpoint, generation_copy, generation_guardian, disk_rollback) = match capture {
+            Ok(capture) => capture,
+            Err(capture_error) => {
+                return match self.resume() {
+                    Ok(()) => Err(capture_error),
+                    Err(resume_error) => Err(Error::Snapshot(format!(
+                        "RAM generation capture failed ({capture_error}); source resume failed ({resume_error})"
+                    ))),
+                };
+            }
+        };
+        if let Err(marker_error) = publish_generation_commit_marker(commit_marker) {
+            drop(generation_copy);
+            drop(generation_guardian);
+            let rollback_error = self
+                .mmio_device_manager
+                .rollback_block_pivots(disk_rollback)
+                .err();
+            let resume_error = self.resume().err();
+            return Err(Error::Snapshot(format!(
+                "publish fork generation: {marker_error}{}{}",
+                rollback_error
+                    .map(|error| format!("; disk pivot rollback failed: {error}"))
+                    .unwrap_or_default(),
+                resume_error
+                    .map(|error| format!("; source resume failed: {error}"))
+                    .unwrap_or_default()
+            )));
+        }
+        if let Err(resume_error) = self.resume() {
+            drop(generation_copy);
+            drop(generation_guardian);
+            let rollback_error = self
+                .mmio_device_manager
+                .rollback_block_pivots(disk_rollback)
+                .err();
+            let marker_cleanup_error = std::fs::remove_file(commit_marker)
+                .err()
+                .filter(|error| error.kind() != io::ErrorKind::NotFound);
+            return Err(match rollback_error {
+                Some(rollback_error) => Error::Snapshot(format!(
+                    "source resume failed ({resume_error}); disk pivot rollback failed ({rollback_error}){}",
+                    marker_cleanup_error
+                        .map(|error| format!("; commit marker cleanup failed: {error}"))
+                        .unwrap_or_default()
+                )),
+                None if marker_cleanup_error.is_none() => resume_error,
+                None => Error::Snapshot(format!(
+                    "source resume failed ({resume_error}); commit marker cleanup failed: {}",
+                    marker_cleanup_error.unwrap()
+                )),
+            });
+        }
+        // The source is live on the new disks. Dropping this token commits the
+        // pivot by closing the old worker-owned handles.
+        drop(disk_rollback);
+
+        let generation = if let Some(guardian) = generation_guardian {
+            ForkContinueRamGeneration::Guardian(guardian)
+        } else if let Some(copy) = generation_copy {
+            let (descs, files) = copy.finish().map_err(|error| {
+                Error::Snapshot(format!("finish RAM generation worker: {error}"))
+            })?;
+            self.retained_generation_files = files;
+            ForkContinueRamGeneration::Memfd(descs)
+        } else {
+            ForkContinueRamGeneration::Memfd(source_descs)
+        };
+        Ok((checkpoint, generation))
+    }
+
     /// Reapply a successful fork checkpoint and resume the original VM.
     ///
     /// Fork capture intentionally leaves device workers stopped and vCPUs
@@ -1031,7 +1256,7 @@ impl Vmm {
             self.vm.restore_state(&vm_state).map_err(Error::Vm)?;
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             self.vm
-                .rebase_vcpu_tsc(&vm_state, &mut vcpu_states)
+                .rebase_vcpu_tsc_same_host(&vm_state, &mut vcpu_states)
                 .map_err(Error::Vm)?;
             #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
             if let Some(bytes) = &ioapic {
@@ -1127,6 +1352,11 @@ impl Vmm {
             VmmRunState::Pausing => "pausing",
             VmmRunState::Resuming => "resuming",
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn demand_pager_failure(&self) -> Option<String> {
+        self.demand_pager.as_ref().and_then(|pager| pager.failure())
     }
 
     /// Configures the system for boot.
@@ -1279,6 +1509,31 @@ mod fork_tests {
         assert!(!has_memfd_backed_memory(&[]));
         assert!(!has_memfd_backed_memory(&[region(-1), region(-1)]));
         assert!(has_memfd_backed_memory(&[region(-1), region(7)]));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "blk"))]
+    #[test]
+    fn generation_commit_marker_is_atomic_and_single_publish() {
+        let directory = std::env::temp_dir().join(format!(
+            "libkrun-generation-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let marker = directory.join("source-continues-v1");
+        publish_generation_commit_marker(&marker).unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), b"source-continues-v1\n");
+        assert_eq!(
+            publish_generation_commit_marker(&marker)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(!directory.join("source-continues-v1.partial").exists());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
 
