@@ -2115,14 +2115,18 @@ pub fn create_guest_memory(
         // fresh file-backed memory containing its current state. This one-time
         // materialization makes the restored machine a stable source for its
         // own descendants without mutating the ancestor's backing files.
-        // A portable checkpoint is already backed by its private sparse memory
-        // image. Keep that mapping: Linux descendants reach its open fd through
-        // `/proc/<pid>/fd`, while macOS retains the file path for descendants.
-        // Other restored mappings still need promotion into fork backing.
-        let needs_fork_backing = guest_mem
-            .iter()
-            .zip(fork_backed_regions.iter())
-            .any(|(region, backed)| *backed && region.file_offset().is_none());
+        // Linux portable restores are promoted from their sparse image into
+        // sealable memfds before reaching the builder; macOS can retain the
+        // private checkpoint file directly. Keep this defensive inspection for
+        // other restored mappings so an unsealable backing cannot fail only at
+        // the first descendant's fork boundary.
+        let needs_fork_backing =
+            super::snapshot::restored_memory_needs_fork_backing(&guest_mem, &fork_backed_regions)
+                .map_err(|error| {
+                StartMicrovmError::GuestMemoryMmap(format!(
+                    "inspect restored fork backing: {error}"
+                ))
+            })?;
         let guest_mem = if memfd_backed_ram_enabled() && needs_fork_backing {
             let promoted =
                 super::snapshot::materialize_guest_memory(&guest_mem, &fork_backed_regions)

@@ -1227,7 +1227,16 @@ fn build_restore_ctx(
                 "memory: image length {actual_memory_len} does not match manifest {expected_memory_len}"
             ));
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        let guest_memory = if std::env::var_os("SMOLVM_FORKABLE").is_some_and(|value| value == "1")
+        {
+            vmm::snapshot::map_guest_memory_file_forkable(&descs, &memory_file)
+                .map_err(|e| format!("promote portable guest memory: {e}"))?
+        } else {
+            vmm::snapshot::map_guest_memory_file(&descs, &memory_file)
+                .map_err(|e| format!("map guest memory: {e}"))?
+        };
+        #[cfg(all(unix, not(target_os = "linux")))]
         let guest_memory = vmm::snapshot::map_guest_memory_file(&descs, &memory_file)
             .map_err(|e| format!("map guest memory: {e}"))?;
         // Windows cannot unlink a live file mapping when smolvm consumes the

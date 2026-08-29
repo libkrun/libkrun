@@ -219,8 +219,19 @@ fn copy_region_backing_extents<R: GuestMemoryRegion>(
     };
     let backing = file_offset.file();
     let backing_start = file_offset.start();
+    copy_file_extents(backing, backing_start, region.len(), out, output_offset)
+}
+
+#[cfg(target_os = "linux")]
+fn copy_file_extents(
+    backing: &File,
+    backing_start: u64,
+    len: u64,
+    out: &mut File,
+    output_offset: u64,
+) -> io::Result<bool> {
     let backing_end = backing_start
-        .checked_add(region.len())
+        .checked_add(len)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "memory region too large"))?;
     let mut cursor = backing_start;
     let mut buffer = vec![0_u8; 1024 * 1024];
@@ -293,6 +304,36 @@ fn copy_region_backing_extents<R: GuestMemoryRegion>(
     }
 
     Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn copy_file_range_sparse(
+    source: &File,
+    source_offset: u64,
+    len: u64,
+    destination: &mut File,
+    destination_offset: u64,
+) -> io::Result<()> {
+    destination.seek(SeekFrom::Start(destination_offset))?;
+    let mut writer = SparseFileWriter::new(destination)?;
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    while copied < len {
+        let wanted = (len - copied).min(buffer.len() as u64) as usize;
+        let offset = source_offset.checked_add(copied).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "memory image offset overflow")
+        })?;
+        let read = source.read_at(&mut buffer[..wanted], offset)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "memory image ended during promotion",
+            ));
+        }
+        writer.write_all(&buffer[..read])?;
+        copied += read as u64;
+    }
+    writer.finish()
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -430,6 +471,70 @@ pub fn map_guest_memory_file(
         .map_err(|error| io::Error::other(format!("map guest memory image: {error:?}")))
 }
 
+/// Promote a portable sparse memory image into sealable Linux memfds without
+/// scanning or allocating its holes.
+///
+/// Portable checkpoints are regular files. They are ideal for demand-mapped
+/// leaf restores, but cannot be sealed into an immutable live-fork generation.
+/// A restored machine that will itself be forkable therefore needs private
+/// memfd backing. Copying only filesystem data extents keeps this promotion
+/// proportional to resident checkpoint pages rather than configured RAM.
+#[cfg(target_os = "linux")]
+pub fn map_guest_memory_file_forkable(
+    descs: &[MemoryRegionDesc],
+    file: &File,
+) -> io::Result<GuestMemoryMmap> {
+    if descs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot contains no guest-memory regions",
+        ));
+    }
+
+    let mut source_offset = 0_u64;
+    let ranges = descs
+        .iter()
+        .map(|desc| {
+            let len = usize::try_from(desc.len).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "guest-memory region does not fit host address space",
+                )
+            })?;
+            if len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "zero-length guest-memory region",
+                ));
+            }
+            let destination =
+                crate::builder::create_guest_ram_memfd(len).map_err(io::Error::other)?;
+            let mut destination_copy = destination.try_clone()?;
+            if !copy_file_extents(file, source_offset, desc.len, &mut destination_copy, 0)? {
+                copy_file_range_sparse(file, source_offset, desc.len, &mut destination_copy, 0)?;
+            }
+            source_offset = source_offset.checked_add(desc.len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "guest-memory image too large")
+            })?;
+            Ok((
+                GuestAddress(desc.gpa),
+                len,
+                Some(FileOffset::new(destination, 0)),
+            ))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let actual = file.metadata()?.len();
+    if source_offset != actual {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("guest-memory image length {actual} does not match manifest {source_offset}"),
+        ));
+    }
+    GuestMemoryMmap::from_ranges_with_files(ranges)
+        .map_err(|error| io::Error::other(format!("map forkable guest memory: {error:?}")))
+}
+
 /// Total byte length of all regions in a descriptor list (the size of the
 /// memory image stream).
 pub fn memory_image_len(descs: &[MemoryRegionDesc]) -> u64 {
@@ -500,6 +605,64 @@ pub fn materialize_guest_memory(
         .map_err(|error| io::Error::other(format!("materialize guest memory: {error:?}")))?;
     copy_guest_memory(src, &dst)?;
     Ok(dst)
+}
+
+/// Return whether a restored guest-memory mapping must be copied into fresh
+/// fork backing before it can become a live fork source.
+///
+/// A local fork clone normally has raw `MAP_PRIVATE` regions with no retained
+/// [`FileOffset`], so promotion is required. A portable checkpoint retains its
+/// sparse regular-file backing, but Linux regular files report `F_SEAL_SEAL`
+/// without `F_SEAL_WRITE`: they cannot be made into the immutable generation
+/// required by [`rebase_guest_memory_private`]. Treat that shape as requiring
+/// promotion too instead of letting the first descendant fail at the fork
+/// boundary.
+pub fn restored_memory_needs_fork_backing(
+    memory: &GuestMemoryMmap,
+    fork_backed_regions: &[bool],
+) -> io::Result<bool> {
+    if memory.num_regions() != fork_backed_regions.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "guest-memory region count {} does not match fork backing mask {}",
+                memory.num_regions(),
+                fork_backed_regions.len()
+            ),
+        ));
+    }
+
+    for (region, fork_backed) in memory.iter().zip(fork_backed_regions.iter().copied()) {
+        if !fork_backed {
+            continue;
+        }
+        let Some(file_offset) = region.file_offset() else {
+            return Ok(true);
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let _ = file_offset;
+
+        #[cfg(target_os = "linux")]
+        {
+            let seals = unsafe { libc::fcntl(file_offset.file().as_raw_fd(), libc::F_GET_SEALS) };
+            if seals < 0 {
+                let error = io::Error::last_os_error();
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL | libc::ENOTTY | libc::EOPNOTSUPP)
+                ) {
+                    return Ok(true);
+                }
+                return Err(error);
+            }
+            if seals & libc::F_SEAL_SEAL != 0 && seals & libc::F_SEAL_WRITE == 0 {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 /// Copy-on-write clone of a `memfd`-backed guest memory image — the core of
@@ -2138,6 +2301,41 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn restored_unsealable_file_backing_requires_promotion() {
+        use crate::builder::create_guest_ram_memfd;
+        use std::os::fd::AsRawFd;
+        use vm_memory::FileOffset;
+
+        const SIZE: usize = 4 * 4096;
+        let sealable = create_guest_ram_memfd(SIZE).expect("sealable memfd");
+        let sealable_memory = GuestMemoryMmap::from_ranges_with_files([(
+            GuestAddress(0),
+            SIZE,
+            Some(FileOffset::new(sealable, 0)),
+        )])
+        .expect("sealable memory");
+        assert!(!restored_memory_needs_fork_backing(&sealable_memory, &[true]).unwrap());
+
+        let unsealable = create_guest_ram_memfd(SIZE).expect("memfd");
+        let result =
+            unsafe { libc::fcntl(unsealable.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_SEAL) };
+        assert_eq!(
+            result,
+            0,
+            "lock memfd seal set: {}",
+            io::Error::last_os_error()
+        );
+        let unsealable_memory = GuestMemoryMmap::from_ranges_with_files([(
+            GuestAddress(0),
+            SIZE,
+            Some(FileOffset::new(unsealable, 0)),
+        )])
+        .expect("unsealable memory");
+        assert!(restored_memory_needs_fork_backing(&unsealable_memory, &[true]).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn rebased_parent_can_continue_without_mutating_fork_generation() {
         use crate::builder::create_guest_ram_memfd;
         use std::os::unix::fs::FileExt;
@@ -2289,6 +2487,44 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_memory_image_promotes_into_independent_fork_backing() {
+        use crate::builder::create_guest_ram_memfd;
+        use std::os::unix::fs::FileExt;
+
+        let descs = [
+            MemoryRegionDesc {
+                gpa: 0,
+                len: 0x20_0000,
+            },
+            MemoryRegionDesc {
+                gpa: 0x40_0000,
+                len: 0x10_0000,
+            },
+        ];
+        let file = create_guest_ram_memfd(0x30_0000).expect("sparse memory image");
+        file.write_all_at(&[0xA5; 4096], 0x1000).unwrap();
+        file.write_all_at(&[0x5A; 4096], 0x20_2000).unwrap();
+
+        let memory = map_guest_memory_file_forkable(&descs, &file).expect("promote sparse image");
+        assert!(!restored_memory_needs_fork_backing(&memory, &[true, true]).unwrap());
+
+        let mut low = [0_u8; 16];
+        let mut high = [0_u8; 16];
+        memory.read_slice(&mut low, GuestAddress(0x1000)).unwrap();
+        memory
+            .read_slice(&mut high, GuestAddress(0x40_2000))
+            .unwrap();
+        assert_eq!(low, [0xA5; 16]);
+        assert_eq!(high, [0x5A; 16]);
+
+        file.write_all_at(&[0x11; 16], 0x1000).unwrap();
+        memory.read_slice(&mut low, GuestAddress(0x1000)).unwrap();
+        assert_eq!(low, [0xA5; 16], "promoted RAM must not alias the artifact");
+        rebase_guest_memory_private(&memory).expect("promoted RAM supports live fork");
     }
 
     #[cfg(target_os = "linux")]
