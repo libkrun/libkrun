@@ -209,17 +209,49 @@ pub fn write_guest_memory_sparse(
 }
 
 #[cfg(target_os = "linux")]
-fn copy_region_backing_extents<R: GuestMemoryRegion>(
-    region: &R,
+fn copy_region_backing_extents(
+    region: &vm_memory::GuestRegionMmap,
     out: &mut File,
     output_offset: u64,
 ) -> io::Result<bool> {
     let Some(file_offset) = region.file_offset() else {
         return Ok(false);
     };
+    // A file-backed MAP_PRIVATE view may contain anonymous CoW pages that are
+    // newer than the backing file. The live-fork rebase uses MAP_FIXED, so the
+    // vm-memory wrapper can still report its original MAP_SHARED flags; a
+    // write-sealed backing is the authoritative signal in that case. Falling
+    // back to the mapped-byte writer preserves those private pages while still
+    // producing a sparse checkpoint image.
+    if region.flags() & libc::MAP_PRIVATE != 0
+        || backing_is_immutable_fork_generation(file_offset.file())?
+    {
+        return Ok(false);
+    }
     let backing = file_offset.file();
     let backing_start = file_offset.start();
     copy_file_extents(backing, backing_start, region.len(), out, output_offset)
+}
+
+#[cfg(target_os = "linux")]
+fn backing_is_immutable_fork_generation(backing: &File) -> io::Result<bool> {
+    let seals = unsafe { libc::fcntl(backing.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals >= 0 {
+        return Ok(seals & libc::F_SEAL_WRITE != 0);
+    }
+    let error = io::Error::last_os_error();
+    if unsupported_seal_query(&error) {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+#[cfg(target_os = "linux")]
+fn unsupported_seal_query(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL) | Some(libc::ENOTTY) | Some(libc::EOPNOTSUPP)
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -648,10 +680,7 @@ pub fn restored_memory_needs_fork_backing(
             let seals = unsafe { libc::fcntl(file_offset.file().as_raw_fd(), libc::F_GET_SEALS) };
             if seals < 0 {
                 let error = io::Error::last_os_error();
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::EINVAL | libc::ENOTTY | libc::EOPNOTSUPP)
-                ) {
+                if unsupported_seal_query(&error) {
                     return Ok(true);
                 }
                 return Err(error);
@@ -2387,6 +2416,70 @@ mod tests {
         assert_eq!(write_error.raw_os_error(), Some(libc::EPERM));
         let truncate_error = inspect_fd.set_len(PAGE as u64).unwrap_err();
         assert_eq!(truncate_error.raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seal_query_unsupported_errnos_are_distinct() {
+        for errno in [libc::EINVAL, libc::ENOTTY, libc::EOPNOTSUPP] {
+            assert!(unsupported_seal_query(&io::Error::from_raw_os_error(errno)));
+        }
+        assert!(!unsupported_seal_query(&io::Error::from_raw_os_error(
+            libc::EPERM
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_snapshot_includes_private_pages_after_live_fork() {
+        use crate::builder::create_guest_ram_memfd;
+
+        const PAGE: usize = 4096;
+        let size = 4 * PAGE;
+        let memfd = create_guest_ram_memfd(size).expect("sealable memfd");
+        let memory = GuestMemoryMmap::from_ranges_with_files([(
+            GuestAddress(0),
+            size,
+            Some(FileOffset::new(memfd, 0)),
+        )])
+        .expect("memfd-backed memory");
+        memory.write_slice(&[0x11; PAGE], GuestAddress(0)).unwrap();
+
+        rebase_guest_memory_private(&memory).expect("private source rebase");
+        memory.write_slice(&[0xA5; PAGE], GuestAddress(0)).unwrap();
+        memory
+            .write_slice(&[0x5A; PAGE], GuestAddress((2 * PAGE) as u64))
+            .unwrap();
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "libkrun-private-sparse-{}-{nonce}",
+            std::process::id()
+        ));
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let descs = write_guest_memory_sparse(&memory, &mut output).unwrap();
+        output.seek(SeekFrom::Start(0)).unwrap();
+        let restored = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), size)]).unwrap();
+        read_guest_memory_into(&restored, &descs, &mut output).unwrap();
+
+        let mut page = [0_u8; PAGE];
+        restored.read_slice(&mut page, GuestAddress(0)).unwrap();
+        assert_eq!(page, [0xA5; PAGE]);
+        restored
+            .read_slice(&mut page, GuestAddress((2 * PAGE) as u64))
+            .unwrap();
+        assert_eq!(page, [0x5A; PAGE]);
+
+        drop(output);
+        fs::remove_file(path).unwrap();
     }
 
     // Pool density: N CoW clones of a faulted-in base must cost only the pages

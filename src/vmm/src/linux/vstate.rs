@@ -1033,7 +1033,18 @@ impl Vm {
     pub fn save_state(&self) -> Result<VmState> {
         let pitstate = self.fd.get_pit2().map_err(Error::VmGetPit2)?;
 
+        let realtime_before = host_realtime_ns()?;
         let mut clock = self.fd.get_clock().map_err(Error::VmGetClock)?;
+        let realtime_after = host_realtime_ns()?;
+        if clock.flags & KVM_CLOCK_REALTIME == 0 {
+            // KVM only publishes its atomic realtime sample while its master
+            // clock is active. KVM_SET_CLOCK can temporarily disable that
+            // mode, so a restored VM may otherwise become impossible to save
+            // again. The VM is paused here; bracket KVM_GET_CLOCK with two
+            // CLOCK_REALTIME reads and use their bounded midpoint.
+            clock.realtime = bounded_realtime_midpoint(realtime_before, realtime_after)?;
+            clock.flags |= KVM_CLOCK_REALTIME;
+        }
         // This bit is not accepted in SET_CLOCK, clear it.
         clock.flags &= !KVM_CLOCK_TSC_STABLE;
 
@@ -1071,9 +1082,11 @@ impl Vm {
     }
 
     #[cfg(target_arch = "x86_64")]
-    /// Refuse a portable checkpoint unless KVM supplied every clock field
-    /// needed to preserve guest time across hosts. A checkpoint that cannot be
-    /// restored is worse than a capture-time error while the source is intact.
+    /// Refuse a portable checkpoint unless it carries the realtime anchor that
+    /// KVM_SET_CLOCK needs to advance guest time while the VM is stopped.
+    /// HOST_TSC enables the exact offset fast path but is optional: older KVM
+    /// implementations and VMs restored with KVM_SET_CLOCK may omit it, in
+    /// which case restore writes the saved absolute guest TSC instead.
     pub fn validate_migration_clock(
         &self,
         state: &VmState,
@@ -1085,7 +1098,7 @@ impl Vm {
         {
             return Ok(());
         }
-        validate_migration_clock_flags(&state.clock, "source")
+        validate_migration_clock_realtime(&state.clock, "source")
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1103,21 +1116,39 @@ impl Vm {
             return Ok(());
         }
 
-        validate_migration_clock_flags(&source.clock, "source")?;
+        validate_migration_clock_realtime(&source.clock, "source")?;
         let destination = self.fd.get_clock().map_err(Error::VmGetClock)?;
-        validate_migration_clock_flags(&destination, "destination")?;
+        let has_full_samples = source.clock.flags & KVM_CLOCK_HOST_TSC != 0
+            && destination.flags & KVM_CLOCK_HOST_TSC != 0;
 
         for state in vcpu_states {
             if let Some(tsc) = &mut state.tsc_migration {
-                tsc.offset = rebased_tsc_offset(
-                    tsc.offset,
-                    tsc.khz,
-                    source.clock.clock,
-                    destination.clock,
-                    source.clock.host_tsc,
-                    destination.host_tsc,
-                );
-                tsc.apply_offset = true;
+                if has_full_samples {
+                    tsc.offset = rebased_tsc_offset(
+                        tsc.offset,
+                        tsc.khz,
+                        source.clock.clock,
+                        destination.clock,
+                        source.clock.host_tsc,
+                        destination.host_tsc,
+                    );
+                    tsc.apply_offset = true;
+                } else {
+                    let guest_delta_ns =
+                        i128::from(destination.clock) - i128::from(source.clock.clock);
+                    let tsc_entry = state
+                        .msrs
+                        .as_mut_slice()
+                        .iter_mut()
+                        .find(|entry| entry.index == 0x10)
+                        .ok_or_else(|| {
+                            Error::VmClockMigration(
+                                "portable vCPU state is missing IA32_TSC".to_string(),
+                            )
+                        })?;
+                    tsc_entry.data = advance_tsc(tsc_entry.data, guest_delta_ns, tsc.khz);
+                    tsc.apply_offset = false;
+                }
             }
         }
         Ok(())
@@ -1241,15 +1272,48 @@ impl Vm {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn validate_migration_clock_flags(clock: &kvm_clock_data, host: &str) -> Result<()> {
-    let required = KVM_CLOCK_REALTIME | KVM_CLOCK_HOST_TSC;
-    if clock.flags & required != required {
+fn validate_migration_clock_realtime(clock: &kvm_clock_data, host: &str) -> Result<()> {
+    if clock.flags & KVM_CLOCK_REALTIME == 0 {
         return Err(Error::VmClockMigration(format!(
-            "{host} KVM clock flags {:#x} do not include KVM_CLOCK_REALTIME and KVM_CLOCK_HOST_TSC",
+            "{host} KVM clock flags {:#x} do not include KVM_CLOCK_REALTIME",
             clock.flags
         )));
     }
     Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn host_realtime_ns() -> Result<u64> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            Error::VmClockMigration(format!(
+                "host CLOCK_REALTIME precedes the Unix epoch: {error}"
+            ))
+        })?;
+    u64::try_from(elapsed.as_nanos()).map_err(|_| {
+        Error::VmClockMigration("host CLOCK_REALTIME does not fit in nanoseconds".to_string())
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn bounded_realtime_midpoint(before: u64, after: u64) -> Result<u64> {
+    const MAX_SAMPLE_WINDOW_NS: u64 = 100_000_000;
+
+    let window = after.checked_sub(before).ok_or_else(|| {
+        Error::VmClockMigration(
+            "host CLOCK_REALTIME moved backwards while sampling KVM clock; retry capture"
+                .to_string(),
+        )
+    })?;
+    if window > MAX_SAMPLE_WINDOW_NS {
+        return Err(Error::VmClockMigration(format!(
+            "host clock sampling took {window} ns; retry capture"
+        )));
+    }
+    Ok(before + window / 2)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3590,6 +3654,27 @@ mod tests {
     fn test_advance_tsc_uses_guest_frequency() {
         assert_eq!(advance_tsc(100, 250_000_000, 2_400_000), 600_000_100);
         assert_eq!(advance_tsc(600_000_100, -250_000_000, 2_400_000), 100);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_portable_clock_allows_absolute_tsc_fallback() {
+        let realtime_only = kvm_clock_data {
+            flags: KVM_CLOCK_REALTIME,
+            ..Default::default()
+        };
+        assert!(validate_migration_clock_realtime(&realtime_only, "source").is_ok());
+
+        let missing_realtime = kvm_clock_data::default();
+        assert!(validate_migration_clock_realtime(&missing_realtime, "source").is_err());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_realtime_midpoint_is_bounded() {
+        assert_eq!(bounded_realtime_midpoint(1_000, 1_100).unwrap(), 1_050);
+        assert!(bounded_realtime_midpoint(1_100, 1_000).is_err());
+        assert!(bounded_realtime_midpoint(0, 100_000_001).is_err());
     }
 
     #[cfg(target_arch = "x86_64")]
