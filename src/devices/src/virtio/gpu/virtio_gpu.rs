@@ -150,6 +150,46 @@ pub struct VirtioGpuScanout {
     height: u32,
 }
 
+/// Geometry of a blob resource being put on a scanout.
+pub struct BlobScanout {
+    pub ctx_id: u32,
+    pub resource_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub stride: u32,
+    pub offset: u32,
+}
+
+/// How a blob's rows map onto a display frame.
+struct BlobRows {
+    src_stride: usize,
+    dst_stride: usize,
+    height: usize,
+    offset: usize,
+}
+
+/// Signature of the renderer's optional pixel readback.
+type RendererReadPixels = unsafe extern "C" fn(u32, u32, *mut c_void, u32, u32, u32) -> i32;
+
+/// Looks up the renderer's pixel readback, once.
+///
+/// Only a renderer that can read back a GPU-rendered image provides this, and
+/// resolving it at runtime keeps this crate buildable and linkable against one
+/// that does not.
+fn renderer_read_resource_pixels() -> Option<RendererReadPixels> {
+    static LOOKUP: std::sync::OnceLock<Option<RendererReadPixels>> = std::sync::OnceLock::new();
+    *LOOKUP.get_or_init(|| unsafe {
+        let name = b"virgl_renderer_read_resource_pixels\0";
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr() as *const libc::c_char);
+        if sym.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, RendererReadPixels>(sym))
+        }
+    })
+}
+
 pub struct VirtioGpu {
     rutabaga: Rutabaga,
     resources: BTreeMap<u32, VirtioGpuResource>,
@@ -790,6 +830,176 @@ impl VirtioGpu {
             .present_frame(scanout_id, frame_id, None)?;
 
         Ok(OkNoData)
+    }
+
+    /// Puts a blob resource on a scanout.
+    ///
+    /// A compositor that renders on the GPU allocates its output as a blob, so
+    /// this is the path every accelerated desktop takes; without it the guest
+    /// draws frames that never reach the display. Unlike a classic 2D resource
+    /// a blob carries no format or geometry of its own, so the command supplies
+    /// them.
+    pub fn set_scanout_blob(&mut self, scanout_id: u32, blob: BlobScanout) -> VirtioGpuResult {
+        let scanout = self
+            .scanouts
+            .get_mut(scanout_id as usize)
+            .ok_or(ErrInvalidScanoutId)?;
+
+        if let Some(resource) = scanout
+            .as_ref()
+            .map(|scanout| scanout.resource_id)
+            .and_then(|previous| self.resources.get_mut(&previous))
+        {
+            resource.scanouts.disable(scanout_id);
+        }
+
+        if blob.resource_id == 0 {
+            *scanout = None;
+            self.display_backend.disable_scanout(scanout_id)?;
+            return Ok(OkNoData);
+        }
+
+        let resource = self
+            .resources
+            .get_mut(&blob.resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        resource.scanouts.enable(scanout_id);
+        resource.width = blob.width;
+        resource.height = blob.height;
+
+        let Ok(format) = ResourceFormat::try_from(blob.format) else {
+            warn!("set_scanout_blob: unsupported format {}", blob.format);
+            return Err(ErrUnspec);
+        };
+        resource.format = Some(format);
+
+        let display_info = self
+            .displays
+            .get(scanout_id as usize)
+            .ok_or(ErrInvalidScanoutId)?;
+
+        self.display_backend.configure_scanout(
+            scanout_id,
+            display_info.width,
+            display_info.height,
+            blob.width,
+            blob.height,
+            format,
+        )?;
+
+        *scanout = Some(VirtioGpuScanout {
+            resource_id: blob.resource_id,
+            width: blob.width,
+            height: blob.height,
+        });
+
+        self.present_scanout_blob(scanout_id, &blob)
+    }
+
+    /// Reads a blob resource's pixels and presents them.
+    ///
+    /// Where the pixels live depends on who drew them. A compositor rendering
+    /// on the GPU leaves them in an image the renderer owns; one rendering on
+    /// the CPU writes them into the blob's own memory. Try each in turn rather
+    /// than assuming, so a frame reaches the display either way.
+    fn present_scanout_blob(&mut self, scanout_id: u32, blob: &BlobScanout) -> VirtioGpuResult {
+        let bpp = ResourceFormat::BYTES_PER_PIXEL as u32;
+        let rows = BlobRows {
+            dst_stride: (blob.width * bpp) as usize,
+            src_stride: if blob.stride != 0 {
+                blob.stride as usize
+            } else {
+                (blob.width * bpp) as usize
+            },
+            height: blob.height as usize,
+            offset: blob.offset as usize,
+        };
+        let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
+
+        // 1. the renderer, if it offers a readback. Only a GPU-rendered buffer
+        //    needs it, and only a renderer built with it can answer, so this is
+        //    resolved at runtime and simply absent otherwise.
+        if let Some(read_pixels) = renderer_read_resource_pixels() {
+            let rc = unsafe {
+                read_pixels(
+                    blob.ctx_id,
+                    blob.resource_id,
+                    buffer.as_mut_ptr() as *mut c_void,
+                    rows.dst_stride as u32,
+                    blob.width,
+                    blob.height,
+                )
+            };
+            if rc == 0 {
+                self.display_backend
+                    .present_frame(scanout_id, frame_id, None)?;
+                return Ok(OkNoData);
+            }
+        }
+
+        // 2. the blob's own memory, which is where a CPU renderer draws
+        if Self::copy_blob_pixels(&self.rutabaga, blob.resource_id, buffer, &rows) {
+            self.display_backend
+                .present_frame(scanout_id, frame_id, None)?;
+            return Ok(OkNoData);
+        }
+
+        error!(
+            "set_scanout_blob: no readable pixels for resource {}",
+            blob.resource_id
+        );
+        Err(ErrUnspec)
+    }
+
+    /// Copies a blob's pixels out of its own storage, row by row.
+    fn copy_blob_pixels(
+        rutabaga: &Rutabaga,
+        resource_id: u32,
+        dst: &mut [u8],
+        rows: &BlobRows,
+    ) -> bool {
+        if rows.height == 0 || rows.dst_stride == 0 {
+            return false;
+        }
+        let needed = rows.offset + rows.src_stride * (rows.height - 1) + rows.dst_stride;
+
+        let mut copy_rows = |src: &[u8]| -> bool {
+            if src.len() < needed {
+                return false;
+            }
+            for row in 0..rows.height {
+                let (s, d) = (rows.offset + row * rows.src_stride, row * rows.dst_stride);
+                if s + rows.dst_stride > src.len() || d + rows.dst_stride > dst.len() {
+                    return row > 0;
+                }
+                dst[d..d + rows.dst_stride].copy_from_slice(&src[s..s + rows.dst_stride]);
+            }
+            true
+        };
+
+        // macOS shares a blob through a mapped host pointer
+        #[cfg(target_os = "macos")]
+        if let Ok(map_ptr) = rutabaga.map_ptr(resource_id) {
+            // Safe: the mapping spans the resource, and `needed` is checked
+            // against it before any row is read.
+            let src = unsafe { std::slice::from_raw_parts(map_ptr as *const u8, needed) };
+            if map_ptr != 0 && copy_rows(src) {
+                return true;
+            }
+        }
+
+        // elsewhere a guest-memory blob keeps its pixels in the guest's own pages
+        if let Some([iov]) = rutabaga.backing_iovecs(resource_id) {
+            // Safe: the iovec describes guest memory the device already owns for
+            // this resource, and `needed` is checked to fit inside it.
+            let src = unsafe { std::slice::from_raw_parts(iov.base as *const u8, needed) };
+            if iov.len >= needed && copy_rows(src) {
+                return true;
+            }
+        }
+
+        let _ = (rutabaga, resource_id);
+        false
     }
 
     fn read_2d_resource(

@@ -909,6 +909,14 @@ impl Rutabaga {
             .ok_or(RutabagaError::SpecViolation("no map info available"))
     }
 
+    /// Returns the guest pages backing a resource, if it has any.
+    ///
+    /// A guest-memory blob keeps its contents there, so this is how the device
+    /// reads pixels a guest drew without going through the renderer.
+    pub fn backing_iovecs(&self, resource_id: u32) -> Option<&[RutabagaIovec]> {
+        self.resources.get(&resource_id)?.backing_iovecs.as_deref()
+    }
+
     /// Returns the `map_ptr` of the blob resource.
     #[cfg(target_os = "macos")]
     pub fn map_ptr(&self, resource_id: u32) -> RutabagaResult<u64> {

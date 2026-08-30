@@ -25,7 +25,7 @@ use super::super::{GpuError, Queue as VirtQueue};
 use super::protocol::{
     GpuCommand, GpuResponse, VirtioGpuResult, virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
 };
-use super::virtio_gpu::VirtioGpu;
+use super::virtio_gpu::{BlobScanout, VirtioGpu};
 use crate::virtio::display::DisplayInfo;
 use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::{VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX};
@@ -640,10 +640,18 @@ impl Worker {
                     mem,
                 )
             }
-            GpuCommand::SetScanoutBlob(_info) => {
-                error!("virtio_gpu: GpuCommand::SetScanoutBlob unimplemented");
-                Err(GpuResponse::ErrUnspec)
-            }
+            GpuCommand::SetScanoutBlob(info) => virtio_gpu.set_scanout_blob(
+                info.scanout_id,
+                BlobScanout {
+                    ctx_id: hdr.ctx_id,
+                    resource_id: info.resource_id,
+                    width: info.width,
+                    height: info.height,
+                    format: info.format,
+                    stride: info.strides[0],
+                    offset: info.offsets[0],
+                },
+            ),
             GpuCommand::ResourceMapBlob(info) => {
                 let resource_id = info.resource_id;
                 let offset = info.offset;
