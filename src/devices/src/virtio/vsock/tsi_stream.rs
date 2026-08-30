@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -60,6 +60,20 @@ pub struct TsiStreamProxy {
     /// the shutdown and marks that remote→guest is done while guest→remote still
     /// flows.
     local_read_shutdown: bool,
+    /// Guest->host bytes accepted from the guest but not yet written to the host
+    /// socket, because the host socket's send buffer was full (a slow or stalled
+    /// remote peer — the #1093 blackhole shape). Drained on EPOLLOUT. Bounded by
+    /// the guest's own vsock send window (`CONN_TX_BUF_SIZE`), since `tx_cnt`
+    /// (which drives the credit we hand back) only advances for bytes actually
+    /// flushed: once the backlog reaches the window the guest's own TCP stack
+    /// blocks, so the host never buffers unboundedly and the muxer thread never
+    /// blocks.
+    tx_buf: VecDeque<u8>,
+    /// True while we have paused reading the host socket (guest RX credit
+    /// exhausted, or the remote half-closed). Kept separate from the epoll
+    /// interest so TX-flush (OUT) and RX-read (IN) interest compose correctly
+    /// via `conn_evset`.
+    rx_paused: bool,
 }
 
 impl TsiStreamProxy {
@@ -130,6 +144,8 @@ impl TsiStreamProxy {
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
+            tx_buf: VecDeque::new(),
+            rx_paused: false,
             pending_accepts: 0,
             #[cfg(target_os = "linux")]
             unixsock_path: None,
@@ -172,6 +188,8 @@ impl TsiStreamProxy {
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
+            tx_buf: VecDeque::new(),
+            rx_paused: false,
             pending_accepts: 0,
             #[cfg(target_os = "linux")]
             unixsock_path: None,
@@ -435,9 +453,10 @@ impl TsiStreamProxy {
 
     fn switch_to_connected(&mut self) {
         self.status = ProxyStatus::Connected;
-        if let Err(e) = self.sock.set_nonblocking(false) {
-            warn!("error switching to blocking: id={}, err={}", self.id, e);
-        }
+        // Deliberately keep the host socket NON-BLOCKING. Guest->host sends are
+        // drained non-blockingly (see `flush_tx`) and buffered on `WouldBlock`,
+        // so a stalled remote peer can never block the single vsock muxer thread
+        // and deadlock the whole VM. See smol-machines/smolvm#1093.
     }
 
     /// Re-establish this freshly-constructed proxy as a host-side inbound
@@ -480,6 +499,77 @@ impl TsiStreamProxy {
             self.id, guest_port, host_port
         );
         0
+    }
+    /// Host-socket epoll interest for a connected data stream: read (IN) unless
+    /// RX is paused for credit/half-close, plus write (OUT) whenever there are
+    /// buffered guest->host bytes still to flush. Keeping the two composable is
+    /// what lets a stalled send keep OUT armed without losing the RX side.
+    fn conn_evset(&self) -> EventSet {
+        let mut e = EventSet::empty();
+        if !self.rx_paused {
+            e |= EventSet::IN;
+        }
+        if !self.tx_buf.is_empty() {
+            e |= EventSet::OUT;
+        }
+        // Edge-triggered: a partially-writable host socket (a slow, not-yet-full
+        // remote peer) would otherwise re-fire OUT every epoll cycle and spin the
+        // muxer (#1093 second-order livelock). Both `flush_tx` and `recv_pkt`
+        // drain until WouldBlock, which is exactly what edge-triggering requires.
+        if !e.is_empty() {
+            e |= EventSet::EDGE_TRIGGERED;
+        }
+        e
+    }
+
+    fn repoll(&self) -> Option<(u64, ProxyRawHandle, EventSet)> {
+        Some((self.id, raw_handle(&self.sock), self.conn_evset()))
+    }
+
+    /// Non-blocking drain of `tx_buf` to the host socket. Advances `tx_cnt` for
+    /// bytes actually written. Returns Ok(true) if any bytes reached the host,
+    /// Ok(false) if none could be sent right now (WouldBlock or empty), Err(())
+    /// if the host socket failed and the connection must be reset.
+    fn flush_tx(&mut self) -> Result<bool, ()> {
+        let mut advanced = false;
+        while !self.tx_buf.is_empty() {
+            let front = self.tx_buf.as_slices().0;
+            match self.sock.send(front) {
+                Ok(0) => break,
+                Ok(n) => {
+                    self.tx_cnt += Wrapping(n as u32);
+                    self.tx_buf.drain(..n);
+                    advanced = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    warn!("flush_tx: host send failed id={}: {e}", self.id);
+                    return Err(());
+                }
+            }
+        }
+        Ok(advanced)
+    }
+
+    /// Emit a vsock credit update to the guest if `tx_cnt` has advanced by at
+    /// least half the guest's advertised buffer since the last one. Returns
+    /// whether a packet was pushed (caller should signal the queue).
+    fn maybe_send_credit_update(&mut self) -> bool {
+        if self.peer_buf_alloc != 0
+            && (self.tx_cnt - self.last_tx_cnt_sent).0 >= self.peer_buf_alloc / 2
+        {
+            self.last_tx_cnt_sent = self.tx_cnt;
+            let rx = MuxerRx::CreditUpdate {
+                local_port: self.local_port,
+                peer_port: self.peer_port,
+                fwd_cnt: self.tx_cnt.0,
+            };
+            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -592,8 +682,9 @@ impl Proxy for TsiStreamProxy {
 
         // Now that the vsock transport is fully established, start listening
         // for events in the TCP socket again.
+        self.rx_paused = false;
         Some(ProxyUpdate {
-            polling: Some((self.id, raw_handle(&self.sock), EventSet::IN)),
+            polling: self.repoll(),
             ..Default::default()
         })
     }
@@ -658,41 +749,29 @@ impl Proxy for TsiStreamProxy {
 
         let mut update = ProxyUpdate::default();
 
-        let ret = if let Some(buf) = pkt.buf() {
-            // `send_all` delivers the whole buffer or fails — a vsock stream
-            // has no way to signal a partial write, so anything short of full
-            // delivery silently corrupts the byte stream. On Windows the
-            // socket is permanently nonblocking (see `sys::send_all`), so the
-            // plain `send` this used could drop the tail of any buffer larger
-            // than the socket's free space.
-            match sys::send_all(&self.sock, buf) {
-                Ok(sent) => {
-                    self.tx_cnt += Wrapping(sent as u32);
-                    sent as i32
-                }
-                Err(err) => -sys::to_linux_errno(&err),
-            }
-        } else {
-            -libc::EINVAL
-        };
-
-        if ret > 0 && (self.tx_cnt - self.last_tx_cnt_sent).0 >= self.peer_buf_alloc / 2 {
-            debug!(
-                "sending credit update: id={}, tx_cnt={}, last_tx_cnt={}",
-                self.id, self.tx_cnt, self.last_tx_cnt_sent
-            );
-            self.last_tx_cnt_sent = self.tx_cnt;
-            // This packet goes to the connection.
-            let rx = MuxerRx::CreditUpdate {
-                local_port: pkt.dst_port(),
-                peer_port: pkt.src_port(),
-                fwd_cnt: self.tx_cnt.0,
-            };
-            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
-            update.signal_queue = true;
+        // Accept the whole buffer from the guest (a vsock data packet is
+        // all-or-nothing — there is no way to tell the guest we took only part),
+        // then drain as much as the host socket will take right now.
+        if let Some(buf) = pkt.buf() {
+            self.tx_buf.extend(buf.iter().copied());
         }
 
-        debug!("sendmsg ret={ret}");
+        match self.flush_tx() {
+            Ok(advanced) => {
+                if advanced && self.maybe_send_credit_update() {
+                    update.signal_queue = true;
+                }
+                update.polling = self.repoll();
+            }
+            Err(()) => {
+                self.push_reset();
+                self.status = ProxyStatus::Closed;
+                update.polling = Some((self.id, raw_handle(&self.sock), EventSet::empty()));
+                update.signal_queue = true;
+                update.remove_proxy = ProxyRemoval::Deferred;
+            }
+        }
+
         update
     }
 
@@ -762,8 +841,9 @@ impl Proxy for TsiStreamProxy {
 
         self.status = ProxyStatus::Connected;
 
+        self.rx_paused = false;
         ProxyUpdate {
-            polling: Some((self.id, raw_handle(&self.sock), EventSet::IN)),
+            polling: self.repoll(),
             ..Default::default()
         }
     }
@@ -795,8 +875,9 @@ impl Proxy for TsiStreamProxy {
 
         self.switch_to_connected();
 
+        self.rx_paused = false;
         ProxyUpdate {
-            polling: Some((self.id, raw_handle(&self.sock), EventSet::IN)),
+            polling: self.repoll(),
             push_accept: Some((self.id, self.parent_id)),
             ..Default::default()
         }
@@ -952,11 +1033,13 @@ impl Proxy for TsiStreamProxy {
                     }
                     self.status = ProxyStatus::Connected;
                     update.signal_queue = true;
-                    update.polling = Some((self.id(), raw_handle(&self.sock), EventSet::empty()));
+                    self.rx_paused = true;
+                    update.polling = self.repoll();
                     return update;
                 } else if self.status == ProxyStatus::WaitingCreditUpdate {
                     debug!("process_event: WaitingCreditUpdate");
-                    update.polling = Some((self.id(), raw_handle(&self.sock), EventSet::empty()));
+                    self.rx_paused = true;
+                    update.polling = self.repoll();
                 }
             } else if self.status == ProxyStatus::Listening
                 || self.status == ProxyStatus::WaitingOnAccept
@@ -988,8 +1071,29 @@ impl Proxy for TsiStreamProxy {
                 // Stop listening for events in the TCP socket until we receive
                 // OP_REQUEST and the vsock transport is fully established.
                 update.polling = Some((self.id(), raw_handle(&self.sock), EventSet::empty()));
+            } else if self.status == ProxyStatus::Connected {
+                // The host socket drained: flush buffered guest->host bytes and,
+                // if enough progressed, re-open the guest's credit window. This
+                // is what makes the non-blocking send in `sendmsg` complete
+                // without ever blocking the muxer thread (#1093).
+                match self.flush_tx() {
+                    Ok(advanced) => {
+                        if advanced && self.maybe_send_credit_update() {
+                            update.signal_queue = true;
+                        }
+                        update.polling = self.repoll();
+                    }
+                    Err(()) => {
+                        self.push_reset();
+                        self.status = ProxyStatus::Closed;
+                        update.polling =
+                            Some((self.id(), raw_handle(&self.sock), EventSet::empty()));
+                        update.signal_queue = true;
+                        update.remove_proxy = ProxyRemoval::Deferred;
+                    }
+                }
             } else {
-                debug!("EventSet::OUT while not connecting");
+                debug!("EventSet::OUT while not connecting/connected");
             }
         }
 

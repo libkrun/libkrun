@@ -3,7 +3,7 @@ use super::{
     proxy::{ProxyRemoval, RecvPkt},
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::Shutdown;
 use std::num::Wrapping;
 use std::path::PathBuf;
@@ -48,6 +48,13 @@ pub struct UnixProxy {
     /// the shutdown and marks that host→guest is done while guest→host still
     /// flows.
     local_read_shutdown: bool,
+    /// Guest->host bytes buffered because the host socket was full (a stalled
+    /// remote peer — #1093). Drained on EPOLLOUT; bounded by the guest's own
+    /// vsock window since `tx_cnt` advances only for flushed bytes.
+    tx_buf: VecDeque<u8>,
+    /// True while reading the host socket is paused for credit/half-close; kept
+    /// separate from epoll interest so TX-flush (OUT) and RX-read (IN) compose.
+    rx_paused: bool,
 }
 
 /// Safety cap on OP_REQUEST retries. Each retry is naturally paced by
@@ -99,6 +106,8 @@ impl UnixProxy {
             rx_cnt: Wrapping(0),
             connect_retries: 0,
             local_read_shutdown: false,
+            tx_buf: VecDeque::new(),
+            rx_paused: false,
         })
     }
 
@@ -134,14 +143,16 @@ impl UnixProxy {
             path: Default::default(),
             connect_retries: 0,
             local_read_shutdown: false,
+            tx_buf: VecDeque::new(),
+            rx_paused: false,
         }
     }
 
     fn switch_to_connected(&mut self) {
         self.status = ProxyStatus::Connected;
-        if let Err(e) = self.sock.set_nonblocking(false) {
-            warn!("error switching to blocking: id={}, err={}", self.id, e);
-        }
+        // Keep the host socket NON-BLOCKING; guest->host sends drain via
+        // `flush_tx` and buffer on WouldBlock so a stalled peer can never block
+        // the vsock muxer thread. See smol-machines/smolvm#1093.
     }
 
     fn push_connect_rsp(&self, result: i32) {
@@ -300,6 +311,66 @@ impl UnixProxy {
             .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
             .set_fwd_cnt(self.tx_cnt.0);
     }
+
+    fn conn_evset(&self) -> EventSet {
+        let mut e = EventSet::empty();
+        if !self.rx_paused {
+            e |= EventSet::IN;
+        }
+        if !self.tx_buf.is_empty() {
+            e |= EventSet::OUT;
+        }
+        // Edge-triggered: a partially-writable host socket would otherwise
+        // re-fire OUT every cycle and spin the muxer (#1093). Both `flush_tx`
+        // and `recv_pkt` drain to WouldBlock, as edge-triggering requires.
+        if !e.is_empty() {
+            e |= EventSet::EDGE_TRIGGERED;
+        }
+        e
+    }
+
+    fn repoll(&self) -> Option<(u64, ProxyRawHandle, EventSet)> {
+        Some((self.id, raw_handle(&self.sock), self.conn_evset()))
+    }
+
+    fn flush_tx(&mut self) -> Result<bool, ()> {
+        let mut advanced = false;
+        while !self.tx_buf.is_empty() {
+            let front = self.tx_buf.as_slices().0;
+            match self.sock.send(front) {
+                Ok(0) => break,
+                Ok(n) => {
+                    self.tx_cnt += Wrapping(n as u32);
+                    self.tx_buf.drain(..n);
+                    advanced = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    warn!("flush_tx: host send failed id={}: {e}", self.id);
+                    return Err(());
+                }
+            }
+        }
+        Ok(advanced)
+    }
+
+    fn maybe_send_credit_update(&mut self) -> bool {
+        if self.peer_buf_alloc != 0
+            && (self.tx_cnt - self.last_tx_cnt_sent).0 >= self.peer_buf_alloc / 2
+        {
+            self.last_tx_cnt_sent = self.tx_cnt;
+            let rx = MuxerRx::CreditUpdate {
+                local_port: self.local_port,
+                peer_port: self.peer_port,
+                fwd_cnt: self.tx_cnt.0,
+            };
+            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Proxy for UnixProxy {
@@ -389,42 +460,29 @@ impl Proxy for UnixProxy {
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
-        let ret = if let Some(buf) = pkt.buf() {
-            // `send_all` delivers the whole buffer or fails — a vsock stream
-            // has no way to signal a partial write, so anything short of full
-            // delivery silently corrupts the byte stream. On Windows the
-            // socket is permanently nonblocking (see `sys::send_all`), so the
-            // plain `send` this used could drop the tail of any buffer larger
-            // than the socket's free space.
-            match sys::send_all(&self.sock, buf) {
-                Ok(sent) => {
-                    self.tx_cnt += Wrapping(sent as u32);
-                    sent as i32
-                }
-                Err(err) => -sys::to_linux_errno(&err),
-            }
-        } else {
-            -libc::EINVAL
-        };
-
-        if ret > 0 && (self.tx_cnt - self.last_tx_cnt_sent).0 >= self.peer_buf_alloc / 2 {
-            debug!(
-                "sending credit update: id={}, tx_cnt={}, last_tx_cnt={}",
-                self.id, self.tx_cnt, self.last_tx_cnt_sent
-            );
-            self.last_tx_cnt_sent = self.tx_cnt;
-
-            let rx = MuxerRx::CreditUpdate {
-                local_port: pkt.dst_port(),
-                peer_port: pkt.src_port(),
-                fwd_cnt: self.tx_cnt.0,
-            };
-
-            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
-            update.signal_queue = true;
+        // Accept the whole buffer (vsock is all-or-nothing), then drain what the
+        // host socket will take now. `tx_cnt` advances only for flushed bytes, so
+        // a stalled host peer backpressures the guest via its own vsock window and
+        // never blocks the muxer thread. See smol-machines/smolvm#1093.
+        if let Some(buf) = pkt.buf() {
+            self.tx_buf.extend(buf.iter().copied());
         }
 
-        debug!("sendmsg ret={ret}");
+        match self.flush_tx() {
+            Ok(advanced) => {
+                if advanced && self.maybe_send_credit_update() {
+                    update.signal_queue = true;
+                }
+                update.polling = self.repoll();
+            }
+            Err(()) => {
+                self.push_reset();
+                self.status = ProxyStatus::Closed;
+                update.polling = Some((self.id, raw_handle(&self.sock), EventSet::empty()));
+                update.signal_queue = true;
+                update.remove_proxy = ProxyRemoval::Deferred;
+            }
+        }
 
         update
     }
@@ -458,8 +516,9 @@ impl Proxy for UnixProxy {
 
         self.status = ProxyStatus::Connected;
 
+        self.rx_paused = false;
         ProxyUpdate {
-            polling: Some((self.id, raw_handle(&self.sock), EventSet::IN)),
+            polling: self.repoll(),
             ..Default::default()
         }
     }
@@ -491,8 +550,9 @@ impl Proxy for UnixProxy {
 
         self.switch_to_connected();
 
+        self.rx_paused = false;
         ProxyUpdate {
-            polling: Some((self.id, raw_handle(&self.sock), EventSet::IN)),
+            polling: self.repoll(),
             ..Default::default()
         }
     }
@@ -623,11 +683,13 @@ impl Proxy for UnixProxy {
                     }
                     self.status = ProxyStatus::Connected;
                     update.signal_queue = true;
-                    update.polling = Some((self.id(), raw_handle(&self.sock), EventSet::empty()));
+                    self.rx_paused = true;
+                    update.polling = self.repoll();
                     return update;
                 } else if self.status == ProxyStatus::WaitingCreditUpdate {
                     debug!("process_event: WaitingCreditUpdate");
-                    update.polling = Some((self.id(), raw_handle(&self.sock), EventSet::empty()));
+                    self.rx_paused = true;
+                    update.polling = self.repoll();
                 }
             } else {
                 debug!("EventSet::IN while not connected: {:?}", self.status);
@@ -641,8 +703,27 @@ impl Proxy for UnixProxy {
                 self.push_connect_rsp(0);
                 update.signal_queue = true;
                 update.polling = Some((self.id(), raw_handle(&self.sock), EventSet::IN));
+            } else if self.status == ProxyStatus::Connected {
+                // Host socket drained: flush buffered guest->host bytes and
+                // re-open the guest's credit window without blocking (#1093).
+                match self.flush_tx() {
+                    Ok(advanced) => {
+                        if advanced && self.maybe_send_credit_update() {
+                            update.signal_queue = true;
+                        }
+                        update.polling = self.repoll();
+                    }
+                    Err(()) => {
+                        self.push_reset();
+                        self.status = ProxyStatus::Closed;
+                        update.polling =
+                            Some((self.id(), raw_handle(&self.sock), EventSet::empty()));
+                        update.signal_queue = true;
+                        update.remove_proxy = ProxyRemoval::Deferred;
+                    }
+                }
             } else {
-                error!("EventSet::OUT while not connecting");
+                error!("EventSet::OUT while not connecting/connected");
             }
         }
 
