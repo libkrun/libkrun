@@ -378,12 +378,19 @@ impl VirglRenderer {
 
     #[cfg(target_os = "macos")]
     fn map_ptr(&self, resource_id: u32) -> RutabagaResult<u64> {
-        let mut map_ptr: *mut c_void = null_mut();
-        let mut size = 0;
-        let ret = unsafe { virgl_renderer_resource_map(resource_id, &mut map_ptr, &mut size) };
+        // 🔴 `get_map_ptr`, not `resource_map`. The macOS virglrenderer build
+        // exposes both, but they are not interchangeable: `get_map_ptr` hands
+        // back the existing host pointer for a host-visible blob, which is what
+        // a guest reading its own GPU memory needs. Establishing a fresh
+        // mapping instead leaves Venus unable to reach its command ring, so
+        // `vkCreateInstance` fails with ERROR_OUT_OF_HOST_MEMORY and the guest
+        // logs SUBMIT_3D rejected (`response 0x1200 (command 0x208)`).
+        // The size `resource_map` also returns was never used here.
+        let mut map_ptr = 0;
+        let ret = unsafe { virgl_renderer_resource_get_map_ptr(resource_id, &mut map_ptr) };
         ret_to_res(ret)?;
 
-        Ok(map_ptr as u64)
+        Ok(map_ptr)
     }
 
     fn query(&self, resource_id: u32) -> RutabagaResult<Resource3DInfo> {
