@@ -59,3 +59,40 @@ pub enum GpuError {
 }
 
 type Result<T> = std::result::Result<T, GpuError>;
+
+/// Which virtio-gpu capsets this host can actually serve, as a rutabaga mask.
+///
+/// 🔴 Passing 0 here means "advertise every capset rutabaga knows about",
+/// which puts VIRGL at index 0. The macOS virglrenderer is built
+/// `-Dvenus=true` with no virgl at all, so the guest's very first capset query
+/// fails — and the guest kernel abandons enumeration on that first failure,
+/// never reaching Venus further down the list. Vulkan then finds no GPU and
+/// the whole desktop silently falls back to software rendering.
+///
+/// Advertising only what exists puts Venus at index 0, where the guest looks.
+pub fn advertised_capset_mask() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        // Venus only: this build has no virgl.
+        1 << 4
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux keeps the historical behaviour: virgl is present, so index 0
+        // resolves and the full list is enumerable.
+        0
+    }
+}
+
+/// How many capsets the device advertises in its config space, matching
+/// [`advertised_capset_mask`] so the guest never queries an index that is not
+/// there.
+pub fn advertised_num_capsets() -> u32 {
+    let mask = advertised_capset_mask();
+    if mask == 0 {
+        // The historical hardcoded count for the "everything" mask.
+        5
+    } else {
+        mask.count_ones()
+    }
+}
