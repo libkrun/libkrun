@@ -241,6 +241,12 @@ int main(int argc, char *const argv[])
         }
     }
 
+    if (err = krun_set_console_output(ctx_id, "/dev/stdout")) {
+        errno = -err;
+        perror("Error configuring console output path");
+        return -1;
+    }
+
     /*
      * Start and enter the microVM. In the libkrun-awsnitro flavor, a positive
      * value returned by krun_start_enter() is the enclave's CID.

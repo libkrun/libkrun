@@ -1,0 +1,21 @@
+[package]
+name = "aws-nitro"
+version = "0.1.0"
+edition = "2024"
+description = "PID-1 init binary for libkrun AWS Nitro Enclave guest VMs"
+license = "Apache-2.0"
+repository = "https://github.com/libkrun/libkrun"
+
+[[bin]]
+name = "krun-init-awsnitro"
+path = "src/main.rs"
+
+[workspace]
+
+[dependencies]
+anyhow = "1.0.103"
+aws-nitro-enclaves-nsm-api = "0.5.2"
+nix = { version = "0.31.3", features = ["fs", "ioctl", "mount", "poll", "signal", "socket"] }
+signal-hook = "0.4.4"
+tar = "0.4.46"
+vsock = "0.5.4"

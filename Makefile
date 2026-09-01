@@ -17,19 +17,6 @@ KRUN_INIT_BINARY_Darwin = libkrun_init.$(KRUN_INIT_FULL_VERSION).dylib
 KRUN_INIT_SONAME_Darwin = libkrun_init.$(KRUN_INIT_ABI_VERSION).dylib
 KRUN_INIT_BASE_Darwin = libkrun_init.dylib
 
-AWS_NITRO_INIT_SRC = \
-		init/aws-nitro/include/*        	  	\
-        init/aws-nitro/main.c				\
-        init/aws-nitro/archive.c				\
-        init/aws-nitro/args_reader.c			\
-        init/aws-nitro/fs.c				\
-        init/aws-nitro/mod.c					\
-		init/aws-nitro/device/include/*			\
-		init/aws-nitro/device/app_stdio_output.c	\
-		init/aws-nitro/device/device.c              \
-		init/aws-nitro/device/net_tap_afvsock.c	\
-		init/aws-nitro/device/signal.c		\
-
 AWS_NITRO_INIT_LD_FLAGS = -larchive -lnsm
 
 ifeq ($(SEV),1)
@@ -134,9 +121,14 @@ ifeq ($(OS),Darwin)
         -C link-arg=-fuse-ld=lld -C link-arg=-Wl,-strip-debug
 endif
 
+ifeq ($(AWS_NITRO), 1)
+AWS_NITRO_MUSL_TARGET = $(ARCH)-unknown-linux-musl
 AWS_NITRO_INIT_BINARY= init/aws-nitro/init
-$(AWS_NITRO_INIT_BINARY): $(AWS_NITRO_INIT_SRC)
-	$(CC) -O2 -static -s -Wall $(AWS_NITRO_INIT_LD_FLAGS) -o $@ $(AWS_NITRO_INIT_SRC) $(AWS_NITRO_INIT_LD_FLAGS)
+$(AWS_NITRO_INIT_BINARY): init/aws-nitro/Cargo.toml $(shell find init/aws-nitro/src -name '*.rs' 2>/dev/null)
+	cargo build --release --manifest-path init/aws-nitro/Cargo.toml \
+		--target $(AWS_NITRO_MUSL_TARGET)
+	cp init/aws-nitro/target/$(AWS_NITRO_MUSL_TARGET)/release/krun-init-awsnitro $@
+endif
 
 ifeq ($(OS),Darwin)
 # macOS -> FreeBSD cross-compilation
@@ -210,7 +202,7 @@ clean-sysroot:
 	rm -rf $(FREEBSD_ROOTFS_DIR)
 
 
-$(LIBRARY_RELEASE_$(OS)): $(INIT_BINARY_BSD)
+$(LIBRARY_RELEASE_$(OS)): $(INIT_BINARY_BSD) $(AWS_NITRO_INIT_BINARY)
 	cargo build --release $(FEATURE_FLAGS)
 	cargo build --release -p krun-init-blob --features ffi
 ifeq ($(SEV),1)
@@ -278,6 +270,9 @@ install: libkrun.pc libkrun_init.pc
 clean:
 ifeq ($(BUILD_BSD_INIT),1)
 	rm -f $(INIT_BINARY_BSD)
+endif
+ifeq ($(AWS_NITRO), 1)
+	rm -f $(AWS_NITRO_INIT_BINARY)
 endif
 	cargo clean
 	rm -rf test-prefix

@@ -62,7 +62,7 @@ use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 use vmm::vmm_config::firmware::FirmwareConfig;
 #[cfg(feature = "tdx")]
 use vmm::vmm_config::firmware::{TeeFirmwareConfig, TeeFirmwareType};
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(not(feature = "tee"))]
 use vmm::vmm_config::fs::FsDeviceConfig;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
@@ -542,7 +542,7 @@ pub extern "C" fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -
 
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(not(feature = "tee"))]
 pub unsafe extern "C" fn krun_add_virtiofs(
     ctx_id: u32,
     c_tag: *const c_char,
@@ -553,7 +553,7 @@ pub unsafe extern "C" fn krun_add_virtiofs(
 
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(not(feature = "tee"))]
 pub unsafe extern "C" fn krun_add_virtiofs2(
     ctx_id: u32,
     c_tag: *const c_char,
@@ -565,7 +565,7 @@ pub unsafe extern "C" fn krun_add_virtiofs2(
 
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(not(feature = "tee"))]
 pub unsafe extern "C" fn krun_add_virtiofs3(
     ctx_id: u32,
     c_tag: *const c_char,
@@ -609,6 +609,7 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
                     shared_dir: path.map(|p| p.to_string()),
                     shm_size: shm,
                     read_only,
+                    #[cfg(not(feature = "aws-nitro"))]
                     virtual_entries: Vec::new(),
                 });
             }

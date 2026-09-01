@@ -19,10 +19,8 @@ members = [
     "src/aws_nitro",
     "src/whp",
 ]
-exclude = ["examples/gtk_display"]
+exclude = ["examples/gtk_display", "init/aws-nitro"]
 resolver = "2"
-
-[profile.dev]
 #panic = "abort"
 
 [profile.release]
