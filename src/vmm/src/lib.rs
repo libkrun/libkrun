@@ -874,6 +874,54 @@ impl Vmm {
         self.checkpoint_frozen_with(|memory| snapshot::write_guest_memory_sparse(memory, mem_out))
     }
 
+    /// Capture CPU and device state together with an immutable COW RAM
+    /// generation, leaving the VM paused only so the caller can snapshot its
+    /// disks at the same boundary. Durable RAM serialization is deferred until
+    /// after the caller resumes the source.
+    #[cfg(all(
+        snapshot_supported,
+        any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+    ))]
+    pub fn checkpoint_frozen_deferred_sparse(
+        &mut self,
+        generation_dir: &std::path::Path,
+    ) -> Result<(VmCheckpoint, snapshot::DeferredMemorySave)> {
+        self.pause()?;
+        self.quiesce_devices();
+        let capture = (|| {
+            let vcpu_states = self.save_vcpu_states()?;
+            let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            self.vm
+                .validate_migration_clock(&vm_state, &vcpu_states)
+                .map_err(Error::Vm)?;
+            let devices = self.snapshot_devices();
+            let memory = snapshot::start_deferred_memory_save(&self.guest_memory, generation_dir)
+                .map_err(|error| {
+                Error::Snapshot(format!("retain COW guest-memory generation: {error}"))
+            })?;
+            #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+            let ioapic = self.intc.lock().unwrap().save_state();
+            #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+            let ioapic = None;
+            Ok((
+                VmCheckpoint {
+                    vm_state,
+                    vcpu_states,
+                    devices,
+                    ioapic,
+                },
+                memory,
+            ))
+        })();
+
+        if capture.is_err() {
+            self.rearm_devices();
+            let _ = self.resume();
+        }
+        capture
+    }
+
     #[cfg(snapshot_supported)]
     fn checkpoint_frozen_with<F>(
         &mut self,

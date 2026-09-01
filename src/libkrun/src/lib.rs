@@ -502,6 +502,25 @@ struct StashedCheckpoint {
 static CHECKPOINTS: Lazy<Mutex<HashMap<String, StashedCheckpoint>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// A durable checkpoint whose CPU/device boundary and immutable RAM generation
+/// have been captured, but whose process-independent memory image is still
+/// being serialized after the source resumes.
+#[cfg(all(
+    snapshot_supported,
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+))]
+struct PreparedSave {
+    checkpoint: vmm::VmCheckpoint,
+    memory: vmm::snapshot::DeferredMemorySave,
+}
+
+#[cfg(all(
+    snapshot_supported,
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+))]
+static PREPARED_SAVES: Lazy<Mutex<HashMap<String, PreparedSave>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 fn log_level_to_filter_str(level: u32) -> &'static str {
     match level {
         0 => "off",
@@ -641,6 +660,57 @@ fn decode_portable_manifest(bytes: &[u8]) -> std::io::Result<Vec<vmm::snapshot::
     Ok(descs)
 }
 
+#[cfg(snapshot_supported)]
+fn publish_portable_save(
+    dir: &std::path::Path,
+    memory: File,
+    checkpoint: vmm::VmCheckpoint,
+    descs: &[vmm::snapshot::MemoryRegionDesc],
+) -> std::result::Result<(u64, usize), String> {
+    let memory_partial = dir.join("memory.bin.partial");
+    let checkpoint_partial = dir.join("checkpoint.bin.partial");
+    let manifest_partial = dir.join("manifest.bin.partial");
+    memory
+        .sync_all()
+        .map_err(|error| format!("sync memory image: {error}"))?;
+
+    let checkpoint_bytes = checkpoint.serialize();
+    let checkpoint_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&checkpoint_partial)
+        .map_err(|error| format!("create checkpoint state: {error}"))?;
+    (&checkpoint_file)
+        .write_all(&checkpoint_bytes)
+        .map_err(|error| format!("write checkpoint state: {error}"))?;
+    checkpoint_file
+        .sync_all()
+        .map_err(|error| format!("sync checkpoint state: {error}"))?;
+
+    let manifest_bytes = encode_portable_manifest(descs);
+    let manifest_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&manifest_partial)
+        .map_err(|error| format!("create snapshot manifest: {error}"))?;
+    (&manifest_file)
+        .write_all(&manifest_bytes)
+        .map_err(|error| format!("write snapshot manifest: {error}"))?;
+    manifest_file
+        .sync_all()
+        .map_err(|error| format!("sync snapshot manifest: {error}"))?;
+
+    std::fs::rename(&memory_partial, dir.join("memory.bin"))
+        .map_err(|error| format!("publish memory image: {error}"))?;
+    std::fs::rename(&checkpoint_partial, dir.join("checkpoint.bin"))
+        .map_err(|error| format!("publish checkpoint state: {error}"))?;
+    // Publish the manifest last: its presence is the completeness marker.
+    std::fs::rename(&manifest_partial, dir.join("manifest.bin"))
+        .map_err(|error| format!("publish snapshot manifest: {error}"))?;
+
+    Ok((vmm::snapshot::memory_image_len(descs), descs.len()))
+}
+
 /// Persist a self-contained VM checkpoint to a newly-created directory. The
 /// manifest is renamed into place last, so a reader never accepts a partial
 /// checkpoint. The VM remains paused on success to let the caller capture its
@@ -656,8 +726,6 @@ fn handle_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     }
 
     let memory_partial = dir.join("memory.bin.partial");
-    let checkpoint_partial = dir.join("checkpoint.bin.partial");
-    let manifest_partial = dir.join("manifest.bin.partial");
     let result = (|| -> std::result::Result<(u64, usize), String> {
         let mut memory = std::fs::OpenOptions::new()
             .write(true)
@@ -676,45 +744,7 @@ fn handle_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
             .unwrap()
             .checkpoint_frozen(&mut memory)
             .map_err(|error| format!("capture VM: {error}"))?;
-        memory
-            .sync_all()
-            .map_err(|error| format!("sync memory image: {error}"))?;
-
-        let checkpoint_bytes = checkpoint.serialize();
-        let checkpoint_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&checkpoint_partial)
-            .map_err(|error| format!("create checkpoint state: {error}"))?;
-        (&checkpoint_file)
-            .write_all(&checkpoint_bytes)
-            .map_err(|error| format!("write checkpoint state: {error}"))?;
-        checkpoint_file
-            .sync_all()
-            .map_err(|error| format!("sync checkpoint state: {error}"))?;
-
-        let manifest_bytes = encode_portable_manifest(&descs);
-        let manifest_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&manifest_partial)
-            .map_err(|error| format!("create snapshot manifest: {error}"))?;
-        (&manifest_file)
-            .write_all(&manifest_bytes)
-            .map_err(|error| format!("write snapshot manifest: {error}"))?;
-        manifest_file
-            .sync_all()
-            .map_err(|error| format!("sync snapshot manifest: {error}"))?;
-
-        std::fs::rename(&memory_partial, dir.join("memory.bin"))
-            .map_err(|error| format!("publish memory image: {error}"))?;
-        std::fs::rename(&checkpoint_partial, dir.join("checkpoint.bin"))
-            .map_err(|error| format!("publish checkpoint state: {error}"))?;
-        // Publish the manifest last: its presence is the completeness marker.
-        std::fs::rename(&manifest_partial, dir.join("manifest.bin"))
-            .map_err(|error| format!("publish snapshot manifest: {error}"))?;
-
-        Ok((vmm::snapshot::memory_image_len(&descs), descs.len()))
+        publish_portable_save(dir, memory, checkpoint, &descs)
     })();
 
     match result {
@@ -731,6 +761,94 @@ fn handle_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
                 None => format!("ERR EIO {error}\n"),
             }
         }
+    }
+}
+
+/// Capture a durable CPU/device/RAM boundary without serializing RAM while the
+/// source is paused. The caller stages disk state, resumes the VM, and then
+/// sends `FINISH_SAVE` to write the retained generation.
+#[cfg(all(
+    snapshot_supported,
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+))]
+fn handle_prepare_save(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
+    if dir.is_empty() {
+        return "ERR EINVAL snapshot dir required\n".to_string();
+    }
+    if !PREPARED_SAVES.lock().unwrap().is_empty() {
+        return "ERR EBUSY another durable save is still pending\n".to_string();
+    }
+    let dir_path = std::path::PathBuf::from(dir);
+    if let Err(error) = std::fs::create_dir(&dir_path) {
+        return format!("ERR EIO create {}: {error}\n", dir_path.display());
+    }
+
+    let (checkpoint, memory) = match vmm
+        .lock()
+        .unwrap()
+        .checkpoint_frozen_deferred_sparse(&dir_path)
+    {
+        Ok(capture) => capture,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&dir_path);
+            let message = error.to_string();
+            if message.contains("deferred durable save requires") {
+                return format!("ERR ENOTSUP {message}\n");
+            }
+            return format!("ERR EIO capture VM: {message}\n");
+        }
+    };
+    PREPARED_SAVES
+        .lock()
+        .unwrap()
+        .insert(dir.to_string(), PreparedSave { checkpoint, memory });
+    "OK prepared (paused)\n".to_string()
+}
+
+#[cfg(all(
+    snapshot_supported,
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+))]
+fn handle_finish_save(dir: &str) -> String {
+    let Some(prepared) = PREPARED_SAVES.lock().unwrap().remove(dir) else {
+        return "ERR ENOENT no prepared durable save\n".to_string();
+    };
+    let dir_path = std::path::Path::new(dir);
+    let result = (|| -> std::result::Result<(u64, usize), String> {
+        let memory_partial = dir_path.join("memory.bin.partial");
+        let mut memory = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&memory_partial)
+            .map_err(|error| format!("create memory image: {error}"))?;
+        let descs = prepared
+            .memory
+            .finish(&mut memory)
+            .map_err(|error| format!("serialize retained RAM generation: {error}"))?;
+        publish_portable_save(dir_path, memory, prepared.checkpoint, &descs)
+    })();
+    match result {
+        Ok((bytes, regions)) => format!("OK saved ({bytes} bytes, {regions} regions)\n"),
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(dir_path);
+            format!("ERR EIO {error}\n")
+        }
+    }
+}
+
+#[cfg(all(
+    snapshot_supported,
+    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+))]
+fn handle_cancel_save(dir: &str) -> String {
+    let removed = PREPARED_SAVES.lock().unwrap().remove(dir);
+    match removed {
+        Some(save) => {
+            drop(save);
+            let _ = std::fs::remove_dir_all(dir);
+            "OK canceled\n".to_string()
+        }
+        None => "ERR ENOENT save is finishing or does not exist\n".to_string(),
     }
 }
 
@@ -1331,7 +1449,7 @@ fn read_control_command<R: std::io::Read>(reader: &mut R) -> std::io::Result<Vec
     }
 }
 
-fn handle_control_stream<S: std::io::Read + std::io::Write>(
+fn handle_control_stream<S: std::io::Read + std::io::Write + Send + 'static>(
     mut stream: S,
     vmm: &Arc<Mutex<vmm::Vmm>>,
 ) {
@@ -1408,6 +1526,48 @@ fn handle_control_stream<S: std::io::Read + std::io::Write>(
                 // disk state from the same boundary.
                 #[cfg(snapshot_supported)]
                 "SAVE" => handle_save(vmm, _arg),
+                // PREPARE_SAVE captures an immutable COW RAM generation and
+                // leaves the VM paused only for caller-side disk staging.
+                // After RESUME, FINISH_SAVE persists that retained generation;
+                // CANCEL_SAVE releases it after a caller-side failure.
+                #[cfg(all(
+                    snapshot_supported,
+                    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+                ))]
+                "PREPARE_SAVE" => handle_prepare_save(vmm, _arg),
+                #[cfg(all(
+                    snapshot_supported,
+                    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+                ))]
+                "FINISH_SAVE" => {
+                    // RAM persistence can take seconds for large resident
+                    // guests. Keep the control listener available so a resumed
+                    // source can fork, checkpoint again, or answer health
+                    // probes while this caller waits for durable completion.
+                    let dir = _arg.to_string();
+                    let stream = Arc::new(Mutex::new(Some(stream)));
+                    let worker_stream = Arc::clone(&stream);
+                    let worker = std::thread::Builder::new()
+                        .name("krun durable save".into())
+                        .spawn(move || {
+                            let response = handle_finish_save(&dir);
+                            if let Some(mut stream) = worker_stream.lock().unwrap().take() {
+                                let _ = stream.write_all(response.as_bytes());
+                            }
+                        });
+                    if let Err(error) = worker
+                        && let Some(mut stream) = stream.lock().unwrap().take()
+                    {
+                        let response = format!("ERR EAGAIN start durable save: {error}\n");
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    return;
+                }
+                #[cfg(all(
+                    snapshot_supported,
+                    any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")
+                ))]
+                "CANCEL_SAVE" => handle_cancel_save(_arg),
                 // FORK <dir>: capture a fork checkpoint to <dir> (checkpoint.bin +
                 // manifest.bin) and leave this VM FROZEN as the CoW base. A clone
                 // process then boots from <dir> via krun_set_snapshot, mapping this

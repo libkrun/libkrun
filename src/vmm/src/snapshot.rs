@@ -1020,6 +1020,141 @@ impl Drop for ForkGenerationCopy {
     }
 }
 
+/// A point-in-time Linux guest-RAM generation retained independently from the
+/// source while a durable checkpoint is written after the VM resumes.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub struct DeferredMemorySave {
+    generation: DeferredLinuxGeneration,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+enum DeferredLinuxGeneration {
+    Stable {
+        descs: Vec<MemfdRegionDesc>,
+        files: Vec<File>,
+    },
+    Copy(ForkGenerationCopy),
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn stable_memfd_generation(
+    parent: &GuestMemoryMmap,
+) -> io::Result<(Vec<MemfdRegionDesc>, Vec<File>)> {
+    let mut descs = Vec::with_capacity(parent.num_regions());
+    let mut files = Vec::with_capacity(parent.num_regions());
+    for region in parent.iter() {
+        let file_offset = region.file_offset().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "deferred durable save requires file-backed guest RAM",
+            )
+        })?;
+        let seals = unsafe { libc::fcntl(file_offset.file().as_raw_fd(), libc::F_GET_SEALS) };
+        if seals < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "deferred durable save requires memfd-backed guest RAM",
+                ));
+            }
+            return Err(error);
+        }
+        if seals & libc::F_SEAL_SEAL != 0 && seals & libc::F_SEAL_WRITE == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "deferred durable save requires sealable memfd-backed guest RAM",
+            ));
+        }
+        let file = file_offset.file().try_clone()?;
+        descs.push(MemfdRegionDesc {
+            gpa: region.start_addr().raw_value(),
+            len: region.len(),
+            fd: file.as_raw_fd(),
+            offset: file_offset.start(),
+            path: String::new(),
+        });
+        files.push(file);
+    }
+    if descs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "guest RAM has no regions",
+        ));
+    }
+    Ok((descs, files))
+}
+
+/// Establish an immutable Linux RAM boundary without writing a durable image.
+///
+/// An initial memfd generation is sealed and the source is remapped privately.
+/// Later generations use the existing syscall-only fork worker so source
+/// writes after resume cannot alter the retained point-in-time view.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn start_deferred_memory_save(
+    parent: &GuestMemoryMmap,
+    _generation_dir: &std::path::Path,
+) -> io::Result<DeferredMemorySave> {
+    // Reject anonymous regions before changing any mappings. Portable capture
+    // falls back to the established synchronous SAVE path for this shape.
+    let _ = stable_memfd_generation(parent)?;
+    let generation = if guest_memory_backing_is_immutable(parent)? {
+        DeferredLinuxGeneration::Copy(start_fork_generation_copy(parent)?)
+    } else {
+        rebase_guest_memory_private(parent)?;
+        let (descs, files) = stable_memfd_generation(parent)?;
+        DeferredLinuxGeneration::Stable { descs, files }
+    };
+    Ok(DeferredMemorySave { generation })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl DeferredMemorySave {
+    /// Materialize this immutable generation into the portable sparse-memory
+    /// stream after the source has resumed.
+    pub fn finish(self, output: &mut File) -> io::Result<Vec<MemoryRegionDesc>> {
+        let (descs, files, extents_are_content_sparse) = match self.generation {
+            DeferredLinuxGeneration::Stable { descs, files } => (descs, files, false),
+            DeferredLinuxGeneration::Copy(copy) => {
+                let (descs, files) = copy.finish()?;
+                (descs, files, true)
+            }
+        };
+        if descs.len() != files.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RAM generation descriptor/file count mismatch",
+            ));
+        }
+
+        let mut output_offset = 0_u64;
+        let mut portable = Vec::with_capacity(descs.len());
+        for (desc, file) in descs.iter().zip(&files) {
+            if extents_are_content_sparse
+                && copy_file_extents(file, desc.offset, desc.len, output, output_offset)?
+            {
+                // The later-generation worker only writes nonzero guest pages
+                // into a fresh sparse memfd, so its extents are authoritative.
+            } else {
+                // Initial guest memfds can contain allocated zero-filled pages
+                // across most of RAM. Scan their content after resume instead
+                // of turning those shmem extents into physical disk writes.
+                copy_file_range_sparse(file, desc.offset, desc.len, output, output_offset)?;
+            }
+            portable.push(MemoryRegionDesc {
+                gpa: desc.gpa,
+                len: desc.len,
+            });
+            output_offset = output_offset.checked_add(desc.len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "memory image too large")
+            })?;
+        }
+        output.set_len(output_offset)?;
+        output.seek(SeekFrom::Start(output_offset))?;
+        Ok(portable)
+    }
+}
+
 /// Begin materializing the source's current private RAM into a fresh immutable
 /// generation. Call only at a fully quiesced snapshot boundary.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1264,6 +1399,67 @@ impl Drop for MacForkGenerationCopy {
                 let _ = std::fs::remove_file(path);
             }
         }
+    }
+}
+
+/// A point-in-time macOS guest-RAM generation retained as Mach COW aliases
+/// while durable serialization proceeds after the source resumes.
+#[cfg(target_os = "macos")]
+pub struct DeferredMemorySave {
+    generation: MacForkGenerationCopy,
+}
+
+#[cfg(target_os = "macos")]
+pub fn start_deferred_memory_save(
+    parent: &GuestMemoryMmap,
+    generation_dir: &std::path::Path,
+) -> io::Result<DeferredMemorySave> {
+    Ok(DeferredMemorySave {
+        generation: start_macos_fork_generation_copy(parent, generation_dir)?,
+    })
+}
+
+#[cfg(target_os = "macos")]
+impl DeferredMemorySave {
+    /// Combine the materialized Mach aliases into the portable sparse-memory
+    /// stream and remove the intermediate per-region files.
+    pub fn finish(self, output: &mut File) -> io::Result<Vec<MemoryRegionDesc>> {
+        let descs = self.generation.finish()?;
+        let mut output_offset = 0_u64;
+        let mut portable = Vec::with_capacity(descs.len());
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        for desc in &descs {
+            output.seek(SeekFrom::Start(output_offset))?;
+            if !desc.path.is_empty() {
+                let mut source = File::open(&desc.path)?;
+                let mut remaining = desc.len;
+                let mut sparse = SparseFileWriter::new(output)?;
+                while remaining > 0 {
+                    let wanted = remaining.min(buffer.len() as u64) as usize;
+                    let read = source.read(&mut buffer[..wanted])?;
+                    if read == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "macOS RAM generation ended during durable save",
+                        ));
+                    }
+                    sparse.write_all(&buffer[..read])?;
+                    remaining -= read as u64;
+                }
+                sparse.finish()?;
+                std::fs::remove_file(&desc.path)?;
+            }
+            portable.push(MemoryRegionDesc {
+                gpa: desc.gpa,
+                len: desc.len,
+            });
+            output_offset = output_offset.checked_add(desc.len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "memory image too large")
+            })?;
+        }
+        output.set_len(output_offset)?;
+        output.seek(SeekFrom::Start(output_offset))?;
+        Ok(portable)
     }
 }
 
@@ -2030,6 +2226,148 @@ mod tests {
                 libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK
             );
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn deferred_durable_save_preserves_initial_and_later_generations() {
+        use crate::builder::create_guest_ram_memfd;
+
+        const PAGE: usize = 4096;
+        const REGION_SIZE: usize = 2 * 1024 * 1024;
+        const HIGH_GPA: u64 = 0x40_0000;
+        let low = create_guest_ram_memfd(REGION_SIZE).unwrap();
+        let high = create_guest_ram_memfd(REGION_SIZE).unwrap();
+        let memory = GuestMemoryMmap::from_ranges_with_files([
+            (GuestAddress(0), REGION_SIZE, Some(FileOffset::new(low, 0))),
+            (
+                GuestAddress(HIGH_GPA),
+                REGION_SIZE,
+                Some(FileOffset::new(high, 0)),
+            ),
+        ])
+        .unwrap();
+        memory
+            .write_slice(&[0x11; PAGE], GuestAddress(PAGE as u64))
+            .unwrap();
+        memory
+            .write_slice(&[0x22; PAGE], GuestAddress(HIGH_GPA + PAGE as u64))
+            .unwrap();
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "libkrun-deferred-save-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+
+        let first = start_deferred_memory_save(&memory, &directory).unwrap();
+        memory
+            .write_slice(&[0xA1; PAGE], GuestAddress(PAGE as u64))
+            .unwrap();
+        let first_path = directory.join("first.bin");
+        let mut first_file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&first_path)
+            .unwrap();
+        let first_descs = first.finish(&mut first_file).unwrap();
+        assert!(
+            first_file.metadata().unwrap().blocks() * 512 < (REGION_SIZE as u64 * 2) / 4,
+            "initial deferred generation lost sparse zero pages"
+        );
+        first_file.seek(SeekFrom::Start(0)).unwrap();
+        let first_memory = load_guest_memory(&first_descs, &mut first_file).unwrap();
+        let mut page = [0_u8; PAGE];
+        first_memory
+            .read_slice(&mut page, GuestAddress(PAGE as u64))
+            .unwrap();
+        assert_eq!(page, [0x11; PAGE]);
+        first_memory
+            .read_slice(&mut page, GuestAddress(HIGH_GPA + PAGE as u64))
+            .unwrap();
+        assert_eq!(page, [0x22; PAGE]);
+
+        let second = start_deferred_memory_save(&memory, &directory).unwrap();
+        memory
+            .write_slice(&[0xB1; PAGE], GuestAddress(PAGE as u64))
+            .unwrap();
+        memory
+            .write_slice(&[0xB2; PAGE], GuestAddress(HIGH_GPA + PAGE as u64))
+            .unwrap();
+        let second_path = directory.join("second.bin");
+        let mut second_file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&second_path)
+            .unwrap();
+        let second_descs = second.finish(&mut second_file).unwrap();
+        assert!(
+            second_file.metadata().unwrap().blocks() * 512 < (REGION_SIZE as u64 * 2) / 4,
+            "later deferred generation lost sparse zero pages"
+        );
+        second_file.seek(SeekFrom::Start(0)).unwrap();
+        let second_memory = load_guest_memory(&second_descs, &mut second_file).unwrap();
+        second_memory
+            .read_slice(&mut page, GuestAddress(PAGE as u64))
+            .unwrap();
+        assert_eq!(page, [0xA1; PAGE]);
+        second_memory
+            .read_slice(&mut page, GuestAddress(HIGH_GPA + PAGE as u64))
+            .unwrap();
+        assert_eq!(page, [0x22; PAGE]);
+
+        drop(first_file);
+        drop(second_file);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn deferred_durable_save_rejects_non_memfd_ram_without_mutation() {
+        const REGION_SIZE: usize = 2 * 1024 * 1024;
+        let directory = std::env::temp_dir();
+
+        let anonymous = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), REGION_SIZE)]).unwrap();
+        let anonymous_error = match start_deferred_memory_save(&anonymous, &directory) {
+            Ok(_) => panic!("anonymous RAM unexpectedly supported deferred save"),
+            Err(error) => error,
+        };
+        assert_eq!(anonymous_error.kind(), io::ErrorKind::Unsupported);
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = directory.join(format!(
+            "libkrun-regular-ram-{}-{nonce}",
+            std::process::id()
+        ));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(REGION_SIZE as u64).unwrap();
+        let regular = GuestMemoryMmap::from_ranges_with_files([(
+            GuestAddress(0),
+            REGION_SIZE,
+            Some(FileOffset::new(file, 0)),
+        )])
+        .unwrap();
+        let regular_error = match start_deferred_memory_save(&regular, &directory) {
+            Ok(_) => panic!("regular-file RAM unexpectedly supported deferred save"),
+            Err(error) => error,
+        };
+        assert_eq!(regular_error.kind(), io::ErrorKind::Unsupported);
+        regular.write_slice(&[0x5a; 4096], GuestAddress(0)).unwrap();
+        fs::remove_file(path).unwrap();
     }
 
     #[cfg(unix)]
