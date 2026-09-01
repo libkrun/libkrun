@@ -13,7 +13,7 @@ use super::muxer_thread::MuxerThread;
 use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
 use super::proxy::{Proxy, ProxyRemoval, ProxyUpdate};
 use super::reaper::ReaperThread;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
@@ -142,7 +142,7 @@ impl VsockMuxer {
         self.mem = Some(mem.clone());
         self.interrupt = Some(interrupt.clone());
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let timesync =
                 TimesyncThread::new(self.cid, mem.clone(), queue.clone(), interrupt.clone());
