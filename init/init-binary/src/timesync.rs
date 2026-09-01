@@ -32,6 +32,7 @@ pub fn run() {
     match unsafe { unistd::fork() } {
         Ok(ForkResult::Child) => {
             // Child: run the sync loop until the socket errors, then exit.
+            timesync_request(sock.as_raw_fd());
             clock_worker(sock.as_raw_fd());
             unsafe { libc::_exit(1) };
         }
@@ -40,6 +41,13 @@ pub fn run() {
             // The child retains its inherited fd.
         }
     }
+}
+
+/// Tell the host the guest started listening, so the time can be synchronised
+/// immediately at the right moment.
+fn timesync_request(sock: libc::c_int) {
+    let addr = VsockAddr::new(libc::VMADDR_CID_HOST, TSYNC_PORT);
+    let _ = socket::sendto(sock, &[0u8], &addr, MsgFlags::empty());
 }
 
 fn clock_worker(sock: libc::c_int) {
