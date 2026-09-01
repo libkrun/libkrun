@@ -96,7 +96,7 @@ use devices::display::NoopDisplayBackend;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::{VirtioShmRegion, fs::ExportTable};
 use flate2::read::GzDecoder;
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", feature = "vhost-user"))]
 use krun_display::DisplayBackend;
 #[cfg(feature = "gpu")]
 use krun_display::IntoDisplayBackend;
@@ -1228,6 +1228,7 @@ pub fn build_microvm(
                     device_config,
                     index,
                     vm_resources.displays.first().cloned(),
+                    vm_resources.display_backend,
                 )?;
             }
 
@@ -2913,6 +2914,7 @@ fn attach_vhost_user_device(
     device_config: &VhostUserDeviceConfig,
     device_index: usize,
     gpu_display: Option<DisplayInfo>,
+    display_backend: Option<DisplayBackend<'static>>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
@@ -2929,6 +2931,7 @@ fn attach_vhost_user_device(
             device_config.num_queues,
             &device_config.queue_sizes,
             gpu_display,
+            display_backend,
         )
         .map_err(|e| RegisterVhostUserDevice(device_manager::mmio::Error::VhostUserDevice(e)))?,
     ));

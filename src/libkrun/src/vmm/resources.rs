@@ -38,7 +38,7 @@ use crate::vmm::vstate::VcpuConfig;
 use devices::display::DisplayInfo;
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", feature = "vhost-user"))]
 use krun_display::DisplayBackend;
 
 type Result<E> = std::result::Result<(), E>;
@@ -211,7 +211,7 @@ pub struct VmResources {
     /// Flags for the virtio-gpu device.
     pub gpu_virgl_flags: Option<u32>,
     pub gpu_shm_size: Option<usize>,
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", feature = "vhost-user"))]
     pub display_backend: Option<DisplayBackend<'static>>,
     #[cfg(any(feature = "gpu", feature = "vhost-user"))]
     pub displays: Vec<DisplayInfo>,
@@ -447,7 +447,7 @@ mod tests {
             net: Default::default(),
             gpu_virgl_flags: None,
             gpu_shm_size: None,
-            #[cfg(feature = "gpu")]
+            #[cfg(any(feature = "gpu", feature = "vhost-user"))]
             display_backend: None,
             #[cfg(any(feature = "gpu", feature = "vhost-user"))]
             displays: Vec::new(),

@@ -7,12 +7,13 @@ use gtk_display::{
 
 use krun_sys::{
     KRUN_LOG_LEVEL_TRACE, KRUN_LOG_LEVEL_WARN, KRUN_LOG_STYLE_ALWAYS, KRUN_LOG_TARGET_DEFAULT,
+    KRUN_VHOST_USER_GPU_NUM_QUEUES, KRUN_VHOST_USER_GPU_SHM_SIZE, KRUN_VIRTIO_DEVICE_GPU,
     VIRGLRENDERER_RENDER_SERVER, VIRGLRENDERER_THREAD_SYNC, VIRGLRENDERER_USE_ASYNC_FENCE_CB,
     VIRGLRENDERER_USE_EGL, VIRGLRENDERER_VENUS, krun_add_display, krun_add_input_device,
-    krun_add_input_device_fd, krun_add_virtio_console_default, krun_add_virtiofs3, krun_create_ctx,
-    krun_display_set_dpi, krun_display_set_physical_size, krun_display_set_refresh_rate,
-    krun_init_log, krun_set_display_backend, krun_set_gpu_options2, krun_set_vm_config,
-    krun_start_enter,
+    krun_add_input_device_fd, krun_add_vhost_user_device, krun_add_virtio_console_default,
+    krun_add_virtiofs3, krun_create_ctx, krun_display_set_dpi, krun_display_set_physical_size,
+    krun_display_set_refresh_rate, krun_init_log, krun_set_display_backend, krun_set_gpu_options2,
+    krun_set_vm_config, krun_start_enter,
 };
 use log::LevelFilter;
 use regex::{Captures, Regex};
@@ -117,6 +118,10 @@ struct Args {
     /// Passthrough an input device (e.g. /dev/input/event0)
     #[arg(long)]
     input: Vec<PathBuf>,
+
+    /// Use vhost-user GPU backend at the given socket path (disables built-in GPU)
+    #[arg(long)]
+    vhost_user_gpu: Option<CString>,
 }
 
 fn krun_thread(
@@ -156,15 +161,28 @@ fn krun_thread(
             std::io::stderr().as_raw_fd(),
         ))?;
 
-        krun_call!(krun_set_gpu_options2(
-            ctx,
-            VIRGLRENDERER_USE_EGL
-                | VIRGLRENDERER_VENUS
-                | VIRGLRENDERER_RENDER_SERVER
-                | VIRGLRENDERER_THREAD_SYNC
-                | VIRGLRENDERER_USE_ASYNC_FENCE_CB,
-            4096
-        ))?;
+        if let Some(socket_path) = &args.vhost_user_gpu {
+            let queue_sizes = [1024u16; KRUN_VHOST_USER_GPU_NUM_QUEUES as usize];
+            krun_call!(krun_add_vhost_user_device(
+                ctx,
+                KRUN_VIRTIO_DEVICE_GPU,
+                socket_path.as_ptr(),
+                std::ptr::null(),
+                KRUN_VHOST_USER_GPU_NUM_QUEUES as u16,
+                queue_sizes.as_ptr(),
+                KRUN_VHOST_USER_GPU_SHM_SIZE,
+            ))?;
+        } else {
+            krun_call!(krun_set_gpu_options2(
+                ctx,
+                VIRGLRENDERER_USE_EGL
+                    | VIRGLRENDERER_VENUS
+                    | VIRGLRENDERER_RENDER_SERVER
+                    | VIRGLRENDERER_THREAD_SYNC
+                    | VIRGLRENDERER_USE_ASYNC_FENCE_CB,
+                4096
+            ))?;
+        }
 
         krun_call!(krun_add_virtiofs3(
             ctx,
