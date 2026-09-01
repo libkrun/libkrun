@@ -2835,6 +2835,8 @@ fn attach_unixsock_vsock_device(
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc, unix_vsock.clone()).map_err(RegisterVsockDevice)?;
 
+    vmm.exit_observers.push(unix_vsock.clone());
+
     Ok(())
 }
 

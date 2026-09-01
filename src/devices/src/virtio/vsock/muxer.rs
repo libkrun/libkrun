@@ -132,6 +132,16 @@ impl VsockMuxer {
         }
     }
 
+    pub(crate) fn cleanup(&self) {
+        if let Some(ipc_map) = &self.unix_ipc_port_map {
+            for (path, listen) in ipc_map.values() {
+                if *listen {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+
     pub(crate) fn activate(
         &mut self,
         mem: GuestMemoryMmap,
