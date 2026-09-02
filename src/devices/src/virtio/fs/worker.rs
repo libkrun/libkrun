@@ -9,6 +9,8 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::thread;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::time::{Duration, Instant};
 #[cfg(windows)]
 use utils::windows::AsRawFd;
 
@@ -27,6 +29,20 @@ use super::read_only::PassthroughFsRo;
 use super::server::Server;
 use super::virtual_entry::VirtualDirEntry;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
+
+// Serial filesystem operations often submit the next request immediately after
+// the guest receives our completion interrupt. Keep the request worker runnable
+// for one short scheduling window so it can service that burst without another
+// eventfd sleep/wake cycle. Yielding lets the guest vCPU produce the request and
+// avoids consuming a host core while the worker waits.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const REQUEST_QUEUE_QUIET_POLL: Duration = Duration::from_micros(50);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const REQUEST_QUEUE_MAX_POLL: Duration = Duration::from_millis(1);
+#[cfg(target_os = "linux")]
+const REQUEST_QUEUE_CONTENTION_YIELD: Duration = Duration::from_micros(250);
+#[cfg(target_os = "linux")]
+const REQUEST_QUEUE_CONTENTION_COOLDOWN: Duration = Duration::from_millis(100);
 
 enum FsServer {
     ReadWrite(Server<AugmentFs<PassthroughFs>>),
@@ -81,6 +97,8 @@ pub struct FsWorker {
     server: FsServer,
     stop_fd: EventFd,
     exit_code: Arc<AtomicI32>,
+    #[cfg(target_os = "linux")]
+    request_poll_after: Instant,
     #[cfg(target_os = "macos")]
     map_sender: Option<Sender<WorkerMessage>>,
 }
@@ -150,6 +168,8 @@ impl FsWorker {
             server,
             stop_fd,
             exit_code,
+            #[cfg(target_os = "linux")]
+            request_poll_after: Instant::now(),
             #[cfg(target_os = "macos")]
             map_sender,
         })
@@ -214,6 +234,8 @@ impl FsWorker {
                             }
                             EventSet::IN if source == virtq_req_ev_fd => {
                                 self.handle_event(REQ_INDEX);
+                                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                                self.poll_request_burst();
                             }
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
@@ -261,10 +283,94 @@ impl FsWorker {
         }
     }
 
-    fn process_queue(&mut self, queue_index: usize) {
+    #[cfg(target_os = "macos")]
+    fn poll_request_burst(&mut self) {
+        let start = Instant::now();
+        let hard_deadline = start + REQUEST_QUEUE_MAX_POLL;
+        let mut quiet_deadline = start + REQUEST_QUEUE_QUIET_POLL;
+
+        loop {
+            if self.process_queue(REQ_INDEX) {
+                quiet_deadline = Instant::now() + REQUEST_QUEUE_QUIET_POLL;
+            } else if Instant::now() >= quiet_deadline {
+                break;
+            } else {
+                thread::yield_now();
+            }
+            if Instant::now() >= hard_deadline {
+                break;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poll_request_burst(&mut self) {
+        let start = Instant::now();
+        if start < self.request_poll_after {
+            return;
+        }
+        let hard_deadline = start + REQUEST_QUEUE_MAX_POLL;
+        let mut quiet_deadline = start + REQUEST_QUEUE_QUIET_POLL;
+
+        // Suppress guest kicks while we watch the queue directly. Besides
+        // avoiding a stale eventfd wake for every request that we process here,
+        // the enable_notification() check below closes the race between the
+        // final empty queue observation and returning to epoll.
+        if let Err(e) = self.queues[REQ_INDEX].disable_notification(&self.mem) {
+            error!("failed to suppress filesystem queue notifications: {e:?}");
+            return;
+        }
+
+        loop {
+            if self.process_queue(REQ_INDEX) {
+                quiet_deadline = Instant::now() + REQUEST_QUEUE_QUIET_POLL;
+            } else if Instant::now() >= quiet_deadline {
+                break;
+            } else {
+                let before_yield = Instant::now();
+                thread::yield_now();
+                let after_yield = Instant::now();
+                if after_yield.duration_since(before_yield) >= REQUEST_QUEUE_CONTENTION_YIELD {
+                    if self.process_queue(REQ_INDEX) {
+                        // The guest vCPU used that scheduling window to produce
+                        // the next request, so the poll was productive rather
+                        // than host contention.
+                        quiet_deadline = after_yield + REQUEST_QUEUE_QUIET_POLL;
+                    } else {
+                        // The CPU ran something unrelated and our queue is still
+                        // empty. Stop competing for it and sample again after a
+                        // short cooldown.
+                        self.request_poll_after = after_yield + REQUEST_QUEUE_CONTENTION_COOLDOWN;
+                        break;
+                    }
+                }
+            }
+            if Instant::now() >= hard_deadline {
+                break;
+            }
+        }
+
+        match self.queues[REQ_INDEX].enable_notification(&self.mem) {
+            Ok(true) => {
+                // Work arrived while notifications were suppressed. Queue a
+                // host-side wake instead of processing indefinitely so the
+                // stop/checkpoint event remains bounded by MAX_POLL.
+                if let Err(e) = self.queue_evts[REQ_INDEX].write(1) {
+                    error!("failed to reawaken filesystem request queue: {e:?}");
+                    self.handle_event(REQ_INDEX);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => error!("failed to re-enable filesystem queue notifications: {e:?}"),
+        }
+    }
+
+    fn process_queue(&mut self, queue_index: usize) -> bool {
         let queue = &mut self.queues[queue_index];
         let mut signal_needed = false;
+        let mut processed = false;
         while let Some(head) = queue.pop(&self.mem) {
+            processed = true;
             let reader = Reader::new(&self.mem, head.clone())
                 .map_err(FsError::QueueReader)
                 .unwrap();
@@ -301,5 +407,6 @@ impl FsWorker {
         if signal_needed {
             self.interrupt.signal_used_queue();
         }
+        processed
     }
 }

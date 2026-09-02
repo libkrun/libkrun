@@ -60,6 +60,9 @@ const FOPEN_NONSEEKABLE: u32 = 4;
 /// Allow caching this directory.
 const FOPEN_CACHE_DIR: u32 = 8;
 
+/// The kernel does not need to send a flush request when the file is closed.
+const FOPEN_NOFLUSH: u32 = 32;
+
 bitflags! {
     /// Options controlling the behavior of files opened by the server in response
     /// to an open or create request.
@@ -68,6 +71,7 @@ bitflags! {
         const KEEP_CACHE = FOPEN_KEEP_CACHE;
         const NONSEEKABLE = FOPEN_NONSEEKABLE;
         const CACHE_DIR = FOPEN_CACHE_DIR;
+        const NOFLUSH = FOPEN_NOFLUSH;
     }
 }
 
