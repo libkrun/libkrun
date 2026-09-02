@@ -751,6 +751,7 @@ version = "0.1.0-2.0.0-dev"
 dependencies = [
  "crossbeam-channel",
  "krun-arch",
+ "libc",
  "libloading",
  "log",
 ]
