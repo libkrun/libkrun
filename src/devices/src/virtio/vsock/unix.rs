@@ -18,6 +18,7 @@ use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, Vs
 use super::proxy::{
     Family, NewProxyType, Proxy, ProxyError, ProxyRawHandle, ProxyStatus, ProxyUpdate, raw_handle,
 };
+use super::snapshot_gate::SnapshotGate;
 use super::sys;
 use utils::epoll::EventSet;
 
@@ -31,6 +32,7 @@ pub struct UnixProxy {
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
     rxq: Arc<Mutex<MuxerRxQ>>,
+    snapshot_gate: Arc<SnapshotGate>,
     path: PathBuf,
     peer_port: u32,
     local_port: u32,
@@ -83,6 +85,7 @@ impl UnixProxy {
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
         path: PathBuf,
+        snapshot_gate: Arc<SnapshotGate>,
     ) -> Result<Self, ProxyError> {
         let sock = proxy_sock_create(id)?;
 
@@ -97,6 +100,7 @@ impl UnixProxy {
             mem,
             queue,
             rxq,
+            snapshot_gate,
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
             path,
@@ -121,6 +125,7 @@ impl UnixProxy {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
+        snapshot_gate: Arc<SnapshotGate>,
     ) -> Self {
         debug!("new_reverse: id={id} local_port={local_port} peer_port={peer_port}");
         UnixProxy {
@@ -134,6 +139,7 @@ impl UnixProxy {
             mem,
             queue,
             rxq,
+            snapshot_gate,
             rx_cnt: Wrapping(0),
             tx_cnt: Wrapping(0),
             last_tx_cnt_sent: Wrapping(0),
@@ -167,7 +173,14 @@ impl UnixProxy {
             peer_port: self.control_port,
             result,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
     }
 
     fn push_reset(&self) {
@@ -181,7 +194,14 @@ impl UnixProxy {
             peer_port: self.peer_port,
         };
 
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
     }
 
     /// Forward a partial SHUTDOWN toward the guest. Used when the host peer
@@ -202,7 +222,14 @@ impl UnixProxy {
             fwd_cnt: self.tx_cnt.0,
         };
 
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
     }
 
     fn peer_avail_credit(&self) -> usize {
@@ -249,6 +276,7 @@ impl UnixProxy {
     fn recv_pkt(&mut self) -> (bool, bool) {
         let mut have_used = false;
         let mut wait_credit = false;
+        let _snapshot_activity = self.snapshot_gate.enter();
         let mut queue = self.queue.lock().unwrap();
 
         while let Some(head) = queue.pop(&self.mem) {
@@ -365,7 +393,14 @@ impl UnixProxy {
                 peer_port: self.peer_port,
                 fwd_cnt: self.tx_cnt.0,
             };
-            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+            push_packet(
+                self.cid,
+                rx,
+                &self.rxq,
+                &self.queue,
+                &self.mem,
+                &self.snapshot_gate,
+            );
             true
         } else {
             false
@@ -448,7 +483,14 @@ impl Proxy for UnixProxy {
             local_port: pkt.dst_port(),
             peer_port: pkt.src_port(),
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
 
         None
     }
@@ -534,7 +576,14 @@ impl Proxy for UnixProxy {
             local_port: self.local_port,
             peer_port: self.peer_port,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
     }
 
     fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate {

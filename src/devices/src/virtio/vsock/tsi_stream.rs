@@ -21,6 +21,7 @@ use super::proxy::{
     Family, ListenerDesc, NewProxyType, Proxy, ProxyError, ProxyRawHandle, ProxyRemoval,
     ProxyStatus, ProxyUpdate, RecvPkt, raw_handle,
 };
+use super::snapshot_gate::SnapshotGate;
 use super::sys;
 use super::vsock_addr::VsockAddr;
 use utils::epoll::EventSet;
@@ -40,6 +41,7 @@ pub struct TsiStreamProxy {
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
     rxq: Arc<Mutex<MuxerRxQ>>,
+    snapshot_gate: Arc<SnapshotGate>,
     rx_cnt: Wrapping<u32>,
     tx_cnt: Wrapping<u32>,
     last_tx_cnt_sent: Wrapping<u32>,
@@ -88,6 +90,7 @@ impl TsiStreamProxy {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
+        snapshot_gate: Arc<SnapshotGate>,
     ) -> Result<Self, ProxyError> {
         let (family, domain) = match family {
             defs::LINUX_AF_INET => (Family::Inet, Domain::IPV4),
@@ -138,6 +141,7 @@ impl TsiStreamProxy {
             mem,
             queue,
             rxq,
+            snapshot_gate,
             rx_cnt: Wrapping(0),
             tx_cnt: Wrapping(0),
             last_tx_cnt_sent: Wrapping(0),
@@ -167,6 +171,7 @@ impl TsiStreamProxy {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
+        snapshot_gate: Arc<SnapshotGate>,
     ) -> Self {
         debug!("new_reverse: id={id} local_port={local_port} peer_port={peer_port}");
         TsiStreamProxy {
@@ -182,6 +187,7 @@ impl TsiStreamProxy {
             mem,
             queue,
             rxq,
+            snapshot_gate,
             rx_cnt: Wrapping(0),
             tx_cnt: Wrapping(0),
             last_tx_cnt_sent: Wrapping(0),
@@ -355,6 +361,7 @@ impl TsiStreamProxy {
     fn recv_pkt(&mut self) -> (bool, bool) {
         let mut have_used = false;
         let mut wait_credit = false;
+        let _snapshot_activity = self.snapshot_gate.enter();
         let mut queue = self.queue.lock().unwrap();
 
         while let Some(head) = queue.pop(&self.mem) {
@@ -414,7 +421,14 @@ impl TsiStreamProxy {
             peer_port: self.control_port,
             result,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
     }
 
     fn push_reset(&self) {
@@ -428,7 +442,14 @@ impl TsiStreamProxy {
             local_port: self.local_port,
             peer_port: self.peer_port,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
     }
 
     /// Forward a partial SHUTDOWN toward the guest. Used when the remote peer
@@ -448,7 +469,14 @@ impl TsiStreamProxy {
             flags,
             fwd_cnt: self.tx_cnt.0,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
     }
 
     fn switch_to_connected(&mut self) {
@@ -565,7 +593,14 @@ impl TsiStreamProxy {
                 peer_port: self.peer_port,
                 fwd_cnt: self.tx_cnt.0,
             };
-            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+            push_packet(
+                self.cid,
+                rx,
+                &self.rxq,
+                &self.queue,
+                &self.mem,
+                &self.snapshot_gate,
+            );
             true
         } else {
             false
@@ -678,7 +713,14 @@ impl Proxy for TsiStreamProxy {
             local_port: pkt.dst_port(),
             peer_port: pkt.src_port(),
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
 
         // Now that the vsock transport is fully established, start listening
         // for events in the TCP socket again.
@@ -726,7 +768,14 @@ impl Proxy for TsiStreamProxy {
             peer_port: pkt.src_port(),
             data,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
     }
 
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
@@ -799,7 +848,14 @@ impl Proxy for TsiStreamProxy {
             peer_port: pkt.src_port(),
             result,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
 
         if result == 0 {
             self.peer_port = req.vm_port;
@@ -859,7 +915,14 @@ impl Proxy for TsiStreamProxy {
             local_port: self.local_port,
             peer_port: self.peer_port,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
     }
 
     fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
@@ -906,7 +969,14 @@ impl Proxy for TsiStreamProxy {
             peer_port: self.control_port,
             result,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
     }
 
     fn shutdown(&mut self, pkt: &VsockPacket) -> ProxyUpdate {

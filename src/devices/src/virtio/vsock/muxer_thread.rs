@@ -7,6 +7,7 @@ use super::super::Queue as VirtQueue;
 use super::muxer::{MuxerRx, ProxyMap, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::proxy::{NewProxyType, Proxy, ProxyRawHandle, ProxyRemoval, ProxyUpdate};
+use super::snapshot_gate::SnapshotGate;
 use super::tsi_stream::TsiStreamProxy;
 
 use crate::virtio::InterruptTransport;
@@ -28,6 +29,7 @@ pub struct MuxerThread {
     reaper_sender: Sender<u64>,
     /// AF_UNIX host-IPC listeners; consumed by `create_lisening_ipc_sockets`.
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+    snapshot_gate: Arc<SnapshotGate>,
 }
 
 impl MuxerThread {
@@ -42,6 +44,7 @@ impl MuxerThread {
         interrupt: InterruptTransport,
         reaper_sender: Sender<u64>,
         unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+        snapshot_gate: Arc<SnapshotGate>,
     ) -> Self {
         MuxerThread {
             cid,
@@ -53,6 +56,7 @@ impl MuxerThread {
             interrupt,
             reaper_sender,
             unix_ipc_port_map,
+            snapshot_gate,
         }
     }
 
@@ -65,7 +69,14 @@ impl MuxerThread {
 
     fn send_credit_request(&self, credit_rx: MuxerRx) {
         debug!("send_credit_request");
-        push_packet(self.cid, credit_rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            credit_rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
     }
 
     pub fn update_polling(&self, id: u64, fd: ProxyRawHandle, evset: EventSet) {
@@ -125,6 +136,7 @@ impl MuxerThread {
                     self.mem.clone(),
                     self.queue.clone(),
                     self.rxq.clone(),
+                    self.snapshot_gate.clone(),
                 )),
                 NewProxyType::Unix => Box::new(UnixProxy::new_reverse(
                     new_id,
@@ -135,6 +147,7 @@ impl MuxerThread {
                     self.mem.clone(),
                     self.queue.clone(),
                     self.rxq.clone(),
+                    self.snapshot_gate.clone(),
                 )),
             };
             self.proxy_map

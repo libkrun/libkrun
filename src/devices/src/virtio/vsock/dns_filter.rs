@@ -33,6 +33,7 @@ use super::vsock_addr::VsockAddr;
 use super::super::Queue as VirtQueue;
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
+use super::snapshot_gate::SnapshotGate;
 use crate::virtio::InterruptTransport;
 
 pub(super) const DNS_PORT: u16 = 53;
@@ -369,6 +370,7 @@ pub(super) struct DnsWorker {
     queue: Arc<Mutex<VirtQueue>>,
     rxq: Arc<Mutex<MuxerRxQ>>,
     interrupt: InterruptTransport,
+    snapshot_gate: Arc<SnapshotGate>,
 }
 
 impl DnsWorker {
@@ -379,6 +381,7 @@ impl DnsWorker {
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
         interrupt: InterruptTransport,
+        snapshot_gate: Arc<SnapshotGate>,
     ) -> Self {
         Self {
             receiver,
@@ -387,6 +390,7 @@ impl DnsWorker {
             queue,
             rxq,
             interrupt,
+            snapshot_gate,
         }
     }
 
@@ -410,6 +414,7 @@ impl DnsWorker {
                 &self.rxq,
                 &self.queue,
                 &self.mem,
+                &self.snapshot_gate,
             );
             self.interrupt.signal_used_queue();
         }

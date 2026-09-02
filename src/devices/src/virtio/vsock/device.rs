@@ -273,6 +273,14 @@ impl Vsock {
 }
 
 impl VirtioDevice for Vsock {
+    fn quiesce_for_snapshot(&mut self) {
+        self.muxer.quiesce_for_snapshot();
+    }
+
+    fn rearm_after_snapshot(&mut self) {
+        self.muxer.rearm_after_snapshot();
+    }
+
     fn avail_features(&self) -> u64 {
         self.avail_features
     }

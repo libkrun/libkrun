@@ -15,6 +15,7 @@ mod muxer_thread;
 mod packet;
 mod proxy;
 mod reaper;
+mod snapshot_gate;
 mod sys;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod timesync;

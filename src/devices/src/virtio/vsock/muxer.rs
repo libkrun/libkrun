@@ -19,6 +19,7 @@ use super::packet::{TsiGetnameRsp, VsockPacket};
 use super::proxy::ProxyRawHandle;
 use super::proxy::{ListenerDesc, Proxy, ProxyRemoval, ProxyStatus, ProxyUpdate};
 use super::reaper::ReaperThread;
+use super::snapshot_gate::SnapshotGate;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
@@ -99,7 +100,9 @@ pub fn push_packet(
     rxq_mutex: &Arc<Mutex<MuxerRxQ>>,
     queue_mutex: &Arc<Mutex<VirtQueue>>,
     mem: &GuestMemoryMmap,
+    snapshot_gate: &SnapshotGate,
 ) {
+    let _snapshot_activity = snapshot_gate.enter();
     let mut queue = queue_mutex.lock().unwrap();
     if let Some(head) = queue.pop(mem) {
         if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
@@ -136,6 +139,7 @@ pub struct VsockMuxer {
     floor: FloorMode,
     /// Sender to the DNS worker thread; Some only when DNS filtering is active.
     dns_sender: Option<Sender<DnsRequest>>,
+    snapshot_gate: Arc<SnapshotGate>,
 }
 
 impl VsockMuxer {
@@ -171,6 +175,7 @@ impl VsockMuxer {
             egress_policy,
             floor: floor_mode(),
             dns_sender: None,
+            snapshot_gate: Arc::new(SnapshotGate::default()),
         }
     }
 
@@ -236,8 +241,13 @@ impl VsockMuxer {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             info!("[VSOCK_TIMING] starting TimesyncThread");
-            let timesync =
-                TimesyncThread::new(self.cid, mem.clone(), queue.clone(), interrupt.clone());
+            let timesync = TimesyncThread::new(
+                self.cid,
+                mem.clone(),
+                queue.clone(),
+                interrupt.clone(),
+                self.snapshot_gate.clone(),
+            );
             timesync.run();
             info!("[VSOCK_TIMING] TimesyncThread started");
         }
@@ -256,6 +266,7 @@ impl VsockMuxer {
                     queue.clone(),
                     self.rxq.clone(),
                     interrupt.clone(),
+                    self.snapshot_gate.clone(),
                 );
                 worker.run();
                 self.dns_sender = Some(dns_sender);
@@ -282,6 +293,7 @@ impl VsockMuxer {
             interrupt.clone(),
             sender.clone(),
             self.unix_ipc_port_map.clone().unwrap_or_default(),
+            self.snapshot_gate.clone(),
         );
         thread.run();
         info!("[VSOCK_TIMING] MuxerThread spawned");
@@ -295,6 +307,22 @@ impl VsockMuxer {
             "[VSOCK_TIMING] muxer.activate() completed in {:?}",
             activate_start.elapsed()
         );
+    }
+
+    pub(crate) fn quiesce_for_snapshot(&self) {
+        self.snapshot_gate.pause();
+        // A producer normally signals just after releasing the RX queue. If
+        // snapshot quiescing lands in that small gap, make the already-written
+        // used entries visible before the interrupt-controller state is saved.
+        // Virtio permits spurious notifications, so this is also safe when the
+        // queue had no pending update.
+        if let Some(interrupt) = &self.interrupt {
+            interrupt.signal_used_queue();
+        }
+    }
+
+    pub(crate) fn rearm_after_snapshot(&self) {
+        self.snapshot_gate.resume();
     }
 
     pub(crate) fn has_pending_rx(&self) -> bool {
@@ -330,6 +358,7 @@ impl VsockMuxer {
             }
         };
 
+        let _snapshot_activity = self.snapshot_gate.enter();
         let mut queue = queue_mutex.lock().unwrap();
         if let Some(head) = queue.pop(mem) {
             if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
@@ -416,6 +445,7 @@ impl VsockMuxer {
                 mem.clone(),
                 queue.clone(),
                 self.rxq.clone(),
+                self.snapshot_gate.clone(),
             ) {
                 Ok(mut proxy) => {
                     let rc = proxy.relisten(d.guest_port, d.backlog, &self.host_port_map);
@@ -529,6 +559,7 @@ impl VsockMuxer {
                         mem.clone(),
                         queue.clone(),
                         self.rxq.clone(),
+                        self.snapshot_gate.clone(),
                     ) {
                         Ok(proxy) => {
                             self.proxy_map
@@ -563,6 +594,7 @@ impl VsockMuxer {
                         queue.clone(),
                         self.rxq.clone(),
                         self.dns_sender.clone(),
+                        self.snapshot_gate.clone(),
                     ) {
                         Ok(proxy) => {
                             self.proxy_map
@@ -814,7 +846,7 @@ impl VsockMuxer {
                         local_port: pkt.dst_port(),
                         peer_port: pkt.src_port(),
                     };
-                    push_packet(self.cid, rx, &self.rxq, queue, mem);
+                    push_packet(self.cid, rx, &self.rxq, queue, mem, &self.snapshot_gate);
                     return;
                 }
                 let rxq = self.rxq.clone();
@@ -828,6 +860,7 @@ impl VsockMuxer {
                     queue.clone(),
                     rxq,
                     path.to_path_buf(),
+                    self.snapshot_gate.clone(),
                 )
                 .unwrap();
                 let tsi = TsiConnectReq {
@@ -852,7 +885,7 @@ impl VsockMuxer {
                         local_port: pkt.dst_port(),
                         peer_port: pkt.src_port(),
                     };
-                    push_packet(self.cid, rx, &self.rxq, queue, mem);
+                    push_packet(self.cid, rx, &self.rxq, queue, mem, &self.snapshot_gate);
                     return;
                 }
                 unix.confirm_connect(pkt);
@@ -982,7 +1015,7 @@ impl VsockMuxer {
                 local_port: pkt.dst_port(),
                 peer_port: pkt.src_port(),
             };
-            push_packet(self.cid, rx, &self.rxq, queue, mem);
+            push_packet(self.cid, rx, &self.rxq, queue, mem, &self.snapshot_gate);
         }
     }
 

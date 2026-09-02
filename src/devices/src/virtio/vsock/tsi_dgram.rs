@@ -18,6 +18,7 @@ use super::proxy::{
     Family, Proxy, ProxyError, ProxyRawHandle, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
     raw_handle,
 };
+use super::snapshot_gate::SnapshotGate;
 use super::sys;
 use super::vsock_addr::VsockAddr;
 use crossbeam_channel::Sender;
@@ -38,6 +39,7 @@ pub struct TsiDgramProxy {
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
     rxq: Arc<Mutex<MuxerRxQ>>,
+    snapshot_gate: Arc<SnapshotGate>,
     rx_cnt: Wrapping<u32>,
     tx_cnt: Wrapping<u32>,
     peer_buf_alloc: u32,
@@ -60,6 +62,7 @@ impl TsiDgramProxy {
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
         dns_sender: Option<Sender<DnsRequest>>,
+        snapshot_gate: Arc<SnapshotGate>,
     ) -> Result<Self, ProxyError> {
         let (family, domain) = match family {
             defs::LINUX_AF_INET => (Family::Inet, Domain::IPV4),
@@ -91,6 +94,7 @@ impl TsiDgramProxy {
             mem,
             queue,
             rxq,
+            snapshot_gate,
             rx_cnt: Wrapping(0),
             tx_cnt: Wrapping(0),
             peer_buf_alloc: 0,
@@ -157,6 +161,7 @@ impl TsiDgramProxy {
     fn recv_pkt(&mut self) -> (bool, bool) {
         let mut have_used = false;
         let mut wait_credit = false;
+        let _snapshot_activity = self.snapshot_gate.enter();
         let mut queue = self.queue.lock().unwrap();
 
         while let Some(head) = queue.pop(&self.mem) {
@@ -296,7 +301,14 @@ impl Proxy for TsiDgramProxy {
             peer_port: pkt.src_port(),
             result: res,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
 
         let mut update = ProxyUpdate::default();
         if poll_host_socket && !self.listening {
@@ -334,7 +346,14 @@ impl Proxy for TsiDgramProxy {
             peer_port: pkt.src_port(),
             data,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
     }
 
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {

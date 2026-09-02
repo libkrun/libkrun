@@ -5,6 +5,7 @@ use std::time;
 use super::super::Queue as VirtQueue;
 use super::defs::uapi;
 use super::packet::VsockPacket;
+use super::snapshot_gate::SnapshotGate;
 
 use crate::virtio::InterruptTransport;
 use vm_memory::GuestMemoryMmap;
@@ -18,6 +19,7 @@ pub struct TimesyncThread {
     mem: GuestMemoryMmap,
     queue_mutex: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
+    snapshot_gate: Arc<SnapshotGate>,
 }
 
 impl TimesyncThread {
@@ -26,16 +28,19 @@ impl TimesyncThread {
         mem: GuestMemoryMmap,
         queue_mutex: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
+        snapshot_gate: Arc<SnapshotGate>,
     ) -> Self {
         Self {
             cid,
             mem,
             queue_mutex,
             interrupt,
+            snapshot_gate,
         }
     }
 
     fn send_time(&self, time: u64) {
+        let _snapshot_activity = self.snapshot_gate.enter();
         let mut queue = self.queue_mutex.lock().unwrap();
         if let Some(head) = queue.pop(&self.mem)
             && let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head)
