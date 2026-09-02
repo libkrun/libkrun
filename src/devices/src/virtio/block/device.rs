@@ -45,7 +45,7 @@ use super::{
 };
 
 use crate::virtio::{
-    ActivateError, InterruptTransport,
+    ActivateError, InterruptTransport, PauseError,
     block::{ImageType, SyncMode},
 };
 
@@ -244,7 +244,7 @@ pub struct Block {
     cache_type: CacheType,
     disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
-    worker_thread: Option<JoinHandle<()>>,
+    worker_thread: Option<JoinHandle<DeviceQueue>>,
     worker_stopfd: EventFd,
 
     // Virtio fields.
@@ -464,6 +464,21 @@ impl VirtioDevice for Block {
 
         self.device_state = DeviceState::Activated(mem, interrupt);
         Ok(())
+    }
+
+    /// Stop the worker and take its queue back; it parks in `epoll` at a
+    /// descriptor boundary, so nothing is in flight.
+    fn pause(&mut self) -> std::result::Result<Vec<DeviceQueue>, PauseError> {
+        let Some(worker) = self.worker_thread.take() else {
+            return Ok(Vec::new());
+        };
+        self.worker_stopfd
+            .write(1)
+            .map_err(|e| PauseError::Failed(format!("virtio_blk stop: {e}")))?;
+        let queue = worker
+            .join()
+            .map_err(|_| PauseError::Failed("virtio_blk worker panicked".into()))?;
+        Ok(vec![queue])
     }
 
     fn reset(&mut self) -> bool {

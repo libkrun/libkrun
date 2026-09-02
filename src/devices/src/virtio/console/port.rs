@@ -64,8 +64,12 @@ enum PortState {
     Active {
         stopfd: utils::eventfd::EventFd,
         stop: Arc<AtomicBool>,
-        rx_thread: Option<JoinHandle<()>>,
-        tx_thread: Option<JoinHandle<()>>,
+        rx_thread: Option<JoinHandle<Queue>>,
+        tx_thread: Option<JoinHandle<Queue>>,
+        // Queues for a direction with no backing fd (an output-only port has no
+        // rx thread). Kept, not dropped, so a snapshot recovers every queue.
+        idle_rx: Option<Queue>,
+        idle_tx: Option<Queue>,
     },
 }
 
@@ -101,6 +105,11 @@ impl Port {
         self.terminal.as_deref()
     }
 
+    /// Whether the port's I/O threads are running (i.e. the guest opened it).
+    pub fn is_active(&self) -> bool {
+        matches!(self.state, PortState::Active { .. })
+    }
+
     pub fn notify_rx(&self) {
         if let PortState::Active {
             rx_thread: Some(handle),
@@ -130,7 +139,7 @@ impl Port {
         control: Arc<ConsoleControl>,
     ) {
         if let PortState::Active { .. } = &mut self.state {
-            self.shutdown();
+            let _ = self.shutdown();
         };
 
         let input = self.input.as_ref().cloned();
@@ -140,63 +149,105 @@ impl Port {
             .expect("Failed to create EventFd for interrupt_evt");
         let stop = Arc::new(AtomicBool::new(false));
 
-        let rx_thread = input.map(|input| {
-            let mem = mem.clone();
-            let interrupt = interrupt.clone();
-            let port_id = self.port_id;
-            let stopfd = stopfd.try_clone().unwrap();
-            let stop = stop.clone();
-            thread::Builder::new()
-                .name("console port".into())
-                .spawn(move || {
-                    process_rx(
-                        mem, rx_queue, interrupt, input, control, port_id, stopfd, stop,
-                    )
-                })
-                .unwrap()
-        });
+        let mut idle_rx = None;
+        let rx_thread = match input {
+            Some(input) => {
+                let mem = mem.clone();
+                let interrupt = interrupt.clone();
+                let port_id = self.port_id;
+                let stopfd = stopfd.try_clone().unwrap();
+                let stop = stop.clone();
+                Some(
+                    thread::Builder::new()
+                        .name("console port".into())
+                        .spawn(move || {
+                            process_rx(
+                                mem, rx_queue, interrupt, input, control, port_id, stopfd, stop,
+                            )
+                        })
+                        .unwrap(),
+                )
+            }
+            None => {
+                idle_rx = Some(rx_queue);
+                None
+            }
+        };
 
-        let tx_thread = output.map(|output| {
-            let stop = stop.clone();
-            thread::spawn(move || process_tx(mem, tx_queue, interrupt, output, stop))
-        });
+        let mut idle_tx = None;
+        let tx_thread = match output {
+            Some(output) => {
+                let stop = stop.clone();
+                let stopfd = stopfd.try_clone().unwrap();
+                Some(thread::spawn(move || {
+                    process_tx(mem, tx_queue, interrupt, output, stopfd, stop)
+                }))
+            }
+            None => {
+                idle_tx = Some(tx_queue);
+                None
+            }
+        };
 
         self.state = PortState::Active {
             stopfd,
             stop,
             rx_thread,
             tx_thread,
+            idle_rx,
+            idle_tx,
         }
     }
 
-    pub fn shutdown(&mut self) {
+    /// Stops the port's I/O threads and returns the queues they owned (each
+    /// `Option` since a port may have only one direction).
+    pub fn shutdown(&mut self) -> PortQueues {
+        let mut queues = PortQueues::default();
         if let PortState::Active {
             stopfd,
             stop,
             tx_thread,
             rx_thread,
+            idle_rx,
+            idle_tx,
         } = &mut self.state
         {
+            queues.rx = idle_rx.take();
+            queues.tx = idle_tx.take();
+            // Signal both wakeup paths before joining: the flag for the
+            // queue-pop park, and the stopfd for a tx thread blocked on a full
+            // output fd. Writing the stopfd after the tx join would deadlock.
             stop.store(true, Ordering::Release);
+            stopfd.write(1).unwrap();
             if let Some(tx_thread) = mem::take(tx_thread) {
                 tx_thread.thread().unpark();
-                if let Err(e) = tx_thread.join() {
-                    log::error!(
+                match tx_thread.join() {
+                    Ok(queue) => queues.tx = Some(queue),
+                    Err(e) => log::error!(
                         "Failed to flush tx for port {port_id}, thread panicked: {e:?}",
                         port_id = self.port_id
-                    )
+                    ),
                 }
             }
-            stopfd.write(1).unwrap();
             if let Some(rx_thread) = mem::take(rx_thread) {
                 rx_thread.thread().unpark();
-                if let Err(e) = rx_thread.join() {
-                    log::error!(
-                        "Failed to flush tx for port {port_id}, thread panicked: {e:?}",
+                match rx_thread.join() {
+                    Ok(queue) => queues.rx = Some(queue),
+                    Err(e) => log::error!(
+                        "Failed to flush rx for port {port_id}, thread panicked: {e:?}",
                         port_id = self.port_id
-                    )
+                    ),
                 }
             }
         };
+        self.state = PortState::Inactive;
+        queues
     }
+}
+
+/// The queues an active port's I/O threads owned, handed back on shutdown.
+#[derive(Default)]
+pub(crate) struct PortQueues {
+    pub rx: Option<Queue>,
+    pub tx: Option<Queue>,
 }

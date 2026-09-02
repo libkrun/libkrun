@@ -11,7 +11,7 @@ use std::{fmt, io};
 
 use devices::fdt::DeviceInfoForFDT;
 use devices::legacy::IrqChip;
-use devices::{BusDevice, DeviceType};
+use devices::{BusDevice, DeviceType, Snapshottable};
 use kernel::cmdline as kernel_cmdline;
 use polly::event_manager::EventManager;
 #[cfg(target_arch = "aarch64")]
@@ -84,6 +84,9 @@ pub struct MMIODeviceManager {
     irq: u32,
     last_irq: u32,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
+    /// Devices that participate in snapshot, collected as they are registered
+    /// so the VMM can capture their state without downcasting bus entries.
+    snapshottables: Vec<Arc<Mutex<dyn Snapshottable>>>,
 }
 
 impl MMIODeviceManager {
@@ -99,13 +102,25 @@ impl MMIODeviceManager {
             last_irq: irq_interval.1,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
+            snapshottables: Vec::new(),
         }
+    }
+
+    /// Devices to capture in a snapshot, in registration order.
+    pub fn snapshottables(&self) -> &[Arc<Mutex<dyn Snapshottable>>] {
+        &self.snapshottables
+    }
+
+    /// Register a snapshottable device created outside this manager (e.g. a
+    /// virtio device built in the VMM builder).
+    pub fn add_snapshottable(&mut self, dev: Arc<Mutex<dyn Snapshottable>>) {
+        self.snapshottables.push(dev);
     }
 
     /// Register an already created MMIO device to be used via MMIO transport.
     pub fn register_mmio_device(
         &mut self,
-        mut mmio_device: devices::virtio::MmioTransport,
+        mmio_device: Arc<Mutex<devices::virtio::MmioTransport>>,
         type_id: u32,
         device_id: String,
     ) -> Result<(u64, u32)> {
@@ -113,10 +128,10 @@ impl MMIODeviceManager {
             return Err(Error::IrqsExhausted);
         }
 
-        mmio_device.set_irq_line(self.irq);
+        mmio_device.lock().unwrap().set_irq_line(self.irq);
 
         self.bus
-            .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)
+            .insert(mmio_device, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
         let ret = (self.mmio_base, self.irq);
         self.id_to_dev_info.insert(
@@ -190,8 +205,10 @@ impl MMIODeviceManager {
         let rtc_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
         let device = devices::legacy::RTC::new(rtc_evt.try_clone().map_err(Error::EventFd)?);
 
+        let device = Arc::new(Mutex::new(device));
+        self.snapshottables.push(device.clone());
         self.bus
-            .insert(Arc::new(Mutex::new(device)), self.mmio_base, MMIO_LEN)
+            .insert(device, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
 
         let ret = self.mmio_base;
@@ -343,11 +360,18 @@ mod tests {
             type_id: u32,
             device_id: &str,
         ) -> Result<u64> {
-            let mmio_device =
-                devices::virtio::MmioTransport::new(guest_mem, DummyIrqChip::new().into(), device)
-                    .unwrap();
-            let (mmio_base, _irq) =
-                self.register_mmio_device(mmio_device, type_id, device_id.to_string())?;
+            let mmio_device = devices::virtio::MmioTransport::new(
+                guest_mem,
+                DummyIrqChip::new().into(),
+                device,
+                device_id.to_string(),
+            )
+            .unwrap();
+            let (mmio_base, _irq) = self.register_mmio_device(
+                Arc::new(Mutex::new(mmio_device)),
+                type_id,
+                device_id.to_string(),
+            )?;
             Ok(mmio_base)
         }
     }

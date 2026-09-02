@@ -164,6 +164,58 @@ pub trait VirtioDevice: AsAny + Send {
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         None
     }
+
+    /// Stop this device's workers and hand its live queues back for snapshot.
+    /// The workers own the running queue indices, so the transport cannot read
+    /// them until they stop. Must not drain in-flight work — a worker blocked on
+    /// a stalled host fd would deadlock; stop at a descriptor boundary. The
+    /// default rejects the snapshot.
+    fn pause(&mut self) -> std::result::Result<Vec<DeviceQueue>, PauseError> {
+        Err(PauseError::Unsupported(self.device_name().to_string()))
+    }
+
+    /// Device state beyond the queues (e.g. the console's open ports, which a
+    /// restored guest won't re-announce). Captured after [`VirtioDevice::pause`].
+    fn save_state(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Load what [`VirtioDevice::save_state`] wrote, before [`VirtioDevice::resume`].
+    fn restore_state(&mut self, _state: &[u8]) -> std::result::Result<(), crate::Error> {
+        Ok(())
+    }
+
+    /// Restart this device with `queues`, in place of [`VirtioDevice::activate`].
+    /// The default re-activates; override when resume differs from a fresh
+    /// activation (the console restarts only the ports the guest had open).
+    fn resume(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        self.activate(mem, interrupt, queues)
+    }
+}
+
+/// Why a device could not be quiesced for a snapshot.
+#[derive(Debug)]
+pub enum PauseError {
+    /// The device has no quiesce support, so it cannot be snapshotted.
+    Unsupported(String),
+    /// The device tried to stop its workers and failed.
+    Failed(String),
+}
+
+impl std::fmt::Display for PauseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            PauseError::Unsupported(name) => {
+                write!(f, "device {name} does not support snapshot quiesce")
+            }
+            PauseError::Failed(e) => write!(f, "device quiesce failed: {e}"),
+        }
+    }
 }
 
 pub trait VmmExitObserver: Send {

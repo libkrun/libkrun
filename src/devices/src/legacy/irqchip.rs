@@ -35,6 +35,30 @@ impl IrqChipDevice {
     ) -> Result<(), DeviceError> {
         self.inner.set_irq(irq_line, interrupt_evt)
     }
+
+    /// Capture the in-kernel GIC distributor/redistributor state (snapshot).
+    #[cfg(target_arch = "aarch64")]
+    pub fn save_gic_state(&self) -> Result<Vec<u8>, DeviceError> {
+        self.inner.save_gic_state()
+    }
+
+    /// Capture one vCPU's GIC CPU-interface (ICC) registers (snapshot).
+    #[cfg(target_arch = "aarch64")]
+    pub fn save_vcpu_icc(&self, vcpuid: u64) -> Result<Vec<(u32, u64)>, DeviceError> {
+        self.inner.save_vcpu_icc(vcpuid)
+    }
+
+    /// Restore the in-kernel GIC distributor/redistributor state (restore).
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_gic_state(&self, blob: &[u8]) -> Result<(), DeviceError> {
+        self.inner.restore_gic_state(blob)
+    }
+
+    /// Restore one vCPU's GIC CPU-interface (ICC) registers (restore).
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_vcpu_icc(&self, vcpuid: u64, regs: &[(u32, u64)]) -> Result<(), DeviceError> {
+        self.inner.restore_vcpu_icc(vcpuid, regs)
+    }
 }
 
 impl BusDevice for IrqChipDevice {
@@ -132,6 +156,39 @@ pub trait IrqChipT: BusDevice + GICDevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    /// Capture the in-kernel GIC distributor/redistributor state as an opaque
+    /// blob (snapshot). Default: unsupported — only the HVF GIC overrides it.
+    fn save_gic_state(&self) -> Result<Vec<u8>, DeviceError> {
+        Err(DeviceError::Snapshot(
+            "GIC state snapshot not supported by this irqchip".into(),
+        ))
+    }
+
+    /// Capture one vCPU's GIC CPU-interface (ICC) registers (snapshot). These
+    /// live in the vCPU interface, not the global blob above. Default:
+    /// unsupported.
+    fn save_vcpu_icc(&self, _vcpuid: u64) -> Result<Vec<(u32, u64)>, DeviceError> {
+        Err(DeviceError::Snapshot(
+            "vCPU ICC snapshot not supported by this irqchip".into(),
+        ))
+    }
+
+    /// Restore the GIC distributor/redistributor blob (restore). Default:
+    /// unsupported — only the HVF GIC overrides it.
+    fn restore_gic_state(&self, _blob: &[u8]) -> Result<(), DeviceError> {
+        Err(DeviceError::Snapshot(
+            "GIC state restore not supported by this irqchip".into(),
+        ))
+    }
+
+    /// Restore one vCPU's GIC CPU-interface (ICC) registers (restore). Default:
+    /// unsupported.
+    fn restore_vcpu_icc(&self, _vcpuid: u64, _regs: &[(u32, u64)]) -> Result<(), DeviceError> {
+        Err(DeviceError::Snapshot(
+            "vCPU ICC restore not supported by this irqchip".into(),
+        ))
+    }
 }
 
 #[cfg(target_arch = "riscv64")]

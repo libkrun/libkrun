@@ -12,7 +12,7 @@ use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, Bytes, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, PauseError, QueueConfig, VirtioDevice,
 };
 use super::{defs, defs::control_event, defs::uapi};
 use crate::virtio::console::console_control::{
@@ -63,6 +63,9 @@ pub struct Console {
     queue_config: Vec<QueueConfig>,
     // Queues are stored as Option so individual queues can be taken when ports start.
     pub(crate) queues: Vec<Option<DeviceQueue>>,
+    // Ports the guest had open at snapshot. A restored guest won't re-send
+    // PORT_OPEN, so this is the only record of which to restart.
+    open_ports: Vec<bool>,
     // TODO: move the queue event handling to the correct threads!
     pub(crate) queue_events: Vec<Arc<EventFd>>,
 
@@ -99,6 +102,7 @@ impl Console {
             ports,
             queue_config,
             queues: Vec::new(),
+            open_ports: Vec::new(),
             queue_events: Vec::new(),
             avail_features: AVAIL_FEATURES,
             acked_features: 0,
@@ -350,6 +354,91 @@ impl VirtioDevice for Console {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    /// Stop the ports' I/O threads and take their queues back — the threads own
+    /// the live indices.
+    fn pause(&mut self) -> std::result::Result<Vec<DeviceQueue>, PauseError> {
+        if !self.device_state.is_activated() {
+            return Ok(Vec::new());
+        }
+        self.open_ports = self.ports.iter().map(|p| p.is_active()).collect();
+
+        for port_id in 0..self.ports.len() {
+            let recovered = self.ports[port_id].shutdown();
+            let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+            let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+            if let Some(queue) = recovered.rx {
+                self.queues[rx_idx] =
+                    Some(DeviceQueue::new(queue, self.queue_events[rx_idx].clone()));
+            }
+            if let Some(queue) = recovered.tx {
+                self.queues[tx_idx] =
+                    Some(DeviceQueue::new(queue, self.queue_events[tx_idx].clone()));
+            }
+        }
+
+        let mut queues = Vec::with_capacity(self.queues.len());
+        for (i, slot) in self.queues.iter_mut().enumerate() {
+            let queue = slot.take().ok_or_else(|| {
+                PauseError::Failed(format!("virtio_console queue {i} was not recovered"))
+            })?;
+            queues.push(queue);
+        }
+        Ok(queues)
+    }
+
+    /// One byte per port: whether the guest had it open. Always full width, even
+    /// if never activated (then `open_ports` is empty = nothing open).
+    fn save_state(&self) -> Vec<u8> {
+        (0..self.ports.len())
+            .map(|i| self.open_ports.get(i).copied().unwrap_or(false) as u8)
+            .collect()
+    }
+
+    fn restore_state(&mut self, state: &[u8]) -> std::result::Result<(), crate::Error> {
+        if state.len() != self.ports.len() {
+            return Err(crate::Error::Snapshot(format!(
+                "virtio_console: snapshot has {} ports, config has {}",
+                state.len(),
+                self.ports.len()
+            )));
+        }
+        self.open_ports = state.iter().map(|&b| b != 0).collect();
+        Ok(())
+    }
+
+    /// Bring the device back up, restarting only the ports the guest had open —
+    /// starting a closed port would consume the queue its later PORT_OPEN needs.
+    fn resume(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        // activate signals `activate_evt`, which makes the event loop watch our
+        // queue eventfds; without it the guest's kick is never seen.
+        self.activate(mem.clone(), interrupt.clone(), queues)?;
+
+        for port_id in 0..self.ports.len() {
+            if !self.open_ports.get(port_id).copied().unwrap_or(false) {
+                continue;
+            }
+            let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+            let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+            let (Some(rx), Some(tx)) = (self.queues[rx_idx].take(), self.queues[tx_idx].take())
+            else {
+                continue;
+            };
+            self.ports[port_id].start(
+                mem.clone(),
+                rx.queue,
+                tx.queue,
+                interrupt.clone(),
+                self.control.clone(),
+            );
+        }
+        Ok(())
     }
 
     fn reset(&mut self) -> bool {

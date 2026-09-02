@@ -145,9 +145,18 @@ impl PortOutput for PortOutputFd {
         })
     }
 
-    fn wait_until_writable(&self) {
-        let mut poll_fds = [PollFd::new(self.0.as_fd(), PollFlags::POLLOUT)];
+    fn wait_until_writable(&self, stopfd: Option<&EventFd>) -> bool {
+        let mut poll_fds = vec![PollFd::new(self.0.as_fd(), PollFlags::POLLOUT)];
+        if let Some(stopfd) = stopfd {
+            // SAFETY: we trust stopfd won't go away to avoid a dup call here.
+            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(stopfd.as_raw_fd()) };
+            poll_fds.push(PollFd::new(borrowed_fd, PollFlags::POLLIN));
+        }
         poll(&mut poll_fds, PollTimeout::NONE).expect("Failed to poll");
+        poll_fds
+            .get(1)
+            .and_then(|pf| pf.revents())
+            .is_some_and(|r| r.intersects(PollFlags::POLLIN))
     }
 }
 

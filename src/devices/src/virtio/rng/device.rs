@@ -6,7 +6,7 @@ use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, RngError, VirtioDevice,
 };
 use super::{defs, defs::uapi};
-use crate::virtio::InterruptTransport;
+use crate::virtio::{InterruptTransport, PauseError};
 
 // Request queue.
 pub(crate) const REQ_INDEX: usize = 0;
@@ -144,6 +144,12 @@ impl VirtioDevice for Rng {
         self.device_state = DeviceState::Activated(mem, interrupt);
 
         Ok(())
+    }
+
+    /// Event-loop driven, and `Vmm::snapshot` runs on that loop, so nothing of
+    /// ours is running — just hand the queues over.
+    fn pause(&mut self) -> std::result::Result<Vec<DeviceQueue>, PauseError> {
+        Ok(self.queues.take().unwrap_or_default())
     }
 
     fn is_activated(&self) -> bool {

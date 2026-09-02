@@ -5,6 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use bincode::{Decode, Encode};
 use std::cmp::min;
 use std::fmt::{self, Debug, Display};
 use std::num::Wrapping;
@@ -705,6 +706,50 @@ impl Queue {
             .map(Wrapping)
             .map_err(Error::GuestMemory)
     }
+
+    /// Capture the queue's runtime state for snapshot. `max_size` is omitted —
+    /// it's fixed at construction from the device config.
+    pub fn snapshot(&self) -> QueueSnapshot {
+        QueueSnapshot {
+            size: self.size,
+            ready: self.ready,
+            desc_table: self.desc_table.raw_value(),
+            avail_ring: self.avail_ring.raw_value(),
+            used_ring: self.used_ring.raw_value(),
+            next_avail: self.next_avail.0,
+            next_used: self.next_used.0,
+            event_idx_enabled: self.event_idx_enabled,
+            num_added: self.num_added.0,
+        }
+    }
+
+    /// Restore runtime state captured by [`Queue::snapshot`].
+    pub fn restore(&mut self, s: &QueueSnapshot) {
+        self.size = s.size;
+        self.ready = s.ready;
+        self.desc_table = GuestAddress(s.desc_table);
+        self.avail_ring = GuestAddress(s.avail_ring);
+        self.used_ring = GuestAddress(s.used_ring);
+        self.next_avail = Wrapping(s.next_avail);
+        self.next_used = Wrapping(s.next_used);
+        self.event_idx_enabled = s.event_idx_enabled;
+        self.num_added = Wrapping(s.num_added);
+    }
+}
+
+/// Serializable virtqueue runtime state. Encoded with bincode by the owning
+/// device; no hand-maintained offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub struct QueueSnapshot {
+    pub size: u16,
+    pub ready: bool,
+    pub desc_table: u64,
+    pub avail_ring: u64,
+    pub used_ring: u64,
+    pub next_avail: u16,
+    pub next_used: u16,
+    pub event_idx_enabled: bool,
+    pub num_added: u16,
 }
 
 #[cfg(test)]
@@ -714,6 +759,27 @@ pub(crate) mod tests {
 
     pub use super::*;
     use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    #[test]
+    fn queue_snapshot_round_trips() {
+        let s = QueueSnapshot {
+            size: 256,
+            ready: true,
+            desc_table: 0x1000,
+            avail_ring: 0x2000,
+            used_ring: 0x3000,
+            next_avail: 5,
+            next_used: 7,
+            event_idx_enabled: true,
+            num_added: 3,
+        };
+        let cfg = bincode::config::standard();
+        let b = bincode::encode_to_vec(s, cfg).unwrap();
+        let (back, _): (QueueSnapshot, _) = bincode::decode_from_slice(&b, cfg).unwrap();
+        assert_eq!(back, s);
+        // Truncated input is rejected, not mis-decoded.
+        assert!(bincode::decode_from_slice::<QueueSnapshot, _>(&b[..b.len() - 1], cfg).is_err());
+    }
 
     // Represents a location in GuestMemoryMmap which holds a given type.
     pub struct SomeplaceInMemory<'a, T> {

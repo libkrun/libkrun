@@ -127,7 +127,7 @@ impl MMIODeviceManager {
     pub fn register_mmio_device(
         &mut self,
         vm: &VmFd,
-        mut mmio_device: devices::virtio::MmioTransport,
+        mmio_device: Arc<Mutex<devices::virtio::MmioTransport>>,
         type_id: u32,
         device_id: String,
     ) -> Result<(u64, u32)> {
@@ -135,22 +135,25 @@ impl MMIODeviceManager {
             return Err(Error::IrqsExhausted);
         }
 
-        for (i, queue_evt) in mmio_device.queue_evts().iter().enumerate() {
-            let io_addr = IoEventAddress::Mmio(
-                self.mmio_base + u64::from(devices::virtio::NOTIFY_REG_OFFSET),
-            );
+        {
+            let mut dev = mmio_device.lock().unwrap();
+            for (i, queue_evt) in dev.queue_evts().iter().enumerate() {
+                let io_addr = IoEventAddress::Mmio(
+                    self.mmio_base + u64::from(devices::virtio::NOTIFY_REG_OFFSET),
+                );
 
-            vm.register_ioevent(queue_evt, &io_addr, i as u32)
-                .map_err(Error::RegisterIoEvent)?;
+                vm.register_ioevent(queue_evt, &io_addr, i as u32)
+                    .map_err(Error::RegisterIoEvent)?;
+            }
+
+            vm.register_irqfd(dev.interrupt_evt(), self.irq)
+                .map_err(Error::RegisterIrqFd)?;
+
+            dev.set_irq_line(self.irq);
         }
 
-        vm.register_irqfd(mmio_device.interrupt_evt(), self.irq)
-            .map_err(Error::RegisterIrqFd)?;
-
-        mmio_device.set_irq_line(self.irq);
-
         self.bus
-            .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)
+            .insert(mmio_device, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
         let ret = (self.mmio_base, self.irq);
         self.id_to_dev_info.insert(
@@ -330,7 +333,7 @@ mod tests {
     use devices::virtio::{
         ActivateResult, DeviceQueue, InterruptTransport, QueueConfig, VirtioDevice,
     };
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use utils::errno;
     use vm_memory::{GuestAddress, GuestMemoryMmap};
 
@@ -346,11 +349,19 @@ mod tests {
             type_id: u32,
             device_id: &str,
         ) -> Result<u64> {
-            let mmio_device =
-                devices::virtio::MmioTransport::new(guest_mem, DummyIrqChip::new().into(), device)
-                    .unwrap();
-            let (mmio_base, _irq) =
-                self.register_mmio_device(vm, mmio_device, type_id, device_id.to_string())?;
+            let mmio_device = devices::virtio::MmioTransport::new(
+                guest_mem,
+                DummyIrqChip::new().into(),
+                device,
+                device_id.to_string(),
+            )
+            .unwrap();
+            let (mmio_base, _irq) = self.register_mmio_device(
+                vm,
+                Arc::new(Mutex::new(mmio_device)),
+                type_id,
+                device_id.to_string(),
+            )?;
             #[cfg(target_arch = "x86_64")]
             self.add_device_to_cmdline(_cmdline, mmio_base, _irq)?;
             Ok(mmio_base)

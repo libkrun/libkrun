@@ -15,7 +15,12 @@ examples/boot_efi
 examples/external_kernel
 examples/nitro
 examples/consoles
+examples/snapshot
+*.dSYM/
 examples/rootfs_fedora
 test-prefix
 /linux-sysroot
 /freebsd-sysroot
+
+# stray rustc playground artifact
+*.rlib

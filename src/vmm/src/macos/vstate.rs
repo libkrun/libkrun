@@ -19,8 +19,8 @@ use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
 use crossbeam_channel::{Receiver, Sender, after, select, unbounded};
-use devices::legacy::VcpuList;
-use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
+use devices::legacy::{IrqChip, VcpuList};
+use hvf::{HvfVcpu, HvfVcpuState, HvfVm, VcpuExit, Vcpus};
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
@@ -202,6 +202,27 @@ pub struct Vcpu {
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+
+    /// Snapshot state to hydrate instead of a normal boot. `None` on a fresh VM.
+    restore: Option<VcpuRestore>,
+
+    /// GIC handle, set before capture so this thread can read its own per-vCPU
+    /// ICC registers (HVF's `hv_gic_*` per-vCPU calls are thread-affine, so the
+    /// coordinator can't read them on the vCPU's behalf). Also carries the
+    /// restore calls, which are thread-affine for the same reason.
+    intc: Option<IrqChip>,
+}
+
+/// State hydrated onto a vCPU on the restore path, replacing its normal boot
+/// (`set_initial_state`). Built by the restore orchestrator in `builder.rs`.
+pub struct VcpuRestore {
+    /// Architectural register file captured at snapshot.
+    pub state: HvfVcpuState,
+    /// Per-vCPU GIC CPU-interface (ICC) registers.
+    pub icc: Vec<(u32, u64)>,
+    /// The global GIC distributor/redistributor blob — `Some` only on the vCPU
+    /// that restores it (once, after every redistributor exists).
+    pub gic: Option<Vec<u8>>,
 }
 
 impl Vcpu {
@@ -295,7 +316,20 @@ impl Vcpu {
             response_sender,
             vcpu_list,
             nested_enabled,
+            restore: None,
+            intc: None,
         })
+    }
+
+    /// Hydrate this vCPU from a snapshot instead of booting it normally.
+    pub fn set_restore(&mut self, restore: VcpuRestore) {
+        self.restore = Some(restore);
+    }
+
+    /// Give this vCPU the GIC handle so it can capture or restore its own ICC
+    /// state on its own thread.
+    pub fn set_intc(&mut self, intc: IrqChip) {
+        self.intc = Some(intc);
     }
 
     /// Returns the cpu index as seen by the guest OS.
@@ -452,15 +486,27 @@ impl Vcpu {
         let (wfe_sender, wfe_receiver) = unbounded();
         self.vcpu_list.register(hvf_vcpuid, wfe_sender);
 
-        let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
-            boot_receiver.recv().unwrap()
+        if let Some(restore) = self.restore.take() {
+            if let Err(e) = self.apply_restore(&hvf_vcpu, hvf_vcpuid, restore) {
+                error!("vCPU {} restore failed: {e}", self.id);
+                self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+                return;
+            }
+            // GIC is loaded; the coordinator can now start the device workers.
+            self.response_sender
+                .send(VcpuResponse::Restored)
+                .expect("failed to send Restored status");
         } else {
-            self.boot_entry_addr
-        };
+            let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
+                boot_receiver.recv().unwrap()
+            } else {
+                self.boot_entry_addr
+            };
 
-        hvf_vcpu
-            .set_initial_state(entry_addr, self.fdt_addr)
-            .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+            hvf_vcpu
+                .set_initial_state(entry_addr, self.fdt_addr)
+                .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+        }
 
         loop {
             // An out-of-band pause request breaks the vCPU out of HVF via
@@ -530,11 +576,48 @@ impl Vcpu {
 
     fn wait_for_resume(&mut self) {}
 
-    /// Freeze this vCPU in response to a `Pause` event and block until `Resume`,
-    /// which carries the paused tick count. Advancing the vtimer offset by it
-    /// keeps the guest's CNTVCT continuous so armed timers don't fire en masse
-    /// to catch up the gap. The coordinator computes the tick count once for the
-    /// whole VM, so multi-vCPU offsets stay in lockstep.
+    /// Hydrate snapshot state onto this freshly-created vCPU instead of booting
+    /// it. The GIC blob (if present) is restored first — its redistributor state
+    /// exists now that `HvfVcpu::new` has run — then the register file, then the
+    /// per-vCPU ICC registers (which live in the now-restored CPU interface).
+    ///
+    /// ponytail: single-vCPU happy path. With >1 vCPU the GIC blob must be
+    /// restored once after ALL redistributors exist (a barrier across the vCPU
+    /// threads), and every vCPU must share one vtimer offset (CNTVCT is
+    /// system-wide). Add both when multi-vCPU restore is needed.
+    ///
+    /// Returns an error (not a panic) on malformed snapshot data — the register
+    /// and ICC ids come from an untrusted snapshot and are validated against the
+    /// capture allowlists inside `restore_state` / `restore_vcpu_icc`.
+    fn apply_restore(
+        &self,
+        hvf_vcpu: &HvfVcpu,
+        hvf_id: u64,
+        restore: VcpuRestore,
+    ) -> std::result::Result<(), String> {
+        let intc = self.intc.as_ref().expect("vcpu intc set before restore");
+        if let Some(gic) = &restore.gic {
+            intc.lock()
+                .unwrap()
+                .restore_gic_state(gic)
+                .map_err(|e| format!("GIC state restore: {e:?}"))?;
+        }
+        let offset =
+            hvf::shared_vtimer_offset(restore.state.host_counter, restore.state.vtimer_offset);
+        hvf_vcpu
+            .restore_state(&restore.state, offset)
+            .map_err(|e| format!("vCPU register restore: {e:?}"))?;
+        intc.lock()
+            .unwrap()
+            .restore_vcpu_icc(hvf_id, &restore.icc)
+            .map_err(|e| format!("vCPU ICC restore: {e:?}"))?;
+        Ok(())
+    }
+
+    /// Freeze in response to `Pause`, block until `Resume`, and advance the vtimer
+    /// offset by the paused ticks (computed once VM-wide) so CNTVCT stays
+    /// continuous. A `Snapshot` event is served while parked — the registers and
+    /// per-vCPU ICC must be read on this thread (HVF's `hv_gic_*` are thread-affine).
     fn pause_and_park(&mut self, hvf_vcpu: &HvfVcpu) {
         self.response_sender
             .send(VcpuResponse::Paused)
@@ -552,7 +635,23 @@ impl Vcpu {
                         .expect("failed to send Resumed status");
                     return;
                 }
-                Ok(_) => {}
+                Ok(VcpuEvent::Snapshot) => {
+                    let state = hvf_vcpu
+                        .save_state()
+                        .unwrap_or_else(|e| panic!("vCPU {} snapshot failed: {e:?}", self.id));
+                    let icc = self
+                        .intc
+                        .as_ref()
+                        .expect("vcpu intc set before snapshot")
+                        .lock()
+                        .unwrap()
+                        .save_vcpu_icc(hvf_vcpu.id())
+                        .unwrap_or_else(|e| panic!("vCPU {} ICC snapshot failed: {e:?}", self.id));
+                    self.response_sender
+                        .send(VcpuResponse::Snapshotted(Box::new(state), icc))
+                        .expect("failed to send snapshot state");
+                }
+                Ok(VcpuEvent::Pause) => {}
                 Err(_) => return,
             }
         }
@@ -584,9 +683,11 @@ pub enum VcpuEvent {
     /// (the wall-clock time the VM spent paused). The coordinator sends the
     /// same value to every vCPU so their counters stay synchronized.
     Resume(u64),
+    /// Report this (already paused) vCPU's register and ICC state.
+    Snapshot,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 /// List of responses that the Vcpu reports.
 pub enum VcpuResponse {
     /// Vcpu is paused.
@@ -595,6 +696,12 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// Vcpu reported its register state and per-vCPU ICC registers in response
+    /// to a `Snapshot` event.
+    Snapshotted(Box<HvfVcpuState>, Vec<(u32, u64)>),
+    /// Vcpu finished hydrating snapshot state (GIC included); the coordinator
+    /// waits for this before starting the device workers.
+    Restored,
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.

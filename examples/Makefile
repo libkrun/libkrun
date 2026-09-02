@@ -13,7 +13,7 @@ ROOTFS_DIR = rootfs_$(ROOTFS_DISTRO)
 
 .PHONY: clean rootfs
 
-EXAMPLES := boot_efi chroot_vm external_kernel consoles
+EXAMPLES := boot_efi chroot_vm external_kernel consoles snapshot
 ifeq ($(SEV),1)
     EXAMPLES := launch-tee
 endif
@@ -51,6 +51,12 @@ endif
 
 consoles: consoles.c
 	gcc -o $@ $< $(CFLAGS) $(LDFLAGS_$(ARCH)_$(OS))
+
+snapshot: snapshot.c
+	gcc -o $@ $< $(CFLAGS) $(LDFLAGS_$(ARCH)_$(OS))
+ifeq ($(OS),Darwin)
+	codesign --entitlements chroot_vm.entitlements --force -s - $@
+endif
 
 nitro: nitro.c
 	gcc -o $@ $< $(CFLAGS) $(LDFLAGS_nitro)

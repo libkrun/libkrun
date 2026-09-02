@@ -63,6 +63,67 @@ Each variant generates a dynamic library with a different name (and ```soname```
 * virtio-rng
 
 
+## Snapshot and restore (experimental)
+
+> Available on the macOS/HVF backend only, and part of the still-evolving 2.0 API.
+
+Capture a running VM (vCPU, interrupt controller, devices, and memory) to a
+directory with `krun_snapshot_request()`, then restore it onto a
+freshly-configured context and resume from the captured point with
+`krun_restore()`. See `include/libkrun.h` for the full API, and
+`examples/snapshot.c` for a working capture/restore pair.
+
+```c
+/* Capture: from a thread other than the one in krun_start_enter(). */
+krun_snapshot_request(ctx, "/path/to/snapshot", KRUN_SNAPSHOT_EXIT);
+
+/* Restore: configure an identical VM, then resume it instead of booting. */
+krun_restore(ctx, "/path/to/snapshot", 0);
+```
+
+The snapshot is a directory holding `manifest.json`, `vmstate` and `memory.img`.
+It is FD-free: only transport and queue state is serialized, never host file
+descriptors. Restore is config-validate — you rebuild the same VM with fresh
+fds, and `krun_restore()` checks it against the manifest (arch, memory, vCPU
+count, and the ordered device topology) before hydrating state onto it. A
+mismatch is rejected rather than silently mis-bound.
+
+Snapshot the guest at a steady state. Capturing mid-boot leaves device state
+that cannot be cleanly restored.
+
+### Limitations
+
+- **macOS/HVF, aarch64 only.** The KVM vCPU and GIC paths are stubs.
+- **Single vCPU.** Restoring a snapshot with more is rejected: the GIC blob must
+  be written once after every redistributor exists, and all vCPUs must share one
+  vtimer offset.
+- **No nested virtualization.** EL2 registers are not captured, so restoring a
+  nested VM is rejected.
+- **Devices**: block, virtio-fs, console, rng and balloon can be snapshotted.
+  The rest (net, vsock, gpu, input) cannot be quiesced yet and refuse the
+  snapshot rather than being captured mid-flight.
+- **Per-device internal state is not captured** beyond the virtio queues and the
+  console's open ports. A device holding host-side state across a snapshot
+  (in-flight block requests, vsock connections, virtio-fs open fids) will not
+  have it restored.
+- **A partially consumed descriptor is not serialized.** Devices are quiesced at
+  a descriptor boundary, so a request the guest had submitted but the device had
+  not finished is not preserved.
+- **`KRUN_SNAPSHOT_RESUME` is not implemented**; capture always exits the
+  process (`KRUN_SNAPSHOT_EXIT`).
+- Restore copies `memory.img` into guest RAM, so RSS is the full VM size.
+
+### Planned
+
+- Quiesce support for the remaining devices (net, vsock, gpu, input).
+- Multi-vCPU restore (a GIC barrier across the vCPU threads, one shared vtimer
+  offset).
+- Per-device internal state, and serializing a partially consumed descriptor.
+- Capture-and-continue (`KRUN_SNAPSHOT_RESUME`).
+- `MAP_PRIVATE` of `memory.img` so a restored VM demand-pages instead of copying,
+  which is also what makes cloning many VMs from one snapshot cheap.
+
+
 ## Networking
 
 In ```libkrun```, networking is provided by two different, mutually exclusive techniques: **virtio-vsock + TSI** and **virtio-net + passt/gvproxy**.

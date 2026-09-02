@@ -18,9 +18,11 @@ pub mod display;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub mod fdt;
 pub mod legacy;
+pub mod snapshot;
 pub mod virtio;
 
 pub use self::bus::{Bus, BusDevice, Error as BusError};
+pub use self::snapshot::{DeviceState, Snapshottable};
 
 #[derive(Debug)]
 pub enum Error {
@@ -34,6 +36,8 @@ pub enum Error {
     IoError(io::Error),
     NoAvailBuffers,
     SpuriousEvent,
+    /// Snapshot save/restore failed, or is unsupported by this device.
+    Snapshot(String),
 }
 
 /// Types of devices that can get attached to this platform.

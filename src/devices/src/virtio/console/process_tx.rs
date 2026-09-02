@@ -6,17 +6,19 @@ use vm_memory::{GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemo
 
 use crate::virtio::console::port_io::PortOutput;
 use crate::virtio::{DescriptorChain, InterruptTransport, Queue};
+use utils::eventfd::EventFd;
 
 pub(crate) fn process_tx(
     mem: GuestMemoryMmap,
     mut queue: Queue,
     interrupt: InterruptTransport,
     output: Arc<Mutex<Box<dyn PortOutput + Send>>>,
+    stopfd: EventFd,
     stop: Arc<AtomicBool>,
-) {
+) -> Queue {
     loop {
         let Some(head) = pop_head_blocking(&mut queue, &mem, &interrupt, &stop) else {
-            return;
+            return queue;
         };
 
         let head_index = head.index;
@@ -24,7 +26,7 @@ pub(crate) fn process_tx(
 
         for desc in head.into_iter().readable() {
             let desc_len = desc.len as usize;
-            match write_desc_to_output(desc, output.lock().unwrap().as_mut(), &interrupt) {
+            match write_desc_to_output(desc, output.lock().unwrap().as_mut(), &interrupt, &stopfd) {
                 Ok(0) => {
                     break;
                 }
@@ -39,10 +41,17 @@ pub(crate) fn process_tx(
                         // Errors could conceivably be spurious. Broken
                         // pipe is not and there is no point in attempting
                         // to write more.
-                        return;
+                        return queue;
                     }
                 }
             }
+        }
+
+        // Stopped mid-write: put the unfinished descriptor back (guest re-drives
+        // it on resume) and hand the queue back for the snapshot.
+        if stop.load(Ordering::Acquire) {
+            queue.undo_pop();
+            return queue;
         }
 
         if bytes_written == 0 {
@@ -82,6 +91,7 @@ fn write_desc_to_output(
     desc: DescriptorChain,
     output: &mut (dyn PortOutput + Send),
     interrupt: &InterruptTransport,
+    stopfd: &EventFd,
 ) -> Result<usize, GuestMemoryError> {
     // TODO: Switch to using `get_slices()` with the next vm-memory
     //       bump.
@@ -98,7 +108,11 @@ fn write_desc_to_output(
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         log::trace!("Tx wait for output (would block)");
                         interrupt.signal_used_queue();
-                        output.wait_until_writable();
+                        // Abandon on stop, else a stalled host reader blocks the
+                        // snapshot forever.
+                        if output.wait_until_writable(Some(stopfd)) {
+                            break Ok(0);
+                        }
                     }
                     Err(e) => break Err(GuestMemoryError::IOError(e)),
                 }

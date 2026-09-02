@@ -4,7 +4,9 @@ extern crate krun_init_blob_via_cdylib as krun_init;
 mod test_vm_config;
 use test_vm_config::TestVmConfig;
 
+mod test_snapshot;
 mod test_vm_pause;
+use test_snapshot::{TestSnapshot, TestSnapshotFsCapture, TestSnapshotResume};
 use test_vm_pause::TestVmPause;
 
 #[cfg(any(feature = "host", target_os = "linux"))]
@@ -99,6 +101,15 @@ pub fn test_cases() -> Vec<TestCase> {
             }),
         ),
         TestCase::new("vm-pause", Box::new(TestVmPause)),
+        TestCase::new("snapshot-create", Box::new(TestSnapshot { ram_mib: 512 })),
+        TestCase::new(
+            "snapshot-resume",
+            Box::new(TestSnapshotResume { ram_mib: 512 }),
+        ),
+        TestCase::new(
+            "snapshot-fs-capture",
+            Box::new(TestSnapshotFsCapture { ram_mib: 512 }),
+        ),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("vsock-guest-connect", Box::new(TestVsockGuestConnect)),
         TestCase::new(
