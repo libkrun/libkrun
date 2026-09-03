@@ -44,13 +44,14 @@ mod defs {
     use super::super::QueueConfig;
 
     pub const FS_DEV_ID: &str = "virtio_fs";
-    pub const NUM_QUEUES: usize = 2;
+    // Let the guest dispatch independent requests concurrently without creating
+    // one host worker per vCPU (or multiplying idle threads for every export).
+    pub const NUM_REQUEST_QUEUES: usize = 2;
+    pub const NUM_QUEUES: usize = 1 + NUM_REQUEST_QUEUES;
     pub const QUEUE_SIZE: u16 = 1024;
     pub static QUEUE_CONFIG: [QueueConfig; NUM_QUEUES] = [QueueConfig::new(QUEUE_SIZE); NUM_QUEUES];
     // High priority queue.
     pub const HPQ_INDEX: usize = 0;
-    // Request queue.
-    pub const REQ_INDEX: usize = 1;
 
     pub mod uapi {
         pub const VIRTIO_ID_FS: u32 = 26;

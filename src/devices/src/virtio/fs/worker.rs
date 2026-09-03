@@ -20,7 +20,7 @@ use vm_memory::GuestMemoryMmap;
 
 use super::super::{FsError, FuseServerState, Queue};
 use super::augment_fs::AugmentFs;
-use super::defs::{HPQ_INDEX, REQ_INDEX};
+use super::defs::HPQ_INDEX;
 use super::descriptor_utils::{Reader, Writer};
 use super::inode_alloc::InodeAllocator;
 use super::null_fs::NullFs;
@@ -44,10 +44,16 @@ const REQUEST_QUEUE_CONTENTION_YIELD: Duration = Duration::from_micros(250);
 #[cfg(target_os = "linux")]
 const REQUEST_QUEUE_CONTENTION_COOLDOWN: Duration = Duration::from_millis(100);
 
-enum FsServer {
+pub(super) enum FsServer {
     ReadWrite(Server<AugmentFs<PassthroughFs>>),
     ReadOnly(Server<AugmentFs<PassthroughFsRo>>),
     Null(Server<AugmentFs<NullFs>>),
+}
+
+pub(super) struct WorkerQueue {
+    pub(super) index: usize,
+    pub(super) queue: Queue,
+    pub(super) event: Arc<EventFd>,
 }
 
 impl FsServer {
@@ -88,13 +94,12 @@ impl FsServer {
     }
 }
 
-pub struct FsWorker {
-    queues: Vec<Queue>,
-    queue_evts: Vec<Arc<EventFd>>,
+pub(super) struct FsWorker {
+    queues: Vec<WorkerQueue>,
     interrupt: InterruptTransport,
     mem: GuestMemoryMmap,
     shm_region: Option<VirtioShmRegion>,
-    server: FsServer,
+    server: Arc<FsServer>,
     stop_fd: EventFd,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "linux")]
@@ -104,21 +109,13 @@ pub struct FsWorker {
 }
 
 impl FsWorker {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        queues: Vec<Queue>,
-        queue_evts: Vec<Arc<EventFd>>,
-        interrupt: InterruptTransport,
-        mem: GuestMemoryMmap,
-        shm_region: Option<VirtioShmRegion>,
+    pub(super) fn new_server(
+        _shm_region: Option<VirtioShmRegion>,
         passthrough_cfg: Option<passthrough::Config>,
         read_only: bool,
         virtual_entries: Vec<VirtualDirEntry>,
-        stop_fd: EventFd,
-        exit_code: Arc<AtomicI32>,
         restore_fuse: Option<FuseServerState>,
-        #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
-    ) -> Result<Self, io::Error> {
+    ) -> Result<Arc<FsServer>, io::Error> {
         let inode_alloc = Arc::new(InodeAllocator::new());
         let server = match passthrough_cfg {
             Some(cfg) if read_only => {
@@ -126,7 +123,7 @@ impl FsWorker {
                 if let Some(state) = restore_fuse.as_ref() {
                     inner.inner().restore(state)?;
                     #[cfg(target_os = "linux")]
-                    if let Some(shm) = shm_region.as_ref() {
+                    if let Some(shm) = _shm_region.as_ref() {
                         inner
                             .inner()
                             .replay_dax_maps(shm.host_addr, shm.size as u64);
@@ -143,7 +140,7 @@ impl FsWorker {
                 if let Some(state) = restore_fuse.as_ref() {
                     inner.restore(state)?;
                     #[cfg(target_os = "linux")]
-                    if let Some(shm) = shm_region.as_ref() {
+                    if let Some(shm) = _shm_region.as_ref() {
                         inner.replay_dax_maps(shm.host_addr, shm.size as u64);
                     }
                 }
@@ -159,9 +156,22 @@ impl FsWorker {
                 virtual_entries,
             ))),
         };
-        Ok(Self {
+        Ok(Arc::new(server))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        queues: Vec<WorkerQueue>,
+        interrupt: InterruptTransport,
+        mem: GuestMemoryMmap,
+        shm_region: Option<VirtioShmRegion>,
+        server: Arc<FsServer>,
+        stop_fd: EventFd,
+        exit_code: Arc<AtomicI32>,
+        #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
+    ) -> Self {
+        Self {
             queues,
-            queue_evts,
             interrupt,
             mem,
             shm_region,
@@ -172,10 +182,10 @@ impl FsWorker {
             request_poll_after: Instant::now(),
             #[cfg(target_os = "macos")]
             map_sender,
-        })
+        }
     }
 
-    pub fn run(self) -> thread::JoinHandle<FsWorker> {
+    pub(super) fn run(self) -> thread::JoinHandle<FsWorker> {
         thread::Builder::new()
             .name("fs worker".into())
             .spawn(|| self.work())
@@ -184,14 +194,17 @@ impl FsWorker {
 
     /// Snapshot the worker's virtqueue indices (for checkpoint/fork). Call only
     /// while the worker is stopped (reclaimed), so there is no concurrent access.
-    pub(crate) fn save_queue_states(&self) -> Vec<crate::virtio::queue::QueueState> {
-        self.queues.iter().map(|q| q.save_state()).collect()
+    pub(super) fn save_queue_states(&self) -> Vec<(usize, crate::virtio::queue::QueueState)> {
+        self.queues
+            .iter()
+            .map(|queue| (queue.index, queue.queue.save_state()))
+            .collect()
     }
 
     /// Snapshot the FUSE passthrough server's logical state (inode/handle maps as
     /// host paths) for checkpoint/fork. Call only while the worker is stopped.
-    pub(crate) fn save_fuse_state(&self) -> Option<FuseServerState> {
-        match &self.server {
+    pub(super) fn save_fuse_state(&self) -> Option<FuseServerState> {
+        match &*self.server {
             FsServer::ReadWrite(s) => Some(s.fs().inner().snapshot()),
             FsServer::ReadOnly(s) => Some(s.fs().inner().inner().snapshot()),
             FsServer::Null(_) => None,
@@ -199,22 +212,18 @@ impl FsWorker {
     }
 
     fn work(mut self) -> FsWorker {
-        let virtq_hpq_ev_fd = self.queue_evts[HPQ_INDEX].as_raw_fd();
-        let virtq_req_ev_fd = self.queue_evts[REQ_INDEX].as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
 
         let mut epoll = Epoll::new().unwrap();
 
-        let _ = epoll.ctl(
-            ControlOperation::Add,
-            virtq_hpq_ev_fd,
-            &EpollEvent::new(EventSet::IN, virtq_hpq_ev_fd as u64),
-        );
-        let _ = epoll.ctl(
-            ControlOperation::Add,
-            virtq_req_ev_fd,
-            &EpollEvent::new(EventSet::IN, virtq_req_ev_fd as u64),
-        );
+        for queue in &self.queues {
+            let queue_ev_fd = queue.event.as_raw_fd();
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                queue_ev_fd,
+                &EpollEvent::new(EventSet::IN, queue_ev_fd as u64),
+            );
+        }
         let _ = epoll.ctl(
             ControlOperation::Add,
             stop_ev_fd,
@@ -229,13 +238,22 @@ impl FsWorker {
                         let source = event.fd();
                         let event_set = event.event_set();
                         match event_set {
-                            EventSet::IN if source == virtq_hpq_ev_fd => {
-                                self.handle_event(HPQ_INDEX);
-                            }
-                            EventSet::IN if source == virtq_req_ev_fd => {
-                                self.handle_event(REQ_INDEX);
+                            EventSet::IN
+                                if self
+                                    .queues
+                                    .iter()
+                                    .any(|queue| queue.event.as_raw_fd() == source) =>
+                            {
+                                let queue_position = self
+                                    .queues
+                                    .iter()
+                                    .position(|queue| queue.event.as_raw_fd() == source)
+                                    .unwrap();
+                                self.handle_event(queue_position);
                                 #[cfg(any(target_os = "linux", target_os = "macos"))]
-                                self.poll_request_burst();
+                                if self.queues[queue_position].index != HPQ_INDEX {
+                                    self.poll_request_burst(queue_position);
+                                }
                             }
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
@@ -257,40 +275,45 @@ impl FsWorker {
         }
     }
 
-    fn handle_event(&mut self, queue_index: usize) {
-        debug!("Fs: queue event: {queue_index}");
+    fn handle_event(&mut self, queue_position: usize) {
+        let queue = &mut self.queues[queue_position];
+        debug!("Fs: queue event: {}", queue.index);
         // A drained eventfd reports WouldBlock on a spurious level-triggered
         // wakeup (common with the Windows epoll shim) — expected, not an error.
-        if let Err(e) = self.queue_evts[queue_index].read()
+        if let Err(e) = queue.event.read()
             && e.kind() != io::ErrorKind::WouldBlock
         {
             error!("Failed to get queue event: {e:?}");
         }
 
         loop {
-            self.queues[queue_index]
-                .disable_notification(&self.mem)
-                .unwrap();
+            queue.queue.disable_notification(&self.mem).unwrap();
 
-            self.process_queue(queue_index);
+            Self::process_queue(
+                &mut queue.queue,
+                &self.server,
+                &self.mem,
+                &self.shm_region,
+                &self.interrupt,
+                &self.exit_code,
+                #[cfg(target_os = "macos")]
+                &self.map_sender,
+            );
 
-            if !self.queues[queue_index]
-                .enable_notification(&self.mem)
-                .unwrap()
-            {
+            if !queue.queue.enable_notification(&self.mem).unwrap() {
                 break;
             }
         }
     }
 
     #[cfg(target_os = "macos")]
-    fn poll_request_burst(&mut self) {
+    fn poll_request_burst(&mut self, queue_position: usize) {
         let start = Instant::now();
         let hard_deadline = start + REQUEST_QUEUE_MAX_POLL;
         let mut quiet_deadline = start + REQUEST_QUEUE_QUIET_POLL;
 
         loop {
-            if self.process_queue(REQ_INDEX) {
+            if self.process_queue_at(queue_position) {
                 quiet_deadline = Instant::now() + REQUEST_QUEUE_QUIET_POLL;
             } else if Instant::now() >= quiet_deadline {
                 break;
@@ -304,7 +327,7 @@ impl FsWorker {
     }
 
     #[cfg(target_os = "linux")]
-    fn poll_request_burst(&mut self) {
+    fn poll_request_burst(&mut self, queue_position: usize) {
         let start = Instant::now();
         if start < self.request_poll_after {
             return;
@@ -316,13 +339,16 @@ impl FsWorker {
         // avoiding a stale eventfd wake for every request that we process here,
         // the enable_notification() check below closes the race between the
         // final empty queue observation and returning to epoll.
-        if let Err(e) = self.queues[REQ_INDEX].disable_notification(&self.mem) {
+        if let Err(e) = self.queues[queue_position]
+            .queue
+            .disable_notification(&self.mem)
+        {
             error!("failed to suppress filesystem queue notifications: {e:?}");
             return;
         }
 
         loop {
-            if self.process_queue(REQ_INDEX) {
+            if self.process_queue_at(queue_position) {
                 quiet_deadline = Instant::now() + REQUEST_QUEUE_QUIET_POLL;
             } else if Instant::now() >= quiet_deadline {
                 break;
@@ -331,7 +357,7 @@ impl FsWorker {
                 thread::yield_now();
                 let after_yield = Instant::now();
                 if after_yield.duration_since(before_yield) >= REQUEST_QUEUE_CONTENTION_YIELD {
-                    if self.process_queue(REQ_INDEX) {
+                    if self.process_queue_at(queue_position) {
                         // The guest vCPU used that scheduling window to produce
                         // the next request, so the poll was productive rather
                         // than host contention.
@@ -350,14 +376,17 @@ impl FsWorker {
             }
         }
 
-        match self.queues[REQ_INDEX].enable_notification(&self.mem) {
+        match self.queues[queue_position]
+            .queue
+            .enable_notification(&self.mem)
+        {
             Ok(true) => {
                 // Work arrived while notifications were suppressed. Queue a
                 // host-side wake instead of processing indefinitely so the
                 // stop/checkpoint event remains bounded by MAX_POLL.
-                if let Err(e) = self.queue_evts[REQ_INDEX].write(1) {
+                if let Err(e) = self.queues[queue_position].event.write(1) {
                     error!("failed to reawaken filesystem request queue: {e:?}");
-                    self.handle_event(REQ_INDEX);
+                    self.handle_event(queue_position);
                 }
             }
             Ok(false) => {}
@@ -365,26 +394,48 @@ impl FsWorker {
         }
     }
 
-    fn process_queue(&mut self, queue_index: usize) -> bool {
-        let queue = &mut self.queues[queue_index];
+    fn process_queue_at(&mut self, queue_position: usize) -> bool {
+        let queue = &mut self.queues[queue_position].queue;
+        Self::process_queue(
+            queue,
+            &self.server,
+            &self.mem,
+            &self.shm_region,
+            &self.interrupt,
+            &self.exit_code,
+            #[cfg(target_os = "macos")]
+            &self.map_sender,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_queue(
+        queue: &mut Queue,
+        server: &FsServer,
+        mem: &GuestMemoryMmap,
+        shm_region: &Option<VirtioShmRegion>,
+        interrupt: &InterruptTransport,
+        exit_code: &Arc<AtomicI32>,
+        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+    ) -> bool {
         let mut signal_needed = false;
         let mut processed = false;
-        while let Some(head) = queue.pop(&self.mem) {
+        while let Some(head) = queue.pop(mem) {
             processed = true;
-            let reader = Reader::new(&self.mem, head.clone())
+            let reader = Reader::new(mem, head.clone())
                 .map_err(FsError::QueueReader)
                 .unwrap();
-            let writer = Writer::new(&self.mem, head.clone())
+            let writer = Writer::new(mem, head.clone())
                 .map_err(FsError::QueueWriter)
                 .unwrap();
 
-            let len = match self.server.handle_message(
+            let len = match server.handle_message(
                 reader,
                 writer,
-                &self.shm_region,
-                &self.exit_code,
+                shm_region,
+                exit_code,
                 #[cfg(target_os = "macos")]
-                &self.map_sender,
+                map_sender,
             ) {
                 Ok(len) => len,
                 Err(e) => {
@@ -393,11 +444,11 @@ impl FsWorker {
                 }
             };
 
-            if let Err(e) = queue.add_used(&self.mem, head.index, len as u32) {
+            if let Err(e) = queue.add_used(mem, head.index, len as u32) {
                 error!("failed to add used elements to the queue: {e:?}");
             }
 
-            if queue.needs_notification(&self.mem).unwrap() {
+            if queue.needs_notification(mem).unwrap() {
                 signal_needed = true;
             }
         }
@@ -405,7 +456,7 @@ impl FsWorker {
         // avoiding redundant IRQ signals when multiple FUSE requests complete in
         // a single epoll wake-up.
         if signal_needed {
-            self.interrupt.signal_used_queue();
+            interrupt.signal_used_queue();
         }
         processed
     }

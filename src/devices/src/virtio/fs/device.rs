@@ -13,13 +13,13 @@ use virtio_bindings::{virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RIN
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, FsError, QueueConfig, VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
     VirtioShmRegion,
 };
 use super::ExportTable;
 use super::passthrough;
 use super::virtual_entry::VirtualDirEntry;
-use super::worker::FsWorker;
+use super::worker::{FsWorker, WorkerQueue};
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
 
@@ -50,12 +50,12 @@ pub struct Fs {
     passthrough_cfg: Option<passthrough::Config>,
     read_only: bool,
     virtual_entries: Vec<VirtualDirEntry>,
-    worker_thread: Option<JoinHandle<FsWorker>>,
-    worker_stopfd: EventFd,
-    /// A worker reclaimed by [`Self::quiesce_for_snapshot`] (stopped, drained):
-    /// holds the virtqueues so their indices can be captured for a checkpoint
+    worker_threads: Vec<JoinHandle<FsWorker>>,
+    worker_stopfds: Vec<EventFd>,
+    /// Workers reclaimed by [`Self::quiesce_for_snapshot`] (stopped, drained):
+    /// hold the virtqueues so their indices can be captured for a checkpoint
     /// and re-armed afterwards.
-    quiesced_worker: Option<FsWorker>,
+    quiesced_workers: Vec<FsWorker>,
     /// FUSE server state restored from a checkpoint, consumed by the next
     /// `activate` to rebuild the worker's passthrough inode/handle maps.
     pending_fuse: Option<FuseServerState>,
@@ -155,7 +155,7 @@ impl Fs {
         let tag = fs_id.into_bytes();
         let mut config = VirtioFsConfig::default();
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
-        config.num_request_queues = 1;
+        config.num_request_queues = defs::NUM_REQUEST_QUEUES as u32;
 
         let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
             root_dir,
@@ -171,9 +171,9 @@ impl Fs {
             passthrough_cfg: fs_cfg,
             read_only,
             virtual_entries,
-            worker_thread: None,
-            worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
-            quiesced_worker: None,
+            worker_threads: Vec::new(),
+            worker_stopfds: Vec::new(),
+            quiesced_workers: Vec::new(),
             pending_fuse: None,
             exit_code,
             #[cfg(target_os = "macos")]
@@ -213,16 +213,18 @@ impl Fs {
     /// must be quiesced ([`Self::quiesce_for_snapshot`]) first so the virtqueue
     /// indices can be read; otherwise the queues are owned by the worker.
     pub fn save_state(&self) -> FsState {
+        let mut queues = vec![None; defs::NUM_QUEUES];
+        for worker in &self.quiesced_workers {
+            for (index, state) in worker.save_queue_states() {
+                queues[index] = Some(state);
+            }
+        }
         FsState {
             acked_features: self.acked_features,
-            queues: self
-                .quiesced_worker
-                .as_ref()
-                .map(|w| w.save_queue_states().into_iter().map(Some).collect())
-                .unwrap_or_default(),
+            queues,
             fuse: self
-                .quiesced_worker
-                .as_ref()
+                .quiesced_workers
+                .first()
                 .and_then(|w| w.save_fuse_state()),
         }
     }
@@ -238,25 +240,48 @@ impl Fs {
         Ok(())
     }
 
-    /// Stop and drain the worker, reclaiming its virtqueues so the indices can
+    /// Stop and drain the workers, reclaiming their virtqueues so the indices can
     /// be captured at a clean checkpoint boundary. Pairs with
     /// [`Self::rearm_worker`].
     fn quiesce_worker(&mut self) {
-        if let Some(worker) = self.worker_thread.take() {
-            let _ = self.worker_stopfd.write(1);
+        for stopfd in &self.worker_stopfds {
+            let _ = stopfd.write(1);
+        }
+        for worker in self.worker_threads.drain(..) {
             match worker.join() {
-                Ok(w) => self.quiesced_worker = Some(w),
+                Ok(w) => self.quiesced_workers.push(w),
                 Err(e) => error!("virtio_fs: error reclaiming worker: {e:?}"),
             }
         }
     }
 
-    /// Re-arm a worker reclaimed by [`Self::quiesce_worker`], resuming FUSE
+    /// Re-arm workers reclaimed by [`Self::quiesce_worker`], resuming FUSE
     /// service from the (possibly restored) virtqueue indices.
     fn rearm_worker(&mut self) {
-        if let Some(worker) = self.quiesced_worker.take() {
-            self.worker_thread = Some(worker.run());
+        for worker in self.quiesced_workers.drain(..) {
+            self.worker_threads.push(worker.run());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertises_two_request_queues() {
+        let fs = Fs::new(
+            "test".to_owned(),
+            None,
+            Arc::new(AtomicI32::new(0)),
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let num_request_queues = fs.config.num_request_queues;
+        assert_eq!(num_request_queues, 2);
+        assert_eq!(fs.queue_config().len(), 3);
     }
 }
 
@@ -313,39 +338,58 @@ impl VirtioDevice for Fs {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        if self.worker_thread.is_some() {
+        if !self.worker_threads.is_empty() {
             panic!("virtio_fs: worker thread already exists");
         }
 
-        // Extract queues and eventfds from DeviceQueues.
-        let mut worker_queues = Vec::with_capacity(queues.len());
-        let mut queue_evts = Vec::with_capacity(queues.len());
-        for dq in queues {
-            worker_queues.push(dq.queue);
-            queue_evts.push(dq.event);
-        }
-
         let virtual_entries = self.virtual_entries.clone();
-        let worker = FsWorker::new(
-            worker_queues,
-            queue_evts,
-            interrupt.clone(),
-            mem.clone(),
+        let server = FsWorker::new_server(
             self.shm_region.clone(),
             self.passthrough_cfg.clone(),
             self.read_only,
             virtual_entries,
-            self.worker_stopfd.try_clone().unwrap(),
-            self.exit_code.clone(),
             self.pending_fuse.take(),
-            #[cfg(target_os = "macos")]
-            self.map_sender.clone(),
         )
         .map_err(|e| {
             error!("virtio_fs: failed to create worker: {}", e);
             ActivateError::BadActivate
         })?;
-        self.worker_thread = Some(worker.run());
+        let mut worker_queues: Vec<Vec<WorkerQueue>> =
+            (0..defs::NUM_REQUEST_QUEUES).map(|_| Vec::new()).collect();
+        for (queue_index, dq) in queues.into_iter().enumerate() {
+            let worker_index = if queue_index == defs::HPQ_INDEX {
+                0
+            } else {
+                queue_index - 1
+            };
+            worker_queues[worker_index].push(WorkerQueue {
+                index: queue_index,
+                queue: dq.queue,
+                event: dq.event,
+            });
+        }
+        self.worker_stopfds = (0..worker_queues.len())
+            .map(|_| {
+                EventFd::new(EFD_NONBLOCK).map_err(|e| {
+                    error!("virtio_fs: failed to create worker stop event: {e}");
+                    ActivateError::BadActivate
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        for (queues, stopfd) in worker_queues.into_iter().zip(self.worker_stopfds.iter()) {
+            let worker = FsWorker::new(
+                queues,
+                interrupt.clone(),
+                mem.clone(),
+                self.shm_region.clone(),
+                server.clone(),
+                stopfd.try_clone().unwrap(),
+                self.exit_code.clone(),
+                #[cfg(target_os = "macos")]
+                self.map_sender.clone(),
+            );
+            self.worker_threads.push(worker.run());
+        }
 
         self.device_state = DeviceState::Activated(mem, interrupt);
         Ok(())
@@ -360,13 +404,16 @@ impl VirtioDevice for Fs {
     }
 
     fn reset(&mut self) -> bool {
-        if let Some(worker) = self.worker_thread.take() {
-            let _ = self.worker_stopfd.write(1);
+        for stopfd in &self.worker_stopfds {
+            let _ = stopfd.write(1);
+        }
+        for worker in self.worker_threads.drain(..) {
             if let Err(e) = worker.join() {
                 error!("error waiting for worker thread: {e:?}");
             }
         }
-        self.quiesced_worker = None;
+        self.worker_stopfds.clear();
+        self.quiesced_workers.clear();
         self.device_state = DeviceState::Inactive;
         true
     }
