@@ -52,6 +52,13 @@ pub struct Vsock {
     /// Inbound listeners staged by `restore_state`, re-established once the muxer
     /// worker is live in `finish_restore_activation` (fork-clone path).
     pending_restore_listeners: Vec<ListenerDesc>,
+    /// Listener metadata captured before RX producers are gated for a snapshot.
+    ///
+    /// A producer can hold a proxy mutex while waiting to enter the snapshot
+    /// gate. Walking the proxy map after closing that gate would then deadlock
+    /// against the producer, so `quiesce_for_snapshot` captures this stable
+    /// metadata first while the guest vCPUs are already paused.
+    quiesced_listeners: Option<Vec<ListenerDesc>>,
 }
 
 impl Vsock {
@@ -85,6 +92,7 @@ impl Vsock {
                 .map_err(super::VsockError::EventFd)?,
             device_state: DeviceState::Inactive,
             pending_restore_listeners: Vec::new(),
+            quiesced_listeners: None,
         })
     }
 
@@ -242,7 +250,10 @@ impl Vsock {
             activated: matches!(self.device_state, DeviceState::Activated(..)),
             queue_rx: q(&self.queue_rx),
             queue_tx: q(&self.queue_tx),
-            listeners: self.muxer.snapshot_listeners(),
+            listeners: self
+                .quiesced_listeners
+                .clone()
+                .unwrap_or_else(|| self.muxer.snapshot_listeners()),
         }
     }
 
@@ -274,11 +285,18 @@ impl Vsock {
 
 impl VirtioDevice for Vsock {
     fn quiesce_for_snapshot(&mut self) {
+        // vCPUs are already paused, so no guest request can add or remove a
+        // listener while this metadata is captured. Do this before pausing RX
+        // producers: a producer may be holding its proxy mutex when it reaches
+        // the gate, and save_state must not wait on that mutex after the gate
+        // has closed.
+        self.quiesced_listeners = Some(self.muxer.snapshot_listeners());
         self.muxer.quiesce_for_snapshot();
     }
 
     fn rearm_after_snapshot(&mut self) {
         self.muxer.rearm_after_snapshot();
+        self.quiesced_listeners = None;
     }
 
     fn avail_features(&self) -> u64 {
@@ -392,5 +410,25 @@ impl VirtioDevice for Vsock {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_state_uses_listener_metadata_captured_before_quiesce() {
+        let mut vsock = Vsock::new(3, None, None, TsiFlags::empty(), None, None, None).unwrap();
+        let listener = ListenerDesc {
+            family: defs::LINUX_AF_INET,
+            peer_port: 41,
+            control_port: 42,
+            guest_port: 8080,
+            backlog: 128,
+        };
+        vsock.quiesced_listeners = Some(vec![listener.clone()]);
+
+        assert_eq!(vsock.save_state().listeners, vec![listener]);
     }
 }
