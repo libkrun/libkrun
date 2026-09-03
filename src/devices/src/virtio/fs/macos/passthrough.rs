@@ -768,6 +768,7 @@ impl PassthroughFs {
             next_handle: self.next_handle.load(Ordering::Relaxed),
             writeback: self.writeback.load(Ordering::Relaxed),
             announce_submounts: self.announce_submounts.load(Ordering::Relaxed),
+            zero_message_opendir: false,
             // DAX fork-replay is Linux-only; macOS clones have no DAX window.
             dax_maps: Vec::new(),
         }

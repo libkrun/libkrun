@@ -92,6 +92,10 @@ pub struct FuseServerState {
     pub next_handle: u64,
     pub writeback: bool,
     pub announce_submounts: bool,
+    /// Whether the guest negotiated handle-free directory operations. A clone
+    /// resumes after FUSE_INIT, so the replacement server must restore this.
+    #[serde(default)]
+    pub zero_message_opendir: bool,
     /// Active DAX window mappings, replayed into a clone's window after the
     /// inode map is rebuilt. Defaults to empty for snapshots taken before this
     /// field existed.

@@ -30,8 +30,8 @@ use super::super::inode_alloc::InodeAllocator;
 use super::super::multikey::MultikeyBTreeMap;
 use super::super::{FuseDaxMapSnap, FuseHandleSnap, FuseInodeSnap, FuseServerState};
 
-const CURRENT_DIR_CSTR: &[u8] = b".\0";
-const PARENT_DIR_CSTR: &[u8] = b"..\0";
+const CURRENT_DIR: &[u8] = b".";
+const PARENT_DIR: &[u8] = b"..";
 const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc/self/fd\0";
 
@@ -397,6 +397,7 @@ pub struct PassthroughFs {
     // `cfg.writeback` is true and `init` was called with `FsOptions::WRITEBACK_CACHE`.
     writeback: AtomicBool,
     announce_submounts: AtomicBool,
+    zero_message_opendir: AtomicBool,
     my_uid: Option<libc::uid_t>,
     my_gid: Option<libc::gid_t>,
     cap_fowner: bool,
@@ -517,6 +518,7 @@ impl PassthroughFs {
 
             writeback: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
+            zero_message_opendir: AtomicBool::new(false),
             my_uid,
             my_gid,
             cap_fowner,
@@ -633,6 +635,7 @@ impl PassthroughFs {
             next_handle: self.next_handle.load(Ordering::Relaxed),
             writeback: self.writeback.load(Ordering::Relaxed),
             announce_submounts: self.announce_submounts.load(Ordering::Relaxed),
+            zero_message_opendir: self.zero_message_opendir.load(Ordering::Relaxed),
             dax_maps: self.dax_maps.read().unwrap().values().copied().collect(),
         }
     }
@@ -709,6 +712,8 @@ impl PassthroughFs {
         self.writeback.store(state.writeback, Ordering::Relaxed);
         self.announce_submounts
             .store(state.announce_submounts, Ordering::Relaxed);
+        self.zero_message_opendir
+            .store(state.zero_message_opendir, Ordering::Relaxed);
 
         for snap in &state.handles {
             match self.open_inode(snap.nodeid, snap.flags) {
@@ -867,8 +872,18 @@ impl PassthroughFs {
             .unwrap()
             .get(&handle)
             .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+            .cloned();
+        let fallback;
+        let file = if let Some(data) = data.as_ref() {
+            &data.file
+        } else if self.zero_message_opendir.load(Ordering::Relaxed) {
+            fallback = RwLock::new(
+                self.open_inode(inode, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK)?,
+            );
+            &fallback
+        } else {
+            return Err(ebadf());
+        };
 
         let mut buf = vec![0; size as usize];
 
@@ -876,7 +891,7 @@ impl PassthroughFs {
             // Since we are going to work with the kernel offset, we have to acquire the file lock
             // for both the `lseek64` and `getdents64` syscalls to ensure that no other thread
             // changes the kernel offset while we are using it.
-            let dir = data.file.write().unwrap();
+            let dir = file.write().unwrap();
 
             // Safe because this doesn't modify any memory and we check the return value.
             let res =
@@ -927,7 +942,7 @@ impl PassthroughFs {
                 .position(|&a| a == 0)
                 .expect("LinuxDirent64 name not NUL-terminated");
             let name = &name[..term];
-            let res = if name.starts_with(CURRENT_DIR_CSTR) || name.starts_with(PARENT_DIR_CSTR) {
+            let res = if name == CURRENT_DIR || name == PARENT_DIR {
                 // We don't want to report the "." and ".." entries. However, returning `Ok(0)` will
                 // break the loop so return `Ok` with a non-zero value instead.
                 Ok(1)
@@ -1160,6 +1175,13 @@ impl FileSystem for PassthroughFs {
             self.announce_submounts.store(true, Ordering::Relaxed);
         }
 
+        let zero_message_opendir = capable.contains(FsOptions::ZERO_MESSAGE_OPENDIR);
+        self.zero_message_opendir
+            .store(zero_message_opendir, Ordering::Relaxed);
+        if zero_message_opendir {
+            opts |= FsOptions::ZERO_MESSAGE_OPENDIR;
+        }
+
         Ok(opts)
     }
 
@@ -1291,7 +1313,11 @@ impl FileSystem for PassthroughFs {
         inode: Inode,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        self.do_open(inode, false, flags | (libc::O_DIRECTORY as u32))
+        if self.zero_message_opendir.load(Ordering::Relaxed) {
+            Err(io::Error::from_raw_os_error(libc::ENOSYS))
+        } else {
+            self.do_open(inode, false, flags | (libc::O_DIRECTORY as u32))
+        }
     }
 
     fn releasedir(
@@ -1952,6 +1978,30 @@ impl FileSystem for PassthroughFs {
         datasync: bool,
         handle: Handle,
     ) -> io::Result<()> {
+        if self.zero_message_opendir.load(Ordering::Relaxed)
+            && !self
+                .handles
+                .read()
+                .unwrap()
+                .get(&handle)
+                .is_some_and(|data| data.inode == inode)
+        {
+            let dir =
+                self.open_inode(inode, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK)?;
+            let res = unsafe {
+                if datasync {
+                    libc::fdatasync(dir.as_raw_fd())
+                } else {
+                    libc::fsync(dir.as_raw_fd())
+                }
+            };
+            return if res == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            };
+        }
+
         self.fsync(ctx, inode, datasync, handle)
     }
 
@@ -2534,6 +2584,94 @@ mod tests {
         )
         .unwrap();
         assert!(create_options.contains(OpenOptions::NOFLUSH));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zero_message_opendir_reads_and_syncs_without_a_handle() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-zero-opendir-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("nested")).unwrap();
+        for index in 0..128 {
+            fs::write(root.join(format!("nested/entry-{index:03}")), b"data").unwrap();
+        }
+
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        let negotiated = FileSystem::init(&filesystem, FsOptions::ZERO_MESSAGE_OPENDIR).unwrap();
+        assert!(negotiated.contains(FsOptions::ZERO_MESSAGE_OPENDIR));
+
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let nested = CString::new("nested").unwrap();
+        let entry = FileSystem::lookup(&filesystem, context, fuse::ROOT_ID, &nested).unwrap();
+        let error = FileSystem::opendir(&filesystem, context, entry.inode, libc::O_RDONLY as u32)
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSYS));
+
+        let mut names = Vec::new();
+        let mut offset = 0;
+        loop {
+            let before = names.len();
+            FileSystem::readdir(
+                &filesystem,
+                context,
+                entry.inode,
+                0,
+                512,
+                offset,
+                |dir_entry| {
+                    offset = dir_entry.offset;
+                    names.push(String::from_utf8(dir_entry.name.to_vec()).unwrap());
+                    Ok(1)
+                },
+            )
+            .unwrap();
+            if names.len() == before {
+                break;
+            }
+        }
+        names.sort();
+        assert_eq!(names.len(), 128);
+        assert_eq!(names.first().unwrap(), "entry-000");
+        assert_eq!(names.last().unwrap(), "entry-127");
+        FileSystem::fsyncdir(&filesystem, context, entry.inode, false, 0).unwrap();
+
+        let snapshot = filesystem.snapshot();
+        assert!(snapshot.zero_message_opendir);
+        let restored = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        restored.restore(&snapshot).unwrap();
+        let mut restored_names = Vec::new();
+        FileSystem::readdir(&restored, context, entry.inode, 0, 4096, 0, |dir_entry| {
+            restored_names.push(String::from_utf8(dir_entry.name.to_vec()).unwrap());
+            Ok(1)
+        })
+        .unwrap();
+        assert!(!restored_names.is_empty());
 
         fs::remove_dir_all(root).unwrap();
     }
