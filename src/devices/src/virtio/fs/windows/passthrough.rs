@@ -742,7 +742,7 @@ fn parse_linux_open_flags(linux_flags: i32, writeback: bool) -> OpenFlags {
 
     match flags & 0b11 {
         0 => access |= GENERIC_READ,
-        1 => access |= GENERIC_WRITE,
+        1 => access |= GENERIC_WRITE | FILE_READ_ATTRIBUTES,
         2 => access |= GENERIC_READ | GENERIC_WRITE,
         _ => {}
     }
