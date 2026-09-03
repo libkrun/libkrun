@@ -20,6 +20,7 @@ use vm_memory::GuestMemoryMmap;
 
 use super::super::{FsError, FuseServerState, Queue};
 use super::augment_fs::AugmentFs;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::defs::HPQ_INDEX;
 use super::descriptor_utils::{Reader, Writer};
 use super::inode_alloc::InodeAllocator;
@@ -394,6 +395,7 @@ impl FsWorker {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn process_queue_at(&mut self, queue_position: usize) -> bool {
         let queue = &mut self.queues[queue_position].queue;
         Self::process_queue(
