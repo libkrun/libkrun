@@ -19,14 +19,13 @@ use std::time::Duration;
 
 use libc::S_IFREG;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
-use windows_sys::Wdk::Storage::FileSystem::FILE_NON_DIRECTORY_FILE;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_ACCESS_INFORMATION, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_INFORMATION,
-    FILE_ID_BOTH_DIR_INFORMATION, FILE_OPEN, FILE_OPEN_BY_FILE_ID, FILE_OPEN_IF,
-    FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE, FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT,
-    FileAccessInformation, FileDispositionInformation, FileIdBothDirectoryInformation,
-    NtCreateFile, NtQueryDirectoryFile, NtQueryInformationFile, NtSetInformationFile, NtWriteFile,
-    RtlNtStatusToDosErrorNoTeb,
+    FILE_ID_BOTH_DIR_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_BY_FILE_ID,
+    FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE, FILE_OVERWRITE_IF,
+    FILE_SYNCHRONOUS_IO_NONALERT, FileAccessInformation, FileDispositionInformation,
+    FileIdBothDirectoryInformation, IO_REPARSE_TAG_LX_SYMLINK, NtCreateFile, NtQueryDirectoryFile,
+    NtQueryInformationFile, NtSetInformationFile, NtWriteFile, RtlNtStatusToDosErrorNoTeb,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
@@ -36,11 +35,13 @@ use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, DeleteFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_WRITE_DATA, GetFileInformationByHandle,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, FileAttributeTagInfo,
+    GetFileInformationByHandle, GetFileInformationByHandleEx,
 };
 use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetVolumePathNameW};
-use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
+use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
 use windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS;
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
@@ -299,8 +300,8 @@ fn unix_to_filetime(secs: i64, nsec: u32) -> u64 {
 
 struct FileInfo {
     file_index: u64,
-    volume_serial: u32,
-    n_number_of_links: u32,
+    raw_info: BY_HANDLE_FILE_INFORMATION,
+    tag_info: FILE_ATTRIBUTE_TAG_INFO,
 }
 
 /// Query NTFS file-index and volume serial via a temporary handle.
@@ -311,18 +312,39 @@ fn get_file_info(path: &Path) -> io::Result<FileInfo> {
         create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
     };
     let h = open_handle(path, &flags)?;
+    let result = get_file_info_by_handle(h);
+    unsafe {
+        CloseHandle(h);
+    }
+    result
+}
+
+// Borrows the handle. The caller is responsible for closing it.
+fn get_file_info_by_handle(handle: HANDLE) -> io::Result<FileInfo> {
     unsafe {
         let mut info: BY_HANDLE_FILE_INFORMATION = mem::zeroed();
-        if GetFileInformationByHandle(h, &mut info) == 0 {
-            CloseHandle(h);
+        if GetFileInformationByHandle(handle, &mut info) == 0 {
             return Err(io::Error::last_os_error());
         }
-        CloseHandle(h);
+
+        // if it's a reparse point, get the tag info so we know what kind of reparse point it is
+        let mut tag_info: FILE_ATTRIBUTE_TAG_INFO = mem::zeroed();
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            if GetFileInformationByHandleEx(
+                handle,
+                FileAttributeTagInfo,
+                &mut tag_info as *mut _ as *mut core::ffi::c_void,
+                mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
         let idx = (info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64;
         Ok(FileInfo {
             file_index: idx,
-            volume_serial: info.dwVolumeSerialNumber,
-            n_number_of_links: info.nNumberOfLinks,
+            raw_info: info,
+            tag_info: tag_info,
         })
     }
 }
@@ -357,45 +379,37 @@ pub fn is_handle_read_only(handle: u64) -> bool {
     }
 }
 
-fn get_reparse_tag(path: &Path) -> u32 {
-    let wide = path_to_wide(path);
-    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
-
-    let handle = unsafe { FindFirstFileW(wide.as_ptr(), &mut data) };
-    if handle != INVALID_HANDLE_VALUE {
-        unsafe { FindClose(handle) };
-        if data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return data.dwReserved0; // This field holds the exact reparse tag!
-        }
-    }
-    0
-}
-
-/// Build a `stat64` from Windows `Metadata`, applying override_stat xattr when available.
-fn metadata_to_stat64(meta: &fs::Metadata, ino: u64, path: &Path, n_link: u32) -> stat64 {
-    let file_attributes = meta.file_attributes();
+/// Build a `stat64` from Windows `BY_HANDLE_FILE_INFORMATION`, applying override_stat xattr when available.
+fn file_info_to_stat64(file_info: &FileInfo, ino: u64, path: &Path, handle: HANDLE) -> stat64 {
+    let info = &file_info.raw_info;
+    let file_attributes = info.dwFileAttributes;
 
     let is_directory = (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-    let mut is_symlink = meta.file_type().is_symlink();
-    if is_symlink && (file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0) {
-        let tag = get_reparse_tag(path);
-        if tag == IO_REPARSE_TAG_MOUNT_POINT {
-            is_symlink = false; // It's a Volume Mount! Force it to be a native directory.
-        }
-    }
+    let is_reparse = (file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+    // If it's a reparse point and not a mount point, it's a symlink
+    let is_symlink = is_reparse && file_info.tag_info.ReparseTag != IO_REPARSE_TAG_MOUNT_POINT;
+
+    let mut size = ((info.nFileSizeHigh as u64) << 32 | info.nFileSizeLow as u64) as i64;
+
     let (base_mode, nlink) = if is_symlink {
+        if let Ok(target) = read_lx_symlink_by_handle(handle) {
+            // st_size MUST match the exact length returned by readlink()
+            size = target.len() as i64;
+        }
         (S_IFLNK | 0o777, 1)
     } else if is_directory {
         (libc::S_IFDIR | 0o755, 2u32)
     } else {
-        (libc::S_IFREG | 0o644, n_link)
+        (libc::S_IFREG | 0o644, info.nNumberOfLinks)
     };
 
-    let size = meta.len() as i64;
-
-    let creation = meta.creation_time();
-    let access = meta.last_access_time();
-    let write = meta.last_write_time();
+    let creation = (info.ftCreationTime.dwHighDateTime as u64) << 32
+        | info.ftCreationTime.dwLowDateTime as u64;
+    let access = (info.ftLastAccessTime.dwHighDateTime as u64) << 32
+        | info.ftLastAccessTime.dwLowDateTime as u64;
+    let write = (info.ftLastWriteTime.dwHighDateTime as u64) << 32
+        | info.ftLastWriteTime.dwLowDateTime as u64;
 
     let mut st = stat64 {
         st_dev: 0,
@@ -433,6 +447,48 @@ fn metadata_to_stat64(meta: &fs::Metadata, ino: u64, path: &Path, n_link: u32) -
     }
 
     st
+}
+
+fn read_lx_symlink_by_handle(handle: HANDLE) -> io::Result<Vec<u8>> {
+    let mut buffer = [0u8; 16384];
+    let mut bytes_returned = 0u32;
+
+    let result = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_GET_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+            buffer.as_mut_ptr() as *mut _,
+            buffer.len() as u32,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if result == 0 || bytes_returned < 8 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Inspect ReparseTag (first 4 bytes)
+    let tag = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
+    if tag != IO_REPARSE_TAG_LX_SYMLINK as u32 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Not an LX_SYMLINK reparse point",
+        ));
+    }
+
+    let data_len = u16::from_le_bytes(buffer[4..6].try_into().unwrap()) as usize;
+    if bytes_returned < (8 + data_len) as u32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Truncated LX_SYMLINK payload",
+        ));
+    }
+
+    // Target UTF-8 bytes start at offset 8
+    Ok(buffer[8..8 + data_len].to_vec())
 }
 
 // ADS-backed override_stat helpers  (uid:gid:0mode)
@@ -1119,10 +1175,16 @@ impl PassthroughFs {
         let child_name = cstr_to_path(name);
         let child_path = parent_data.get_path().join(&child_name);
 
-        let file_info = get_file_info(&child_path).map_err(win_err_to_linux)?;
+        let flags = OpenFlags {
+            desired_access: FILE_READ_ATTRIBUTES,
+            create_disposition: FILE_OPEN,
+            create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        };
+        let handle = HandleGuard(open_handle(&child_path, &flags)?);
+        let file_info = get_file_info_by_handle(handle.as_raw()).map_err(win_err_to_linux)?;
         let alt_key = InodeAltKey {
             file_index: file_info.file_index,
-            volume_serial: file_info.volume_serial,
+            volume_serial: file_info.raw_info.dwVolumeSerialNumber,
         };
 
         let inode = {
@@ -1164,8 +1226,7 @@ impl PassthroughFs {
             }
         };
 
-        let meta = fs::symlink_metadata(&child_path).map_err(win_err_to_linux)?;
-        let st = metadata_to_stat64(&meta, inode, &child_path, file_info.n_number_of_links);
+        let st = file_info_to_stat64(&file_info, inode, &child_path, handle.as_raw());
 
         let mut attr_flags = 0u32;
         if st.st_mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32
@@ -1173,7 +1234,9 @@ impl PassthroughFs {
         {
             // Different volume ⟹ submount
             if let Ok(parent_file_info) = get_file_info(&parent_data.get_path()) {
-                if file_info.volume_serial != parent_file_info.volume_serial {
+                if file_info.raw_info.dwVolumeSerialNumber
+                    != parent_file_info.raw_info.dwVolumeSerialNumber
+                {
                     attr_flags |= fuse::ATTR_SUBMOUNT;
                 }
             }
@@ -1192,30 +1255,26 @@ impl PassthroughFs {
     fn do_getattr(&self, inode: Inode, handle: Option<Handle>) -> io::Result<(stat64, Duration)> {
         let path = self.inode_path(inode)?;
 
-        if let Some(h) = handle {
-            if h != 0 && (h & (1 << 63)) == 0 {
-                if let Ok(file) = self.reopen_inode(inode, h, FILE_READ_ATTRIBUTES) {
-                    if let Ok(meta) = file.metadata() {
-                        let mut n_link = 1;
-                        unsafe {
-                            let mut info: BY_HANDLE_FILE_INFORMATION = mem::zeroed();
-                            if GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info)
-                                != 0
-                            {
-                                n_link = info.nNumberOfLinks;
-                            }
-                        }
-                        let st = metadata_to_stat64(&meta, inode, &path, n_link);
-                        return Ok((st, self.cfg.attr_timeout));
-                    }
-                }
+        let (raw_h, _guard) = match handle {
+            Some(h) if h != 0 && (h & (1 << 63)) == 0 => (h as HANDLE, None),
+            _ => {
+                let h = open_handle(
+                    &path,
+                    &OpenFlags {
+                        desired_access: FILE_READ_ATTRIBUTES,
+                        create_disposition: FILE_OPEN,
+                        create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+                    },
+                )?;
+                // HandleGuard will call CloseHandle automatically when dropped at end of scope!
+                (h, Some(HandleGuard(h)))
             }
-        }
+        };
 
-        let meta = fs::symlink_metadata(&*path).map_err(win_err_to_linux)?;
-        let file_info = get_file_info(&path).map_err(win_err_to_linux)?;
-        let st = metadata_to_stat64(&meta, inode, &path, file_info.n_number_of_links);
-        Ok((st, self.cfg.attr_timeout))
+        let info = get_file_info_by_handle(raw_h).map_err(win_err_to_linux)?;
+
+        let stat = file_info_to_stat64(&info, inode, &path, raw_h);
+        Ok((stat, self.cfg.attr_timeout))
     }
 
     // To avoid global lookup maps we reuse Win32 HANDLE for file descriptors and
@@ -1464,7 +1523,7 @@ impl FileSystem for PassthroughFs {
 
         let alt_key = InodeAltKey {
             file_index: file_info.file_index,
-            volume_serial: file_info.volume_serial,
+            volume_serial: file_info.raw_info.dwVolumeSerialNumber,
         };
 
         let mut inodes = self.inodes.write().unwrap();
@@ -1901,12 +1960,30 @@ impl FileSystem for PassthroughFs {
 
         let path = data.get_path();
 
-        let target = fs::read_link(&*path).map_err(win_err_to_linux)?;
+        let handle = HandleGuard(open_handle(
+            &path,
+            &OpenFlags {
+                desired_access: FILE_READ_ATTRIBUTES,
+                create_disposition: FILE_OPEN,
+                create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            },
+        )?);
+
+        let mut buf = match read_lx_symlink_by_handle(handle.as_raw()) {
+            Ok(buf) => buf,
+            _ => {
+                let target = fs::read_link(&*path).map_err(win_err_to_linux)?;
+                target.to_string_lossy().into_owned().into_bytes()
+            }
+        };
 
         // Convert Windows path formatting back to a Linux-friendly format.
         // Windows symlinks use '\', but the FUSE Linux guest expects '/'
-        let unix_path = target.to_string_lossy().replace('\\', "/");
-        let mut buf = unix_path.into_bytes();
+        buf.iter_mut().for_each(|b| {
+            if *b == b'\\' {
+                *b = b'/'
+            }
+        });
 
         // Cap to PATH_MAX (4096) to match Linux parity exactly.
         // While Windows NT paths can be 32k, FUSE/Linux expects a max of 4096 bytes.
