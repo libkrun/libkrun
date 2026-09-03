@@ -9,8 +9,7 @@ use std::fs::{self, File};
 use std::io;
 use std::mem;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::os::windows::fs::MetadataExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,15 +30,14 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
     STATUS_NO_MORE_FILES, UNICODE_STRING,
 };
-use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
-use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, DeleteFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, FileAttributeTagInfo,
-    GetFileInformationByHandle, GetFileInformationByHandleEx,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileAttributeTagInfo,
+    GetDiskFreeSpaceExW, GetFileAttributesW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetVolumePathNameW, SetFileAttributesW,
 };
-use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetVolumePathNameW};
 use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
 use windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS;
@@ -56,8 +54,6 @@ use super::super::filesystem::*;
 use super::super::fuse;
 use super::super::multikey::MultikeyBTreeMap;
 use super::fs_utils::{ebadf, einval, enosys, win_err_to_linux};
-
-use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
 
 const OVERRIDE_STAT_STREAM: &str = ":user.containers.override_stat";
 const SECURITY_CAPABILITY_STREAM: &str = ":security.capability";
@@ -194,6 +190,22 @@ impl FromStr for CachePolicy {
     }
 }
 
+/// The permission semantics to be emulated by this file system personality.
+#[derive(Debug, Default, Clone, Copy)]
+pub enum PermissionSemantics {
+    /// Be as close as possible to the common semantics of Linux file systems.
+    #[default]
+    LinuxComplete,
+
+    /// As `LinuxComplete`, with the following simplifications:
+    ///  - Extended attributes are not supported.
+    ///  - Idmaps are not supported.
+    ///  - Ownership bits are ignored, always returning the uid/gid from the process
+    ///    requesting the operation within the guest (obtained from `Context`).
+    ///  - Permissions bits are stored in the host, not as extended attributes.
+    LinuxSimplified,
+}
+
 /// Options that configure the behavior of the file system.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -244,8 +256,13 @@ pub struct Config {
 
     /// ID of this filesystem to uniquely identify exports.
     pub export_fsid: u64,
+
     /// Table of exported FDs to share with other subsystems.
     pub export_table: Option<ExportTable>,
+
+    /// The permission semantics to be emulated. See the documentation for `PermissionSemantics` for
+    /// more details.
+    pub semantics: PermissionSemantics,
 }
 
 impl Default for Config {
@@ -259,6 +276,7 @@ impl Default for Config {
             xattr: true,
             export_fsid: 0,
             export_table: None,
+            semantics: PermissionSemantics::LinuxComplete,
         }
     }
 }
@@ -380,7 +398,14 @@ pub fn is_handle_read_only(handle: u64) -> bool {
 }
 
 /// Build a `stat64` from Windows `BY_HANDLE_FILE_INFORMATION`, applying override_stat xattr when available.
-fn file_info_to_stat64(file_info: &FileInfo, ino: u64, path: &Path, handle: HANDLE) -> stat64 {
+fn file_info_to_stat64(
+    ctx: &Context,
+    semantics: PermissionSemantics,
+    file_info: &FileInfo,
+    ino: u64,
+    path: &Path,
+    handle: HANDLE,
+) -> stat64 {
     let info = &file_info.raw_info;
     let file_attributes = info.dwFileAttributes;
 
@@ -401,7 +426,18 @@ fn file_info_to_stat64(file_info: &FileInfo, ino: u64, path: &Path, handle: HAND
     } else if is_directory {
         (libc::S_IFDIR | 0o755, 2u32)
     } else {
-        (libc::S_IFREG | 0o644, info.nNumberOfLinks)
+        let is_readonly = (file_attributes & FILE_ATTRIBUTE_READONLY) != 0;
+        let mode_bits = match semantics {
+            PermissionSemantics::LinuxSimplified => {
+                if is_readonly {
+                    0o444
+                } else {
+                    0o644
+                }
+            }
+            PermissionSemantics::LinuxComplete => 0o644,
+        };
+        (libc::S_IFREG | mode_bits, info.nNumberOfLinks)
     };
 
     let creation = (info.ftCreationTime.dwHighDateTime as u64) << 32
@@ -430,18 +466,26 @@ fn file_info_to_stat64(file_info: &FileInfo, ino: u64, path: &Path, handle: HAND
         st_blocks: (size + 511) / 512,
     };
 
-    if let Ok((uid, gid, mode)) = read_override_stat(path) {
-        if let Some(uid) = uid {
-            st.st_uid = uid;
+    match semantics {
+        PermissionSemantics::LinuxSimplified => {
+            st.st_uid = ctx.uid;
+            st.st_gid = ctx.gid;
         }
-        if let Some(gid) = gid {
-            st.st_gid = gid;
-        }
-        if let Some(mode) = mode {
-            if mode & libc::S_IFMT as u32 == 0 {
-                st.st_mode = (st.st_mode & libc::S_IFMT as u32) | mode;
-            } else {
-                st.st_mode = mode;
+        PermissionSemantics::LinuxComplete => {
+            if let Ok((uid, gid, mode)) = read_override_stat(path) {
+                if let Some(uid) = uid {
+                    st.st_uid = uid;
+                }
+                if let Some(gid) = gid {
+                    st.st_gid = gid;
+                }
+                if let Some(mode) = mode {
+                    if mode & libc::S_IFMT as u32 == 0 {
+                        st.st_mode = (st.st_mode & libc::S_IFMT as u32) | mode;
+                    } else {
+                        st.st_mode = mode;
+                    }
+                }
             }
         }
     }
@@ -1145,10 +1189,10 @@ impl PassthroughFs {
         Ok(self.inode_data(inode)?.get_path())
     }
 
-    fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
+    fn do_lookup(&self, ctx: &Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
         let name_bytes = name.to_bytes();
         if name_bytes == b"." {
-            let (attr, _) = self.do_getattr(parent, None)?;
+            let (attr, _) = self.do_getattr(ctx, parent, None)?;
             return Ok(Entry {
                 inode: parent,
                 generation: 0,
@@ -1161,7 +1205,7 @@ impl PassthroughFs {
         if name_bytes == b".." {
             let parent_data = self.inode_data(parent)?;
             let grand_parent = parent_data.parent_inode;
-            let (attr, _) = self.do_getattr(grand_parent, None)?;
+            let (attr, _) = self.do_getattr(ctx, grand_parent, None)?;
             return Ok(Entry {
                 inode: grand_parent,
                 generation: 0,
@@ -1226,7 +1270,14 @@ impl PassthroughFs {
             }
         };
 
-        let st = file_info_to_stat64(&file_info, inode, &child_path, handle.as_raw());
+        let st = file_info_to_stat64(
+            ctx,
+            self.cfg.semantics,
+            &file_info,
+            inode,
+            &child_path,
+            handle.as_raw(),
+        );
 
         let mut attr_flags = 0u32;
         if st.st_mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32
@@ -1252,7 +1303,12 @@ impl PassthroughFs {
         })
     }
 
-    fn do_getattr(&self, inode: Inode, handle: Option<Handle>) -> io::Result<(stat64, Duration)> {
+    fn do_getattr(
+        &self,
+        ctx: &Context,
+        inode: Inode,
+        handle: Option<Handle>,
+    ) -> io::Result<(stat64, Duration)> {
         let path = self.inode_path(inode)?;
 
         let (raw_h, _guard) = match handle {
@@ -1273,7 +1329,7 @@ impl PassthroughFs {
 
         let info = get_file_info_by_handle(raw_h).map_err(win_err_to_linux)?;
 
-        let stat = file_info_to_stat64(&info, inode, &path, raw_h);
+        let stat = file_info_to_stat64(ctx, self.cfg.semantics, &info, inode, &path, raw_h);
         Ok((stat, self.cfg.attr_timeout))
     }
 
@@ -1325,7 +1381,7 @@ impl PassthroughFs {
             .or_else(|_| open_handle(&data.get_path(), &oflags))
             .map_err(win_err_to_linux)?;
 
-        if kill_priv {
+        if kill_priv && matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
             let path = data.get_path();
             remove_security_capability(&path);
             if let Ok((_, _, Some(mode))) = read_override_stat(&path) {
@@ -1620,8 +1676,8 @@ impl FileSystem for PassthroughFs {
         })
     }
 
-    fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        self.do_lookup(parent, name)
+    fn lookup(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        self.do_lookup(&ctx, parent, name)
     }
 
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
@@ -1697,14 +1753,16 @@ impl FileSystem for PassthroughFs {
             .map_err(win_err_to_linux)?,
         );
 
-        if let Some(secctx) = extensions.secctx {
-            let stream_name = format!(":{}", secctx.name.to_string_lossy());
-            write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
-        }
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
+            if let Some(secctx) = extensions.secctx {
+                let stream_name = format!(":{}", secctx.name.to_string_lossy());
+                write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
+            }
 
-        let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, mode & !umask);
-        write_ads_by_handle(child_g.as_raw(), OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
-        self.do_lookup(parent, name)
+            let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, mode & !umask);
+            write_ads_by_handle(child_g.as_raw(), OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
+        }
+        self.do_lookup(&ctx, parent, name)
     }
 
     fn rmdir(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
@@ -1806,7 +1864,7 @@ impl FileSystem for PassthroughFs {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let entry = match self.do_lookup(inode, &name_cstr) {
+            let entry = match self.do_lookup(&ctx, inode, &name_cstr) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
@@ -1829,16 +1887,16 @@ impl FileSystem for PassthroughFs {
 
     fn getattr(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         handle: Option<Handle>,
     ) -> io::Result<(stat64, Duration)> {
-        self.do_getattr(inode, handle)
+        self.do_getattr(&ctx, inode, handle)
     }
 
     fn setattr(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         attr: stat64,
         handle: Option<Handle>,
@@ -1846,35 +1904,87 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<(stat64, Duration)> {
         let path = self.inode_path(inode)?;
 
-        // Extract or read current cached state cleanly to avoid overwriting conflicts
-        let (mut current_uid, mut current_gid, mut current_mode) =
-            read_override_stat(&path).unwrap_or((Some(u32::MAX), Some(u32::MAX), None));
+        match self.cfg.semantics {
+            PermissionSemantics::LinuxSimplified => {
+                // In LinuxSimplified mode:
+                // 1. UID/GID changes (chown) are ignored since ownership is dynamically returned as ctx.uid/gid.
+                // 2. Extended attribute (ADS) overrides are not written.
+                // 3. chmod maps POSIX write permissions to the native Windows Read-Only attribute.
+                if valid.contains(SetattrValid::MODE) {
+                    let is_writable = (attr.st_mode & 0o200) != 0;
+                    let wide_path = path_to_wide(&path);
 
-        let mut override_changed = false;
+                    unsafe {
+                        let current_attrs = GetFileAttributesW(wide_path.as_ptr());
+                        if current_attrs != u32::MAX {
+                            let new_attrs = if is_writable {
+                                current_attrs & !FILE_ATTRIBUTE_READONLY
+                            } else {
+                                current_attrs | FILE_ATTRIBUTE_READONLY
+                            };
 
-        if valid.contains(SetattrValid::MODE) {
-            current_mode = Some(attr.st_mode);
-            override_changed = true;
-        }
-
-        if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
-            if valid.contains(SetattrValid::UID) {
-                current_uid = Some(attr.st_uid);
-            }
-            if valid.contains(SetattrValid::GID) {
-                current_gid = Some(attr.st_gid);
-            };
-
-            remove_security_capability(&path);
-
-            if !valid.contains(SetattrValid::MODE) {
-                if let Some(mode) = current_mode {
-                    let new_mode = clear_suid_sgid(mode);
-                    current_mode = Some(new_mode);
+                            if new_attrs != current_attrs {
+                                SetFileAttributesW(wide_path.as_ptr(), new_attrs);
+                            }
+                        }
+                    }
                 }
             }
+            PermissionSemantics::LinuxComplete => {
+                // In LinuxComplete mode, preserve permissions and ownership using the ADS stream.
+                // Check if any state mutation requires updating the ADS metadata
+                let needs_suid_clear = valid.contains(SetattrValid::SIZE)
+                    || valid.intersects(SetattrValid::UID | SetattrValid::GID);
 
-            override_changed = true;
+                if valid.intersects(SetattrValid::MODE | SetattrValid::UID | SetattrValid::GID)
+                    || needs_suid_clear
+                {
+                    // Single read to inspect current state
+                    let (mut current_uid, mut current_gid, mut current_mode) =
+                        read_override_stat(&path).unwrap_or((Some(u32::MAX), Some(u32::MAX), None));
+
+                    let mut override_changed = false;
+
+                    if valid.contains(SetattrValid::MODE) {
+                        current_mode = Some(attr.st_mode);
+                        override_changed = true;
+                    }
+
+                    if valid.contains(SetattrValid::UID) {
+                        current_uid = Some(attr.st_uid);
+                        override_changed = true;
+                    }
+
+                    if valid.contains(SetattrValid::GID) {
+                        current_gid = Some(attr.st_gid);
+                        override_changed = true;
+                    }
+
+                    // If size or ownership changed, clear capabilities and suid/sgid
+                    if needs_suid_clear {
+                        remove_security_capability(&path);
+
+                        if !valid.contains(SetattrValid::MODE) {
+                            if let Some(mode) = current_mode {
+                                let new_mode = clear_suid_sgid(mode);
+                                if new_mode != mode {
+                                    current_mode = Some(new_mode);
+                                    override_changed = true;
+                                }
+                            }
+                        }
+                    }
+
+                    // Single unified write if metadata changed
+                    if override_changed {
+                        let owner_param = match (current_uid, current_gid) {
+                            (Some(u), Some(g)) => Some((u, g)),
+                            _ => None,
+                        };
+                        write_override_stat(&path, owner_param, current_mode)?;
+                    }
+                }
+            }
         }
 
         if valid.contains(SetattrValid::SIZE) {
@@ -1897,24 +2007,6 @@ impl FileSystem for PassthroughFs {
                 file.set_len(attr.st_size as u64)
                     .map_err(win_err_to_linux)?;
             }
-
-            remove_security_capability(&path);
-
-            if let Some(mode) = current_mode {
-                let new_mode = clear_suid_sgid(mode);
-                if new_mode != mode {
-                    current_mode = Some(new_mode);
-                    override_changed = true;
-                }
-            }
-        }
-
-        if override_changed {
-            let owner_param = match (current_uid, current_gid) {
-                (Some(u), Some(g)) => Some((u, g)),
-                _ => None,
-            };
-            write_override_stat(&path, owner_param, current_mode)?;
         }
 
         if valid.intersects(
@@ -1946,7 +2038,7 @@ impl FileSystem for PassthroughFs {
             set_file_times(&path, atime, mtime).map_err(win_err_to_linux)?;
         }
 
-        self.do_getattr(inode, handle)
+        self.do_getattr(&ctx, inode, handle)
     }
 
     fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
@@ -2029,17 +2121,19 @@ impl FileSystem for PassthroughFs {
             .or_else(|_| std::os::windows::fs::symlink_dir(&target, &link_path))
             .map_err(win_err_to_linux)?;
 
-        if let Some(secctx) = extensions.secctx {
-            write_secctx(&link_path, secctx, true)?;
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
+            if let Some(secctx) = extensions.secctx {
+                write_secctx(&link_path, secctx, true)?;
+            }
+
+            write_override_stat(
+                &link_path,
+                Some((ctx.uid, ctx.gid)),
+                Some(S_IFLNK as u32 | 0o777),
+            )?;
         }
 
-        write_override_stat(
-            &link_path,
-            Some((ctx.uid, ctx.gid)),
-            Some(S_IFLNK as u32 | 0o777),
-        )?;
-
-        self.do_lookup(parent, name)
+        self.do_lookup(&ctx, parent, name)
     }
 
     fn mknod(
@@ -2089,19 +2183,21 @@ impl FileSystem for PassthroughFs {
             .map_err(win_err_to_linux)?,
         );
 
-        // Write security context via the active handle
-        if let Some(secctx) = extensions.secctx {
-            let stream_name = format!(":{}", secctx.name.to_string_lossy());
-            write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
+            // Write security context via the active handle
+            if let Some(secctx) = extensions.secctx {
+                let stream_name = format!(":{}", secctx.name.to_string_lossy());
+                write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
+            }
+
+            // Write ownership and mode to ADS via the active handle
+            // Note: The `mode` parameter naturally contains the file type bits
+            // (S_IFIFO, S_IFCHR, S_IFSOCK, etc.) which will be persisted here.
+            let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, mode & !umask);
+            write_ads_by_handle(child_g.as_raw(), OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
         }
 
-        // Write ownership and mode to ADS via the active handle
-        // Note: The `mode` parameter naturally contains the file type bits
-        // (S_IFIFO, S_IFCHR, S_IFSOCK, etc.) which will be persisted here.
-        let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, mode & !umask);
-        write_ads_by_handle(child_g.as_raw(), OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
-
-        self.do_lookup(parent, name)
+        self.do_lookup(&ctx, parent, name)
     }
 
     // There is one minor edge-case to be aware of
@@ -2201,7 +2297,7 @@ impl FileSystem for PassthroughFs {
         // Because NTFS shares MFT records for hard links, the existing ADS
         // permissions are natively shared with the new link!
         fs::hard_link(&*existing, &new_path).map_err(win_err_to_linux)?;
-        self.do_lookup(newparent, newname)
+        self.do_lookup(&ctx, newparent, newname)
     }
 
     fn open(
@@ -2250,32 +2346,34 @@ impl FileSystem for PassthroughFs {
         let oflags = parse_linux_open_flags(flags as i32 | LINUX_O_CREAT, wb);
         let h = open_handle(&child_path, &oflags).map_err(win_err_to_linux)?;
 
-        if let Some(secctx) = extensions.secctx {
-            let stream_name = format!(":{}", secctx.name.to_string_lossy());
-            if let Err(e) = write_ads_by_handle(h, &stream_name, &secctx.secctx) {
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
+            if let Some(secctx) = extensions.secctx {
+                let stream_name = format!(":{}", secctx.name.to_string_lossy());
+                if let Err(e) = write_ads_by_handle(h, &stream_name, &secctx.secctx) {
+                    unsafe { CloseHandle(h) };
+                    return Err(e);
+                }
+            }
+
+            // Write the ownership and mode using the open handle directly
+            let stat_str = format!(
+                "{}:{}:0{:o}",
+                ctx.uid,
+                ctx.gid,
+                S_IFREG as u32 | (mode & !(umask & 0o777))
+            );
+            if let Err(e) = write_ads_by_handle(h, OVERRIDE_STAT_STREAM, stat_str.as_bytes()) {
                 unsafe { CloseHandle(h) };
                 return Err(e);
             }
+
+            // If O_TRUNC and kill_priv are set, strip capabilities
+            if (flags as i32 & LINUX_O_TRUNC) != 0 && kill_priv {
+                remove_security_capability(&child_path);
+            }
         }
 
-        // Write the ownership and mode using the open handle directly
-        let stat_str = format!(
-            "{}:{}:0{:o}",
-            ctx.uid,
-            ctx.gid,
-            S_IFREG as u32 | (mode & !(umask & 0o777))
-        );
-        if let Err(e) = write_ads_by_handle(h, OVERRIDE_STAT_STREAM, stat_str.as_bytes()) {
-            unsafe { CloseHandle(h) };
-            return Err(e);
-        }
-
-        // If O_TRUNC and kill_priv are set, strip capabilities
-        if (flags as i32 & LINUX_O_TRUNC) != 0 && kill_priv {
-            remove_security_capability(&child_path);
-        }
-
-        let entry = match self.do_lookup(parent, name) {
+        let entry = match self.do_lookup(&ctx, parent, name) {
             Ok(e) => e,
             Err(e) => {
                 unsafe { CloseHandle(h) };
@@ -2338,7 +2436,10 @@ impl FileSystem for PassthroughFs {
         };
 
         // Only process kill_priv if the write was successful, and log any errors
-        if result.is_ok() && kill_priv {
+        if result.is_ok()
+            && kill_priv
+            && matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete)
+        {
             let path = self.inode_path(inode)?;
             remove_security_capability(&path);
 
@@ -2403,6 +2504,11 @@ impl FileSystem for PassthroughFs {
     }
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) {
+            // Directories and files owned by ctx always have access unless host-level denied
+            return Ok(());
+        }
+
         // POSIX access mode constants (since Windows libc doesn't define them)
         const F_OK: u32 = 0;
         const X_OK: u32 = 1;
@@ -2410,7 +2516,7 @@ impl FileSystem for PassthroughFs {
         const R_OK: u32 = 4;
 
         // Get the emulated POSIX stats from the ADS override stream
-        let (st, _) = self.do_getattr(inode, None)?;
+        let (st, _) = self.do_getattr(&ctx, inode, None)?;
 
         let mode = mask & (R_OK | W_OK | X_OK);
 
@@ -2458,7 +2564,7 @@ impl FileSystem for PassthroughFs {
         value: &[u8],
         flags: u32,
     ) -> io::Result<()> {
-        if !self.cfg.xattr {
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) || !self.cfg.xattr {
             return Err(enosys());
         }
 
@@ -2489,7 +2595,7 @@ impl FileSystem for PassthroughFs {
         name: &CStr,
         size: u32,
     ) -> io::Result<GetxattrReply> {
-        if !self.cfg.xattr {
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) || !self.cfg.xattr {
             return Err(enosys());
         }
 
@@ -2526,7 +2632,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn listxattr(&self, _ctx: Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
-        if !self.cfg.xattr {
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) || !self.cfg.xattr {
             return Err(enosys());
         }
 
@@ -2552,7 +2658,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn removexattr(&self, _ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
-        if !self.cfg.xattr {
+        if matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) || !self.cfg.xattr {
             return Err(enosys());
         }
 
