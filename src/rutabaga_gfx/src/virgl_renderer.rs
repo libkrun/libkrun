@@ -696,35 +696,6 @@ impl RutabagaComponent for VirglRenderer {
         Err(RutabagaError::Unsupported)
     }
 
-    fn resource_map(
-        &self,
-        _resource_id: u32,
-        _addr: u64,
-        _size: u64,
-        _prot: i32,
-        _flags: i32,
-    ) -> RutabagaResult<()> {
-        #[cfg(feature = "virgl_resource_map2")]
-        {
-            let ret = unsafe {
-                virgl_renderer_resource_map2(
-                    _resource_id,
-                    _addr as *mut libc::c_void,
-                    _size,
-                    _prot,
-                    _flags,
-                )
-            };
-            if ret != 0 {
-                return Err(RutabagaError::MappingFailed(ret));
-            }
-
-            Ok(())
-        }
-        #[cfg(not(feature = "virgl_resource_map2"))]
-        Err(RutabagaError::Unsupported)
-    }
-
     fn map(&self, resource_id: u32) -> RutabagaResult<RutabagaMapping> {
         #[cfg(feature = "virgl_renderer_next")]
         {

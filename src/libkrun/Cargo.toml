@@ -20,7 +20,6 @@ efi = ["blk", "net", "vmm/efi", "devices/efi"]
 gpu = ["vmm/gpu", "devices/gpu", "krun_display"]
 snd = ["vmm/snd", "devices/snd"]
 input = ["krun_input", "vmm/input", "devices/input"]
-virgl_resource_map2 = ["devices/virgl_resource_map2"]
 aws-nitro = ["vmm/aws-nitro", "devices/aws-nitro", "dep:aws-nitro", "dep:nitro-enclaves"]
 
 [dependencies]

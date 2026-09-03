@@ -116,8 +116,7 @@ When TSI is enabled, the VMM acts as a proxy for AF_INET, AF_INET6 and AF_UNIX s
 
 #### Optional features
 
-* **GPU=1**: Enables virtio-gpu. Requires virglrenderer-devel.
-* **VIRGL_RESOURCE_MAP2=1**: Uses virgl_resource_map2 function. Requires a virglrenderer-devel patched with [1374](https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1374)
+* **GPU=1**: Enables virtio-gpu. Fixed-address resource mapping is used automatically when virglrenderer exports `virgl_renderer_resource_map_fixed` and can be queried with `KRUN_FEATURE_VIRGL_RESOURCE_MAP_FIXED`.
 * **BLK=1**: Enables virtio-block.
 * **NET=1**: Enables virtio-net.
 * **SND=1**: Enables virtio-snd.
