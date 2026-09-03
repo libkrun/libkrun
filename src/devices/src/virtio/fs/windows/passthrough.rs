@@ -1090,6 +1090,31 @@ impl PassthroughFs {
     }
 
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        let name_bytes = name.to_bytes();
+        if name_bytes == b"." {
+            let (attr, _) = self.do_getattr(parent, None)?;
+            return Ok(Entry {
+                inode: parent,
+                generation: 0,
+                attr,
+                attr_flags: 0,
+                attr_timeout: self.cfg.attr_timeout,
+                entry_timeout: self.cfg.entry_timeout,
+            });
+        }
+        if name_bytes == b".." {
+            let parent_data = self.inode_data(parent)?;
+            let grand_parent = parent_data.parent_inode;
+            let (attr, _) = self.do_getattr(grand_parent, None)?;
+            return Ok(Entry {
+                inode: grand_parent,
+                generation: 0,
+                attr,
+                attr_flags: 0,
+                attr_timeout: self.cfg.attr_timeout,
+                entry_timeout: self.cfg.entry_timeout,
+            });
+        }
         let parent_data = self.inode_data(parent)?;
         let child_name = cstr_to_path(name);
         let child_path = parent_data.get_path().join(&child_name);
