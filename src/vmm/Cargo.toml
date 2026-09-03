@@ -17,7 +17,7 @@ blk = ["devices/blk"]
 gpu = ["devices/gpu", "krun_display"]
 input = ["devices/input", "krun_input"]
 aws-nitro = []
-vhost-user = ["devices/vhost-user"]
+vhost-user = ["devices/vhost-user", "krun_display"]
 
 [dependencies]
 crossbeam-channel = ">=0.5.15"

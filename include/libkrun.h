@@ -684,7 +684,7 @@ int krun_add_input_device_fd(uint32_t ctx_id, int input_fd);
  */
 #define KRUN_VHOST_USER_GPU_NUM_QUEUES 2
 #define KRUN_VHOST_USER_GPU_QUEUE_SIZES ((uint16_t[]){1024, 1024})
-#define KRUN_VHOST_USER_GPU_SHM_SIZE (UINT64_C(1) << 33)
+#define KRUN_VHOST_USER_GPU_SHM_SIZE (1ULL << 33)
 
 /**
  * Vhost-user media device default queue configuration.
@@ -692,7 +692,7 @@ int krun_add_input_device_fd(uint32_t ctx_id, int input_fd);
  */
 #define KRUN_VHOST_USER_MEDIA_NUM_QUEUES 2
 #define KRUN_VHOST_USER_MEDIA_QUEUE_SIZES ((uint16_t[]){1024, 1024})
-#define KRUN_VHOST_USER_MEDIA_SHM_SIZE (UINT64_C(1) << 32)
+#define KRUN_VHOST_USER_MEDIA_SHM_SIZE (1ULL << 32)
 
 /**
  * Add a vhost-user device to the VM.

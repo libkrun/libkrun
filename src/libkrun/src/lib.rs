@@ -11,7 +11,7 @@ use devices::virtio::block::{ImageType, SyncMode};
 #[cfg(feature = "net")]
 use devices::virtio::net::device::VirtioNetBackend;
 use env_logger::{Env, Target};
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", feature = "vhost-user"))]
 use krun_display::DisplayBackend;
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -1443,7 +1443,7 @@ pub unsafe extern "C" fn krun_set_gpu_options2(
     KRUN_SUCCESS
 }
 
-#[cfg(not(feature = "gpu"))]
+#[cfg(not(any(feature = "gpu", feature = "vhost-user")))]
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_set_display_backend(
@@ -1455,7 +1455,7 @@ pub extern "C" fn krun_set_display_backend(
     -libc::ENOTSUP
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", feature = "vhost-user"))]
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_set_display_backend(

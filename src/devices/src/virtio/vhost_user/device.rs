@@ -11,14 +11,17 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
+use krun_display::{
+    DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, ResourceFormat,
+};
 use log::{debug, error, warn};
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vhost::vhost_user::gpu_message::{
-    GpuBackendReq, VhostUserGpuHeaderFlag, VirtioGpuDisplayOne, VirtioGpuRect,
-    VirtioGpuRespDisplayInfo, VirtioGpuRespGetEdid,
+    GpuBackendReq, VhostUserGpuHeaderFlag, VhostUserGpuScanout, VhostUserGpuUpdate,
+    VirtioGpuDisplayOne, VirtioGpuRect, VirtioGpuRespDisplayInfo, VirtioGpuRespGetEdid,
 };
 use vhost::vhost_user::message::{
     FrontendReq, VhostUserConfigFlags, VhostUserMMap, VhostUserMMapFlags,
@@ -28,7 +31,7 @@ use vhost::vhost_user::{
     VhostUserProtocolFeatures,
 };
 use vhost::{VhostBackend, VhostUserMemoryRegionInfo, VringConfigData};
-use vm_memory::{Address, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Address, ByteValued, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
 use vmm_sys_util::eventfd::EventFd as VhostEventFd;
 
 use crate::display::DisplayInfo;
@@ -250,6 +253,30 @@ pub struct VhostUserDevice {
 
     /// Handler for backend-to-frontend requests (BACKEND_REQ protocol feature)
     backend_req_handler: Option<FrontendReqHandler<Mutex<BackendReqInner>>>,
+    display_backend: Option<DisplayBackend<'static>>,
+
+    display_instance: Option<EpollThreadLocal<DisplayBackendInstance>>,
+}
+
+struct EpollThreadLocal<T>(T);
+
+// SAFETY: VhostUserDevice is registered with a single EventManager and its
+// Subscriber::process() is always called from the same epoll thread. The
+// DisplayBackendInstance inside is created and used exclusively in that
+// callback, so it never actually crosses a thread boundary.
+unsafe impl<T> Send for EpollThreadLocal<T> {}
+
+impl<T> std::ops::Deref for EpollThreadLocal<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for EpollThreadLocal<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
 }
 
 impl VhostUserDevice {
@@ -273,6 +300,7 @@ impl VhostUserDevice {
         num_queues: u16,
         queue_sizes: &[u16],
         gpu_display: Option<DisplayInfo>,
+        display_backend: Option<DisplayBackend<'static>>,
     ) -> IoResult<Self> {
         debug!(
             "Connecting to vhost-user backend at {}",
@@ -369,6 +397,12 @@ impl VhostUserDevice {
             gpu_display_info,
             shm_region: None,
             backend_req_handler: None,
+            display_backend: if device_type == VIRTIO_ID_GPU {
+                display_backend
+            } else {
+                None
+            },
+            display_instance: None,
         })
     }
 
@@ -729,6 +763,7 @@ impl VirtioDevice for VhostUserDevice {
 
 impl VhostUserDevice {
     fn handle_gpu_socket_event(&mut self, event: &EpollEvent) {
+        debug!("{}: GPU socket event received", self.device_name);
         let event_set = event.event_set();
 
         if event_set.contains(EventSet::HANG_UP) || event_set.contains(EventSet::ERROR) {
@@ -790,9 +825,17 @@ impl VhostUserDevice {
     }
 
     fn handle_gpu_message(&mut self, request: u32, _flags: u32, payload: &[u8]) {
+        debug!(
+            "{}: GPU message: request={}, payload_len={}",
+            self.device_name,
+            request,
+            payload.len()
+        );
         match GpuBackendReq::try_from(request) {
             Ok(GpuBackendReq::GET_DISPLAY_INFO) => self.send_gpu_display_info(request),
             Ok(GpuBackendReq::GET_EDID) => self.send_gpu_edid(request, payload),
+            Ok(GpuBackendReq::SCANOUT) => self.handle_gpu_scanout(payload),
+            Ok(GpuBackendReq::UPDATE) => self.handle_gpu_update(payload),
             _ => {
                 warn!("{}: unhandled GPU message: {}", self.device_name, request);
             }
@@ -855,6 +898,164 @@ impl VhostUserDevice {
 
         if let Err(e) = self.send_gpu_response(request, &display_info) {
             error!("{}: failed to send DISPLAY_INFO: {}", self.device_name, e);
+        }
+    }
+
+    fn get_display_instance(&mut self) -> Option<&mut DisplayBackendInstance> {
+        if self.display_instance.is_none()
+            && let Some(backend) = self.display_backend.take()
+        {
+            match backend.create_instance() {
+                Ok(instance) => self.display_instance = Some(EpollThreadLocal(instance)),
+                Err(e) => {
+                    error!(
+                        "{}: failed to create display instance: {e}",
+                        self.device_name
+                    );
+                    return None;
+                }
+            }
+        }
+        self.display_instance.as_deref_mut()
+    }
+
+    fn handle_gpu_scanout(&mut self, payload: &[u8]) {
+        let header_size = std::mem::size_of::<VhostUserGpuScanout>();
+        if payload.len() < header_size {
+            error!("{}: SCANOUT payload too short", self.device_name);
+            return;
+        }
+        let mut scanout = VhostUserGpuScanout::default();
+        scanout
+            .as_mut_slice()
+            .copy_from_slice(&payload[..header_size]);
+
+        let scanout_id = scanout.scanout_id;
+
+        // Validate scanout ID - frontend only advertises scanout 0
+        if scanout_id != 0 {
+            error!(
+                "{}: invalid scanout_id {} (only 0 is supported)",
+                self.device_name, scanout_id
+            );
+            return;
+        }
+
+        if scanout.width == 0 || scanout.height == 0 {
+            debug!("{}: disabling scanout {scanout_id}", self.device_name);
+            if let Some(display) = self.get_display_instance()
+                && let Err(e) = display.disable_scanout(scanout_id)
+            {
+                error!("{}: disable_scanout failed: {e}", self.device_name);
+            }
+            return;
+        }
+
+        debug!(
+            "{}: configuring scanout {scanout_id} ({}x{})",
+            self.device_name, scanout.width, scanout.height
+        );
+
+        let display_info = self.gpu_display_info.as_ref();
+        let display_width = display_info.map_or(scanout.width, |d| d.width);
+        let display_height = display_info.map_or(scanout.height, |d| d.height);
+
+        if let Some(display) = self.get_display_instance()
+            && let Err(e) = display.configure_scanout(
+                scanout_id,
+                display_width,
+                display_height,
+                scanout.width,
+                scanout.height,
+                ResourceFormat::XRGB,
+            )
+        {
+            error!("{}: configure_scanout failed: {e}", self.device_name);
+        }
+    }
+
+    fn handle_gpu_update(&mut self, payload: &[u8]) {
+        let header_size = std::mem::size_of::<VhostUserGpuUpdate>();
+        if payload.len() < header_size {
+            error!("{}: UPDATE payload too short", self.device_name);
+            return;
+        }
+        let mut update = VhostUserGpuUpdate::default();
+        update
+            .as_mut_slice()
+            .copy_from_slice(&payload[..header_size]);
+
+        let pixel_data = &payload[header_size..];
+        let scanout_id = update.scanout_id;
+        let bytes_per_pixel = ResourceFormat::BYTES_PER_PIXEL;
+        let update_x = update.x as usize;
+        let update_y = update.y as usize;
+        let update_width = update.width as usize;
+        let update_height = update.height as usize;
+
+        if scanout_id != 0 {
+            error!(
+                "{}: invalid scanout_id {} (only 0 is supported)",
+                self.device_name, scanout_id
+            );
+            return;
+        }
+
+        let expected_len = update_width * update_height * bytes_per_pixel;
+        if pixel_data.len() < expected_len {
+            error!("{}: UPDATE pixel data too short", self.device_name);
+            return;
+        }
+
+        let scanout_width = self
+            .gpu_display_info
+            .as_ref()
+            .map_or(update_width, |d| d.width as usize);
+        let scanout_height = self
+            .gpu_display_info
+            .as_ref()
+            .map_or(update_height, |d| d.height as usize);
+
+        if update_x + update_width > scanout_width || update_y + update_height > scanout_height {
+            error!(
+                "{}: UPDATE rectangle out of bounds: ({},{}) {}x{} exceeds scanout {}x{}",
+                self.device_name,
+                update_x,
+                update_y,
+                update_width,
+                update_height,
+                scanout_width,
+                scanout_height
+            );
+            return;
+        }
+
+        let Some(display) = self.get_display_instance() else {
+            return;
+        };
+
+        let (frame_id, buffer) = match display.alloc_frame(scanout_id) {
+            Ok(frame) => frame,
+            Err(e) => {
+                error!("{}: alloc_frame failed: {e}", self.device_name);
+                return;
+            }
+        };
+
+        // UPDATE carries a rectangular region (x, y, width, height). For partial updates,
+        // pixel_data contains only the update rectangle, packed row-by-row. Copy each row
+        // into the correct position in the full-frame buffer.
+        for row in 0..update_height {
+            let dst_offset = ((update_y + row) * scanout_width + update_x) * bytes_per_pixel;
+            let src_offset = row * update_width * bytes_per_pixel;
+            let row_bytes = update_width * bytes_per_pixel;
+
+            buffer[dst_offset..dst_offset + row_bytes]
+                .copy_from_slice(&pixel_data[src_offset..src_offset + row_bytes]);
+        }
+
+        if let Err(e) = display.present_frame(scanout_id, frame_id, None) {
+            error!("{}: present_frame failed: {e}", self.device_name);
         }
     }
 

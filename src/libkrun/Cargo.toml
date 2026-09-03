@@ -18,7 +18,7 @@ gpu = ["vmm/gpu", "devices/gpu", "krun_display"]
 input = ["krun_input", "vmm/input", "devices/input"]
 virgl_resource_map2 = ["devices/virgl_resource_map2"]
 aws-nitro = ["vmm/aws-nitro", "devices/aws-nitro", "dep:aws-nitro", "dep:nitro-enclaves"]
-vhost-user = ["vmm/vhost-user", "devices/vhost-user"]
+vhost-user = ["vmm/vhost-user", "devices/vhost-user", "krun_display"]
 timesync = ["devices/timesync"]
 
 [dependencies]

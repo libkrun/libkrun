@@ -20,7 +20,7 @@ virgl_resource_map2 = []
 aws-nitro = []
 test_utils = []
 timesync = []
-vhost-user = ["vhost", "vmm-sys-util"]
+vhost-user = ["vhost", "vmm-sys-util", "krun_display"]
 
 [dependencies]
 bitflags = "1.2.0"
