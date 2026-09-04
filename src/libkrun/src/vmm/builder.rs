@@ -37,7 +37,8 @@ use super::{Error, Vmm};
 use crate::vmm::device_manager::legacy::PortIODeviceManager;
 use crate::vmm::device_manager::mmio::MMIODeviceManager;
 use crate::vmm::resources::{
-    DefaultVirtioConsoleConfig, PortConfig, TsiFlags, VirtioConsoleConfigMode, VmResources,
+    DefaultVirtioConsoleConfig, PortConfig, TsiFlags, VirtioConsoleConfigMode, VirtioTransport,
+    VmResources,
 };
 use crate::vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(feature = "net")]
@@ -925,6 +926,15 @@ pub fn build_microvm(
                 size: 4096,
                 attributes: 0,
             },
+            MeasuredRegion {
+                guest_addr: arch::x86_64::layout::RSDP_ADDR,
+                host_addr: guest_memory
+                    .get_host_address(GuestAddress(arch::x86_64::layout::RSDP_ADDR))
+                    .unwrap() as u64,
+                size: (arch::x86_64::layout::HIMEM_START - arch::x86_64::layout::RSDP_ADDR)
+                    as usize,
+                attributes: 0,
+            },
         ]
     };
 
@@ -1024,6 +1034,40 @@ pub fn build_microvm(
         &mut (arch::MMIO_MEM_START.clone()),
         (arch::IRQ_BASE, arch::IRQ_MAX),
     );
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let pci_device_manager = if vm_resources.virtio_transport == VirtioTransport::Pci {
+        log::debug!(
+            target: "krun_vmm::pci",
+            "virtio-pci transport: BAR base={:#x} ECAM={:#x} MSI GSI {}..{}",
+            arch::x86_64::layout::PCI_MMIO_START,
+            arch::x86_64::layout::PCI_ECAM_START,
+            arch::x86_64::layout::PCI_MSI_GSI_BASE,
+            arch::x86_64::layout::PCI_MSI_GSI_MAX,
+        );
+        let mut mgr = device_manager::pci::PciDeviceManager::new(
+            arch::x86_64::layout::PCI_MMIO_START,
+            (
+                arch::x86_64::layout::PCI_MSI_GSI_BASE,
+                arch::x86_64::layout::PCI_MSI_GSI_MAX,
+            ),
+            _sender.clone(),
+            // In-kernel irqchip: MSI-X GSI updates must preserve PIC/IOAPIC defaults.
+            !vm_resources.split_irqchip,
+        );
+        mgr.register_ecam(
+            &mut mmio_device_manager.bus,
+            arch::x86_64::layout::PCI_ECAM_START,
+        )
+        .map_err(|e| {
+            StartMicrovmError::Internal(Error::EventFd(io::Error::other(e.to_string())))
+        })?;
+        Some(mgr)
+    } else {
+        None
+    };
+
+    let virtio_transport = vm_resources.virtio_transport;
 
     #[cfg(target_os = "macos")]
     let vcpu_list = {
@@ -1197,6 +1241,8 @@ pub fn build_microvm(
         exit_code: exit_code.clone(),
         vm,
         mmio_device_manager,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        pci_device_manager,
         #[cfg(target_os = "macos")]
         vm_ctl_tx,
         #[cfg(target_os = "macos")]
@@ -1338,11 +1384,18 @@ pub fn build_microvm(
         load_cmdline(&vmm)?;
     }
 
+    #[cfg(target_os = "linux")]
+    let virtio_mmio_devices = vmm.mmio_device_manager.virtio_mmio_devices();
+    #[cfg(not(target_os = "linux"))]
+    let virtio_mmio_devices: Vec<(u64, u32)> = vec![];
+    let virtio_pci = virtio_transport == VirtioTransport::Pci;
     vmm.configure_system(
         vcpus.as_slice(),
         &intc,
         &payload_config.initrd_config,
         &vm_resources.smbios_oem_strings,
+        &virtio_mmio_devices,
+        virtio_pci,
         payload_config.pvh,
     )
     .map_err(StartMicrovmError::Internal)?;
@@ -2335,6 +2388,45 @@ fn create_vcpus_riscv64(
     Ok(vcpus)
 }
 
+/// Attaches a virtio device using the configured transport.
+fn attach_virtio_device(
+    vmm: &mut Vmm,
+    id: String,
+    intc: IrqChip,
+    device: Arc<Mutex<dyn VirtioDevice>>,
+) -> std::result::Result<(), device_manager::mmio::Error> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if vmm.pci_device_manager.is_some() {
+        return attach_pci_device(vmm, id, device)
+            .map_err(|e| device_manager::mmio::Error::EventFd(io::Error::other(e.to_string())));
+    }
+    attach_mmio_device(vmm, id, intc, device)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn attach_pci_device(
+    vmm: &mut Vmm,
+    id: String,
+    device: Arc<Mutex<dyn VirtioDevice>>,
+) -> std::result::Result<(), device_manager::pci::Error> {
+    let guest_mem = vmm.guest_memory().clone();
+    let vm_fd = vmm.vm.fd();
+    let pci_mgr = vmm
+        .pci_device_manager
+        .as_mut()
+        .expect("pci_device_manager must be initialized for PCI transport");
+    let type_id = device.lock().unwrap().device_type();
+    pci_mgr.register_pci_device(
+        vm_fd,
+        &mut vmm.mmio_device_manager.bus,
+        guest_mem,
+        device,
+        type_id,
+        id,
+    )?;
+    Ok(())
+}
+
 /// Attaches an virtio mmio device to the device manager.
 fn attach_mmio_device(
     vmm: &mut Vmm,
@@ -2345,20 +2437,13 @@ fn attach_mmio_device(
     let mmio_device = MmioTransport::new(vmm.guest_memory().clone(), intc, device)?;
 
     let type_id = mmio_device.locked_device().device_type();
-    let _cmdline = &mut vmm.kernel_cmdline;
 
     #[cfg(target_os = "linux")]
-    let (_mmio_base, _irq) =
-        vmm.mmio_device_manager
-            .register_mmio_device(vmm.vm.fd(), mmio_device, type_id, id)?;
-    #[cfg(target_os = "macos")]
-    let (_mmio_base, _irq) =
-        vmm.mmio_device_manager
-            .register_mmio_device(mmio_device, type_id, id)?;
-
-    #[cfg(target_arch = "x86_64")]
     vmm.mmio_device_manager
-        .add_device_to_cmdline(_cmdline, _mmio_base, _irq)?;
+        .register_mmio_device(vmm.vm.fd(), mmio_device, type_id, id)?;
+    #[cfg(target_os = "macos")]
+    vmm.mmio_device_manager
+        .register_mmio_device(mmio_device, type_id, id)?;
 
     Ok(())
 }
@@ -2410,7 +2495,7 @@ fn attach_fs_devices(
         fs.lock().unwrap().set_map_sender(map_sender.clone());
 
         // The device mutex mustn't be locked here otherwise it will deadlock.
-        attach_mmio_device(vmm, id, intc.clone(), fs).map_err(RegisterFsDevice)?;
+        attach_virtio_device(vmm, id, intc.clone(), fs).map_err(RegisterFsDevice)?;
     }
 
     Ok(())
@@ -2800,7 +2885,7 @@ fn attach_console_devices(
         .map_err(RegisterFsSigwinch)?;
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
-    attach_mmio_device(vmm, format!("hvc{id_number}"), intc, console)
+    attach_virtio_device(vmm, format!("hvc{id_number}"), intc, console)
         .map_err(RegisterConsoleDevice)?;
 
     Ok(())
@@ -2815,7 +2900,7 @@ fn attach_net_devices(
     for net_device in net_devices.list.iter() {
         let id = net_device.lock().unwrap().id().to_string();
 
-        attach_mmio_device(vmm, id, intc.clone(), net_device.clone())
+        attach_virtio_device(vmm, id, intc.clone(), net_device.clone())
             .map_err(StartMicrovmError::RegisterNetDevice)?;
     }
     Ok(())
@@ -2836,7 +2921,7 @@ fn attach_unixsock_vsock_device(
     let id = String::from(unix_vsock.lock().unwrap().id());
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
-    attach_mmio_device(vmm, id, intc, unix_vsock.clone()).map_err(RegisterVsockDevice)?;
+    attach_virtio_device(vmm, id, intc, unix_vsock.clone()).map_err(RegisterVsockDevice)?;
 
     Ok(())
 }
@@ -2858,7 +2943,7 @@ fn attach_balloon_device(
     let id = String::from(balloon.lock().unwrap().id());
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
-    attach_mmio_device(vmm, id, intc.clone(), balloon).map_err(RegisterBalloonDevice)?;
+    attach_virtio_device(vmm, id, intc.clone(), balloon).map_err(RegisterBalloonDevice)?;
 
     Ok(())
 }
@@ -2875,7 +2960,7 @@ fn attach_block_devices(
         let id = String::from(block.lock().unwrap().id());
 
         // The device mutex mustn't be locked here otherwise it will deadlock.
-        attach_mmio_device(vmm, id, intc.clone(), block.clone()).map_err(RegisterBlockDevice)?;
+        attach_virtio_device(vmm, id, intc.clone(), block.clone()).map_err(RegisterBlockDevice)?;
     }
 
     Ok(())
@@ -2898,7 +2983,7 @@ fn attach_rng_device(
     let id = String::from(rng.lock().unwrap().id());
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
-    attach_mmio_device(vmm, id, intc.clone(), rng).map_err(RegisterRngDevice)?;
+    attach_virtio_device(vmm, id, intc.clone(), rng).map_err(RegisterRngDevice)?;
 
     Ok(())
 }
@@ -2948,7 +3033,8 @@ fn attach_vhost_user_device(
         .add_subscriber(device.clone())
         .map_err(RegisterEvent)?;
 
-    attach_mmio_device(vmm, device_name, intc.clone(), device).map_err(RegisterVhostUserDevice)?;
+    attach_virtio_device(vmm, device_name, intc.clone(), device)
+        .map_err(RegisterVhostUserDevice)?;
 
     Ok(())
 }
@@ -2997,7 +3083,7 @@ fn attach_gpu_device(
     }
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
-    attach_mmio_device(vmm, id, intc, gpu).map_err(RegisterGpuDevice)?;
+    attach_virtio_device(vmm, id, intc, gpu).map_err(RegisterGpuDevice)?;
 
     Ok(())
 }
@@ -3019,7 +3105,7 @@ fn attach_input_devices(
         ));
 
         let id = format!("input{}", index);
-        attach_mmio_device(vmm, id, intc.clone(), input_device).map_err(RegisterInputDevice)?;
+        attach_virtio_device(vmm, id, intc.clone(), input_device).map_err(RegisterInputDevice)?;
     }
 
     Ok(())

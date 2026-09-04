@@ -7,8 +7,13 @@
 
 use std::fmt::{Display, Formatter};
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+#[cfg(target_arch = "x86_64")]
+use super::pci_common::VIRTQ_MSI_NO_VECTOR;
+#[cfg(target_arch = "x86_64")]
+use crate::pci::MsixConfig;
 
 use utils::eventfd::EFD_NONBLOCK;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -80,12 +85,21 @@ pub struct MmioTransport {
     interrupt: InterruptTransport,
 }
 
+#[cfg(target_arch = "x86_64")]
+struct PciMsixBackend {
+    msix: Arc<Mutex<MsixConfig>>,
+    config_vector: Arc<AtomicU16>,
+    queue_vectors: Arc<Mutex<Vec<u16>>>,
+}
+
 struct InterruptTransportInner {
     log_target: String,
     status: AtomicUsize,
     event: EventFd,
     intc: IrqChip,
     irq_line: Option<u32>,
+    #[cfg(target_arch = "x86_64")]
+    pci_msix: Option<PciMsixBackend>,
 }
 
 #[derive(Clone)]
@@ -99,6 +113,49 @@ impl InterruptTransport {
             event: EventFd::new(0).map_err(CreateMmioTransportError::CreateInterruptEventFd)?,
             intc,
             irq_line: None,
+            #[cfg(target_arch = "x86_64")]
+            pci_msix: None,
+        })))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn new_pci(
+        msix: Arc<Mutex<MsixConfig>>,
+        config_vector: Arc<AtomicU16>,
+        queue_vectors: Arc<Mutex<Vec<u16>>>,
+        log_target: String,
+    ) -> Result<Self, CreateMmioTransportError> {
+        struct NoopIrqChip;
+        impl crate::legacy::IrqChipT for NoopIrqChip {
+            fn get_mmio_addr(&self) -> u64 {
+                0
+            }
+            fn get_mmio_size(&self) -> u64 {
+                0
+            }
+            fn set_irq(
+                &self,
+                _irq_line: Option<u32>,
+                _event: Option<&EventFd>,
+            ) -> Result<(), crate::Error> {
+                Ok(())
+            }
+        }
+        impl crate::bus::BusDevice for NoopIrqChip {}
+
+        Ok(Self(Arc::new(InterruptTransportInner {
+            log_target,
+            status: AtomicUsize::new(0),
+            event: EventFd::new(0).map_err(CreateMmioTransportError::CreateInterruptEventFd)?,
+            intc: Arc::new(Mutex::new(crate::legacy::IrqChipDevice::new(Box::new(
+                NoopIrqChip,
+            )))),
+            irq_line: None,
+            pci_msix: Some(PciMsixBackend {
+                msix,
+                config_vector,
+                queue_vectors,
+            }),
         })))
     }
 
@@ -130,8 +187,29 @@ impl InterruptTransport {
         }
     }
 
-    fn try_signal(&self, status: u32) -> Result<(), crate::Error> {
-        self.status().fetch_or(status as usize, Ordering::SeqCst);
+    fn signal_used_queue_inner(&self, queue_index: usize) -> Result<(), crate::Error> {
+        debug!(target: &self.0.log_target, "interrupt: signal_used_queue");
+        self.status()
+            .fetch_or(VIRTIO_MMIO_INT_VRING as usize, Ordering::SeqCst);
+        #[cfg(target_arch = "x86_64")]
+        if let Some(pci) = &self.0.pci_msix {
+            let vector = pci
+                .queue_vectors
+                .lock()
+                .unwrap()
+                .get(queue_index)
+                .copied()
+                .unwrap_or(VIRTQ_MSI_NO_VECTOR);
+            if vector == VIRTQ_MSI_NO_VECTOR {
+                return Ok(());
+            }
+            return pci
+                .msix
+                .lock()
+                .unwrap()
+                .trigger_vector(vector as usize)
+                .map_err(crate::Error::FailedSignalingUsedQueue);
+        }
         self.intc()
             .lock()
             .unwrap()
@@ -140,18 +218,60 @@ impl InterruptTransport {
     }
 
     pub fn try_signal_used_queue(&self) -> Result<(), crate::Error> {
-        debug!(target: &self.0.log_target, "interrupt: signal_used_queue");
-        self.try_signal(VIRTIO_MMIO_INT_VRING)
+        #[cfg(target_arch = "x86_64")]
+        if let Some(pci) = &self.0.pci_msix {
+            // MMIO callers share one IRQ; under MSI-X notify every assigned queue vector.
+            let vectors = pci.queue_vectors.lock().unwrap().clone();
+            for (idx, vector) in vectors.iter().enumerate() {
+                if *vector != VIRTQ_MSI_NO_VECTOR {
+                    self.signal_used_queue_inner(idx)?;
+                }
+            }
+            return Ok(());
+        }
+        self.signal_used_queue_inner(0)
+    }
+
+    pub fn try_signal_used_queue_index(&self, queue_index: usize) -> Result<(), crate::Error> {
+        self.signal_used_queue_inner(queue_index)
     }
 
     pub fn try_signal_config_change(&self) -> Result<(), crate::Error> {
         debug!(target: &self.0.log_target, "interrupt: signal_config_change");
-        self.try_signal(VIRTIO_MMIO_INT_CONFIG)
+        #[cfg(target_arch = "x86_64")]
+        if let Some(pci) = &self.0.pci_msix {
+            let vector = pci.config_vector.load(Ordering::Acquire);
+            if vector != VIRTQ_MSI_NO_VECTOR {
+                return pci
+                    .msix
+                    .lock()
+                    .unwrap()
+                    .trigger_vector(vector as usize)
+                    .map_err(crate::Error::FailedSignalingUsedQueue);
+            }
+            return Ok(());
+        }
+        self.status()
+            .fetch_or(VIRTIO_MMIO_INT_CONFIG as usize, Ordering::SeqCst);
+        self.intc()
+            .lock()
+            .unwrap()
+            .set_irq(self.0.irq_line, Some(&self.0.event))?;
+        Ok(())
     }
 
     pub fn signal_used_queue(&self) {
         if let Err(e) = self.try_signal_used_queue() {
             warn!(target: &self.0.log_target, "Failed to signal used queue: {e:?}");
+        }
+    }
+
+    pub fn signal_used_queue_index(&self, queue_index: usize) {
+        if let Err(e) = self.try_signal_used_queue_index(queue_index) {
+            warn!(
+                target: &self.0.log_target,
+                "Failed to signal used queue {queue_index}: {e:?}"
+            );
         }
     }
 

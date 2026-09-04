@@ -49,6 +49,7 @@ static void print_help(char *const name)
         "              --vhost-user-vsock=PATH Use vhost-user vsock backend at socket PATH\n"
         "              --vhost-user-can=PATH Use vhost-user CAN backend at socket PATH\n"
         "              --vhost-user-console=PATH Use vhost-user console backend at socket PATH\n"
+        "              --virtio-pci            Use virtio-pci instead of virtio-mmio\n"
         "NET_MODE can be either TSI (default) or PASST\n"
         "\n"
         "NEWROOT:      the root directory of the vm\n"
@@ -108,6 +109,7 @@ static const struct option long_options[] = {
     { "vhost-user-can", required_argument, NULL, 'A' },
     { "vhost-user-console", required_argument, NULL, 'O' },
     { "vhost-user-media", required_argument, NULL, 'M' },
+    { "virtio-pci", no_argument, NULL, 'T' },
     { NULL, 0, NULL, 0 }
 };
 
@@ -126,6 +128,7 @@ struct cmdline {
     char const *vhost_user_can_socket;
     char const *vhost_user_console_socket;
     char const *vhost_user_media_socket;
+    bool virtio_pci;
     char const *new_root;
     char *const *guest_argv;
 };
@@ -161,6 +164,7 @@ bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
         .vhost_user_can_socket = NULL,
         .vhost_user_console_socket = NULL,
         .vhost_user_media_socket = NULL,
+        .virtio_pci = false,
         .new_root = NULL,
         .guest_argv = NULL,
         .log_target = KRUN_LOG_TARGET_DEFAULT,
@@ -222,6 +226,9 @@ bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
             break;
         case 'M':
             cmdline->vhost_user_media_socket = optarg;
+            break;
+        case 'T':
+            cmdline->virtio_pci = true;
             break;
         case '?':
             return false;
@@ -341,11 +348,19 @@ int main(int argc, char *const argv[])
         return -1;
     }
 
-    // Configure the number of vCPUs (1) and the amount of RAM (512 MiB).
+    // Configure the number of vCPUs (4) and the amount of RAM (4096 MiB).
     if (err = krun_set_vm_config(ctx_id, 4, 4096)) {
         errno = -err;
         perror("Error configuring the number of vCPUs and/or the amount of RAM");
         return -1;
+    }
+
+    if (cmdline.virtio_pci) {
+        if (err = krun_set_virtio_transport(ctx_id, KRUN_VIRTIO_PCI_TRNSPT)) {
+            errno = -err;
+            perror("Error configuring virtio-pci transport");
+            return -1;
+        }
     }
 
     if (err = krun_add_virtio_console_default(ctx_id, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO)) {

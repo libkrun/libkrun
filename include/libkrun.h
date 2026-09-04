@@ -1413,6 +1413,21 @@ int32_t krun_vm_pause(uint32_t ctx_id);
  */
 int32_t krun_vm_resume(uint32_t ctx_id);
 
+#define KRUN_VIRTIO_MMIO_TRNSPT 0
+#define KRUN_VIRTIO_PCI_TRNSPT 1
+
+/**
+ * Configure the bus transport for virtio devices.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *  "transport" - KRUN_VIRTIO_MMIO_TRNSPT or KRUN_VIRTIO_PCI_TRNSPT.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_virtio_transport(uint32_t ctx_id, uint32_t transport);
+
 #ifdef __cplusplus
 }
 #endif

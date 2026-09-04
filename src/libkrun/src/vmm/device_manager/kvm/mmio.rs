@@ -14,6 +14,7 @@ use devices::DeviceType;
 use devices::fdt::DeviceInfoForFDT;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::legacy::IrqChip;
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use kernel::cmdline as kernel_cmdline;
 use kvm_ioctls::{IoEventAddress, VmFd};
 #[cfg(target_arch = "aarch64")]
@@ -28,8 +29,6 @@ pub enum Error {
     CreateMmioTransport(devices::virtio::CreateMmioTransportError),
     /// Failed to perform an operation on the bus.
     BusError(devices::BusError),
-    /// Appending to kernel command line failed.
-    Cmdline(kernel_cmdline::Error),
     /// Failure in creating or cloning an event fd.
     EventFd(io::Error),
     /// No more IRQs are available.
@@ -38,6 +37,9 @@ pub enum Error {
     RegisterIoEvent(kvm_ioctls::Error),
     /// Registering an IRQ FD failed.
     RegisterIrqFd(kvm_ioctls::Error),
+    /// Failed to insert a device in the kernel command line.
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    Cmdline(kernel_cmdline::Error),
     /// Failed to create vhost-user device.
     #[cfg(all(feature = "vhost-user", target_os = "linux"))]
     VhostUserDevice(io::Error),
@@ -50,13 +52,14 @@ impl fmt::Display for Error {
                 write!(f, "failed to create mmio transport for the device {e}")
             }
             Error::BusError(ref e) => write!(f, "failed to perform bus operation: {e}"),
-            Error::Cmdline(ref e) => {
-                write!(f, "unable to add device to kernel command line: {e}")
-            }
             Error::EventFd(ref e) => write!(f, "failed to create or clone event descriptor: {e}"),
             Error::IrqsExhausted => write!(f, "no more IRQs are available"),
             Error::RegisterIoEvent(ref e) => write!(f, "failed to register IO event: {e}"),
             Error::RegisterIrqFd(ref e) => write!(f, "failed to register irqfd: {e}"),
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+            Error::Cmdline(ref e) => {
+                write!(f, "failed to insert device in kernel command line: {e}")
+            }
             #[cfg(all(feature = "vhost-user", target_os = "linux"))]
             Error::VhostUserDevice(ref e) => write!(f, "failed to create vhost-user device: {e}"),
         }
@@ -162,27 +165,6 @@ impl MMIODeviceManager {
         Ok(ret)
     }
 
-    /// Append a registered MMIO device to the kernel cmdline.
-    #[cfg(target_arch = "x86_64")]
-    pub fn add_device_to_cmdline(
-        &mut self,
-        cmdline: &mut kernel_cmdline::Cmdline,
-        mmio_base: u64,
-        irq: u32,
-    ) -> Result<()> {
-        // as per doc, [virtio_mmio.]device=<size>@<baseaddr>:<irq> needs to be appended
-        // to kernel commandline for virtio mmio devices to get recognized
-        // the size parameter has to be transformed to KiB, so dividing hexadecimal value in
-        // bytes to 1024; further, the '{}' formatting rust construct will automatically
-        // transform it to decimal
-        cmdline
-            .insert(
-                "virtio_mmio.device",
-                &format!("{}K@0x{:08x}:{}", MMIO_LEN / 1024, mmio_base, irq),
-            )
-            .map_err(Error::Cmdline)
-    }
-
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     /// Register an early console at some MMIO address.
     pub fn register_mmio_serial(
@@ -273,6 +255,23 @@ impl MMIODeviceManager {
     pub fn get_device_info(&self) -> &HashMap<(DeviceType, String), MMIODeviceInfo> {
         &self.id_to_dev_info
     }
+
+    /// Gets the MMIO base address and IRQ for all registered virtio devices.
+    pub fn virtio_mmio_devices(&self) -> Vec<(u64, u32)> {
+        let mut devices: Vec<(u64, u32)> = self
+            .id_to_dev_info
+            .iter()
+            .filter_map(|((device_type, _), info)| {
+                if matches!(device_type, DeviceType::Virtio(_)) {
+                    Some((info.addr, info._irq))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        devices.sort_unstable_by_key(|(base, _)| *base);
+        devices
+    }
 }
 
 /// Private structure for storing information about the MMIO device registered at some address on the bus.
@@ -322,7 +321,6 @@ mod tests {
             vm: &VmFd,
             guest_mem: GuestMemoryMmap,
             device: Arc<Mutex<dyn devices::virtio::VirtioDevice>>,
-            _cmdline: &mut kernel_cmdline::Cmdline,
             type_id: u32,
             device_id: &str,
         ) -> Result<u64> {
@@ -331,8 +329,6 @@ mod tests {
                     .unwrap();
             let (mmio_base, _irq) =
                 self.register_mmio_device(vm, mmio_device, type_id, device_id.to_string())?;
-            #[cfg(target_arch = "x86_64")]
-            self.add_device_to_cmdline(_cmdline, mmio_base, _irq)?;
             Ok(mmio_base)
         }
     }
@@ -409,12 +405,11 @@ mod tests {
         #[cfg(target_arch = "aarch64")]
         let _gic = KvmGicV3::new(vm.fd(), 1).unwrap();
 
-        let mut cmdline = kernel_cmdline::Cmdline::new(4096);
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
 
         assert!(
             device_manager
-                .register_virtio_device(vm.fd(), guest_mem, dummy, &mut cmdline, 0, "dummy")
+                .register_virtio_device(vm.fd(), guest_mem, dummy, 0, "dummy")
                 .is_ok()
         );
     }
@@ -433,15 +428,12 @@ mod tests {
         #[cfg(target_arch = "aarch64")]
         let _gic = KvmGicV3::new(vm.fd(), 1).unwrap();
 
-        let mut cmdline = kernel_cmdline::Cmdline::new(4096);
-
         for _i in arch::IRQ_BASE..=arch::IRQ_MAX {
             device_manager
                 .register_virtio_device(
                     vm.fd(),
                     guest_mem.clone(),
                     Arc::new(Mutex::new(DummyDevice::new())),
-                    &mut cmdline,
                     0,
                     "dummy1",
                 )
@@ -455,7 +447,6 @@ mod tests {
                         vm.fd(),
                         guest_mem,
                         Arc::new(Mutex::new(DummyDevice::new())),
-                        &mut cmdline,
                         0,
                         "dummy2"
                     )
@@ -474,29 +465,6 @@ mod tests {
 
     #[test]
     fn test_error_messages() {
-        let device_manager =
-            MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
-        let mut cmdline = kernel_cmdline::Cmdline::new(4096);
-        let e = Error::Cmdline(
-            cmdline
-                .insert(
-                    "virtio_mmio=device",
-                    &format!(
-                        "{}K@0x{:08x}:{}",
-                        MMIO_LEN / 1024,
-                        device_manager.mmio_base,
-                        device_manager.irq
-                    ),
-                )
-                .unwrap_err(),
-        );
-        assert_eq!(
-            format!("{e}"),
-            format!(
-                "unable to add device to kernel command line: {}",
-                kernel_cmdline::Error::HasEquals
-            ),
-        );
         assert_eq!(
             format!("{}", Error::BusError(devices::BusError::Overlap)),
             format!(
@@ -527,19 +495,13 @@ mod tests {
         let vm = builder::setup_vm(&guest_mem, false).unwrap();
         let mut device_manager =
             MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
-        let mut cmdline = kernel_cmdline::Cmdline::new(4096);
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
 
         let type_id = 0;
         let id = String::from("foo");
-        if let Ok(addr) = device_manager.register_virtio_device(
-            vm.fd(),
-            guest_mem,
-            dummy,
-            &mut cmdline,
-            type_id,
-            &id,
-        ) {
+        if let Ok(addr) =
+            device_manager.register_virtio_device(vm.fd(), guest_mem, dummy, type_id, &id)
+        {
             assert_eq!(
                 addr,
                 device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id.clone())].addr
@@ -549,5 +511,46 @@ mod tests {
                 device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id.clone())]._irq
             );
         }
+    }
+
+    #[test]
+    fn test_virtio_mmio_devices() {
+        let start_addr1 = GuestAddress(0x0);
+        let start_addr2 = GuestAddress(0x1000);
+        let guest_mem =
+            GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+        let vm = builder::setup_vm(&guest_mem, false).unwrap();
+        let mut device_manager =
+            MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
+        #[cfg(target_arch = "x86_64")]
+        let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
+        #[cfg(target_arch = "aarch64")]
+        let _gic = KvmGicV3::new(vm.fd(), 1).unwrap();
+
+        assert!(device_manager.virtio_mmio_devices().is_empty());
+
+        device_manager
+            .register_virtio_device(
+                vm.fd(),
+                guest_mem.clone(),
+                Arc::new(Mutex::new(DummyDevice::new())),
+                0,
+                "dev0",
+            )
+            .unwrap();
+        device_manager
+            .register_virtio_device(
+                vm.fd(),
+                guest_mem,
+                Arc::new(Mutex::new(DummyDevice::new())),
+                0,
+                "dev1",
+            )
+            .unwrap();
+
+        let devices = device_manager.virtio_mmio_devices();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0], (0xd000_0000, arch::IRQ_BASE));
+        assert_eq!(devices[1], (0xd000_1000, arch::IRQ_BASE + 1));
     }
 }

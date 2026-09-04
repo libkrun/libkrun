@@ -54,9 +54,17 @@ impl super::Vmm {
                 let mut routing = kvm_bindings::KvmIrqRouting::new(entries.len()).unwrap();
                 let routing_entries = routing.as_mut_slice();
                 routing_entries.copy_from_slice(&entries);
-                sender
-                    .send(self.vm.fd().set_gsi_routing(&routing).is_ok())
-                    .unwrap();
+                let ok = match self.vm.fd().set_gsi_routing(&routing) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        error!(
+                            "KVM_SET_GSI_ROUTING failed ({} entries): {e}",
+                            entries.len()
+                        );
+                        false
+                    }
+                };
+                sender.send(ok).unwrap();
             }
             #[cfg(target_arch = "x86_64")]
             WorkerMessage::IrqLine(sender, irq, active) => {

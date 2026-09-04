@@ -18,6 +18,8 @@ pub mod display;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub mod fdt;
 pub mod legacy;
+#[cfg(target_arch = "x86_64")]
+pub mod pci;
 pub mod virtio;
 
 pub use self::bus::{Bus, BusDevice, Error as BusError};

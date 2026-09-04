@@ -2042,6 +2042,34 @@ pub extern "C" fn krun_get_max_vcpus() -> i32 {
 
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
+pub extern "C" fn krun_set_virtio_transport(ctx_id: u32, transport: u32) -> i32 {
+    use vmm::resources::VirtioTransport;
+
+    let virtio_transport = match transport {
+        KRUN_VIRTIO_MMIO_TRNSPT => VirtioTransport::Mmio,
+        KRUN_VIRTIO_PCI_TRNSPT => {
+            if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                return -libc::EINVAL;
+            }
+            VirtioTransport::Pci
+        }
+        _ => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg.get_mut().vmr.set_virtio_transport(virtio_transport);
+            KRUN_SUCCESS
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
+}
+
+const KRUN_VIRTIO_MMIO_TRNSPT: u32 = 0;
+const KRUN_VIRTIO_PCI_TRNSPT: u32 = 1;
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub extern "C" fn krun_split_irqchip(ctx_id: u32, enable: bool) -> i32 {
     if enable && !cfg!(target_arch = "x86_64") {
         return -libc::EINVAL;
@@ -3134,9 +3162,14 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
     }
 
+    // virtio-pci MSI-X updates KVM GSI routes via the worker. Without it,
+    // programming the MSI-X table blocks the vCPU forever on reply_rx.recv().
     #[cfg(target_arch = "x86_64")]
-    if ctx_cfg.vmr.split_irqchip {
-        vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
+    {
+        use vmm::resources::VirtioTransport;
+        if ctx_cfg.vmr.split_irqchip || ctx_cfg.vmr.virtio_transport == VirtioTransport::Pci {
+            vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
+        }
     }
 
     #[cfg(any(feature = "amd-sev", feature = "tdx"))]

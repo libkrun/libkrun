@@ -46,6 +46,14 @@ type Result<E> = std::result::Result<(), E>;
 // Re-export TsiFlags from devices crate
 pub use devices::virtio::TsiFlags;
 
+/// Virtio device transport type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VirtioTransport {
+    #[default]
+    Mmio,
+    Pci,
+}
+
 #[cfg(feature = "vhost-user")]
 /// Configuration for a vhost-user device.
 #[derive(Debug, Clone)]
@@ -238,6 +246,8 @@ pub struct VmResources {
     /// Enable the embedded dhcp client in init.c
     #[cfg(feature = "net")]
     pub dhcp_client: bool,
+    /// Virtio device transport (MMIO or PCI).
+    pub virtio_transport: VirtioTransport,
 }
 
 impl VmResources {
@@ -296,6 +306,11 @@ impl VmResources {
         }
 
         Ok(())
+    }
+
+    /// Set the virtio device transport type.
+    pub fn set_virtio_transport(&mut self, transport: VirtioTransport) {
+        self.virtio_transport = transport;
     }
 
     /// Set the guest kernel cmdline configuration.

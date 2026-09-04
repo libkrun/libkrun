@@ -31,6 +31,10 @@ pub mod linux_errno;
 mod mmio;
 #[cfg(feature = "net")]
 pub mod net;
+#[cfg(target_arch = "x86_64")]
+mod pci;
+#[cfg(target_arch = "x86_64")]
+mod pci_common;
 mod queue;
 #[cfg(not(feature = "tee"))]
 pub mod rng;
@@ -51,6 +55,8 @@ pub use self::gpu::*;
 pub use self::mmio::*;
 #[cfg(feature = "net")]
 pub use self::net::Net;
+#[cfg(target_arch = "x86_64")]
+pub use self::pci::*;
 pub use self::queue::{Descriptor, DescriptorChain, Queue};
 #[cfg(not(feature = "tee"))]
 pub use self::rng::*;
