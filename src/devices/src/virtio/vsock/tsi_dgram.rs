@@ -9,8 +9,8 @@ use nix::fcntl::{FcntlArg, OFlag, fcntl};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::UnixAddr;
 use nix::sys::socket::{
-    AddressFamily, MsgFlags, SockFlag, SockType, SockaddrIn, SockaddrLike, SockaddrStorage, bind,
-    connect, getpeername, recv, send, sendto, socket,
+    AddressFamily, MsgFlags, SockFlag, SockProtocol, SockType, SockaddrIn, SockaddrLike,
+    SockaddrStorage, bind, connect, getpeername, recv, send, sendto, socket,
 };
 
 use super::super::Queue as VirtQueue;
@@ -38,6 +38,8 @@ pub struct TsiDgramProxy {
     sendto_addr: Option<SockaddrStorage>,
     listening: bool,
     family: AddressFamily,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    protocol: u16,
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
     rxq: Arc<Mutex<MuxerRxQ>>,
@@ -48,11 +50,13 @@ pub struct TsiDgramProxy {
 }
 
 impl TsiDgramProxy {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u64,
         cid: u64,
         family: u16,
         peer_port: u32,
+        protocol: u16,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
@@ -65,7 +69,15 @@ impl TsiDgramProxy {
             _ => return Err(ProxyError::InvalidFamily),
         };
 
-        let fd = socket(family, SockType::Datagram, SockFlag::empty(), None)
+        // When the guest requests IPPROTO_ICMP (1) or IPPROTO_ICMPV6 (58),
+        // create a ping socket instead of a plain UDP socket.
+        let sock_protocol = match protocol as _ {
+            libc::IPPROTO_ICMP => Some(SockProtocol::Icmp),
+            libc::IPPROTO_ICMPV6 => Some(SockProtocol::IcmpV6),
+            _ => None,
+        };
+
+        let fd = socket(family, SockType::Datagram, SockFlag::empty(), sock_protocol)
             .map_err(ProxyError::CreatingSocket)?;
 
         // macOS forces us to do this here instead of just using SockFlag::SOCK_NONBLOCK above.
@@ -106,6 +118,7 @@ impl TsiDgramProxy {
             sendto_addr: None,
             listening: false,
             family,
+            protocol,
             mem,
             queue,
             rxq,
@@ -170,11 +183,27 @@ impl TsiDgramProxy {
             match recv(self.fd.as_raw_fd(), &mut buf[..max_len], MsgFlags::empty()) {
                 Ok(cnt) => {
                     debug!("recv cnt={cnt}");
-                    if cnt > 0 {
-                        RecvPkt::Read(cnt)
-                    } else {
-                        RecvPkt::Close
+                    if cnt == 0 {
+                        return RecvPkt::Close;
                     }
+
+                    // macOS DGRAM ICMP sockets include the IPv4 header in
+                    // recv, unlike Linux which strips it.  Strip the IPv4
+                    // header so the guest sees the same format as a Linux
+                    // ping socket.  IPv6 DGRAM sockets do NOT prepend a
+                    // header on any platform, so only strip for IPPROTO_ICMP.
+                    #[cfg(target_os = "macos")]
+                    if self.protocol as libc::c_int == libc::IPPROTO_ICMP && cnt >= 20 {
+                        // IHL (Internet Header Length): low 4 bits of first
+                        // byte, in 32-bit words.
+                        let ip_hdr_len = (buf[0] & 0x0F) as usize * 4;
+                        if ip_hdr_len <= cnt {
+                            buf.copy_within(ip_hdr_len..cnt, 0);
+                            return RecvPkt::Read(cnt - ip_hdr_len);
+                        }
+                    }
+
+                    RecvPkt::Read(cnt)
                 }
                 Err(e) => {
                     debug!("recv_pkt: recv error: {e:?}");

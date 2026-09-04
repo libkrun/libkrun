@@ -103,6 +103,7 @@ pub struct TsiProxyCreate {
     pub peer_port: u32,
     pub family: u16,
     pub _type: u16,
+    pub protocol: u16,
 }
 
 #[repr(C)]
@@ -625,15 +626,24 @@ impl VsockPacket {
     }
 
     pub fn read_proxy_create(&self) -> Option<TsiProxyCreate> {
-        if self.buf_size >= 6 {
-            let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
-            let family: u16 = byte_order::read_le_u16(&self.buf().unwrap()[4..]);
-            let _type: u16 = byte_order::read_le_u16(&self.buf().unwrap()[6..]);
+        if self.buf_size >= 8 {
+            let buf = self.buf().unwrap();
+            let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
+            let family: u16 = byte_order::read_le_u16(&buf[4..]);
+            let _type: u16 = byte_order::read_le_u16(&buf[6..]);
+            // Protocol field added for ICMP ping socket support. Old guests
+            // that don't send it get 0 (= default, same as before).
+            let protocol: u16 = if self.buf_size >= 10 {
+                byte_order::read_le_u16(&buf[8..])
+            } else {
+                0
+            };
 
             Some(TsiProxyCreate {
                 peer_port,
                 family,
                 _type,
+                protocol,
             })
         } else {
             None

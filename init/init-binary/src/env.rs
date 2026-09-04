@@ -174,6 +174,17 @@ pub fn enable_dummy_interface() {
     }
 }
 
+/// Allow all GIDs to create ICMP ping sockets (SOCK_DGRAM + IPPROTO_ICMP).
+/// Without this the guest kernel rejects them with EACCES, preventing TSI
+/// from hijacking ping sockets.
+#[cfg(target_os = "linux")]
+pub fn enable_ping_sockets() {
+    use std::fs;
+    if let Err(e) = fs::write("/proc/sys/net/ipv4/ping_group_range", "0 2147483647") {
+        eprintln!("Warning: failed to set ping_group_range: {e}");
+    }
+}
+
 pub fn apply_hostname() {
     let hostname = env::var("HOSTNAME").unwrap_or_else(|_| "localhost".into());
     let _ = nix::unistd::sethostname(&hostname);

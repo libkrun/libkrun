@@ -27,6 +27,9 @@ use test_net_perf::TestNetPerf;
 mod test_multiport_console;
 use test_multiport_console::TestMultiportConsole;
 
+mod test_tsi_ping;
+use test_tsi_ping::TestTsiPing;
+
 #[cfg(any(feature = "host", target_os = "linux"))]
 mod test_virtiofs_root_ro;
 #[cfg(any(feature = "host", target_os = "linux"))]
@@ -117,6 +120,8 @@ pub fn test_cases() -> Vec<TestCase> {
             Box::new(TestNet::new_gvproxy_long_path()),
         ),
         TestCase::new("net-vmnet-helper", Box::new(TestNet::new_vmnet_helper())),
+        TestCase::new("tsi-ping", Box::new(TestTsiPing::v4())),
+        TestCase::new("tsi-ping6", Box::new(TestTsiPing::v6())),
         TestCase::new("multiport-console", Box::new(TestMultiportConsole)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-root-ro", Box::new(TestVirtiofsRootRo)),

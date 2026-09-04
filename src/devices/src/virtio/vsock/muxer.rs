@@ -316,7 +316,7 @@ impl VsockMuxer {
                     }
                 }
                 defs::SOCK_DGRAM => {
-                    debug!("proxy create dgram");
+                    debug!("proxy create dgram (protocol={})", req.protocol);
                     let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
                     if req.family as i32 == libc::AF_UNIX
                         && !self.tsi_flags.contains(TsiFlags::HIJACK_UNIX)
@@ -335,6 +335,7 @@ impl VsockMuxer {
                         self.cid,
                         req.family,
                         req.peer_port,
+                        req.protocol,
                         mem.clone(),
                         queue.clone(),
                         self.rxq.clone(),

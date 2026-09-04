@@ -152,7 +152,7 @@ fn run_single_test(
         Command::new("buildah")
             .args(["unshare", "--", "unshare", "--net", "--", "sh", "-c"])
             .arg(format!(
-                "echo '=== namespace debug ===' >&2; id >&2; cat /proc/self/uid_map >&2; cat /proc/self/gid_map >&2; ip link >&2; ip addr add 127.0.0.1/8 dev lo && ip link set lo up; echo '=== lo setup exit: '$?' ===' >&2; ip addr >&2; echo '=== end debug ===' >&2; exec {exe} start-vm --test-case {name} --tmp-dir {dir}"
+                "echo '=== namespace debug ===' >&2; id >&2; cat /proc/self/uid_map >&2; cat /proc/self/gid_map >&2; ip link >&2; ip addr add 127.0.0.1/8 dev lo && ip link set lo up; ip addr add 192.0.2.1/32 dev lo; ip -6 addr add 2001:db8::1/128 dev lo; echo '0 0' > /proc/sys/net/ipv4/ping_group_range; echo '=== lo setup exit: '$?' ===' >&2; ip addr >&2; echo '=== end debug ===' >&2; exec {exe} start-vm --test-case {name} --tmp-dir {dir}"
             ))
             .stdin(Stdio::piped())
             .stdout(stdout_file)

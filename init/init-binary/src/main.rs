@@ -96,6 +96,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     if env::tsi_enabled() {
         env::enable_dummy_interface();
+        env::enable_ping_sockets();
     }
 
     #[cfg(target_os = "freebsd")]
