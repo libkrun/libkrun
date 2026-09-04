@@ -350,6 +350,17 @@ impl NetWorker {
                 }
             }
 
+            if read_count <= VNET_HDR_LEN {
+                log::debug!(
+                    "Discarding malformed TX frame of {read_count} bytes: expected a {VNET_HDR_LEN}-byte virtio-net header and payload"
+                );
+                tx_queue
+                    .add_used(&self.mem, head_index, 0)
+                    .map_err(TxError::QueueError)?;
+                raise_irq = true;
+                continue;
+            }
+
             self.tx_frame_len = read_count;
             match self
                 .backend
@@ -475,5 +486,119 @@ impl NetWorker {
     fn read_into_rx_frame_buf_from_backend(&mut self) -> result::Result<(), ReadError> {
         self.rx_frame_buf_len = self.backend.read_frame(&mut self.rx_frame_buf)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+    use std::sync::Arc;
+
+    use nix::errno::Errno;
+    use nix::sys::socket::{AddressFamily, MsgFlags, SockFlag, SockType, recv, socketpair};
+    use utils::eventfd::{EFD_NONBLOCK, EventFd};
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::queue::tests::VirtQueue;
+
+    use super::*;
+
+    fn assert_tx_frames_processed(
+        frame_lengths: &[u32],
+        socket_type: SockType,
+        make_backend: fn(RawFd) -> VirtioNetBackend,
+        expected_peer_data: Option<&[u8]>,
+    ) {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let rx_vq = VirtQueue::new(GuestAddress(0), &mem, 8);
+        let tx_vq = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+
+        for (index, frame_len) in frame_lengths.iter().enumerate() {
+            tx_vq.dtable[index].set(0x3000 + index as u64 * 0x100, *frame_len, 0, 0);
+            tx_vq.avail.ring[index].set(index as u16);
+        }
+        tx_vq.avail.idx.set(frame_lengths.len() as u16);
+
+        let rx_q = DeviceQueue::new(
+            rx_vq.create_queue(),
+            Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+        );
+        let tx_q = DeviceQueue::new(
+            tx_vq.create_queue(),
+            Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+        );
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "virtio-net test".to_string())
+                .unwrap();
+        let (backend, peer) =
+            socketpair(AddressFamily::Unix, socket_type, None, SockFlag::empty()).unwrap();
+        let mut worker = NetWorker::new(
+            rx_q,
+            tx_q,
+            interrupt,
+            mem.clone(),
+            0,
+            make_backend(backend.into_raw_fd()),
+        )
+        .unwrap();
+
+        worker.process_tx().unwrap();
+
+        assert_eq!(tx_vq.used.idx.get(), frame_lengths.len() as u16);
+        for index in 0..frame_lengths.len() {
+            assert_eq!(tx_vq.used.ring[index].get().id, index as u32);
+            assert_eq!(tx_vq.used.ring[index].get().len, 0);
+        }
+
+        let mut peer_data = [0u8; 64];
+        let received = recv(peer.as_raw_fd(), &mut peer_data, MsgFlags::MSG_DONTWAIT);
+        match expected_peer_data {
+            Some(expected) => {
+                assert_eq!(received.unwrap(), expected.len());
+                assert_eq!(&peer_data[..expected.len()], expected);
+            }
+            None => assert_eq!(received, Err(Errno::EAGAIN)),
+        }
+    }
+
+    #[test]
+    fn process_tx_discards_frame_shorter_than_vnet_header() {
+        assert_tx_frames_processed(
+            &[VNET_HDR_LEN as u32 - 1],
+            SockType::Datagram,
+            VirtioNetBackend::UnixgramFd,
+            None,
+        );
+    }
+
+    #[test]
+    fn process_tx_discards_frame_without_payload() {
+        assert_tx_frames_processed(
+            &[VNET_HDR_LEN as u32],
+            SockType::Stream,
+            VirtioNetBackend::UnixstreamFd,
+            None,
+        );
+    }
+
+    #[test]
+    fn process_tx_discards_multiple_malformed_frames() {
+        assert_tx_frames_processed(
+            &[VNET_HDR_LEN as u32, VNET_HDR_LEN as u32 - 1],
+            SockType::Datagram,
+            VirtioNetBackend::UnixgramFd,
+            None,
+        );
+    }
+
+    #[test]
+    fn process_tx_forwards_frame_larger_than_vnet_header() {
+        assert_tx_frames_processed(
+            &[VNET_HDR_LEN as u32 + 1],
+            SockType::Datagram,
+            VirtioNetBackend::UnixgramFd,
+            Some(&[0]),
+        );
     }
 }

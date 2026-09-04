@@ -24,6 +24,9 @@ jobs:
       - name: Unit tests
         run: cargo test
 
+      - name: Virtio-net unit tests
+        run: cargo test -p krun-devices --features net --lib
+
   unit-tests-linux-aarch64:
     name: Unit tests (Linux aarch64)
     runs-on: self-hosted
@@ -39,3 +42,5 @@ jobs:
       - name: Unit tests
         run: cargo test
 
+      - name: Virtio-net unit tests
+        run: cargo test -p krun-devices --features net --lib
