@@ -37,6 +37,27 @@ pub const LINUX_FALLOC_FL_PUNCH_HOLE: libc::c_int = 2;
 pub type stat64 = libc::stat;
 #[cfg(target_os = "linux")]
 pub use libc::stat64;
+#[cfg(target_os = "windows")]
+// We create a custom stat64 type for Windows because the Windows C-Runtime still use 16-bit for the inode field.
+#[repr(C)]
+pub struct stat64 {
+    pub st_ino: u64,
+    pub st_size: i64,
+    pub st_atime: i64,
+    pub st_mtime: i64,
+    pub st_ctime: i64,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u32,
+    pub st_dev: u32,
+    pub st_atime_nsec: u32,
+    pub st_mtime_nsec: u32,
+    pub st_ctime_nsec: u32,
+    pub st_blksize: i64,
+    pub st_blocks: i64,
+}
 
 #[cfg(target_os = "macos")]
 pub type off64_t = libc::off_t;
