@@ -925,6 +925,15 @@ pub fn build_microvm(
                 size: 4096,
                 attributes: 0,
             },
+            MeasuredRegion {
+                guest_addr: arch::x86_64::layout::RSDP_ADDR,
+                host_addr: guest_memory
+                    .get_host_address(GuestAddress(arch::x86_64::layout::RSDP_ADDR))
+                    .unwrap() as u64,
+                size: (arch::x86_64::layout::HIMEM_START - arch::x86_64::layout::RSDP_ADDR)
+                    as usize,
+                attributes: 0,
+            },
         ]
     };
 
@@ -1338,11 +1347,16 @@ pub fn build_microvm(
         load_cmdline(&vmm)?;
     }
 
+    #[cfg(target_os = "linux")]
+    let virtio_mmio_devices = vmm.mmio_device_manager.virtio_mmio_devices();
+    #[cfg(not(target_os = "linux"))]
+    let virtio_mmio_devices: Vec<(u64, u32)> = vec![];
     vmm.configure_system(
         vcpus.as_slice(),
         &intc,
         &payload_config.initrd_config,
         &vm_resources.smbios_oem_strings,
+        &virtio_mmio_devices,
         payload_config.pvh,
     )
     .map_err(StartMicrovmError::Internal)?;
@@ -2345,20 +2359,13 @@ fn attach_mmio_device(
     let mmio_device = MmioTransport::new(vmm.guest_memory().clone(), intc, device)?;
 
     let type_id = mmio_device.locked_device().device_type();
-    let _cmdline = &mut vmm.kernel_cmdline;
 
     #[cfg(target_os = "linux")]
-    let (_mmio_base, _irq) =
-        vmm.mmio_device_manager
-            .register_mmio_device(vmm.vm.fd(), mmio_device, type_id, id)?;
-    #[cfg(target_os = "macos")]
-    let (_mmio_base, _irq) =
-        vmm.mmio_device_manager
-            .register_mmio_device(mmio_device, type_id, id)?;
-
-    #[cfg(target_arch = "x86_64")]
     vmm.mmio_device_manager
-        .add_device_to_cmdline(_cmdline, _mmio_base, _irq)?;
+        .register_mmio_device(vmm.vm.fd(), mmio_device, type_id, id)?;
+    #[cfg(target_os = "macos")]
+    vmm.mmio_device_manager
+        .register_mmio_device(mmio_device, type_id, id)?;
 
     Ok(())
 }

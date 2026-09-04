@@ -7,6 +7,9 @@ use test_vm_config::TestVmConfig;
 mod test_vm_pause;
 use test_vm_pause::TestVmPause;
 
+mod test_acpi_smp;
+use test_acpi_smp::TestAcpiSmp;
+
 #[cfg(any(feature = "host", target_os = "linux"))]
 mod test_vsock_guest_connect;
 #[cfg(any(feature = "host", target_os = "linux"))]
@@ -99,6 +102,7 @@ pub fn test_cases() -> Vec<TestCase> {
             }),
         ),
         TestCase::new("vm-pause", Box::new(TestVmPause)),
+        TestCase::new("acpi-smp-4cpu", Box::new(TestAcpiSmp { num_cpus: 4 })),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("vsock-guest-connect", Box::new(TestVsockGuestConnect)),
         TestCase::new(

@@ -22,11 +22,12 @@ pub const INITRD_SEV_START: u64 = 0xa00000;
 /// Start of the high memory.
 pub const HIMEM_START: u64 = 0x0010_0000; //1 MB.
 
-// Typically, on x86 systems 16 IRQs are used (0-15).
+// The I/O APIC has 24 pins (0-23). ISA IRQs 0-4 are reserved for
+// legacy devices, leaving GSIs 5-23 for virtio-mmio devices.
 /// First usable IRQ ID for virtio device interrupts on x86_64.
 pub const IRQ_BASE: u32 = 5;
 /// Last usable IRQ ID for virtio device interrupts on x86_64.
-pub const IRQ_MAX: u32 = 15;
+pub const IRQ_MAX: u32 = 23;
 
 /// Address for the TSS setup.
 pub const KVM_TSS_ADDRESS: u64 = 0xfffb_d000;

@@ -13,9 +13,11 @@ amd-sev = [ "tee" ]
 tdx = [ "tee", "dep:tdx" ]
 
 [dependencies]
+acpi_tables = "0.2.1"
 libc = ">=0.2.39"
 vm-memory = { version = "0.18.0", default-features = false, features = ["backend-mmap"] }
 vmm-sys-util = "0.15"
+zerocopy = "0.8.26"
 
 arch_gen = { package = "krun-arch-gen", version = "=0.1.0-2.0.0-dev", path = "../arch_gen" }
 utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }
