@@ -71,7 +71,10 @@ use kvm_bindings::{
     kvm_memory_attributes, kvm_userspace_memory_region2,
 };
 #[cfg(target_arch = "aarch64")]
-use kvm_bindings::{KVM_REG_SIZE_MASK, KVM_REG_SIZE_SHIFT, RegList, kvm_mp_state};
+use kvm_bindings::{
+    KVM_REG_ARM_COPROC_MASK, KVM_REG_ARM_DEMUX, KVM_REG_ARM_DEMUX_ID_CCSIDR,
+    KVM_REG_ARM_DEMUX_ID_MASK, KVM_REG_SIZE_MASK, KVM_REG_SIZE_SHIFT, RegList, kvm_mp_state,
+};
 use kvm_ioctls::{Cap::*, *};
 use utils::eventfd::EventFd;
 use utils::signal::{Killable, register_signal_handler, sigrtmin};
@@ -2527,11 +2530,12 @@ impl Vcpu {
         Ok(())
     }
 
-    /// Capture the full aarch64 vCPU state: the MP (power) state plus every
-    /// register KVM enumerates via `KVM_GET_REG_LIST` — core registers, FP/SIMD,
-    /// system registers, the generic timer (`CNTVCT`/`CNTV_CTL`/`CNTV_CVAL`,
-    /// so the clone's virtual counter resumes from the checkpoint), and the
-    /// PSCI firmware registers. The in-kernel GIC's CPU-interface state is
+    /// Capture the full aarch64 vCPU execution state: the MP (power) state plus
+    /// every mutable register KVM enumerates via `KVM_GET_REG_LIST` — core
+    /// registers, FP/SIMD, system registers, the generic timer
+    /// (`CNTVCT`/`CNTV_CTL`/`CNTV_CVAL`, so the clone's virtual counter resumes
+    /// from the checkpoint), and the PSCI firmware registers. Host cache
+    /// descriptors are excluded. The in-kernel GIC's CPU-interface state is
     /// deliberately absent from the list; it travels in `VmState`.
     #[cfg(target_arch = "aarch64")]
     fn save_state(&self) -> Result<VcpuState> {
@@ -2547,6 +2551,9 @@ impl Vcpu {
             .map_err(Error::VcpuGetRegList)?;
         let mut regs = Vec::with_capacity(reg_list.as_slice().len());
         for &id in reg_list.as_slice() {
+            if is_host_cache_descriptor(id) {
+                continue;
+            }
             let size = reg_size_bytes(id);
             if size > 16 {
                 // Only SVE state is wider than 128 bits and it is never
@@ -2573,6 +2580,9 @@ impl Vcpu {
             .set_mp_state(state.mp_state)
             .map_err(Error::VcpuSetMpState)?;
         for &(id, val) in &state.regs {
+            if is_host_cache_descriptor(id) {
+                continue;
+            }
             let size = reg_size_bytes(id);
             self.fd
                 .set_one_reg(id, &val.to_le_bytes()[..size])
@@ -3168,10 +3178,25 @@ fn reg_size_bytes(id: u64) -> usize {
     1usize << ((id & KVM_REG_SIZE_MASK) >> KVM_REG_SIZE_SHIFT)
 }
 
-/// Full aarch64 vCPU state for a checkpoint: the MP (power) state plus every
-/// `KVM_GET_REG_LIST`-enumerated register as an (id, value) pair. Values are
-/// stored as `u128` (the widest non-SVE register); each register's true width
-/// is derived from its id on the way back in.
+/// Whether `id` describes the physical CPU's cache rather than vCPU state.
+///
+/// Older arm64 KVM kernels implement `KVM_REG_ARM_DEMUX` by reading CCSIDR on
+/// whichever physical CPU services the ioctl. On heterogeneous systems such
+/// as RK3588, saving on a Cortex-A76 and restoring on a Cortex-A55 produces a
+/// different immutable value, so `KVM_SET_ONE_REG` rejects it with `EINVAL`.
+/// Cache geometry is host identification, not mutable guest execution state,
+/// and must not travel in a checkpoint. Filtering on restore also makes
+/// checkpoints produced before this fix usable.
+#[cfg(target_arch = "aarch64")]
+fn is_host_cache_descriptor(id: u64) -> bool {
+    id & KVM_REG_ARM_COPROC_MASK as u64 == KVM_REG_ARM_DEMUX as u64
+        && id & KVM_REG_ARM_DEMUX_ID_MASK as u64 == KVM_REG_ARM_DEMUX_ID_CCSIDR as u64
+}
+
+/// Full aarch64 vCPU execution state for a checkpoint: the MP (power) state
+/// plus each selected `KVM_GET_REG_LIST` register as an (id, value) pair.
+/// Values are stored as `u128` (the widest non-SVE register); each register's
+/// true width is derived from its id on the way back in.
 #[cfg(target_arch = "aarch64")]
 #[derive(Debug)]
 pub struct VcpuState {
@@ -3455,7 +3480,7 @@ mod tests {
         let kvm = KvmContext::new().unwrap();
         let vm_resources = VmResources::default();
         let (guest_memory, arch_memory_info, _shm_manager, _payload_config) =
-            create_guest_memory(128, &vm_resources, &Payload::Empty).unwrap();
+            create_guest_memory(128, &vm_resources, &Payload::Empty, None).unwrap();
         let mut vm = Vm::new(kvm.fd()).expect("new vm failed");
         assert!(vm.memory_init(&guest_memory, kvm.max_memslots()).is_ok());
 
@@ -3484,6 +3509,20 @@ mod tests {
             vcpu.configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0))
                 .is_ok()
         );
+
+        // Exercise the real KVM register-list GET/SET path. Physical cache
+        // descriptors may appear in KVM_GET_REG_LIST, but must not survive in
+        // the checkpoint or be replayed through KVM_SET_ONE_REG.
+        let state = vcpu.save_state().expect("save aarch64 vCPU state");
+        assert!(
+            state
+                .regs
+                .iter()
+                .all(|(id, _)| !is_host_cache_descriptor(*id))
+        );
+        let state = VcpuState::deserialize(&state.serialize()).expect("decode vCPU state");
+        vcpu.restore_state(state)
+            .expect("restore aarch64 vCPU state");
     }
 
     #[test]
@@ -3686,5 +3725,20 @@ mod tests {
         }
         assert!(portable_msr_should_serialize(0x10));
         assert!(portable_msr_should_serialize(0x4b56_4d01));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn host_cache_descriptors_are_not_vcpu_state() {
+        let ccsidr = kvm_bindings::KVM_REG_ARM64 as u64
+            | kvm_bindings::KVM_REG_SIZE_U32
+            | KVM_REG_ARM_DEMUX as u64
+            | 3;
+        let system_register = kvm_bindings::KVM_REG_ARM64 as u64
+            | kvm_bindings::KVM_REG_SIZE_U64
+            | kvm_bindings::KVM_REG_ARM64_SYSREG as u64;
+
+        assert!(is_host_cache_descriptor(ccsidr));
+        assert!(!is_host_cache_descriptor(system_register));
     }
 }
