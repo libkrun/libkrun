@@ -278,7 +278,7 @@ impl Worker {
                         if let Err(e) = self.cursor_evt.read() {
                             error!("Failed to read cursor_evt: {e:?}");
                         }
-                        self.process_cursor_queue();
+                        self.process_cursor_queue(virtio_gpu);
                     }
                     TOKEN_RUTABAGA => {
                         // Global poll fd fired (non-render-server mode): process events.
@@ -386,7 +386,7 @@ impl Worker {
                 if let Err(e) = self.cursor_evt.read() {
                     error!("Failed to read cursor_evt: {e:?}");
                 }
-                self.process_cursor_queue();
+                self.process_cursor_queue(virtio_gpu);
             }
         }
     }
@@ -667,12 +667,31 @@ impl Worker {
     /// Drain and ack the cursor queue. Cursor commands carry no response
     /// payload, so returning the descriptors (len 0) and signaling is enough
     /// to keep the guest's cursor ring from running out of free entries.
-    fn process_cursor_queue(&mut self) {
+    fn process_cursor_queue(&mut self, virtio_gpu: &mut VirtioGpu) {
         let mem = self.mem.clone();
         let mut used_any = false;
         loop {
             let head = self.cursor_queue.lock().unwrap().pop(&mem);
             let Some(head) = head else { break };
+            // Cursor commands need no response payload, but they carry the
+            // pointer image and position, which a display backend can show
+            // itself instead of the guest drawing a software pointer.
+            if let Ok(mut reader) = Reader::new(&mem, head.clone()) {
+                match GpuCommand::decode(&mut reader) {
+                    Ok((_, GpuCommand::UpdateCursor(info))) => {
+                        if let Err(e) = virtio_gpu.update_cursor(info) {
+                            debug!("update_cursor failed: {e:?}");
+                        }
+                    }
+                    Ok((_, GpuCommand::MoveCursor(info))) => {
+                        if let Err(e) = virtio_gpu.move_cursor(info) {
+                            debug!("move_cursor failed: {e:?}");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => debug!("cursor queue: undecodable command: {e:?}"),
+                }
+            }
             if let Err(e) = self
                 .cursor_queue
                 .lock()

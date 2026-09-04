@@ -3020,14 +3020,23 @@ pub extern "C" fn krun_set_display_backend(
     vtable: *const c_void,
     vtable_size: usize,
 ) -> i32 {
-    if vtable_size < size_of::<DisplayBackend>() {
+    // Callers built against an older header pass a struct that ends at the basic vtable; the
+    // cursor vtable that follows is optional and stays zero for them.
+    let basic_len = std::mem::offset_of!(DisplayBackend, cursor);
+    if vtable_size < basic_len {
         return -libc::EINVAL;
     }
 
-    // SAFETY: We have checked the vtable size is fine, otherwise we have to trust the user. Just
-    // to be extra careful, this uses read_unaligned, but we could probably get away with ptr::read.
-    let display_backend: DisplayBackend =
-        unsafe { std::ptr::read_unaligned(vtable as *const DisplayBackend) };
+    // SAFETY: the struct is plain data (integers, pointers and optional function pointers), so an
+    // all-zero value is valid, and only `vtable_size` bytes are read from the caller.
+    let mut display_backend: DisplayBackend = unsafe { std::mem::zeroed() };
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            vtable as *const u8,
+            (&raw mut display_backend) as *mut u8,
+            vtable_size.min(size_of::<DisplayBackend>()),
+        )
+    };
 
     if !display_backend.verify() {
         return -libc::EINVAL;

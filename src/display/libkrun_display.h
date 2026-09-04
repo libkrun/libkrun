@@ -38,6 +38,9 @@ extern "C" {
  * and `present_frame`.
  */
 #define KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER 1
+/* The backend shows the guest's pointer itself: the guest hands over the pointer image and its
+ * position instead of drawing a software pointer into every frame. */
+#define KRUN_DISPLAY_FEATURE_CURSOR 2
 
 /**
  * Called to create a display instance.
@@ -162,6 +165,20 @@ typedef int32_t (*krun_display_present_frame_fn)(void *instance, uint32_t scanou
  * krun_set_display_backend. The user of the library *MUST* zero initialize this struct to make all (future) unset
  * fields NULL.
  */
+/**
+ * Replace the pointer image for a scanout. `bgra` holds `width * height` pixels, 4 bytes each in
+ * B,G,R,A order with straight alpha, and the pointer hot spot is at (`hot_x`, `hot_y`). A width or
+ * height of 0 hides the pointer. The pixels are only valid during the call.
+ */
+typedef int32_t (*krun_display_set_cursor_fn)(void *instance, uint32_t scanout_id, uint32_t width,
+                                              uint32_t height, uint32_t hot_x, uint32_t hot_y,
+                                              const uint8_t *bgra, size_t bgra_size);
+
+/**
+ * Move the pointer: (`x`, `y`) is where the hot spot now sits on the scanout.
+ */
+typedef int32_t (*krun_display_move_cursor_fn)(void *instance, uint32_t scanout_id, uint32_t x, uint32_t y);
+
 struct krun_display_basic_framebuffer_vtable {
     krun_display_destroy_fn             destroy; // (optional)
     krun_display_disable_scanout_fn     disable_scanout; // Required by KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER
@@ -174,11 +191,17 @@ union krun_display_vtable {
     struct krun_display_basic_framebuffer_vtable basic_framebuffer;
 };
 
+struct krun_display_cursor_vtable {
+    krun_display_set_cursor_fn          set_cursor; // Required by KRUN_DISPLAY_FEATURE_CURSOR
+    krun_display_move_cursor_fn         move_cursor; // Required by KRUN_DISPLAY_FEATURE_CURSOR
+};
+
 struct krun_display_backend {
     uint64_t features;
     void *create_userdata; // (optional)
     krun_display_create_fn create; // (optional)
     union krun_display_vtable vtable;
+    struct krun_display_cursor_vtable cursor; // Read only when KRUN_DISPLAY_FEATURE_CURSOR is set
 };
 
 #ifdef __cplusplus

@@ -146,6 +146,10 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
                     disable_scanout: Some(disable_scanout_fb::<I>),
                 },
             },
+            cursor: crate::DisplayCursorVtable {
+                set_cursor: None,
+                move_cursor: None,
+            },
         }
     }
 }

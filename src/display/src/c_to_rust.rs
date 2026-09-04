@@ -1,6 +1,6 @@
 use crate::{
     DisplayBackendBasicFramebuffer, DisplayBackendError, DisplayBasicFramebufferVtable,
-    DisplayFeatures, DisplayVtable, Rect, ResourceFormat, header,
+    DisplayCursorVtable, DisplayFeatures, DisplayVtable, Rect, ResourceFormat, header,
 };
 use log::{error, warn};
 use static_assertions::assert_not_impl_any;
@@ -45,6 +45,49 @@ macro_rules! method_call {
 pub struct DisplayBackendInstance {
     instance: *mut c_void,
     vtable: DisplayBasicFramebufferVtable,
+    cursor: DisplayCursorVtable,
+}
+
+impl DisplayBackendInstance {
+    /// Hand the backend the guest's pointer image; a zero size hides it.
+    pub fn set_cursor(
+        &mut self,
+        scanout_id: u32,
+        width: u32,
+        height: u32,
+        hot_x: u32,
+        hot_y: u32,
+        bgra: &[u8],
+    ) -> Result<(), DisplayBackendError> {
+        let Some(set_cursor) = self.cursor.set_cursor else {
+            return Err(DisplayBackendError::MethodNotSupported);
+        };
+        into_rust_result!(unsafe {
+            set_cursor(
+                self.instance,
+                scanout_id,
+                width,
+                height,
+                hot_x,
+                hot_y,
+                bgra.as_ptr(),
+                bgra.len(),
+            )
+        })
+    }
+
+    /// Tell the backend where the pointer hot spot now is.
+    pub fn move_cursor(
+        &mut self,
+        scanout_id: u32,
+        x: u32,
+        y: u32,
+    ) -> Result<(), DisplayBackendError> {
+        let Some(move_cursor) = self.cursor.move_cursor else {
+            return Err(DisplayBackendError::MethodNotSupported);
+        };
+        into_rust_result!(unsafe { move_cursor(self.instance, scanout_id, x, y) })
+    }
 }
 
 // By design the struct is !Send and !Sync to allow for the implementation to safely assume that
@@ -140,6 +183,8 @@ pub struct DisplayBackend<'userdata> {
     pub create_userdata_lifetime: PhantomData<&'userdata c_void>,
     pub create_fn: header::krun_display_create_fn,
     pub vtable: DisplayVtable,
+    /// Only meaningful when `features` carries `CURSOR`; zero otherwise.
+    pub cursor: DisplayCursorVtable,
 }
 
 impl DisplayBackend<'_> {
@@ -158,6 +203,16 @@ impl DisplayBackend<'_> {
             instance,
             // SAFETY: we have checked the feature flags, so basic_framebuffer should be populated
             vtable: unsafe { self.vtable.basic_framebuffer },
+            cursor: if DisplayFeatures::from_bits_retain(self.features)
+                .contains(DisplayFeatures::CURSOR)
+            {
+                self.cursor
+            } else {
+                DisplayCursorVtable {
+                    set_cursor: None,
+                    move_cursor: None,
+                }
+            },
         })
     }
 
@@ -183,6 +238,12 @@ impl DisplayBackend<'_> {
                     error!("Missing required methods for BASIC_FRAMEBUFFER");
                     return false;
                 }
+            }
+            if feature.contains(DisplayFeatures::CURSOR)
+                && (self.cursor.set_cursor.is_none() || self.cursor.move_cursor.is_none())
+            {
+                error!("Missing required methods for CURSOR");
+                return false;
             } else {
                 warn!("Unknown display features ({feature:x}) will be ignored")
             }
