@@ -671,18 +671,21 @@ impl VsockMuxer {
     fn process_stream_rst(&self, pkt: &VsockPacket) {
         debug!("OP_RST");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
+        let update = if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
             debug!(
                 "allowing OP_RST: id={} src={} dst={}",
                 id,
                 pkt.src_port(),
                 pkt.dst_port()
             );
-            let mut proxy = proxy_lock.lock().unwrap();
-            let update = proxy.release();
-            self.process_proxy_update(id, update);
+            Some(proxy_lock.lock().unwrap().release())
         } else {
             debug!("invalid OP_RST for {}", pkt.src_port());
+            None
+        };
+
+        if let Some(update) = update {
+            self.process_proxy_update(id, update);
         }
     }
 
