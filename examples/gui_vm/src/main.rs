@@ -1,5 +1,6 @@
 use clap::Parser;
 use clap_derive::Parser;
+use gtk::prelude::*;
 use gtk_display::{
     Axis, DisplayBackendHandle, DisplayInputOptions, InputBackendHandle, TouchArea,
     TouchScreenOptions,
@@ -269,12 +270,10 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let (display_backend, input_backends, display_worker) = gtk_display::init(
-        "libkrun examples/gui_vm".to_string(),
-        args.keyboard_input,
-        per_display_inputs,
-    )?;
+    let (display_backend, input_backends, display_worker) =
+        gtk_display::init(args.keyboard_input, per_display_inputs)?;
 
+    let display_args: Vec<DisplayArg> = args.display.clone();
     thread::scope(|s| {
         s.spawn(|| {
             if let Err(e) = krun_thread(&args, display_backend, input_backends) {
@@ -282,7 +281,22 @@ fn main() -> anyhow::Result<()> {
                 exit(1);
             }
         });
-        display_worker.run()
+        display_worker.run(move |worker| {
+            for (idx, display) in display_args.iter().enumerate() {
+                let paintable =
+                    worker.create_paintable(idx, display.width as i32, display.height as i32);
+                let picture = gtk::Picture::for_paintable(&paintable);
+                let window = gtk::Window::builder()
+                    .title(format!(
+                        "libkrun gui_vm - display {idx} ({}x{})",
+                        display.width, display.height
+                    ))
+                    .child(&picture)
+                    .build();
+                window.present();
+                worker.attach_input(idx, &picture);
+            }
+        })
     });
     unreachable!("Expected libkrun (or error handling) to exit the process");
 }
