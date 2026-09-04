@@ -3,6 +3,7 @@ on: [pull_request]
 
 jobs:
   integration-tests-x86_64:
+    if: ${{ !contains(github.event.pull_request.title, '[CI:docs]') }}
     name: Integration Tests (Linux x86_64)
     runs-on: ubuntu-26.04
     steps:
@@ -92,6 +93,7 @@ jobs:
           if-no-files-found: ignore
 
   integration-tests-aarch64:
+    if: ${{ !contains(github.event.pull_request.title, '[CI:docs]') }}
     name: Integration Tests (Linux aarch64)
     runs-on: self-hosted
     steps:

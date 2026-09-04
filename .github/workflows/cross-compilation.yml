@@ -3,6 +3,7 @@ on: [pull_request]
 
 jobs:
   cross-compile-macos:
+    if: ${{ !contains(github.event.pull_request.title, '[CI:docs]') }}
     name: Cross-compilation (macOS)
     runs-on: macos-latest
     env:
@@ -24,6 +25,7 @@ jobs:
         run: make BUILD_BSD_INIT=1 -- init/init-binary/init-freebsd
 
   cross-compile-linux:
+    if: ${{ !contains(github.event.pull_request.title, '[CI:docs]') }}
     name: Cross-compilation (Linux x86_64 -> FreeBSD)
     runs-on: ubuntu-26.04
     steps:
@@ -41,6 +43,7 @@ jobs:
         run: make BUILD_BSD_INIT=1 -- init/init-binary/init-freebsd
 
   cross-compile-linux-aarch64:
+    if: ${{ !contains(github.event.pull_request.title, '[CI:docs]') }}
     name: Cross-compilation (Linux aarch64 -> FreeBSD)
     runs-on: ubuntu-26.04-arm
     steps:
