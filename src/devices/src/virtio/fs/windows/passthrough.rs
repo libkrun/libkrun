@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, OsString};
 use std::fs::{self, File};
 use std::io;
-use std::mem;
+use std::mem::{self, ManuallyDrop};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
@@ -2404,10 +2404,29 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<usize> {
         debug!("read: {inode:?}");
 
-        let file = self
-            .reopen_inode(inode, handle, GENERIC_READ)
-            .map_err(win_err_to_linux)?;
-        w.write_from(&file, size as usize, offset)
+        // Instead of opening a new file handle, if we have a valid handle we borrow it
+        let borrowed_file = if handle != 0 && (handle & (1 << 63)) == 0 {
+            let raw_h = handle as windows_sys::Win32::Foundation::HANDLE;
+            // We use ManuallyDrop to ensure `file` is NEVER dropped,
+            // preventing handle closure even if `write_from` panics.
+            let file = unsafe { std::fs::File::from_raw_handle(raw_h as _) };
+            Some(ManuallyDrop::new(file))
+        } else {
+            None
+        };
+
+        let opened_file;
+        let file_ref: &std::fs::File = match &borrowed_file {
+            Some(file) => file,
+            None => {
+                opened_file = self
+                    .reopen_inode(inode, handle, GENERIC_READ)
+                    .map_err(win_err_to_linux)?;
+                &opened_file
+            }
+        };
+
+        w.write_from(file_ref, size as usize, offset)
     }
 
     fn write<R: io::Read + ZeroCopyReader>(
