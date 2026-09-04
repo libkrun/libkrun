@@ -250,24 +250,28 @@ unsafe fn get_handle_cpu_time(handle: HANDLE, is_process: bool) -> u64 {
     let mut user = MaybeUninit::<FILETIME>::uninit();
 
     if is_process {
-        let _ = GetProcessTimes(
-            handle,
-            creation.as_mut_ptr(),
-            exit.as_mut_ptr(),
-            kernel.as_mut_ptr(),
-            user.as_mut_ptr(),
-        );
+        let _ = unsafe {
+            GetProcessTimes(
+                handle,
+                creation.as_mut_ptr(),
+                exit.as_mut_ptr(),
+                kernel.as_mut_ptr(),
+                user.as_mut_ptr(),
+            )
+        };
     } else {
-        let _ = GetThreadTimes(
-            handle,
-            creation.as_mut_ptr(),
-            exit.as_mut_ptr(),
-            kernel.as_mut_ptr(),
-            user.as_mut_ptr(),
-        );
+        let _ = unsafe {
+            GetThreadTimes(
+                handle,
+                creation.as_mut_ptr(),
+                exit.as_mut_ptr(),
+                kernel.as_mut_ptr(),
+                user.as_mut_ptr(),
+            )
+        };
     }
 
-    let (kernel, user) = (kernel.assume_init(), user.assume_init());
+    let (kernel, user) = unsafe { (kernel.assume_init(), user.assume_init()) };
     filetime_to_nanos(&kernel) + filetime_to_nanos(&user)
 }
 

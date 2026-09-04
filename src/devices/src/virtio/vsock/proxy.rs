@@ -1,11 +1,26 @@
 use std::collections::HashMap;
 use std::fmt;
+
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::OwnedSocket as OwnedFd;
+#[cfg(windows)]
+use utils::windows::{AsRawFd, RawFd};
 
 use super::muxer::MuxerRx;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
+#[cfg(unix)]
 use nix::sys::socket::AddressFamily;
+/// On Windows, reuse the WinSock `ADDRESS_FAMILY` type (a `u16`) directly so
+/// that converted values are already native WinSock constants (AF_INET, …).
+#[cfg(windows)]
+use windows_sys::Win32::Networking::WinSock::{
+    ADDRESS_FAMILY as AddressFamily, AF_INET, AF_INET6, AF_UNIX,
+};
+
 use utils::epoll::EventSet;
 
 #[derive(Debug)]
@@ -19,10 +34,10 @@ pub enum RecvPkt {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum ProxyError {
-    CreatingSocket(nix::errno::Errno),
+    CreatingSocket(std::io::Error),
     InvalidFamily,
-    SettingReuseAddr(nix::errno::Errno),
-    SettingReusePort(nix::errno::Errno),
+    SettingReuseAddr(std::io::Error),
+    SettingReusePort(std::io::Error),
 }
 
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
@@ -69,6 +84,7 @@ impl fmt::Display for ProxyError {
 }
 
 pub trait Proxy: Send + AsRawFd {
+    #[allow(dead_code)]
     fn id(&self) -> u64;
     #[allow(dead_code)]
     fn status(&self) -> ProxyStatus;
@@ -95,4 +111,14 @@ pub trait Proxy: Send + AsRawFd {
     fn shutdown(&mut self, _pkt: &VsockPacket) {}
     fn release(&mut self) -> ProxyUpdate;
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate;
+}
+
+#[cfg(windows)]
+pub fn address_family_from_linux(family: u16) -> Option<AddressFamily> {
+    match family {
+        super::defs::LINUX_AF_INET => Some(AF_INET),
+        super::defs::LINUX_AF_INET6 => Some(AF_INET6),
+        super::defs::LINUX_AF_UNIX => Some(AF_UNIX),
+        _ => None,
+    }
 }

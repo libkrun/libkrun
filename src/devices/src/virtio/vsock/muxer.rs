@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+#[cfg(windows)]
+use utils::windows::RawFd;
 
 use super::super::Queue as VirtQueue;
 use super::TsiFlags;
@@ -17,13 +20,18 @@ use super::reaper::ReaperThread;
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
-use super::unix::UnixProxy;
+use super::unix_proxy::UnixProxy;
 use crossbeam_channel::{Sender, unbounded};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 
 use crate::virtio::InterruptTransport;
 use std::net::{Ipv4Addr, SocketAddrV4};
+
+#[cfg(windows)]
+use defs::{LINUX_AF_INET as AF_INET, LINUX_AF_INET6 as AF_INET6, LINUX_AF_UNIX as AF_UNIX};
+#[cfg(unix)]
+use libc::{AF_INET, AF_INET6, AF_UNIX};
 
 pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
 
@@ -220,13 +228,28 @@ impl VsockMuxer {
 
     pub fn update_polling(&self, id: u64, fd: RawFd, evset: EventSet) {
         debug!("update_polling id={id} fd={fd:?} evset={evset:?}");
-        let _ = self
-            .epoll
-            .ctl(ControlOperation::Delete, fd, &EpollEvent::default());
-        if !evset.is_empty() {
+        #[cfg(unix)]
+        {
             let _ = self
                 .epoll
-                .ctl(ControlOperation::Add, fd, &EpollEvent::new(evset, id));
+                .ctl(ControlOperation::Delete, fd, &EpollEvent::default());
+            if !evset.is_empty() {
+                let _ = self
+                    .epoll
+                    .ctl(ControlOperation::Add, fd, &EpollEvent::new(evset, id));
+            }
+        }
+        #[cfg(windows)]
+        {
+            let sock = fd as windows_sys::Win32::Networking::WinSock::SOCKET;
+            let _ = self
+                .epoll
+                .ctl_socket(ControlOperation::Delete, sock, &EpollEvent::default());
+            if !evset.is_empty() {
+                let _ =
+                    self.epoll
+                        .ctl_socket(ControlOperation::Add, sock, &EpollEvent::new(evset, id));
+            }
         }
     }
 
@@ -283,13 +306,13 @@ impl VsockMuxer {
                 defs::SOCK_STREAM => {
                     debug!("proxy create stream");
                     let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-                    if req.family as i32 == libc::AF_UNIX
+                    if req.family == AF_UNIX as u16
                         && !self.tsi_flags.contains(TsiFlags::HIJACK_UNIX)
                     {
                         warn!("rejecting stream unix proxy because HIJACK_UNIX is disabled");
                         return;
                     }
-                    if (req.family as i32 == libc::AF_INET || req.family as i32 == libc::AF_INET6)
+                    if (req.family == AF_INET as u16 || req.family == AF_INET6 as u16)
                         && !self.tsi_flags.contains(TsiFlags::HIJACK_INET)
                     {
                         warn!("rejecting stream inet proxy because HIJACK_INET is disabled");
@@ -318,13 +341,13 @@ impl VsockMuxer {
                 defs::SOCK_DGRAM => {
                     debug!("proxy create dgram");
                     let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-                    if req.family as i32 == libc::AF_UNIX
+                    if req.family == AF_UNIX as u16
                         && !self.tsi_flags.contains(TsiFlags::HIJACK_UNIX)
                     {
                         warn!("rejecting dgram unix proxy because HIJACK_UNIX is disabled");
                         return;
                     }
-                    if (req.family as i32 == libc::AF_INET || req.family as i32 == libc::AF_INET6)
+                    if (req.family == AF_INET as u16 || req.family == AF_INET6 as u16)
                         && !self.tsi_flags.contains(TsiFlags::HIJACK_INET)
                     {
                         warn!("rejecting dgram inet proxy because HIJACK_INET is disabled");

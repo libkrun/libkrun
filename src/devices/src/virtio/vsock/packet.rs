@@ -23,8 +23,11 @@ use std::net::{Ipv6Addr, SocketAddrV6};
 use std::os::raw::c_char;
 use std::result;
 
+#[cfg(windows)]
+use super::windows::sockaddr_storage::SockaddrStorage;
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{AddressFamily, sockaddr};
+#[cfg(unix)]
 use nix::sys::socket::{SockaddrLike, SockaddrStorage};
 use utils::byte_order;
 use vm_memory::{self, Address, GuestAddress, GuestMemoryBackend, GuestMemoryError};
@@ -622,6 +625,11 @@ impl VsockPacket {
             }
             _ => None,
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn parse_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
+        SockaddrStorage::from_linux_bytes(buf, addr_len)
     }
 
     pub fn read_proxy_create(&self) -> Option<TsiProxyCreate> {

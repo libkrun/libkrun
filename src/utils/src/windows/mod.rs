@@ -1,3 +1,5 @@
+use std::os::windows::io::{AsRawSocket, OwnedSocket};
+
 use windows_sys::Win32::Foundation::HANDLE;
 
 pub(crate) mod bindings;
@@ -11,6 +13,12 @@ pub type RawFd = HANDLE;
 /// Windows equivalent of [`std::os::unix::io::AsRawFd`].
 pub trait AsRawFd {
     fn as_raw_fd(&self) -> RawFd;
+}
+
+impl AsRawFd for OwnedSocket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.as_raw_socket() as RawFd
+    }
 }
 
 /// A thin wrapper around a raw `HANDLE` that implements [`Send`].

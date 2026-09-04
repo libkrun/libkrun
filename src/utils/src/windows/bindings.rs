@@ -13,14 +13,14 @@ use windows_sys::Win32::Foundation::HANDLE;
 pub type NTSTATUS = i32;
 
 #[link(name = "ntdll")]
-extern "system" {
-    pub fn NtCreateWaitCompletionPacket(
+unsafe extern "system" {
+    pub unsafe fn NtCreateWaitCompletionPacket(
         WaitCompletionPacketHandle: *mut HANDLE,
         DesiredAccess: u32,
         ObjectAttributes: *const std::ffi::c_void,
     ) -> NTSTATUS;
 
-    pub fn NtAssociateWaitCompletionPacket(
+    pub unsafe fn NtAssociateWaitCompletionPacket(
         WaitCompletionPacketHandle: HANDLE,
         IoCompletionHandle: HANDLE,
         TargetObjectHandle: HANDLE,
@@ -31,12 +31,12 @@ extern "system" {
         AlreadySignaled: *mut u8,
     ) -> NTSTATUS;
 
-    pub fn NtCancelWaitCompletionPacket(
+    pub unsafe fn NtCancelWaitCompletionPacket(
         WaitCompletionPacketHandle: HANDLE,
         RemoveSignaledPacket: u8,
     ) -> NTSTATUS;
 
-    pub fn RtlNtStatusToDosError(Status: NTSTATUS) -> u32;
+    pub unsafe fn RtlNtStatusToDosError(Status: NTSTATUS) -> u32;
 }
 
 /// Equivalent of the `NT_SUCCESS` macro: returns `true` when `status` is in
