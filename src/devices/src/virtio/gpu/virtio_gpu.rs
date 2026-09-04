@@ -150,9 +150,13 @@ pub struct VirtioGpuScanout {
     resource_id: u32,
     width: u32,
     height: u32,
+    /// Set when the scanout holds a blob resource, so a later RESOURCE_FLUSH
+    /// can be presented through the renderer instead of the 2D read path.
+    blob: Option<BlobScanout>,
 }
 
 /// Geometry of a blob resource being put on a scanout.
+#[derive(Clone, Copy)]
 pub struct BlobScanout {
     pub ctx_id: u32,
     pub resource_id: u32,
@@ -811,6 +815,7 @@ impl VirtioGpu {
             resource_id,
             width,
             height,
+            blob: None,
         });
 
         // Present the newly scanned-out buffer. A page-flipping compositor
@@ -893,6 +898,7 @@ impl VirtioGpu {
             resource_id: blob.resource_id,
             width: blob.width,
             height: blob.height,
+            blob: Some(blob),
         });
 
         self.present_scanout_blob(scanout_id, &blob)
@@ -1137,6 +1143,18 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         for scanout_id in resource.scanouts.iter_enabled() {
+            // A blob scanout has no 2D backing to read; present it the same
+            // way SET_SCANOUT_BLOB did, or every damage-only frame fails.
+            let blob = self
+                .scanouts
+                .get(scanout_id as usize)
+                .and_then(|s| s.as_ref())
+                .and_then(|s| s.blob)
+                .filter(|b| b.resource_id == resource_id);
+            if let Some(blob) = blob {
+                self.present_scanout_blob(scanout_id, &blob)?;
+                continue;
+            }
             let (crop_w, crop_h) = self
                 .scanouts
                 .get(scanout_id as usize)
