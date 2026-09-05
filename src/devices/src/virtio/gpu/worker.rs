@@ -259,6 +259,7 @@ impl Worker {
             // ticks so fences retire even with no incoming traffic.
             if n == 0 {
                 virtio_gpu.event_poll();
+                virtio_gpu.represent_dirty_scanouts();
             }
 
             let mut process_queue = false;
@@ -359,6 +360,7 @@ impl Worker {
                 match poll(&mut fds, PollTimeout::from(1u8)) {
                     Ok(0) => {
                         virtio_gpu.event_poll();
+                        virtio_gpu.represent_dirty_scanouts();
                         continue;
                     }
                     Ok(_) => (

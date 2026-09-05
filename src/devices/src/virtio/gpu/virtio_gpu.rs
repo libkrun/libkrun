@@ -196,8 +196,22 @@ fn renderer_read_resource_pixels() -> Option<RendererReadPixels> {
     })
 }
 
+/// Set from the fence handler when a render fence retires, so the display can
+/// take a second look at the scanouts. A guest can flush a frame for scanout
+/// before the render behind it has reached the host, so the read taken at the
+/// flush shows the previous frame; re-reading once that render completes, which
+/// is exactly when a fence retires, is what lets a lone change on a quiet
+/// screen appear without waiting for the next unrelated redraw.
+static SCANOUT_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub struct VirtioGpu {
     rutabaga: Rutabaga,
+    /// Keep re-presenting until this time; extended each time a render fence
+    /// retires, so a frame that was not yet coherent on the first look is
+    /// caught on a later one.
+    represent_until: Option<std::time::Instant>,
+    /// Rate-limits the re-present to a sane cadence.
+    last_represent: Option<std::time::Instant>,
     resources: BTreeMap<u32, VirtioGpuResource>,
     fence_state: Arc<Mutex<FenceState>>,
     #[cfg(target_os = "macos")]
@@ -231,6 +245,12 @@ impl VirtioGpu {
                     ring_idx: completed_fence.ring_idx,
                 },
             };
+
+            // A render just finished; a scanout flushed before it landed can now
+            // be re-read to show that render. See SCANOUT_DIRTY.
+            if !matches!(ring, VirtioGpuRing::Global) {
+                SCANOUT_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+            }
 
             while i < fence_state.descs.len() {
                 debug!("XXX - fence_id: {}", fence_state.descs[i].fence_id);
@@ -626,6 +646,8 @@ impl VirtioGpu {
             rutabaga,
             resources: Default::default(),
             fence_state,
+            represent_until: None,
+            last_represent: None,
             scanouts: Default::default(),
             displays,
             display_backend,
@@ -1128,6 +1150,43 @@ impl VirtioGpu {
         {
             Ok(()) | Err(DisplayBackendError::MethodNotSupported) => Ok(OkNoData),
             Err(_) => Err(ErrUnspec),
+        }
+    }
+
+    /// Re-present the blob scanouts if a render fence has retired since the last
+    /// look, so a frame flushed before its render landed is not left stale.
+    /// Called from the worker's idle ticks; rate-limited, and a re-read whose
+    /// pixels are unchanged produces no downstream update.
+    pub fn represent_dirty_scanouts(&mut self) {
+        use std::sync::atomic::Ordering;
+        let now = std::time::Instant::now();
+        // A render just retired: keep re-reading for a short window so a frame
+        // that is not yet coherent on the first look is caught on a later one.
+        if SCANOUT_DIRTY.swap(false, Ordering::AcqRel) {
+            self.represent_until = Some(now + std::time::Duration::from_millis(250));
+        }
+        match self.represent_until {
+            Some(until) if now < until => {}
+            _ => return,
+        }
+        // Read at roughly 120 Hz within the window.
+        if self
+            .last_represent
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(8))
+        {
+            return;
+        }
+        self.last_represent = Some(now);
+        let blobs: Vec<(u32, BlobScanout)> = self
+            .scanouts
+            .iter()
+            .enumerate()
+            .filter_map(|(id, sc)| sc.as_ref().and_then(|sc| sc.blob).map(|b| (id as u32, b)))
+            .collect();
+        for (scanout_id, blob) in blobs {
+            if let Err(e) = self.present_scanout_blob(scanout_id, &blob) {
+                debug!("dirty re-present of scanout {scanout_id} failed: {e:?}");
+            }
         }
     }
 
