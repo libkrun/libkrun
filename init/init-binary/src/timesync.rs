@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 
 const TSYNC_PORT: u32 = 123;
 const NANOS_IN_SECOND: u64 = 1_000_000_000;
-const DELTA_SYNC: u64 = 100_000_000; // 100ms — don't bother adjusting for smaller drifts
+const DELTA_SYNC: u64 = 10_000_000; // 10ms — don't bother adjusting for smaller drifts
 
 /// Spawn a child process that synchronises the guest clock from the host.
 ///
