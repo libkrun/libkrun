@@ -1251,9 +1251,11 @@ fn remove_security_capability(file: &InodeHandle) {
         },
     };
 
-    // ENODATA means the attribute didn't exist, which is fine
-    if ret != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ENODATA) {
-        warn!("Error removing security.capability from file");
+    if ret != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENOATTR) {
+            warn!("Error removing security.capability from file: {error}");
+        }
     }
 }
 
@@ -2827,5 +2829,88 @@ impl FileSystem for PassthroughFs {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use log::{Level, LevelFilter, Log, Metadata, Record};
+    use std::cell::RefCell;
+    use std::os::unix::ffi::OsStrExt;
+    use utils::tempfile::TempFile;
+
+    thread_local! {
+        static WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    struct CaptureWarnings;
+
+    impl Log for CaptureWarnings {
+        fn enabled(&self, metadata: &Metadata) -> bool {
+            metadata.level() == Level::Warn
+        }
+
+        fn log(&self, record: &Record) {
+            if self.enabled(record.metadata()) {
+                WARNINGS.with_borrow_mut(|warnings| warnings.push(record.args().to_string()));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn remove_capability_ignores_missing_attributes_and_reports_real_errors() {
+        log::set_logger(&CaptureWarnings).unwrap();
+        log::set_max_level(LevelFilter::Warn);
+        let mut temp = TempFile::new().unwrap();
+        let fd = temp.as_file().as_raw_fd();
+        let path = CString::new(temp.as_path().as_os_str().as_bytes()).unwrap();
+        let handles = [InodeHandle::Path(path), InodeHandle::Fd(fd)];
+
+        for handle in &handles {
+            remove_security_capability(handle);
+            WARNINGS.with_borrow(|warnings| assert!(warnings.is_empty(), "{warnings:?}"));
+
+            let capability = b"capability fixture";
+            let ret = unsafe {
+                libc::fsetxattr(
+                    fd,
+                    SECURITY_CAPABILITY.as_ptr().cast(),
+                    capability.as_ptr().cast(),
+                    capability.len(),
+                    0,
+                    0,
+                )
+            };
+            assert_eq!(ret, 0, "{}", io::Error::last_os_error());
+            remove_security_capability(handle);
+            WARNINGS.with_borrow(|warnings| assert!(warnings.is_empty(), "{warnings:?}"));
+            let ret = unsafe {
+                libc::fgetxattr(fd, SECURITY_CAPABILITY.as_ptr().cast(), null_mut(), 0, 0, 0)
+            };
+            assert_eq!(ret, -1);
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOATTR)
+            );
+        }
+
+        remove_security_capability(&InodeHandle::Fd(-1));
+        temp.remove().unwrap();
+        remove_security_capability(&handles[0]);
+        WARNINGS.with_borrow(|warnings| {
+            let expected: Vec<_> = [libc::EBADF, libc::ENOENT]
+                .into_iter()
+                .map(|errno| {
+                    format!(
+                        "Error removing security.capability from file: {}",
+                        io::Error::from_raw_os_error(errno)
+                    )
+                })
+                .collect();
+            assert_eq!(*warnings, expected);
+        });
     }
 }
