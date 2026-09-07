@@ -2,14 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io;
+use std::os::fd::AsRawFd;
 
 use crate::Error as DeviceError;
 use crate::bus::BusDevice;
 use crate::legacy::irqchip::IrqChipT;
 
-use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
+use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config, kvm_reinject_control};
 use kvm_ioctls::{Error, VmFd};
 use utils::eventfd::EventFd;
+
+// replace this wrapper when kvm-ioctls exposes KVM_REINJECT_CONTROL
+// https://github.com/rust-vmm/kvm/pull/386
+nix::ioctl_write_ptr_bad!(
+    set_pit_reinject,
+    nix::request_code_none!(0xae, 0x71),
+    kvm_reinject_control
+);
 
 pub struct KvmIoapic {}
 
@@ -23,6 +32,17 @@ impl KvmIoapic {
             ..Default::default()
         };
         vm.create_pit2(pit_config)?;
+
+        // PIT reinjection inhibits KVM APIC acceleration, including
+        // acceleration of unrelated inter-vCPU interrupts.
+        let reinject = kvm_reinject_control {
+            pit_reinject: 0,
+            ..Default::default()
+        };
+        // SAFETY: the VM owns the fd and the initialized structure lives
+        // through this synchronous ioctl, which copies its input.
+        unsafe { set_pit_reinject(vm.as_raw_fd(), &reinject) }
+            .map_err(|error| Error::new(error as i32))?;
 
         Ok(Self {})
     }
