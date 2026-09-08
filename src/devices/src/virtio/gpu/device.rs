@@ -12,7 +12,7 @@ use super::super::{
 use super::defs;
 use super::defs::uapi;
 use super::defs::uapi::virtio_gpu_config;
-use super::virtio_gpu::virgl_flags_to_capsets;
+use super::virtio_gpu::GpuBackendConfig;
 use super::worker::Worker;
 use crate::display::DisplayInfo;
 use crate::virtio::InterruptTransport;
@@ -38,7 +38,7 @@ pub struct Gpu {
     pub(crate) acked_features: u64,
     pub(crate) device_state: DeviceState,
     shm_region: Option<VirtioShmRegion>,
-    virgl_flags: u32,
+    backend_config: GpuBackendConfig,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     export_table: Option<ExportTable>,
@@ -49,7 +49,7 @@ pub struct Gpu {
 
 impl Gpu {
     pub fn new(
-        virgl_flags: u32,
+        backend_config: GpuBackendConfig,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
@@ -59,7 +59,7 @@ impl Gpu {
             acked_features: 0,
             device_state: DeviceState::Inactive,
             shm_region: None,
-            virgl_flags,
+            backend_config,
             #[cfg(target_os = "macos")]
             map_sender,
             export_table: None,
@@ -174,7 +174,7 @@ impl VirtioDevice for Gpu {
             events_read: 0,
             events_clear: 0,
             num_scanouts: self.displays.len() as u32,
-            num_capsets: virgl_flags_to_capsets(self.virgl_flags).count_ones(),
+            num_capsets: self.backend_config.capset_mask.count_ones(),
             blob_alignment: self.blob_alignment,
         };
 
@@ -224,7 +224,7 @@ impl VirtioDevice for Gpu {
             mem.clone(),
             interrupt.clone(),
             shm_region,
-            self.virgl_flags,
+            self.backend_config,
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
             self.export_table.take(),
