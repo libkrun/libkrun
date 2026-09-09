@@ -1963,7 +1963,7 @@ const KRUN_FEATURE_TEE: u64 = 6;
 const KRUN_FEATURE_AMD_SEV: u64 = 7;
 const KRUN_FEATURE_INTEL_TDX: u64 = 8;
 const KRUN_FEATURE_AWS_NITRO: u64 = 9;
-const KRUN_FEATURE_VIRGL_RESOURCE_MAP2: u64 = 10;
+const KRUN_FEATURE_VIRGL_RESOURCE_MAP_FIXED: u64 = 10;
 const KRUN_FEATURE_INIT_BLOB: u64 = 11;
 
 #[no_mangle]
@@ -1979,12 +1979,40 @@ pub extern "C" fn krun_has_feature(feature: u64) -> c_int {
         KRUN_FEATURE_AMD_SEV => cfg!(feature = "amd-sev"),
         KRUN_FEATURE_INTEL_TDX => cfg!(feature = "tdx"),
         KRUN_FEATURE_AWS_NITRO => cfg!(feature = "aws-nitro"),
-        KRUN_FEATURE_VIRGL_RESOURCE_MAP2 => cfg!(feature = "virgl_resource_map2"),
+        KRUN_FEATURE_VIRGL_RESOURCE_MAP_FIXED => {
+            #[cfg(feature = "gpu")]
+            {
+                devices::supports_virgl_renderer_resource_map_fixed()
+            }
+
+            #[cfg(not(feature = "gpu"))]
+            {
+                false
+            }
+        }
         KRUN_FEATURE_INIT_BLOB => cfg!(feature = "init-blob"),
         _ => return -libc::EINVAL,
     };
 
     supported as c_int
+}
+
+#[cfg(test)]
+mod test_has_feature {
+    use super::*;
+
+    #[test]
+    fn virgl_resource_map_fixed_matches_runtime_support() {
+        #[cfg(feature = "gpu")]
+        let expected = devices::supports_virgl_renderer_resource_map_fixed() as c_int;
+        #[cfg(not(feature = "gpu"))]
+        let expected = 0;
+
+        assert_eq!(
+            krun_has_feature(KRUN_FEATURE_VIRGL_RESOURCE_MAP_FIXED),
+            expected
+        );
+    }
 }
 
 /// Gets the maximum number of vCPUs supported by the hypervisor.

@@ -1046,11 +1046,12 @@ int32_t krun_check_nested_virt(void);
 #define KRUN_FEATURE_AMD_SEV 7
 #define KRUN_FEATURE_INTEL_TDX 8
 #define KRUN_FEATURE_AWS_NITRO 9
-#define KRUN_FEATURE_VIRGL_RESOURCE_MAP2 10
+#define KRUN_FEATURE_VIRGL_RESOURCE_MAP_FIXED 10
+#define KRUN_FEATURE_VIRGL_RESOURCE_MAP2 KRUN_FEATURE_VIRGL_RESOURCE_MAP_FIXED
 #define KRUN_FEATURE_INIT_BLOB 11
 
 /**
- * Checks if a specific feature was enabled at build time.
+ * Checks if a specific feature is available.
  *
  * Arguments:
  *  "feature" - one of the KRUN_FEATURE_* constants.
@@ -1060,6 +1061,9 @@ int32_t krun_check_nested_virt(void);
  *  number on failure (e.g., -EINVAL for invalid/unknown feature constant).
  *
  * Notes:
+ *  Most features reflect build-time configuration. Features backed by optional
+ *  runtime symbols are available only when the required symbol is present.
+ *
  *  When linking against an older version of libkrun, this function may
  *  return -EINVAL for feature constants that were added in newer versions.
  */
