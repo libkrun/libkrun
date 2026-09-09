@@ -157,6 +157,9 @@ pub enum Error {
     /// Error doing Vcpu Init on Arm.
     VcpuArmInit(kvm_ioctls::Error),
     #[cfg(target_arch = "aarch64")]
+    /// Error finalizing a Vcpu feature on Arm.
+    VcpuArmFinalize(kvm_ioctls::Error),
+    #[cfg(target_arch = "aarch64")]
     /// Error getting the Vcpu preferred target on Arm.
     VcpuArmPreferredTarget(kvm_ioctls::Error),
     /// vCPU count is not initialized.
@@ -417,6 +420,10 @@ impl Display for Error {
             }
             #[cfg(target_arch = "aarch64")]
             VcpuArmInit(e) => write!(f, "Error doing Vcpu Init on Arm: {e}"),
+            #[cfg(target_arch = "aarch64")]
+            VcpuArmFinalize(e) => {
+                write!(f, "Error finalizing a Vcpu feature on Arm: {e}")
+            }
 
             #[cfg(feature = "tee")]
             InvalidTee => write!(f, "TEE selected is not currently supported"),
@@ -1245,7 +1252,21 @@ impl Vcpu {
             kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PTRAUTH_GENERIC;
         }
 
+        // Expose SVE to the guest when the host can virtualise it.
+        let sve = vm_fd.check_extension(kvm_ioctls::Cap::ArmSve);
+        if sve {
+            kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_SVE;
+        }
+
         self.fd.vcpu_init(&kvi).map_err(Error::VcpuArmInit)?;
+
+        // Must precede any register access; KVM returns -EPERM until finalized.
+        if sve {
+            self.fd
+                .vcpu_finalize(&(kvm_bindings::KVM_ARM_VCPU_SVE as std::os::raw::c_int))
+                .map_err(Error::VcpuArmFinalize)?;
+        }
+
         arch::aarch64::regs::setup_regs(&self.fd, self.id, kernel_load_addr.raw_value(), mem_info)
             .map_err(Error::REGSConfiguration)?;
 
