@@ -14,7 +14,7 @@ mod muxer_thread;
 mod packet;
 mod proxy;
 mod reaper;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod timesync;
 mod tsi_dgram;
 mod tsi_stream;

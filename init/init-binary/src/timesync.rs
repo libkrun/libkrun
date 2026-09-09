@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 
 const TSYNC_PORT: u32 = 123;
 const NANOS_IN_SECOND: u64 = 1_000_000_000;
-const DELTA_SYNC: u64 = 100_000_000; // 100ms — don't bother adjusting for smaller drifts
+const DELTA_SYNC: u64 = 10_000_000; // 10ms — don't bother adjusting for smaller drifts
 
 /// Spawn a child process that synchronises the guest clock from the host.
 ///
@@ -32,6 +32,7 @@ pub fn run() {
     match unsafe { unistd::fork() } {
         Ok(ForkResult::Child) => {
             // Child: run the sync loop until the socket errors, then exit.
+            timesync_request(sock.as_raw_fd());
             clock_worker(sock.as_raw_fd());
             unsafe { libc::_exit(1) };
         }
@@ -40,6 +41,13 @@ pub fn run() {
             // The child retains its inherited fd.
         }
     }
+}
+
+/// Tell the host the guest started listening, so the time can be synchronised
+/// immediately at the right moment.
+fn timesync_request(sock: libc::c_int) {
+    let addr = VsockAddr::new(libc::VMADDR_CID_HOST, TSYNC_PORT);
+    let _ = socket::sendto(sock, &[0u8], &addr, MsgFlags::empty());
 }
 
 fn clock_worker(sock: libc::c_int) {

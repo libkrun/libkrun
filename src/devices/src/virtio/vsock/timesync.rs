@@ -2,6 +2,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time;
 
+use crossbeam_channel::Receiver;
+
 use super::super::Queue as VirtQueue;
 use super::defs::uapi;
 use super::packet::VsockPacket;
@@ -11,13 +13,14 @@ use vm_memory::GuestMemoryMmap;
 
 const UPDATE_INTERVAL: u64 = 60 * 1000 * 1000 * 1000;
 const SLEEP_NSECS: u64 = 2 * 1000 * 1000 * 1000;
-const TSYNC_PORT: u32 = 123;
+pub(super) const TSYNC_PORT: u32 = 123;
 
 pub struct TimesyncThread {
     cid: u64,
     mem: GuestMemoryMmap,
     queue_mutex: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
+    timesync_request_receiver: Receiver<()>,
 }
 
 impl TimesyncThread {
@@ -26,12 +29,14 @@ impl TimesyncThread {
         mem: GuestMemoryMmap,
         queue_mutex: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
+        timesync_request_receiver: Receiver<()>,
     ) -> Self {
         Self {
             cid,
             mem,
             queue_mutex,
             interrupt,
+            timesync_request_receiver,
         }
     }
 
@@ -62,20 +67,31 @@ impl TimesyncThread {
         let mut last_update = 0u64;
         let mut last_awake = utils::time::get_time(utils::time::ClockType::Real);
         loop {
+            let mut force_update = false;
+            match self
+                .timesync_request_receiver
+                .recv_timeout(time::Duration::from_nanos(SLEEP_NSECS))
+            {
+                Ok(()) => force_update = true,
+                Err(_) => {}
+            }
+
             let now = utils::time::get_time(utils::time::ClockType::Real);
             /*
-             * We send a time sync packet if we slept for 3 times more
-             * nanoseconds than expected (which is an indication the
-             * system forced us to take a long nap), or if UPDATE_INTERVAL
-             * has been reached.
+             * We send a time sync packet if it was requested by the guest, or
+             * we slept for 3 times more nanoseconds than expected (which is an
+             * indication the system forced us to take a long nap), or if
+             * UPDATE_INTERVAL has been reached.
              */
-            if (now - last_awake) >= (SLEEP_NSECS * 3) || (now - last_update) >= UPDATE_INTERVAL {
+            if force_update
+                || (now - last_awake) >= (SLEEP_NSECS * 3)
+                || (now - last_update) >= UPDATE_INTERVAL
+            {
                 self.send_time(now);
                 last_update = now;
             }
 
             last_awake = utils::time::get_time(utils::time::ClockType::Real);
-            thread::sleep(time::Duration::from_nanos(SLEEP_NSECS));
         }
     }
 

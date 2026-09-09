@@ -16,8 +16,8 @@ use super::muxer_thread::MuxerThread;
 use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
 use super::proxy::{Proxy, ProxyRemoval, ProxyUpdate};
 use super::reaper::ReaperThread;
-#[cfg(target_os = "macos")]
-use super::timesync::TimesyncThread;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use super::timesync::{TSYNC_PORT, TimesyncThread};
 use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
 use super::unix_proxy::UnixProxy;
@@ -116,6 +116,7 @@ pub struct VsockMuxer {
     reaper_sender: Option<Sender<u64>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     tsi_flags: TsiFlags,
+    timesync_request_sender: Option<Sender<()>>,
 }
 
 impl VsockMuxer {
@@ -137,6 +138,7 @@ impl VsockMuxer {
             reaper_sender: None,
             unix_ipc_port_map,
             tsi_flags,
+            timesync_request_sender: None,
         }
     }
 
@@ -150,11 +152,18 @@ impl VsockMuxer {
         self.mem = Some(mem.clone());
         self.interrupt = Some(interrupt.clone());
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            let timesync =
-                TimesyncThread::new(self.cid, mem.clone(), queue.clone(), interrupt.clone());
+            let (timesync_request_sender, timesync_request_receiver) = unbounded();
+            let timesync = TimesyncThread::new(
+                self.cid,
+                mem.clone(),
+                queue.clone(),
+                interrupt.clone(),
+                timesync_request_receiver,
+            );
             timesync.run();
+            self.timesync_request_sender = Some(timesync_request_sender);
         }
 
         let (sender, receiver) = unbounded();
@@ -547,6 +556,7 @@ impl VsockMuxer {
             defs::TSI_PROXY_RELEASE if self.tsi_flags.tsi_enabled() => {
                 self.process_proxy_release(pkt)
             }
+            TSYNC_PORT if pkt.op() == uapi::VSOCK_OP_RW => self.process_timesync_request(),
             _ => {
                 if pkt.op() == uapi::VSOCK_OP_RW {
                     self.process_dgram_rw(pkt);
@@ -557,6 +567,12 @@ impl VsockMuxer {
         }
 
         Ok(())
+    }
+
+    fn process_timesync_request(&self) {
+        if let Some(sender) = &self.timesync_request_sender {
+            let _ = sender.send(());
+        }
     }
 
     fn process_op_request(&mut self, pkt: &VsockPacket) {
