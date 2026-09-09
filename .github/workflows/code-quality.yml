@@ -64,6 +64,39 @@ jobs:
         env:
           KRUN_INIT_BINARY_PATH: ${{ github.workspace }}/init/init
 
+  public-headers:
+    name: Public headers
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -yqq --no-install-recommends gcc g++ clang
+
+      # Every header in include/ is part of the public API, so each one has
+      # to be self contained and warning free on its own: a warning here is
+      # one that every consumer of libkrun gets, and one that a consumer
+      # building with -Werror cannot get rid of at all.
+      - name: Compile every public header on its own
+        run: |
+          status=0
+          for header in include/*.h; do
+              name=$(basename "$header")
+              printf '#include <%s>\n' "$name" > header-check.c
+              cp header-check.c header-check.cc
+              for compiler in "gcc header-check.c" "clang header-check.c" \
+                              "g++ header-check.cc" "clang++ header-check.cc"; do
+                  echo "::group::$name (${compiler%% *})"
+                  # shellcheck disable=SC2086
+                  $compiler -Iinclude -Wall -Wextra -Werror -fsyntax-only || status=1
+                  echo "::endgroup::"
+              done
+          done
+          rm -f header-check.c header-check.cc
+          exit $status
+
   verify-init-blob-bindings:
     name: init-blob bindings
     runs-on: ubuntu-26.04
