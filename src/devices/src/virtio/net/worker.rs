@@ -288,7 +288,11 @@ impl NetWorker {
                 Err(TxError::Backend(WriteError::NothingWritten)) => true,
                 Err(e) => {
                     log::error!("Failed to process tx: {e:?}");
-                    false
+                    // Re-enable notifications before breaking so the guest
+                    // can still kick the TX queue on future descriptors.
+                    let _ = self.tx_q.queue.enable_notification(&self.mem);
+                    self.tx_has_deferred_frame = false;
+                    break;
                 }
                 _ => false,
             };
