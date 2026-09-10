@@ -4,8 +4,9 @@ mod input_backend;
 mod input_constants;
 mod scanout_paintable;
 
-use crate::display_worker::DisplayWorker;
+use crate::display_worker::{DisplayWorker, attach_keyboard, attach_per_display_inputs};
 use crate::input_backend::{GtkInputEventProvider, GtkKeyboardConfig, GtkTouchscreenConfig};
+use crate::scanout_paintable::ScanoutPaintable;
 use anyhow::Context;
 pub use display_backend::DisplayEvent;
 pub use display_backend::GtkDisplayBackend;
@@ -13,6 +14,8 @@ use krun_display::{DisplayBackend, IntoDisplayBackend};
 use krun_input::{InputAbsInfo, InputConfigBackend, InputEventProviderBackend};
 use krun_input::{InputEvent, IntoInputConfig, IntoInputEvents};
 use utils::pollable_channel::{PollableChannelReciever, PollableChannelSender, pollable_channel};
+
+use gtk::{Picture, gdk, prelude::*};
 
 pub struct DisplayBackendHandle {
     tx: PollableChannelSender<DisplayEvent>,
@@ -57,21 +60,42 @@ impl InputBackendHandle {
 }
 
 pub struct DisplayBackendWorker {
-    app_name: String,
-    display_rx: PollableChannelReciever<DisplayEvent>,
-    keyboard_tx: Option<PollableChannelSender<InputEvent>>,
-    per_display_inputs: Vec<Vec<(PollableChannelSender<InputEvent>, DisplayInputOptions)>>,
+    pub(crate) display_rx: PollableChannelReciever<DisplayEvent>,
+    pub(crate) keyboard_tx: Option<PollableChannelSender<InputEvent>>,
+    pub(crate) per_display_inputs:
+        Vec<Vec<(PollableChannelSender<InputEvent>, DisplayInputOptions)>>,
+    pub(crate) paintables: Vec<Option<ScanoutPaintable>>,
 }
 
 impl DisplayBackendWorker {
+    pub fn create_paintable(
+        &mut self,
+        display_id: usize,
+        width: i32,
+        height: i32,
+    ) -> gdk::Paintable {
+        let paintable = ScanoutPaintable::new(width, height);
+        if self.paintables.len() <= display_id {
+            self.paintables.resize_with(display_id + 1, || None);
+        }
+        self.paintables[display_id] = Some(paintable.clone());
+        paintable.upcast()
+    }
+
+    pub fn attach_input(&self, display_id: usize, picture: &Picture) {
+        if let Some(keyboard_tx) = &self.keyboard_tx {
+            picture.set_focusable(true);
+            picture.grab_focus();
+            attach_keyboard(keyboard_tx.clone(), picture);
+        }
+        if let Some(inputs) = self.per_display_inputs.get(display_id) {
+            attach_per_display_inputs(picture, inputs.clone());
+        }
+    }
+
     /// NOTE: on macOS GTK has to run on the main thread of the application.
-    pub fn run(self) {
-        DisplayWorker::run(
-            self.app_name,
-            self.display_rx,
-            self.keyboard_tx,
-            self.per_display_inputs,
-        );
+    pub fn run(self, on_activate: impl FnOnce(&mut Self) + 'static) {
+        DisplayWorker::run(self, on_activate);
     }
 }
 
@@ -125,7 +149,6 @@ pub enum DisplayInputOptions {
 /// `per_display_inputs` is an array indexed by display id.
 /// It contains inputs associated with that specific scanout
 pub fn init(
-    app_name: String,
     keyboard_input: bool,
     per_display_inputs: Vec<Vec<DisplayInputOptions>>,
 ) -> anyhow::Result<(
@@ -172,10 +195,10 @@ pub fn init(
     let display_backend = DisplayBackendHandle { tx: display_tx };
 
     let worker = DisplayBackendWorker {
-        app_name,
         display_rx,
         keyboard_tx,
         per_display_inputs: per_display_event_tx,
+        paintables: Vec::new(),
     };
 
     Ok((display_backend, input_backend_handles, worker))

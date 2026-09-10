@@ -665,6 +665,7 @@ dependencies = [
  "clap",
  "clap_derive",
  "env_logger",
+ "gtk4",
  "gtk_display",
  "krun-init-blob-via-cdylib",
  "krun-input",
