@@ -5,6 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+mod acpi;
 mod gdt;
 /// Contains logic for setting up Advanced Programmable Interrupt Controller (local version).
 pub mod interrupts;
