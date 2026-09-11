@@ -884,6 +884,15 @@ pub fn build_microvm(
                 size: 4096,
                 attributes: 0,
             },
+            MeasuredRegion {
+                guest_addr: arch::x86_64::layout::RSDP_ADDR,
+                host_addr: guest_memory
+                    .get_host_address(GuestAddress(arch::x86_64::layout::RSDP_ADDR))
+                    .unwrap() as u64,
+                size: (arch::x86_64::layout::HIMEM_START - arch::x86_64::layout::RSDP_ADDR)
+                    as usize,
+                attributes: 0,
+            },
         ]
     };
 
