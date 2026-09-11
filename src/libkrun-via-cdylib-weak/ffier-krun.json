@@ -1444,6 +1444,33 @@
           "ffi_name": "krun_vmm_builder_split_irqchip"
         },
         {
+          "name": "acpi",
+          "doc": [
+            " Enable ACPI table generation for x86_64 guests.",
+            "",
+            " When disabled (the default), virtio-mmio devices are passed on the kernel",
+            " command line and SMP uses the MP table. When enabled, devices are described",
+            " in the ACPI DSDT and the RSDP is published in boot parameters."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "enabled",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vmm_builder_acpi"
+        },
+        {
           "name": "add_smbios_oem_string",
           "receiver": "value",
           "params": [

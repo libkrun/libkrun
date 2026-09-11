@@ -153,8 +153,7 @@ pub enum Error {
 pub type Result<T> = result::Result<T, Error>;
 
 /// Builds and writes RSDP, XSDT, FADT, DSDT, and MADT into guest memory
-/// starting at `RSDP_ADDR`. Must be called for every payload type, including TEE.
-#[allow(dead_code)]
+/// starting at `RSDP_ADDR`.
 pub fn setup_acpi(
     mem: &GuestMemoryMmap,
     num_cpus: u8,

@@ -523,6 +523,9 @@ int main(int argc, char *const argv[])
     krun_vmm_builder_payload(&builder, payload);
     krun_vmm_builder_devices(&builder, devices);
     CHECK(krun_vmm_builder_split_irqchip(&builder, false, &krun_err));
+#if defined(__x86_64__)
+    CHECK(krun_vmm_builder_acpi(&builder, false, &krun_err));
+#endif
 
     CHECK(KrunVmm vmm = krun_vmm_builder_build(&builder, &krun_err));
     krun_vmm_run(vmm); // never returns

@@ -116,6 +116,9 @@ pub struct VmResources {
     pub nested_enabled: bool,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
+    /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
+    /// discovered via the kernel command line and SMP uses the MP table.
+    pub acpi_enabled: bool,
     /// The console id to use for console= in the kernel cmdline
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
@@ -260,6 +263,7 @@ mod tests {
             smbios_oem_strings: None,
             nested_enabled: false,
             split_irqchip: false,
+            acpi_enabled: false,
             serial_consoles: Vec::new(),
             kernel_console: None,
         }

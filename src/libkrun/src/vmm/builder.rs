@@ -853,7 +853,7 @@ pub fn build_microvm(
             return Err(StartMicrovmError::MissingKernelConfig);
         };
 
-        vec![
+        let mut regions = vec![
             MeasuredRegion {
                 guest_addr: arch::FIRMWARE_START,
                 host_addr: guest_memory
@@ -884,7 +884,9 @@ pub fn build_microvm(
                 size: 4096,
                 attributes: 0,
             },
-            MeasuredRegion {
+        ];
+        if vm_resources.acpi_enabled {
+            regions.push(MeasuredRegion {
                 guest_addr: arch::x86_64::layout::RSDP_ADDR,
                 host_addr: guest_memory
                     .get_host_address(GuestAddress(arch::x86_64::layout::RSDP_ADDR))
@@ -892,8 +894,9 @@ pub fn build_microvm(
                 size: (arch::x86_64::layout::HIMEM_START - arch::x86_64::layout::RSDP_ADDR)
                     as usize,
                 attributes: 0,
-            },
-        ]
+            });
+        }
+        regions
     };
 
     #[cfg(feature = "tdx")]
@@ -1195,6 +1198,23 @@ pub fn build_microvm(
         vmm.kernel_cmdline.insert_str(s).unwrap();
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if !vm_resources.acpi_enabled {
+        use device_manager::mmio::Error as MmioError;
+        for (mmio_base, irq) in vmm.mmio_device_manager.virtio_mmio_devices() {
+            vmm.mmio_device_manager
+                .add_device_to_cmdline(&mut vmm.kernel_cmdline, mmio_base, irq)
+                .map_err(|e| match e {
+                    MmioError::Cmdline(cmdline_err) => {
+                        StartMicrovmError::LoadCommandline(cmdline_err)
+                    }
+                    other => StartMicrovmError::Internal(Error::EventFd(io::Error::other(
+                        format!("virtio_mmio cmdline: {other:?}"),
+                    ))),
+                })?;
+        }
+    }
+
     // Write the kernel command line to guest memory. This is x86_64 specific, since on
     // aarch64 the command line will be specified through the FDT.
     // For the TD-Shim path, the cmdline is written so TD-Shim can reference it when
@@ -1207,11 +1227,21 @@ pub fn build_microvm(
         load_cmdline(&vmm)?;
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let virtio_mmio_devices = if vm_resources.acpi_enabled {
+        vmm.mmio_device_manager.virtio_mmio_devices()
+    } else {
+        Vec::new()
+    };
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let virtio_mmio_devices: Vec<(u64, u32)> = vec![];
     vmm.configure_system(
         vcpus.as_slice(),
         &intc,
         &payload_config.initrd_config,
         &vm_resources.smbios_oem_strings,
+        vm_resources.acpi_enabled,
+        &virtio_mmio_devices,
         payload_config.pvh,
     )
     .map_err(StartMicrovmError::Internal)?;
@@ -2212,20 +2242,13 @@ pub(crate) fn attach_mmio_device(
     let mmio_device = MmioTransport::new(vmm.guest_memory().clone(), intc, device)?;
 
     let type_id = mmio_device.locked_device().device_type();
-    let _cmdline = &mut vmm.kernel_cmdline;
 
     #[cfg(target_os = "linux")]
-    let (_mmio_base, _irq) =
-        vmm.mmio_device_manager
-            .register_mmio_device(vmm.vm.fd(), mmio_device, type_id, id)?;
-    #[cfg(target_os = "macos")]
-    let (_mmio_base, _irq) =
-        vmm.mmio_device_manager
-            .register_mmio_device(mmio_device, type_id, id)?;
-
-    #[cfg(target_arch = "x86_64")]
     vmm.mmio_device_manager
-        .add_device_to_cmdline(_cmdline, _mmio_base, _irq)?;
+        .register_mmio_device(vmm.vm.fd(), mmio_device, type_id, id)?;
+    #[cfg(target_os = "macos")]
+    vmm.mmio_device_manager
+        .register_mmio_device(mmio_device, type_id, id)?;
 
     Ok(())
 }

@@ -275,7 +275,7 @@ impl MMIODeviceManager {
     }
 
     /// Gets the MMIO base address and IRQ for all registered virtio devices.
-    #[allow(dead_code)]
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub fn virtio_mmio_devices(&self) -> Vec<(u64, u32)> {
         let mut devices: Vec<(u64, u32)> = self
             .id_to_dev_info
