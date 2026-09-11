@@ -184,6 +184,7 @@ struct ContextConfig {
     shutdown_efd: Option<EventFd>,
     gpu_virgl_flags: Option<u32>,
     gpu_shm_size: Option<usize>,
+    render_server_fd: Option<RawFd>,
     enable_snd: bool,
     console_output: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
@@ -1572,6 +1573,24 @@ pub unsafe extern "C" fn krun_set_gpu_options2(
             let cfg = ctx_cfg.get_mut();
             cfg.set_gpu_virgl_flags(virgl_flags);
             cfg.set_gpu_shm_size(shm_size.try_into().unwrap());
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_gpu_render_server_fd(ctx_id: u32, render_server_fd: i32) -> i32 {
+    if render_server_fd < 0 {
+        return -libc::EINVAL;
+    }
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.render_server_fd = Some(render_server_fd);
         }
         Entry::Vacant(_) => return -libc::ENOENT,
     }
@@ -2981,6 +3000,9 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
     if let Some(shm_size) = ctx_cfg.gpu_shm_size {
         ctx_cfg.vmr.set_gpu_shm_size(shm_size);
+    }
+    if let Some(render_server_fd) = ctx_cfg.render_server_fd {
+        ctx_cfg.vmr.set_gpu_render_server_fd(render_server_fd);
     }
 
     #[cfg(feature = "snd")]

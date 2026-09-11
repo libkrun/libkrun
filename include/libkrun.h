@@ -644,6 +644,20 @@ int32_t krun_set_gpu_options2(uint32_t ctx_id,
                               uint32_t virgl_flags,
                               uint64_t shm_size);
 
+/**
+ * Sets the file descriptor of the virgl render server to be used instead of having
+ * libvirglrenderer starting it on its own. This enables the caller to have total control
+ * over the context where the render server is started.
+ *
+ * Arguments:
+ *  "ctx_id"            - the configuration context ID.
+ *  "render_server_fd"  - the file descriptor of the render server.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_gpu_render_server_fd(uint32_t ctx_id, int render_server_fd);
+
 /* Maximum number of displays. Same as VIRTIO_GPU_MAX_SCANOUTS defined in the virtio-gpu spec */
 #define KRUN_MAX_DISPLAYS 16
 
