@@ -403,6 +403,15 @@ void krun_vmm_builder_nested_virt(KrunVmmBuilder* handle, bool enabled);
 typedef void (*krun_vmm_builder_nested_virt_fn)(KrunVmmBuilder* handle, bool enabled);
 KrunResult krun_vmm_builder_split_irqchip(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 typedef KrunResult (*krun_vmm_builder_split_irqchip_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
+/**
+ * Enable ACPI table generation for x86_64 guests.
+ *
+ * When disabled (the default), virtio-mmio devices are passed on the kernel
+ * command line and SMP uses the MP table. When enabled, devices are described
+ * in the ACPI DSDT and the RSDP is published in boot parameters.
+ */
+KrunResult krun_vmm_builder_acpi(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
+typedef KrunResult (*krun_vmm_builder_acpi_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 void krun_vmm_builder_add_smbios_oem_string(KrunVmmBuilder* handle, KrunStr s);
 typedef void (*krun_vmm_builder_add_smbios_oem_string_fn)(KrunVmmBuilder* handle, KrunStr s);
 /**

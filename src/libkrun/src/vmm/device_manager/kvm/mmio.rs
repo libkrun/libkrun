@@ -273,6 +273,24 @@ impl MMIODeviceManager {
     pub fn get_device_info(&self) -> &HashMap<(DeviceType, String), MMIODeviceInfo> {
         &self.id_to_dev_info
     }
+
+    /// Gets the MMIO base address and IRQ for all registered virtio devices.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub fn virtio_mmio_devices(&self) -> Vec<(u64, u32)> {
+        let mut devices: Vec<(u64, u32)> = self
+            .id_to_dev_info
+            .iter()
+            .filter_map(|((device_type, _), info)| {
+                if matches!(device_type, DeviceType::Virtio(_)) {
+                    Some((info.addr, info._irq))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        devices.sort_unstable_by_key(|(base, _)| *base);
+        devices
+    }
 }
 
 /// Private structure for storing information about the MMIO device registered at some address on the bus.
@@ -549,5 +567,54 @@ mod tests {
                 device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id.clone())]._irq
             );
         }
+    }
+    #[test]
+    fn test_virtio_mmio_devices() {
+        let start_addr1 = GuestAddress(0x0);
+        let start_addr2 = GuestAddress(0x1000);
+        let guest_mem =
+            GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+        let vm = builder::setup_vm(&guest_mem, false).unwrap();
+        let mut device_manager =
+            MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
+        #[cfg(target_arch = "x86_64")]
+        let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
+        #[cfg(target_arch = "aarch64")]
+        let _gic = KvmGicV3::new(vm.fd(), 1).unwrap();
+
+        let mut cmdline = kernel_cmdline::Cmdline::new(4096);
+
+        assert!(device_manager.virtio_mmio_devices().is_empty());
+
+        device_manager
+            .register_virtio_device(
+                vm.fd(),
+                guest_mem.clone(),
+                Arc::new(Mutex::new(DummyDevice::new())),
+                &mut cmdline,
+                0,
+                "dev0",
+            )
+            .unwrap();
+        device_manager
+            .register_virtio_device(
+                vm.fd(),
+                guest_mem,
+                Arc::new(Mutex::new(DummyDevice::new())),
+                &mut cmdline,
+                0,
+                "dev1",
+            )
+            .unwrap();
+
+        let devices = device_manager.virtio_mmio_devices();
+        assert_eq!(devices.len(), 2);
+        let first = if cfg!(any(target_arch = "aarch64", target_arch = "riscv64")) {
+            0xd000_1000
+        } else {
+            0xd000_0000
+        };
+        assert_eq!(devices[0], (first, arch::IRQ_BASE));
+        assert_eq!(devices[1], (first + MMIO_LEN, arch::IRQ_BASE + 1));
     }
 }

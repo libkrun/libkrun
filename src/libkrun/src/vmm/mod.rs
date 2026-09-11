@@ -279,12 +279,15 @@ impl Vmm {
     }
 
     /// Configures the system for boot.
+    #[allow(clippy::too_many_arguments)]
     pub fn configure_system(
         &self,
         vcpus: &[Vcpu],
         _intc: &IrqChip,
         initrd: &Option<InitrdConfig>,
         _smbios_oem_strings: &Option<Vec<String>>,
+        _acpi_enabled: bool,
+        _virtio_mmio_devices: &[(u64, u32)],
         _pvh: bool,
     ) -> Result<()> {
         #[cfg(target_arch = "x86_64")]
@@ -303,6 +306,8 @@ impl Vmm {
                 initrd,
                 vcpus.len() as u8,
                 _pvh,
+                _acpi_enabled,
+                _virtio_mmio_devices,
             )
             .map_err(Error::ConfigureSystem)?;
         }

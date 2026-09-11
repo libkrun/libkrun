@@ -32,6 +32,7 @@ pub struct VmmBuilder<'a> {
     kernel_console: Option<String>,
     nested_virt: bool,
     split_irqchip: bool,
+    acpi: bool,
     smbios_oem_strings: Vec<String>,
     shutdown_support: bool,
 }
@@ -106,6 +107,19 @@ impl<'a> VmmBuilder<'a> {
             return Err(VmmError::InvalidParam());
         }
         self.split_irqchip = enabled;
+        Ok(self)
+    }
+
+    /// Enable ACPI table generation for x86_64 guests.
+    ///
+    /// When disabled (the default), virtio-mmio devices are passed on the kernel
+    /// command line and SMP uses the MP table. When enabled, devices are described
+    /// in the ACPI DSDT and the RSDP is published in boot parameters.
+    pub fn acpi(mut self, enabled: bool) -> Result<Self, VmmError> {
+        if enabled && !cfg!(target_arch = "x86_64") {
+            return Err(VmmError::InvalidParam());
+        }
+        self.acpi = enabled;
         Ok(self)
     }
 
@@ -385,6 +399,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
 
     vm_resources.nested_enabled = builder_cfg.nested_virt;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
+    vm_resources.acpi_enabled = builder_cfg.acpi;
     if !builder_cfg.smbios_oem_strings.is_empty() {
         vm_resources.smbios_oem_strings = Some(builder_cfg.smbios_oem_strings);
     }
