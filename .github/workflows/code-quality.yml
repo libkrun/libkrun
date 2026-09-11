@@ -64,8 +64,8 @@ jobs:
         env:
           KRUN_INIT_BINARY_PATH: ${{ github.workspace }}/init/init
 
-  verify-init-blob-bindings:
-    name: init-blob bindings
+  verify-bindings:
+    name: Verify bindings up-to-date
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
@@ -76,18 +76,21 @@ jobs:
       - name: Install ffier-gen-c-header
         run: cargo install --git https://github.com/mtjhrc/ffier.git --tag 0.2.0rc1 ffier-gen-c-header
 
+      - name: Regenerate libkrun bindings
+        run: make gen-libkrun-bindings
+
       - name: Regenerate init-blob bindings
         run: make gen-init-blob-bindings
 
-      - name: Verify init-blob JSON schema is up to date
+      - name: Verify libkrun bindings are up to date
         run: |
-          git diff --exit-code init/init-blob-via-cdylib/ffier-krun_init.json \
-            || { echo "error: init-blob JSON schema is out of date — run 'make gen-init-blob-bindings' and commit the result"; exit 1; }
+          git diff --exit-code bindings/libkrun-via-cdylib-weak/ffier-krun.json include/libkrun.h \
+            || { echo "error: libkrun bindings or schema out of date — run 'make gen-libkrun-bindings' and commit the result"; exit 1; }
 
-      - name: Verify init-blob C header is up to date
+      - name: Verify init-blob bindings are up to date
         run: |
-          git diff --exit-code include/libkrun_init.h \
-            || { echo "error: init-blob C header is out of date — run 'make gen-init-blob-bindings' and commit the result"; exit 1; }
+          git diff --exit-code bindings/init-blob-via-cdylib/ffier-krun_init.json include/libkrun_init.h \
+            || { echo "error: init-blob bindings or schema out of date — run 'make gen-init-blob-bindings' and commit the result"; exit 1; }
 
   code-quality-examples:
     name: ${{ matrix.name }}

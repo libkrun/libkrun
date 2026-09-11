@@ -3,7 +3,7 @@ members = [
     "init/init-binary",
     "src/libkrun",
     "init/init-blob",
-    "init/init-blob-via-cdylib",
+    "bindings/init-blob-via-cdylib",
     "src/input",
     "src/display",
     "src/utils",
@@ -17,7 +17,7 @@ members = [
     "src/devices",
     "src/aws_nitro",
     "src/whp",
-    "src/libkrun-via-cdylib-weak",
+    "bindings/libkrun-via-cdylib-weak",
 ]
 exclude = ["examples/gtk_display"]
 resolver = "2"

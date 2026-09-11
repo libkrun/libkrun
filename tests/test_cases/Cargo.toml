@@ -13,9 +13,9 @@ name = "test_cases"
 
 [dependencies]
 krun = { path = "../../src/libkrun", package = "libkrun", optional = true }
-krun-cdylib = { path = "../../src/libkrun-via-cdylib-weak", package = "krun-via-cdylib-weak", optional = true }
+krun-cdylib = { path = "../../bindings/libkrun-via-cdylib-weak", package = "krun-via-cdylib-weak", optional = true }
 krun-init-blob = { path = "../../init/init-blob", package = "krun-init-blob", features = ["direct"], optional = true }
-krun-init-cdylib = { path = "../../init/init-blob-via-cdylib", package = "krun-init-blob-via-cdylib", optional = true }
+krun-init-cdylib = { path = "../../bindings/init-blob-via-cdylib", package = "krun-init-blob-via-cdylib", optional = true }
 libloading = { version = "0.8", optional = true }
 macros = { path = "../macros" }
 nix = { version = "0.29.0", features = ["fs", "socket", "ioctl", "user"] }

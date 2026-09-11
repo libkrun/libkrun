@@ -24,4 +24,4 @@ pkg-config = "0.3"
 
 [dependencies]
 ffier = { git = "https://github.com/mtjhrc/ffier.git", tag = "0.2.0rc1" }
-krun-via-cdylib-weak = { path = "../../src/libkrun-via-cdylib-weak" }
+krun-via-cdylib-weak = { path = "../libkrun-via-cdylib-weak" }
