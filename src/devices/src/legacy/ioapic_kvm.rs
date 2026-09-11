@@ -249,8 +249,8 @@ impl IoApicBackend for IoApicKvmBackend {
         self.service(regs);
     }
 
-    fn on_eoi(&mut self, _regs: &mut IoApicRegs) {
-        // TODO: implement
+    fn on_eoi(&mut self, regs: &mut IoApicRegs) {
+        self.service(regs);
     }
 
     fn set_irq(
