@@ -2,8 +2,8 @@
 The testing framework here allows you to write code to configure libkrun (using the public API) and run some specific code in the guest.
 
 ## Running the tests:
-The tests can be ran using `make test` (from the main libkrun directory).
-You can also run `./run.sh` inside the `test` directory. When using the `./run.sh` script you probably want specify the `PKG_CONFIG_PATH` enviroment variable, otherwise you will be testing the system wide installation of libkrun.
+The tests can be run using `make test` (from the main libkrun directory).
+You can also run `./run.sh` inside the `tests` directory. When using the `./run.sh` script you probably want specify the `PKG_CONFIG_PATH` environment variable, otherwise you will be testing the system wide installation of libkrun.
 
 ## Running on macOS
 
@@ -66,9 +66,9 @@ FreeBSD guest tests run on Linux (amd64, arm64) and macOS (arm64) hosts. They re
 
 2. Build the FreeBSD sysroot and `init-freebsd` (from the libkrun root directory):
    ```bash
-   make BUILD_BSD_INIT=1 -- init/init-freebsd
+   make BUILD_BSD_INIT=1 -- init/init-binary/init-freebsd
    ```
-   This downloads `freebsd-sysroot/base.txz`, extracts it to `freebsd-sysroot/`, and compiles `init/init-freebsd`.
+   This downloads `freebsd-sysroot/base.txz`, extracts it to `freebsd-sysroot/`, and compiles `init/init-binary/init-freebsd`.
 
 3. The FreeBSD kernel is downloaded and cached automatically by `run.sh` (from
    `download.freebsd.org`). To use a locally-provided kernel instead, set
