@@ -1844,7 +1844,7 @@ impl FileSystem for PassthroughFs {
 
     fn readdirplus<F>(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         handle: Handle,
         _size: u32,
@@ -2284,7 +2284,7 @@ impl FileSystem for PassthroughFs {
 
     fn link(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         newparent: Inode,
         newname: &CStr,

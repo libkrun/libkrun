@@ -487,10 +487,10 @@ impl FileSystem for PassthroughFsRo {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    use super::super::windows::fs_utils;
     use super::linux_errno;
     use super::read_only_open_flags;
-    #[cfg(target_os = "windows")]
-    use super::windows::fs_utils;
 
     #[test]
     fn read_only_open_flags_allow_append() {
