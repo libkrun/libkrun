@@ -10,6 +10,7 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr::{from_ref, null, null_mut};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use utils::pollable_channel::PollableChannelSender;
 
 // We try to push the maximum amount of data to the GTK thread. Currently, we want the display thread
@@ -62,7 +63,7 @@ pub enum DisplayEvent {
         scanout_id: u32,
         rect: Option<Rect>,
         /// Response channel - signals when texture build completes (not when painted!)
-        response_tx: std::sync::mpsc::SyncSender<bool>,
+        response_tx: SyncSender<bool>,
     },
 }
 
@@ -192,13 +193,16 @@ impl DisplayBackendBasicFramebuffer for GtkDisplayBackend {
 
 fn resource_format_into_gdk(format: ResourceFormat) -> MemoryFormat {
     match format {
-        ResourceFormat::BGRA => MemoryFormat::B8g8r8a8,
+        // Map formats with alpha channel to X variants - the guest treats alpha
+        // as opaque (0xff), but GTK blends it with the background, making content
+        // invisible. Ignoring alpha fixes white-on-white rendering issues.
+        ResourceFormat::BGRA => MemoryFormat::B8g8r8x8,
         ResourceFormat::BGRX => MemoryFormat::B8g8r8x8,
-        ResourceFormat::ARGB => MemoryFormat::A8r8g8b8,
+        ResourceFormat::ARGB => MemoryFormat::X8r8g8b8,
         ResourceFormat::XRGB => MemoryFormat::X8r8g8b8,
-        ResourceFormat::RGBA => MemoryFormat::R8g8b8a8,
+        ResourceFormat::RGBA => MemoryFormat::R8g8b8x8,
         ResourceFormat::XBGR => MemoryFormat::X8b8g8r8,
-        ResourceFormat::ABGR => MemoryFormat::A8b8g8r8,
+        ResourceFormat::ABGR => MemoryFormat::X8b8g8r8,
         ResourceFormat::RGBX => MemoryFormat::R8g8b8x8,
     }
 }
@@ -335,7 +339,7 @@ impl DisplayBackendDmabuf for GtkDisplayBackend {
         };
 
         // Synchronously wait for texture build to complete
-        let (response_tx, response_rx) = std::sync::mpsc::sync_channel(0);
+        let (response_tx, response_rx) = sync_channel(0);
 
         self.channel
             .send(DisplayEvent::UpdateScanoutDmabuf {
