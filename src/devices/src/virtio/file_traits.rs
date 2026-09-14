@@ -4,17 +4,27 @@
 
 use std::fs::File;
 use std::io::{Error, ErrorKind, Result};
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
 #[cfg(feature = "blk")]
 use imago::io_buffers::{IoVector, IoVectorMut};
 use vm_memory::VolatileSlice;
 
+#[cfg(unix)]
 use libc::{c_int, c_void, read, readv, size_t, write, writev};
 
+#[cfg(unix)]
 use super::bindings::{off64_t, pread64, preadv64, pwrite64, pwritev64};
 #[cfg(feature = "blk")]
 use super::block::device::DiskProperties;
+
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::OVERLAPPED;
 
 /// A trait for setting the size of a file.
 /// This is equivalent to File's `set_len` method, but
@@ -220,6 +230,7 @@ impl<T: FileReadWriteAtVolatile + ?Sized> FileReadWriteAtVolatile for &T {
     }
 }
 
+#[cfg(unix)]
 macro_rules! volatile_impl {
     ($ty:ty) => {
         impl FileReadWriteVolatile for $ty {
@@ -409,6 +420,157 @@ macro_rules! volatile_impl {
                 } else {
                     Err(Error::last_os_error())
                 }
+            }
+        }
+    };
+}
+
+#[cfg(windows)]
+macro_rules! volatile_impl {
+    ($ty:ty) => {
+        impl FileReadWriteVolatile for $ty {
+            fn read_volatile(&mut self, slice: VolatileSlice) -> Result<usize> {
+                // Safe because only bytes inside the slice are accessed and the kernel is expected
+                // to handle arbitrary memory for I/O.
+                let mut bytes_read: u32 = 0;
+                let ret = unsafe {
+                    ReadFile(
+                        self.as_raw_handle(),
+                        slice.ptr_guard_mut().as_ptr() as *mut _,
+                        slice.len() as u32,
+                        &mut bytes_read,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ret != 0 {
+                    Ok(bytes_read as usize)
+                } else {
+                    Err(Error::last_os_error())
+                }
+            }
+            fn read_vectored_volatile(&mut self, bufs: &[VolatileSlice]) -> Result<usize> {
+                let mut total = 0;
+                for buf in bufs {
+                    if buf.is_empty() {
+                        continue;
+                    }
+                    let n = self.read_volatile(*buf)?;
+                    total += n;
+                    // If we didn't fill this buffer, don't try to fill the next ones.
+                    // This prevents blocking and matches expected 'read' semantics.
+                    if n < buf.len() {
+                        break;
+                    }
+                }
+                Ok(total)
+            }
+            fn write_volatile(&mut self, slice: VolatileSlice) -> Result<usize> {
+                // Safe because only bytes inside the slice are accessed and the kernel is expected
+                // to handle arbitrary memory for I/O.
+                let mut bytes_written = 0;
+                let ret = unsafe {
+                    WriteFile(
+                        self.as_raw_handle(),
+                        slice.ptr_guard().as_ptr() as *const _,
+                        slice.len() as u32,
+                        &mut bytes_written,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ret != 0 {
+                    Ok(bytes_written as usize)
+                } else {
+                    Err(Error::last_os_error())
+                }
+            }
+            fn write_vectored_volatile(&mut self, bufs: &[VolatileSlice]) -> Result<usize> {
+                let mut total = 0;
+                // TODO: maybe we could use WriteFileScatter instead
+                for buf in bufs {
+                    let n = self.write_volatile(*buf)?;
+                    total += n;
+                    if n < buf.len() {
+                        break;
+                    }
+                }
+                Ok(total)
+            }
+        }
+        impl FileReadWriteAtVolatile for $ty {
+            fn read_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
+                let mut bytes_read = 0;
+                let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+                overlapped.Anonymous.Anonymous.Offset = offset as u32;
+                overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+                let ret = unsafe {
+                    ReadFile(
+                        self.as_raw_handle(),
+                        slice.ptr_guard_mut().as_ptr() as *mut _,
+                        slice.len() as u32,
+                        &mut bytes_read,
+                        &mut overlapped,
+                    )
+                };
+                if ret != 0 {
+                    Ok(bytes_read as usize)
+                } else {
+                    Err(Error::last_os_error())
+                }
+            }
+            fn read_vectored_at_volatile(
+                &self,
+                bufs: &[VolatileSlice],
+                offset: u64,
+            ) -> Result<usize> {
+                let mut total = 0;
+                let mut current_offset = offset;
+                for buf in bufs {
+                    let n = self.read_at_volatile(*buf, current_offset)?;
+                    total += n;
+                    current_offset += n as u64;
+                    if n < buf.len() {
+                        break;
+                    }
+                }
+                Ok(total)
+            }
+            fn write_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
+                let mut bytes_written: u32 = 0;
+                // Windows handles "pwrite" by passing the offset in the OVERLAPPED struct
+                let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+                overlapped.Anonymous.Anonymous.Offset = offset as u32;
+                overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+                let res = unsafe {
+                    WriteFile(
+                        self.as_raw_handle(),
+                        slice.ptr_guard().as_ptr() as *mut _,
+                        slice.len() as u32,
+                        &mut bytes_written,
+                        &mut overlapped,
+                    )
+                };
+                if res != 0 {
+                    Ok(bytes_written as usize)
+                } else {
+                    Err(Error::last_os_error())
+                }
+            }
+            fn write_vectored_at_volatile(
+                &self,
+                bufs: &[VolatileSlice],
+                offset: u64,
+            ) -> Result<usize> {
+                let mut total = 0;
+                let mut current_offset = offset;
+                for buf in bufs {
+                    let n = self.write_at_volatile(*buf, current_offset)?;
+                    total += n;
+                    current_offset += n as u64;
+                    if n < buf.len() {
+                        break;
+                    }
+                }
+                Ok(total)
             }
         }
     };
