@@ -10,6 +10,7 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr::{from_ref, null, null_mut};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use utils::pollable_channel::PollableChannelSender;
 
 // We try to push the maximum amount of data to the GTK thread. Currently, we want the display thread
@@ -62,7 +63,7 @@ pub enum DisplayEvent {
         scanout_id: u32,
         rect: Option<Rect>,
         /// Response channel - signals when texture build completes (not when painted!)
-        response_tx: std::sync::mpsc::SyncSender<bool>,
+        response_tx: SyncSender<bool>,
     },
 }
 
@@ -335,7 +336,7 @@ impl DisplayBackendDmabuf for GtkDisplayBackend {
         };
 
         // Synchronously wait for texture build to complete
-        let (response_tx, response_rx) = std::sync::mpsc::sync_channel(0);
+        let (response_tx, response_rx) = sync_channel(0);
 
         self.channel
             .send(DisplayEvent::UpdateScanoutDmabuf {
