@@ -1,4 +1,4 @@
-mod rust_to_c;
+pub mod rust_to_c;
 pub use rust_to_c::*;
 mod c_to_rust;
 pub use c_to_rust::*;
@@ -20,6 +20,7 @@ mod header {
 bitflags! {
     pub struct DisplayFeatures: u64 {
         const BASIC_FRAMEBUFFER = header::KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER as u64;
+        const DMABUF_CONSUMER = header::KRUN_DISPLAY_FEATURE_DMABUF_CONSUMER as u64;
     }
 }
 
@@ -77,4 +78,6 @@ impl TryFrom<u32> for ResourceFormat {
 
 pub type DisplayVtable = header::krun_display_vtable;
 pub type DisplayBasicFramebufferVtable = header::krun_display_basic_framebuffer_vtable;
+pub type DisplayDmabufVtable = header::krun_display_dmabuf_vtable;
+pub type DmabufExport = header::krun_display_dmabuf_export;
 pub type Rect = header::krun_rect;
