@@ -1,4 +1,4 @@
-use std::os::windows::io::{AsRawSocket, OwnedSocket};
+use std::os::windows::io::{AsRawHandle, AsRawSocket, OwnedSocket};
 
 use windows_sys::Win32::Foundation::HANDLE;
 
@@ -13,6 +13,12 @@ pub type RawFd = HANDLE;
 /// Windows equivalent of [`std::os::unix::io::AsRawFd`].
 pub trait AsRawFd {
     fn as_raw_fd(&self) -> RawFd;
+}
+
+impl AsRawFd for std::fs::File {
+    fn as_raw_fd(&self) -> RawFd {
+        self.as_raw_handle() as RawFd
+    }
 }
 
 impl AsRawFd for OwnedSocket {

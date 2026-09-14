@@ -90,7 +90,7 @@ pub trait ReadableFd: std::io::Read + std::os::fd::AsRawFd {}
 impl ReadableFd for std::fs::File {}
 
 #[cfg(windows)]
-pub trait ReadableFd: std::io::Read + Send {}
+pub trait ReadableFd: std::io::Read + utils::windows::AsRawFd {}
 #[cfg(windows)]
 impl ReadableFd for std::fs::File {}
 
