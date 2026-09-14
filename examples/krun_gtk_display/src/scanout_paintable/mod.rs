@@ -104,17 +104,9 @@ impl ScanoutPaintable {
 
         match new_texture {
             Some(texture) => {
-                let old_texture = imp.texture.replace(Some(texture.clone()));
+                imp.texture.replace(Some(texture));
                 self.invalidate_contents();
-                if let Some(old_texture) = old_texture {
-                    if old_texture.width() != texture.width()
-                        || old_texture.height() != texture.height()
-                    {
-                        self.invalidate_size();
-                    }
-                } else {
-                    self.invalidate_size();
-                }
+                self.invalidate_size();
                 true
             }
             None => {

@@ -4,7 +4,7 @@ use crate::display_worker::SharedDmabuf;
 use gtk::gdk::DmabufTextureBuilder;
 use gtk::{
     cairo::{RectangleInt as CairoRect, Region},
-    gdk::{Paintable, PaintableFlags, Snapshot, Texture},
+    gdk::{self, Paintable, PaintableFlags, RGBA, Snapshot, Texture},
     glib,
     graphene::Rect,
     prelude::*,
@@ -22,7 +22,7 @@ pub struct DmabufUpdate {
     pub damage_area: Option<KrunRect>,
 }
 
-#[derive(Default, glib::Properties)]
+#[derive(glib::Properties)]
 #[properties(wrapper_type = super::ScanoutPaintable)]
 pub struct ScanoutPaintable {
     // Store the texture that this paintable will draw.
@@ -32,6 +32,17 @@ pub struct ScanoutPaintable {
     #[property(get, set)]
     pub default_height: Cell<i32>,
     pub update_region: RefCell<Option<Region>>,
+}
+
+impl Default for ScanoutPaintable {
+    fn default() -> Self {
+        Self {
+            texture: RefCell::new(None),
+            default_width: Cell::new(0),
+            default_height: Cell::new(0),
+            update_region: RefCell::new(None),
+        }
+    }
 }
 
 #[glib::object_subclass]
@@ -62,6 +73,7 @@ pub fn build_dmabuf_texture(
         return None;
     }
     let mut builder = DmabufTextureBuilder::new()
+        .set_display(gdk::Display::default().as_ref().unwrap())
         .set_width(dmabuf.width)
         .set_height(dmabuf.height)
         .set_fourcc(dmabuf.fourcc)
@@ -125,6 +137,12 @@ pub fn build_dmabuf_texture(
 
 impl PaintableImpl for ScanoutPaintable {
     fn snapshot(&self, snapshot: &Snapshot, width: f64, height: f64) {
+        snapshot.append_color(
+            &RGBA::BLACK,
+            &Rect::new(0.0, 0.0, width as f32, height as f32),
+        );
+
+        // Texture is now built immediately in configure_dmabuf(), not lazily here
         if let Some(texture) = self.texture.borrow().as_ref() {
             snapshot.append_texture(texture, &Rect::new(0.0, 0.0, width as f32, height as f32));
             self.update_region.replace(None);
