@@ -15,6 +15,7 @@ mod backend;
 pub mod device;
 #[cfg(target_os = "linux")]
 mod tap;
+#[cfg(unix)]
 mod unixgram;
 mod unixstream;
 mod worker;
@@ -23,6 +24,7 @@ mod worker;
 const VNET_HDR_LEN: usize = mem::size_of::<virtio_net_hdr_v1>();
 
 // This initializes to all 0 the virtio_net_hdr part of a buf and return the length of the header
+#[cfg(unix)]
 fn write_virtio_net_hdr(buf: &mut [u8]) -> usize {
     buf[0..VNET_HDR_LEN].fill(0);
     VNET_HDR_LEN

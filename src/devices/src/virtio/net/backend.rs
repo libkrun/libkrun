@@ -1,17 +1,36 @@
 use std::io;
+
+#[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(windows)]
+use std::os::windows::io::RawSocket;
+
+#[cfg(windows)]
+use vm_memory::GuestMemoryMmap;
+
+#[cfg(unix)]
+pub type SysError = nix::Error;
+#[cfg(windows)]
+pub type SysError = io::Error;
 
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum ConnectError {
-    InvalidAddress(nix::Error),
-    CreateSocket(nix::Error),
-    Binding(nix::Error),
+    InvalidAddress(SysError),
+    CreateSocket(SysError),
+    Binding(SysError),
+    #[cfg(windows)]
+    Worker(SysError),
+    #[cfg(not(target_os = "windows"))]
     SendingMagic(nix::Error),
     // Tap backend errors.
+    #[cfg(not(target_os = "windows"))]
     OpenNetTun(nix::Error),
+    #[cfg(not(target_os = "windows"))]
     TunSetIff(io::Error),
+    #[cfg(not(target_os = "windows"))]
     TunSetVnetHdrSz(io::Error),
+    #[cfg(not(target_os = "windows"))]
     TunSetOffload(io::Error),
 }
 
@@ -20,8 +39,15 @@ pub enum ConnectError {
 pub enum ReadError {
     /// Nothing was written
     NothingRead,
+    /// The guest queue ran out of available descriptors
+    #[cfg(windows)]
+    DescriptorStarvation,
+    #[cfg(windows)]
+    ProcessNotRunning,
+    #[cfg(windows)]
+    Queue(crate::virtio::queue::Error),
     /// Another internal error occurred
-    Internal(nix::Error),
+    Internal(SysError),
 }
 
 #[allow(dead_code)]
@@ -34,9 +60,10 @@ pub enum WriteError {
     /// Passt doesnt seem to be running (received EPIPE)
     ProcessNotRunning,
     /// Another internal error occurred
-    Internal(nix::Error),
+    Internal(SysError),
 }
 
+#[cfg(unix)]
 pub trait NetBackend {
     fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError>;
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError>;
@@ -51,4 +78,28 @@ pub trait NetBackend {
     fn write_retry_delay_us(&self) -> u64 {
         0
     }
+}
+
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum WriteStatus {
+    Complete,
+    Pending,
+}
+
+#[cfg(windows)]
+pub trait NetBackend {
+    fn prepare_tx_buffer(&mut self) -> &mut [u8];
+
+    fn start_tx(&mut self, total_bytes: usize) -> Result<WriteStatus, WriteError>;
+
+    fn resume_tx(&mut self) -> Result<WriteStatus, WriteError>;
+
+    fn read_frames_to_guest(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        rx_queue: &mut crate::virtio::queue::Queue,
+    ) -> Result<u32, ReadError>;
+
+    fn raw_socket_fd(&self) -> RawSocket;
 }

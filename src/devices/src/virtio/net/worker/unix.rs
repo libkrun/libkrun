@@ -1,22 +1,23 @@
+use std::cmp;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::result;
+use std::thread;
+
+use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
 use crate::virtio::net::backend::ConnectError;
+use crate::virtio::net::backend::{NetBackend, ReadError, WriteError};
+use crate::virtio::net::device::{FrontendError, RxError, TxError, VirtioNetBackend};
 #[cfg(target_os = "linux")]
 use crate::virtio::net::tap::Tap;
 use crate::virtio::net::unixgram::Unixgram;
 use crate::virtio::net::unixstream::Unixstream;
-use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE};
+use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE, VNET_HDR_LEN};
 use crate::virtio::{DeviceQueue, InterruptTransport};
-
-use super::VNET_HDR_LEN;
-use super::backend::{NetBackend, ReadError, WriteError};
-use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
 
 #[cfg(target_os = "macos")]
 use std::os::fd::RawFd;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::thread;
-use std::{cmp, result};
-use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 pub struct NetWorker {
     rx_q: DeviceQueue,
@@ -188,7 +189,7 @@ impl NetWorker {
         }
     }
 
-    pub(crate) fn process_rx_queue_event(&mut self) {
+    fn process_rx_queue_event(&mut self) {
         if let Err(e) = self.rx_q.event.read() {
             log::error!("Failed to get rx event from queue: {e:?}");
         }
@@ -203,7 +204,7 @@ impl NetWorker {
         }
     }
 
-    pub(crate) fn process_tx_queue_event(&mut self) {
+    fn process_tx_queue_event(&mut self) {
         match self.tx_q.event.read() {
             Ok(_) => self.process_tx_loop(),
             Err(e) => {
@@ -212,7 +213,7 @@ impl NetWorker {
         }
     }
 
-    pub(crate) fn process_backend_socket_readable(&mut self) {
+    fn process_backend_socket_readable(&mut self) {
         if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
             error!("error disabling queue notifications: {e:?}");
         }
@@ -224,7 +225,7 @@ impl NetWorker {
         }
     }
 
-    pub(crate) fn process_backend_socket_writeable(&mut self) {
+    fn process_backend_socket_writeable(&mut self) {
         match self
             .backend
             .try_finish_write(VNET_HDR_LEN, &self.tx_frame_buf[..self.tx_frame_len])
