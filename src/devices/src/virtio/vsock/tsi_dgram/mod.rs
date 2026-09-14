@@ -5,14 +5,10 @@ use std::sync::{Arc, Mutex};
 use super::super::Queue as VirtQueue;
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
-#[cfg(unix)]
-use nix::sys::socket::AddressFamily;
-#[cfg(unix)]
-use std::os::fd::OwnedFd;
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, RawFd};
 
-use super::proxy::{Proxy, ProxyError, ProxyStatus, ProxyUpdate, RecvPkt};
+use super::proxy::{
+    AddressFamily, AsRawFd, OwnedFd, Proxy, ProxyError, ProxyStatus, ProxyUpdate, RawFd, RecvPkt,
+};
 
 use utils::epoll::EventSet;
 use vm_memory::GuestMemoryMmap;
@@ -59,9 +55,10 @@ impl TsiDgramProxy {
         sys::create(id, cid, family, peer_port, mem, queue, rxq)
     }
 
-    /* pub(crate) fn peer_avail_credit(&self) -> usize {
+    #[cfg(windows)]
+    pub(crate) fn peer_avail_credit(&self) -> usize {
         (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
-    } */
+    }
 
     pub(crate) fn recv_pkt(&mut self) -> (bool, bool) {
         let mut have_used = false;

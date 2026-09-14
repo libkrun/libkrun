@@ -67,6 +67,7 @@ whp = { package = "krun-whp", version = "=0.1.0-2.0.0-dev", path = "../whp" }
 vm-memory = { version = "0.18", default-features = false, features = ["backend-mmap"] }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_IO",

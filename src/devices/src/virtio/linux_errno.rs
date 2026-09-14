@@ -87,6 +87,54 @@ const LINUX_ENOTRECOVERABLE: i32 = 131;
 // Errors to be directly used.
 pub const LINUX_ERANGE: i32 = 34;
 
+/// Translate WSA error codes to Linux errno values.
+///
+/// On Windows, WinSock errors live in the 10000+ range (WSA* constants).
+/// We map them to their Linux equivalents so the guest sees the right errno.
+#[cfg(target_os = "windows")]
+pub fn wsa_errno_to_linux(wsa_err: i32) -> i32 {
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY, WSAECONNABORTED,
+        WSAECONNREFUSED, WSAECONNRESET, WSAEDESTADDRREQ, WSAEHOSTDOWN, WSAEHOSTUNREACH,
+        WSAEINPROGRESS, WSAEISCONN, WSAEMSGSIZE, WSAENETDOWN, WSAENETRESET, WSAENETUNREACH,
+        WSAENOBUFS, WSAENOPROTOOPT, WSAENOTCONN, WSAENOTSOCK, WSAEOPNOTSUPP, WSAEPFNOSUPPORT,
+        WSAEPROTONOSUPPORT, WSAEPROTOTYPE, WSAESHUTDOWN, WSAESOCKTNOSUPPORT, WSAETIMEDOUT,
+        WSAEWOULDBLOCK,
+    };
+
+    match wsa_err {
+        WSAEWOULDBLOCK => LINUX_EAGAIN,
+        WSAEINPROGRESS => LINUX_EINPROGRESS,
+        WSAEALREADY => LINUX_EALREADY,
+        WSAENOTSOCK => LINUX_ENOTSOCK,
+        WSAEDESTADDRREQ => LINUX_EDESTADDRREQ,
+        WSAEMSGSIZE => LINUX_EMSGSIZE,
+        WSAEPROTOTYPE => LINUX_EPROTOTYPE,
+        WSAENOPROTOOPT => LINUX_ENOPROTOOPT,
+        WSAEPROTONOSUPPORT => LINUX_EPROTONOSUPPORT,
+        WSAESOCKTNOSUPPORT => LINUX_ESOCKTNOSUPPORT,
+        WSAEOPNOTSUPP => LINUX_EOPNOTSUPP,
+        WSAEPFNOSUPPORT => LINUX_EPFNOSUPPORT,
+        WSAEAFNOSUPPORT => LINUX_EAFNOSUPPORT,
+        WSAEADDRINUSE => LINUX_EADDRINUSE,
+        WSAEADDRNOTAVAIL => LINUX_EADDRNOTAVAIL,
+        WSAENETDOWN => LINUX_ENETDOWN,
+        WSAENETUNREACH => LINUX_ENETUNREACH,
+        WSAENETRESET => LINUX_ENETRESET,
+        WSAECONNABORTED => LINUX_ECONNABORTED,
+        WSAECONNRESET => LINUX_ECONNRESET,
+        WSAENOBUFS => LINUX_ENOBUFS,
+        WSAEISCONN => LINUX_EISCONN,
+        WSAENOTCONN => LINUX_ENOTCONN,
+        WSAESHUTDOWN => LINUX_ESHUTDOWN,
+        WSAETIMEDOUT => LINUX_ETIMEDOUT,
+        WSAECONNREFUSED => LINUX_ECONNREFUSED,
+        WSAEHOSTDOWN => LINUX_EHOSTDOWN,
+        WSAEHOSTUNREACH => LINUX_EHOSTUNREACH,
+        _ => LINUX_EIO,
+    }
+}
+
 pub fn linux_error(error: std::io::Error) -> std::io::Error {
     std::io::Error::from_raw_os_error(linux_errno_raw(error.raw_os_error().unwrap_or(libc::EIO)))
 }
@@ -106,6 +154,7 @@ pub fn linux_errno_raw(errno: i32) -> i32 {
         libc::ENOMEM => LINUX_ENOMEM,
         libc::EACCES => LINUX_EACCES,
         libc::EFAULT => LINUX_EFAULT,
+        #[cfg(not(target_os = "windows"))]
         libc::ENOTBLK => LINUX_ENOTBLK,
         libc::EBUSY => LINUX_EBUSY,
         libc::EEXIST => LINUX_EEXIST,
@@ -134,7 +183,9 @@ pub fn linux_errno_raw(errno: i32) -> i32 {
         libc::EPROTOTYPE => LINUX_EPROTOTYPE,
         libc::ENOPROTOOPT => LINUX_ENOPROTOOPT,
         libc::EPROTONOSUPPORT => LINUX_EPROTONOSUPPORT,
+        #[cfg(not(target_os = "windows"))]
         libc::ESOCKTNOSUPPORT => LINUX_ESOCKTNOSUPPORT,
+        #[cfg(not(target_os = "windows"))]
         libc::EPFNOSUPPORT => LINUX_EPFNOSUPPORT,
         libc::EAFNOSUPPORT => LINUX_EAFNOSUPPORT,
         libc::EADDRINUSE => LINUX_EADDRINUSE,
@@ -147,18 +198,25 @@ pub fn linux_errno_raw(errno: i32) -> i32 {
         libc::ENOBUFS => LINUX_ENOBUFS,
         libc::EISCONN => LINUX_EISCONN,
         libc::ENOTCONN => LINUX_ENOTCONN,
+        #[cfg(not(target_os = "windows"))]
         libc::ESHUTDOWN => LINUX_ESHUTDOWN,
+        #[cfg(not(target_os = "windows"))]
         libc::ETOOMANYREFS => LINUX_ETOOMANYREFS,
         libc::ETIMEDOUT => LINUX_ETIMEDOUT,
         libc::ECONNREFUSED => LINUX_ECONNREFUSED,
         libc::ELOOP => LINUX_ELOOP,
         libc::ENAMETOOLONG => LINUX_ENAMETOOLONG,
+        #[cfg(not(target_os = "windows"))]
         libc::EHOSTDOWN => LINUX_EHOSTDOWN,
         libc::EHOSTUNREACH => LINUX_EHOSTUNREACH,
         libc::ENOTEMPTY => LINUX_ENOTEMPTY,
+        #[cfg(not(target_os = "windows"))]
         libc::EUSERS => LINUX_EUSERS,
+        #[cfg(not(target_os = "windows"))]
         libc::EDQUOT => LINUX_EDQUOT,
+        #[cfg(not(target_os = "windows"))]
         libc::ESTALE => LINUX_ESTALE,
+        #[cfg(not(target_os = "windows"))]
         libc::EREMOTE => LINUX_EREMOTE,
         libc::ENOLCK => LINUX_ENOLCK,
         libc::ENOSYS => LINUX_ENOSYS,
@@ -170,6 +228,7 @@ pub fn linux_errno_raw(errno: i32) -> i32 {
         #[cfg(target_os = "macos")]
         libc::ENOATTR => LINUX_ENODATA,
         libc::EBADMSG => LINUX_EBADMSG,
+        #[cfg(not(target_os = "windows"))]
         libc::EMULTIHOP => LINUX_EMULTIHOP,
         libc::ENODATA => LINUX_ENODATA,
         libc::ENOLINK => LINUX_ENOLINK,

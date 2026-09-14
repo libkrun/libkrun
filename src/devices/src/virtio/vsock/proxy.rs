@@ -2,22 +2,22 @@ use std::collections::HashMap;
 use std::fmt;
 
 #[cfg(unix)]
-use std::os::fd::OwnedFd;
+pub(super) use std::os::fd::OwnedFd;
 #[cfg(unix)]
-use std::os::unix::io::{AsRawFd, RawFd};
+pub(super) use std::os::unix::io::{AsRawFd, RawFd};
 #[cfg(windows)]
-use std::os::windows::io::OwnedSocket as OwnedFd;
+pub(super) use std::os::windows::io::OwnedSocket as OwnedFd;
 #[cfg(windows)]
-use utils::windows::{AsRawFd, RawFd};
+pub(super) use utils::windows::{AsRawFd, RawFd};
 
 use super::muxer::MuxerRx;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
 #[cfg(unix)]
-use nix::sys::socket::AddressFamily;
+pub(super) use nix::sys::socket::AddressFamily;
 /// On Windows, reuse the WinSock `ADDRESS_FAMILY` type (a `u16`) directly so
 /// that converted values are already native WinSock constants (AF_INET, …).
 #[cfg(windows)]
-use windows_sys::Win32::Networking::WinSock::{
+pub(super) use windows_sys::Win32::Networking::WinSock::{
     ADDRESS_FAMILY as AddressFamily, AF_INET, AF_INET6, AF_UNIX,
 };
 

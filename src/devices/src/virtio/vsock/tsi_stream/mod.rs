@@ -10,14 +10,11 @@ use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
 
-#[cfg(unix)]
-use nix::sys::socket::AddressFamily;
-#[cfg(unix)]
-use std::os::fd::OwnedFd;
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, RawFd};
+use super::proxy::{
+    AddressFamily, AsRawFd, OwnedFd, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate,
+    RawFd, RecvPkt,
+};
 
-use super::proxy::{Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt};
 use utils::epoll::EventSet;
 use vm_memory::GuestMemoryMmap;
 
