@@ -4,9 +4,7 @@
 use vm_memory::GuestMemoryMmap;
 
 use super::super::gdt::SegmentDescriptor;
-use super::super::layout::{
-    AP_TRAMPOLINE_START, BOOT_STACK_POINTER, RESET_VECTOR_SEV_AP, ZERO_PAGE_START,
-};
+use super::super::layout::{BOOT_STACK_POINTER, ZERO_PAGE_START};
 use super::super::regs::{
     EFER_LMA, EFER_LME, Error, X86_CR0_PE, compute_page_tables, compute_segments,
 };
@@ -21,28 +19,14 @@ type Result<T> = std::result::Result<T, Error>;
 /// * `vcpu` - Structure for the VCPU that holds the WHP VCPU.
 /// * `boot_ip` - Starting instruction pointer.
 pub fn setup_regs(vcpu: &whp::WhpVcpu, boot_ip: u64) -> Result<()> {
-    if vcpu.index() == 0 {
-        vcpu.set_registers64([
-            (WHvX64RegisterRflags, 0x0000_0000_0000_0002u64),
-            (WHvX64RegisterRip, boot_ip),
-            (WHvX64RegisterRsp, BOOT_STACK_POINTER),
-            (WHvX64RegisterRbp, BOOT_STACK_POINTER),
-            (WHvX64RegisterRsi, ZERO_PAGE_START),
-        ])
-        .map_err(Error::SetWhpRegisters)
-    } else {
-        let rip = if cfg!(feature = "tee") {
-            RESET_VECTOR_SEV_AP
-        } else {
-            AP_TRAMPOLINE_START
-        };
-
-        vcpu.set_registers64([
-            (WHvX64RegisterRflags, 0x0000_0000_0000_0002u64),
-            (WHvX64RegisterRip, rip),
-        ])
-        .map_err(Error::SetWhpRegisters)
-    }
+    vcpu.set_registers64([
+        (WHvX64RegisterRflags, 0x0000_0000_0000_0002u64),
+        (WHvX64RegisterRip, boot_ip),
+        (WHvX64RegisterRsp, BOOT_STACK_POINTER),
+        (WHvX64RegisterRbp, BOOT_STACK_POINTER),
+        (WHvX64RegisterRsi, ZERO_PAGE_START),
+    ])
+    .map_err(Error::SetWhpRegisters)
 }
 
 /// Configures the segment registers and system page tables for a given CPU.
@@ -52,13 +36,6 @@ pub fn setup_regs(vcpu: &whp::WhpVcpu, boot_ip: u64) -> Result<()> {
 /// * `mem` - The memory that will be passed to the guest.
 /// * `vcpu` - Structure for the VCPU that holds the WHP VCPU.
 pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &whp::WhpVcpu) -> Result<()> {
-    if vcpu.index() != 0 {
-        if cfg!(feature = "tee") {
-            return Ok(());
-        }
-        return setup_ap_segments(vcpu);
-    }
-
     let segs = compute_segments(mem, false)?;
     let pt = compute_page_tables(mem)?;
 
@@ -112,20 +89,6 @@ pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &whp::WhpVcpu) -> Result<()> {
         (WHvX64RegisterEfer, to_reg64(efer | EFER_LME | EFER_LMA)),
     ])
     .map_err(Error::SetWhpRegisters)
-}
-
-/// Reset CS.base to 0 for an AP vCPU so that RIP addresses land in low
-/// memory rather than at the default reset CS.base of 0xFFFF_0000.
-/// All other segment registers and control registers stay at their
-/// power-on defaults (real mode).
-fn setup_ap_segments(vcpu: &whp::WhpVcpu) -> Result<()> {
-    let [mut value] = vcpu
-        .get_registers([WHvX64RegisterCs])
-        .map_err(Error::GetWhpRegisters)?;
-    value.Segment.Base = 0;
-    value.Segment.Selector = 0;
-    vcpu.set_registers([(WHvX64RegisterCs, value)])
-        .map_err(Error::SetWhpRegisters)
 }
 
 #[cfg(test)]
@@ -183,24 +146,16 @@ mod tests {
     }
 
     #[test]
-    fn test_setup_regs_ap() {
+    fn test_ap_starts_suspended() {
         let vm = Arc::new(WhpVm::new(2).unwrap());
         let _bsp = WhpVcpu::new(vm.clone(), 0).unwrap();
         let ap = WhpVcpu::new(vm.clone(), 1).unwrap();
 
-        setup_regs(&ap, 0).unwrap();
-
-        let [rflags, rip] = ap
-            .get_registers64([WHvX64RegisterRflags, WHvX64RegisterRip])
+        let [activity] = ap
+            .get_registers64([WHvRegisterInternalActivityState])
             .unwrap();
 
-        assert_eq!(rflags & 0x2, 0x2);
-        let expected_rip = if cfg!(feature = "tee") {
-            RESET_VECTOR_SEV_AP
-        } else {
-            AP_TRAMPOLINE_START
-        };
-        assert_eq!(rip, expected_rip);
+        assert_eq!(activity & 1, 1);
     }
 
     #[test]
@@ -246,19 +201,5 @@ mod tests {
         for i in 0..512u64 {
             assert_eq!((i << 21) + 0x83, read_u64(0xb000 + (i * 8)));
         }
-    }
-
-    #[test]
-    fn test_setup_ap_segments() {
-        let vm = Arc::new(WhpVm::new(2).unwrap());
-        let _bsp = WhpVcpu::new(vm.clone(), 0).unwrap();
-        let ap = WhpVcpu::new(vm.clone(), 1).unwrap();
-
-        setup_ap_segments(&ap).unwrap();
-
-        let [cs_val] = ap.get_registers([WHvX64RegisterCs]).unwrap();
-        let cs = unsafe { cs_val.Segment };
-        assert_eq!(cs.Base, 0);
-        assert_eq!(cs.Selector, 0);
     }
 }
