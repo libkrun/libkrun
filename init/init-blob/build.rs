@@ -121,6 +121,22 @@ fn build_rust_init() -> PathBuf {
         // flags from the Makefile would be silently ignored. Remove it so
         // the per-target env vars take effect.
         cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
+
+        if cfg!(target_os = "macos") {
+            let target_env_key = musl_target.to_uppercase().replace('-', "_");
+            let linker_triple = musl_target.replace("-unknown", "").replace("-musl", "-gnu");
+            cmd.env(
+                format!("CARGO_TARGET_{target_env_key}_LINKER"),
+                "/usr/bin/clang",
+            );
+            cmd.env(
+                format!("CARGO_TARGET_{target_env_key}_RUSTFLAGS"),
+                format!(
+                    "-C link-arg=-target -C link-arg={linker_triple} \
+                     -C link-arg=-fuse-ld=lld -C link-arg=-Wl,-strip-debug"
+                ),
+            );
+        }
     }
 
     let mut features: Vec<&str> = Vec::new();

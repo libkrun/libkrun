@@ -34,6 +34,12 @@ fi
 if [ "$OS" = "Darwin" ]; then
 	echo "Cross-compiling guest-agent for $GUEST_TARGET"
 
+	# Cross-linker for musl targets on macOS (brew install llvm for lld).
+	export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="/usr/bin/clang"
+	export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="\
+		-C link-arg=-target -C link-arg=aarch64-linux-gnu \
+		-C link-arg=-fuse-ld=lld -C link-arg=-Wl,-strip-debug"
+
 	# e2fsprogs is keg-only on macOS; add it to PATH for mke2fs.
 	if [ -d "/opt/homebrew/opt/e2fsprogs/sbin" ]; then
 		export PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH"
