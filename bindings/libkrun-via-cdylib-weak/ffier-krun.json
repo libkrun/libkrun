@@ -2725,6 +2725,11 @@
           "name": "VFKIT",
           "c_name": "KRUN_NET_FLAGS_VFKIT",
           "value": 1
+        },
+        {
+          "name": "INCLUDE_VNET_HEADER",
+          "c_name": "KRUN_NET_FLAGS_INCLUDE_VNET_HEADER",
+          "value": 4
         }
       ],
       "cfg": "feature = \"net\""

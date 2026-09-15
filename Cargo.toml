@@ -28,3 +28,4 @@ resolver = "2"
 [profile.release]
 #panic = "abort"
 lto = true
+debug = true
