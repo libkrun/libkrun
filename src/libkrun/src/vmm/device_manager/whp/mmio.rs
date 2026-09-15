@@ -163,6 +163,19 @@ impl MMIODeviceManager {
             .map_err(Error::Cmdline)
     }
 
+    /// Returns the address and interrupt assigned to each virtio-mmio device.
+    pub fn virtio_mmio_devices(&self) -> Vec<(u64, u32)> {
+        let mut devices = self
+            .id_to_dev_info
+            .iter()
+            .filter_map(|((device_type, _), info)| {
+                matches!(device_type, DeviceType::Virtio(_)).then_some((info.addr, info.irq))
+            })
+            .collect::<Vec<_>>();
+        devices.sort_unstable_by_key(|(addr, _)| *addr);
+        devices
+    }
+
     /// Gets the specified device.
     pub fn get_device(
         &self,
