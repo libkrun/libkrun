@@ -14,18 +14,18 @@ use windows_sys::Win32::System::Hypervisor::{
     WHV_CAPABILITY, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT,
     WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY, WHV_PARTITION_PROPERTY_CODE,
     WHV_PROCESSOR_FEATURES_BANKS, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
-    WHV_VP_EXIT_CONTEXT, WHV_X64_CPUID_RESULT, WHV_X64_IO_PORT_ACCESS_CONTEXT,
-    WHvCancelRunVirtualProcessor, WHvCapabilityCodeHypervisorPresent,
-    WHvCapabilityCodeProcessorFeaturesBanks, WHvCreatePartition, WHvCreateVirtualProcessor,
-    WHvDeletePartition, WHvDeleteVirtualProcessor, WHvEmulatorCreateEmulator,
-    WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation, WHvEmulatorTryMmioEmulation,
-    WHvGetCapability, WHvGetVirtualProcessorRegisters, WHvMapGpaRange, WHvMapGpaRangeFlagExecute,
-    WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeCpuidResultList,
-    WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
+    WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS, WHV_VP_EXIT_CONTEXT, WHV_X64_CPUID_RESULT,
+    WHV_X64_IO_PORT_ACCESS_CONTEXT, WHvCancelRunVirtualProcessor,
+    WHvCapabilityCodeHypervisorPresent, WHvCapabilityCodeProcessorFeaturesBanks,
+    WHvCapabilityCodeSyntheticProcessorFeaturesBanks, WHvCreatePartition,
+    WHvCreateVirtualProcessor, WHvDeletePartition, WHvDeleteVirtualProcessor,
+    WHvEmulatorCreateEmulator, WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation,
+    WHvEmulatorTryMmioEmulation, WHvGetCapability, WHvGetVirtualProcessorRegisters, WHvMapGpaRange,
+    WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
+    WHvPartitionPropertyCodeCpuidResultList, WHvPartitionPropertyCodeLocalApicEmulationMode,
     WHvPartitionPropertyCodeProcessorCount, WHvPartitionPropertyCodeProcessorFeaturesBanks,
-    WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
-    WHvPartitionPropertyCodeX64MsrExitBitmap, WHvRequestInterrupt, WHvRunVirtualProcessor,
-    WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
+    WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks, WHvRequestInterrupt,
+    WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
     WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException,
     WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
     WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64IoPortAccess,
@@ -175,6 +175,53 @@ fn get_processor_features_banks() -> Result<WHV_PROCESSOR_FEATURES_BANKS, Error>
     }
 }
 
+// These are WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS bits, not the bit positions
+// returned to the guest in CPUID 0x40000003.EAX. WHP performs that translation.
+const WHP_HYPERVISOR_PRESENT: u64 = 1 << 0;
+const WHP_HV1_INTERFACE: u64 = 1 << 1;
+const WHP_ACCESS_VP_RUNTIME: u64 = 1 << 2;
+const WHP_ACCESS_REFERENCE_COUNTER: u64 = 1 << 3;
+const WHP_ACCESS_HYPERCALL_REGISTERS: u64 = 1 << 7;
+const WHP_ACCESS_VP_INDEX: u64 = 1 << 8;
+const WHP_ACCESS_REFERENCE_TSC: u64 = 1 << 9;
+const WHP_ACCESS_FREQUENCY_REGISTERS: u64 = 1 << 11;
+
+const HV1_BASELINE: u64 = WHP_HYPERVISOR_PRESENT
+    | WHP_HV1_INTERFACE
+    | WHP_ACCESS_HYPERCALL_REGISTERS
+    | WHP_ACCESS_VP_INDEX;
+const REQUESTED_ENLIGHTENMENTS: u64 = HV1_BASELINE
+    | WHP_ACCESS_VP_RUNTIME
+    | WHP_ACCESS_REFERENCE_COUNTER
+    | WHP_ACCESS_REFERENCE_TSC
+    | WHP_ACCESS_FREQUENCY_REGISTERS;
+
+fn select_synthetic_processor_features(supported: u64) -> Option<u64> {
+    let enabled = supported & REQUESTED_ENLIGHTENMENTS;
+    (enabled & HV1_BASELINE == HV1_BASELINE).then_some(enabled)
+}
+
+fn get_synthetic_processor_features_banks() -> Option<WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS> {
+    let mut capability = MaybeUninit::<WHV_CAPABILITY>::uninit();
+    let mut written_size = 0;
+
+    unsafe {
+        let hr = WHvGetCapability(
+            WHvCapabilityCodeSyntheticProcessorFeaturesBanks,
+            capability.as_mut_ptr().cast(),
+            mem::size_of::<WHV_CAPABILITY>() as u32,
+            &mut written_size,
+        );
+
+        if hr != S_OK {
+            debug!("WHP synthetic processor features are unavailable: HRESULT 0x{hr:08x}");
+            return None;
+        }
+
+        Some(capability.assume_init().SyntheticProcessorFeaturesBanks)
+    }
+}
+
 /// Parsed CPUID exit context returned by [`WhpVcpu::cpuid_exit_info`].
 #[derive(Debug, Clone)]
 pub struct CpuidExitInfo {
@@ -285,19 +332,6 @@ impl WhpVm {
             },
         )?;
 
-        // Enable MSR exits (bit 1)
-        // https://github.com/google/crosvm/blob/main/hypervisor/src/whpx/whpx_sys/WinHvPlatformDefs.h#L74
-        Self::set_property(handle, WHvPartitionPropertyCodeExtendedVmExits, |p| {
-            p.ExtendedVmExits.AsUINT64 = 0b10; // bit 1 = X64MsrExit
-        })?;
-
-        // Configure how MSRs are handled
-        // We just set the bit 0 (UnhandledMsrs) so that any MSR read/write does not automatically fail
-        // but it triggers an exit that we can handle
-        Self::set_property(handle, WHvPartitionPropertyCodeX64MsrExitBitmap, |p| {
-            p.X64MsrExitBitmap.AsUINT64 = 0b01; // bit 0 = UnhandledMsrs
-        })?;
-
         // Set invariant TSC support
         // First we need to retrieve the processor features banks and re-set them with the invariant TSC support
         // otherwise they get lost
@@ -316,110 +350,28 @@ impl WhpVm {
             )?;
         }
 
-        // This unlocks the MSRs you are advertising in CPUID.
-        Self::set_property(
-            handle,
-            WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
-            |p| {
-                p.SyntheticProcessorFeaturesBanks.BanksCount = 1;
-                // We use bitwise OR on the AsUINT64 array of the union for safety/clarity.
-                // Bit 0: HypervisorPresent
-                // Bit 1: Hv1 (Report support for Hv1: CPUID leaves 0x40000000 - 0x40000006)
-                // Bit 2: AccessVpRunTimeReg
-                // Bit 3: AccessPartitionReferenceCounter
-                // Bit 7: Hypercalls
-                // Bit 8: AccessVpIndex
-                // Bit 9: AccessPartitionReferenceTsc
-                // Bit 11: AccessFrequencyRegs
-                unsafe {
-                    p.SyntheticProcessorFeaturesBanks.Anonymous.AsUINT64[0] = 0xB8F;
-                }
-            },
-        )?;
+        if let Some(supported_synthetic_features) = get_synthetic_processor_features_banks()
+            && supported_synthetic_features.BanksCount > 0
+        {
+            let supported = unsafe { supported_synthetic_features.Anonymous.AsUINT64[0] };
+
+            if let Some(enabled) = select_synthetic_processor_features(supported) {
+                Self::set_property(
+                    handle,
+                    WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
+                    |property| {
+                        property.SyntheticProcessorFeaturesBanks.BanksCount = 1;
+                        unsafe {
+                            property.SyntheticProcessorFeaturesBanks.Anonymous.AsUINT64[0] =
+                                enabled;
+                        }
+                    },
+                )?;
+                debug!("Enabled WHP synthetic processor features: 0x{enabled:x}");
+            }
+        }
 
         let mut cpuid_results: Vec<WHV_X64_CPUID_RESULT> = Vec::new();
-
-        // WHP does NOT expose Hyper-V CPUID to the guest automatically;
-        // we must provide 0x40000000+ via CpuidResultList.
-        // More info on Hypervisor Top Level Functional Specification
-        // https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/tlfs
-
-        // 0x40000000 — Hypervisor signature: "Microsoft Hv"
-        cpuid_results.push(WHV_X64_CPUID_RESULT {
-            Function: 0x40000000,
-            Reserved: [0; 3],
-            Eax: 0x40000006,
-            Ebx: 0x7263694D, // "Micr"
-            Ecx: 0x666F736F, // "osof"
-            Edx: 0x76482074, // "t Hv"
-        });
-        // 0x40000001 — Interface identification: "Hv#1"
-        cpuid_results.push(WHV_X64_CPUID_RESULT {
-            Function: 0x40000001,
-            Reserved: [0; 3],
-            Eax: 0x31237648, // "Hv#1"
-            Ebx: 0,
-            Ecx: 0,
-            Edx: 0,
-        });
-        // 0x40000002 — Version (minimal)
-        cpuid_results.push(WHV_X64_CPUID_RESULT {
-            Function: 0x40000002,
-            Reserved: [0; 3],
-            Eax: 0x3839,  // build number
-            Ebx: 0xa0000, // version
-            Ecx: 0,
-            Edx: 0,
-        });
-        // 0x40000003 — Feature identification (Hyper-V TLFS §2.4)
-        const ACCESS_VP_RUNTIME: u32 = 1 << 0;
-        const ACCESS_REF_COUNTER: u32 = 1 << 1;
-        const ACCESS_HYPERCALLS: u32 = 1 << 5;
-        const ACCESS_VP_INDEX: u32 = 1 << 6;
-        const ACCESS_REF_TSC: u32 = 1 << 9;
-        const ACCESS_FREQ_REGS: u32 = 1 << 11;
-        cpuid_results.push(WHV_X64_CPUID_RESULT {
-            Function: 0x40000003,
-            Reserved: [0; 3],
-            Eax: ACCESS_VP_RUNTIME
-                | ACCESS_REF_COUNTER
-                | ACCESS_HYPERCALLS
-                | ACCESS_VP_INDEX
-                | ACCESS_REF_TSC
-                | ACCESS_FREQ_REGS,
-            Ebx: 0,
-            Ecx: 0,
-            Edx: 0,
-        });
-        // 0x40000004 — Recommendations
-        cpuid_results.push(WHV_X64_CPUID_RESULT {
-            Function: 0x40000004,
-            Reserved: [0; 3],
-            Eax: 1 << 5, // RelaxedTiming
-            Ebx: 0,
-            Ecx: 0,
-            Edx: 0,
-        });
-        // 0x40000005 — Implementation limits
-        cpuid_results.push(WHV_X64_CPUID_RESULT {
-            Function: 0x40000005,
-            Reserved: [0; 3],
-            Eax: 64, // max virtual processors
-            Ebx: 0,
-            Ecx: 0,
-            Edx: 0,
-        });
-        // 0x40000006: Hardware Features
-        const HV_MSR_BITMAPS: u32 = 1 << 1;
-        const HV_SLAT: u32 = 1 << 3;
-        cpuid_results.push(WHV_X64_CPUID_RESULT {
-            Function: 0x40000006,
-            Reserved: [0; 3],
-            Eax: HV_MSR_BITMAPS | HV_SLAT,
-            Ebx: 0,
-            Ecx: 0,
-            Edx: 0,
-        });
 
         // invariant tsc
         if processor_features_banks.BanksCount >= 2 {
@@ -457,16 +409,18 @@ impl WhpVm {
             });
         }
 
-        let hr = unsafe {
-            WHvSetPartitionProperty(
-                handle,
-                WHvPartitionPropertyCodeCpuidResultList,
-                cpuid_results.as_ptr() as *const _,
-                (cpuid_results.len() * mem::size_of::<WHV_X64_CPUID_RESULT>()) as u32,
-            )
-        };
-        if hr != S_OK {
-            return Err(Error::SetPartitionProperty(hr));
+        if !cpuid_results.is_empty() {
+            let hr = unsafe {
+                WHvSetPartitionProperty(
+                    handle,
+                    WHvPartitionPropertyCodeCpuidResultList,
+                    cpuid_results.as_ptr().cast(),
+                    (cpuid_results.len() * mem::size_of::<WHV_X64_CPUID_RESULT>()) as u32,
+                )
+            };
+            if hr != S_OK {
+                return Err(Error::SetPartitionProperty(hr));
+            }
         }
 
         let hr = unsafe { WHvSetupPartition(handle) };
@@ -1068,5 +1022,26 @@ impl Drop for WhpVcpu {
                 self.index
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_features_require_hv1_baseline() {
+        assert_eq!(
+            select_synthetic_processor_features(REQUESTED_ENLIGHTENMENTS),
+            Some(REQUESTED_ENLIGHTENMENTS)
+        );
+        assert_eq!(
+            select_synthetic_processor_features(HV1_BASELINE),
+            Some(HV1_BASELINE)
+        );
+        assert_eq!(
+            select_synthetic_processor_features(REQUESTED_ENLIGHTENMENTS & !WHP_ACCESS_VP_INDEX),
+            None
+        );
     }
 }
