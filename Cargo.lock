@@ -385,9 +385,19 @@ name = "ffier"
 version = "0.2.0"
 source = "git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1#9616083b528a045fbc6a275e77da0ec03bd28bea"
 dependencies = [
- "ffier-builtins",
- "ffier-impl",
- "ffier-rt",
+ "ffier-builtins 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1)",
+ "ffier-impl 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1)",
+ "ffier-rt 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1)",
+]
+
+[[package]]
+name = "ffier"
+version = "0.2.0"
+source = "git+https://github.com/mtjhrc/ffier.git?tag=v0.2.0-rc2#4609b7a4e3c826b64e961569dc9403d45ebc0dad"
+dependencies = [
+ "ffier-builtins 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=v0.2.0-rc2)",
+ "ffier-impl 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=v0.2.0-rc2)",
+ "ffier-rt 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=v0.2.0-rc2)",
 ]
 
 [[package]]
@@ -395,8 +405,17 @@ name = "ffier-builtins"
 version = "0.2.0"
 source = "git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1#9616083b528a045fbc6a275e77da0ec03bd28bea"
 dependencies = [
- "ffier-impl",
- "ffier-rt",
+ "ffier-impl 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1)",
+ "ffier-rt 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1)",
+]
+
+[[package]]
+name = "ffier-builtins"
+version = "0.2.0"
+source = "git+https://github.com/mtjhrc/ffier.git?tag=v0.2.0-rc2#4609b7a4e3c826b64e961569dc9403d45ebc0dad"
+dependencies = [
+ "ffier-impl 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=v0.2.0-rc2)",
+ "ffier-rt 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=v0.2.0-rc2)",
 ]
 
 [[package]]
@@ -404,7 +423,7 @@ name = "ffier-gen-rust-client"
 version = "0.2.0"
 source = "git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1#9616083b528a045fbc6a275e77da0ec03bd28bea"
 dependencies = [
- "ffier-schema",
+ "ffier-schema 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1)",
  "serde_json",
 ]
 
@@ -413,7 +432,19 @@ name = "ffier-impl"
 version = "0.2.0"
 source = "git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1#9616083b528a045fbc6a275e77da0ec03bd28bea"
 dependencies = [
- "ffier-schema",
+ "ffier-schema 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1)",
+ "proc-macro2",
+ "quote",
+ "serde_json",
+ "syn",
+]
+
+[[package]]
+name = "ffier-impl"
+version = "0.2.0"
+source = "git+https://github.com/mtjhrc/ffier.git?tag=v0.2.0-rc2#4609b7a4e3c826b64e961569dc9403d45ebc0dad"
+dependencies = [
+ "ffier-schema 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=v0.2.0-rc2)",
  "proc-macro2",
  "quote",
  "serde_json",
@@ -426,9 +457,23 @@ version = "0.2.0"
 source = "git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1#9616083b528a045fbc6a275e77da0ec03bd28bea"
 
 [[package]]
+name = "ffier-rt"
+version = "0.2.0"
+source = "git+https://github.com/mtjhrc/ffier.git?tag=v0.2.0-rc2#4609b7a4e3c826b64e961569dc9403d45ebc0dad"
+
+[[package]]
 name = "ffier-schema"
 version = "0.2.0"
 source = "git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1#9616083b528a045fbc6a275e77da0ec03bd28bea"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ffier-schema"
+version = "0.2.0"
+source = "git+https://github.com/mtjhrc/ffier.git?tag=v0.2.0-rc2#4609b7a4e3c826b64e961569dc9403d45ebc0dad"
 dependencies = [
  "serde",
  "serde_json",
@@ -718,7 +763,7 @@ dependencies = [
  "bitflags 1.3.2",
  "caps",
  "crossbeam-channel",
- "ffier",
+ "ffier 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1)",
  "imago",
  "krun-arch",
  "krun-display",
@@ -782,7 +827,7 @@ dependencies = [
 name = "krun-init-blob"
 version = "0.1.0-2.0.0-dev"
 dependencies = [
- "ffier",
+ "ffier 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1)",
  "krun-via-cdylib-weak",
  "libkrun",
  "serde",
@@ -795,7 +840,7 @@ name = "krun-init-blob-via-cdylib"
 version = "0.1.0-1.18.1"
 dependencies = [
  "anyhow",
- "ffier",
+ "ffier 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1)",
  "ffier-gen-rust-client",
  "krun-via-cdylib-weak",
  "pkg-config",
@@ -855,7 +900,7 @@ name = "krun-via-cdylib-weak"
 version = "2.0.0-dev"
 dependencies = [
  "bitflags 2.11.0",
- "ffier",
+ "ffier 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1)",
  "ffier-gen-rust-client",
  "libloading",
 ]
@@ -910,8 +955,8 @@ dependencies = [
  "bzip2",
  "crossbeam-channel",
  "env_logger",
- "ffier",
- "ffier-builtins",
+ "ffier 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=v0.2.0-rc2)",
+ "ffier-builtins 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=v0.2.0-rc2)",
  "flate2",
  "iocuddle",
  "kbs-types",

@@ -39,9 +39,10 @@ pub use device_builders::RngDevice;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
 pub use device_builders::VhostUserDevice;
 pub use device_builders::{
-    AttachContext, AttachDevice, ConsoleBuilder, ConsoleDevice, DeviceManager, DeviceRequirements,
-    MmioDeviceManager, ResolvedShmRegion, TsiFlags, VsockDevice,
+    AttachContext, AttachDevice, DeviceManager, DeviceRequirements, MmioDeviceManager,
+    ResolvedShmRegion, TsiFlags, VsockDevice,
 };
+pub use device_builders::{ConsoleBuilder, ConsoleDevice};
 #[cfg(any(feature = "gpu", feature = "vhost-user"))]
 pub use device_builders::{DisplayBackend, DisplayInfoBuilder};
 #[cfg(feature = "gpu")]

@@ -823,7 +823,8 @@
           },
           "ffi_name": "krun_console_builder_add_default_console"
         }
-      ]
+      ],
+      "cfg": "not(target_os = \"windows\")"
     },
     {
       "name": "FsOverlay",
@@ -1405,7 +1406,7 @@
             "c_convention": "out_param"
           },
           "ffi_name": "krun_vmm_builder_add_serial_console",
-          "cfg": "unix"
+          "cfg": "not(target_os = \"windows\")"
         },
         {
           "name": "nested_virt",

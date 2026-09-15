@@ -277,6 +277,8 @@ const KRUNFW_NAME: &str = "libkrunfw-sev.so.5";
 const KRUNFW_NAME: &str = "libkrunfw-tdx.so.5";
 #[cfg(target_os = "macos")]
 const KRUNFW_NAME: &str = "libkrunfw.5.dylib";
+#[cfg(target_os = "windows")]
+const KRUNFW_NAME: &str = "libkrunfw.dll";
 
 static KRUNFW: std::sync::LazyLock<Option<libloading::Library>> =
     std::sync::LazyLock::new(|| unsafe { libloading::Library::new(KRUNFW_NAME).ok() });

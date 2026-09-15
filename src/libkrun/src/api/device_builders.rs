@@ -3,11 +3,16 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::IsTerminal;
 use std::marker::PhantomData;
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", not(target_os = "windows")))]
 use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
+#[cfg(not(target_os = "windows"))]
 use std::os::fd::{AsRawFd, BorrowedFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+#[cfg(target_os = "windows")]
+use std::os::windows::io::{AsRawSocket, OwnedHandle};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
@@ -187,8 +192,14 @@ impl<'a> AttachContext<'a> {
 
     /// Set up terminal raw mode for the given fd, registering a cleanup
     /// observer to restore the terminal on VM shutdown.
+    #[cfg(not(target_os = "windows"))]
     pub fn setup_terminal_raw_mode(&mut self, fd: BorrowedFd<'_>) {
         setup_terminal_raw_mode(self.vmm, Some(fd), false);
+    }
+
+    #[cfg(windows)]
+    pub fn setup_terminal_raw_mode(&mut self, handle: BorrowedHandle<'_>) {
+        setup_terminal_raw_mode(self.vmm, Some(handle), false);
     }
 
     /// Get the macOS memory mapping channel sender, if available.
@@ -575,9 +586,17 @@ impl<'a> AttachDevice<'a> for FsDevice<'a> {
 ///
 /// Use [`ConsoleDevice::builder`] to configure ports, then
 /// [`ConsoleBuilder::build`] to finalize.
+#[cfg(not(target_os = "windows"))]
 pub struct ConsoleDevice<'a> {
     pub(crate) ports: Vec<PortDescription>,
     pub(crate) tty_fds: Vec<BorrowedFd<'static>>,
+    _lifetime: PhantomData<&'a ()>,
+}
+
+#[cfg(target_os = "windows")]
+pub struct ConsoleDevice<'a> {
+    pub(crate) ports: Vec<PortDescription>,
+    pub(crate) tty_fds: Vec<BorrowedHandle<'static>>,
     _lifetime: PhantomData<&'a ()>,
 }
 
@@ -585,9 +604,17 @@ pub struct ConsoleDevice<'a> {
 ///
 /// Add one or more ports with [`add_tty_port`](ConsoleBuilder::add_tty_port),
 /// then call [`build`](ConsoleBuilder::build) to create the device.
+#[cfg(not(target_os = "windows"))]
 pub struct ConsoleBuilder<'a> {
     ports: Vec<PortDescription>,
     tty_fds: Vec<BorrowedFd<'static>>,
+    _lifetime: PhantomData<&'a ()>,
+}
+
+#[cfg(target_os = "windows")]
+pub struct ConsoleBuilder<'a> {
+    ports: Vec<PortDescription>,
+    tty_fds: Vec<BorrowedHandle<'static>>,
     _lifetime: PhantomData<&'a ()>,
 }
 
@@ -603,7 +630,9 @@ impl<'a> ConsoleDevice<'a> {
     }
 }
 
-#[cfg_attr(feature = "ffi", ffier::export)]
+#[cfg_attr(feature = "ffi", ffier::export(cfg = "not(target_os = \"windows\")"))]
+#[cfg_attr(not(feature = "ffi"), cfg(not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 impl<'a> ConsoleBuilder<'a> {
     /// Add a TTY-backed port to the console.
     ///
@@ -774,6 +803,155 @@ impl<'a> ConsoleBuilder<'a> {
     }
 }
 
+#[cfg(target_os = "windows")]
+#[cfg_attr(feature = "ffi", ffier::export(cfg = "target_os = \"windows\""))]
+#[cfg_attr(not(feature = "ffi"), cfg(target_os = "windows"))]
+impl<'a> ConsoleBuilder<'a> {
+    pub fn add_tty_port(
+        &mut self,
+        name: &str,
+        tty_fd: BorrowedHandle<'a>,
+    ) -> Result<u32, VmmError> {
+        let index = self.ports.len() as u32;
+        self.add_tty_port_inner(name, tty_fd)?;
+        Ok(index)
+    }
+
+    pub fn add_inout_port(
+        &mut self,
+        name: &str,
+        input_fd: Option<BorrowedHandle<'a>>,
+        output_fd: Option<BorrowedHandle<'a>>,
+    ) -> Result<u32, VmmError> {
+        let index = self.ports.len() as u32;
+        let input = input_fd
+            .map(|fd| {
+                port_io::input_to_handle_dup(fd.as_raw_handle()).map_err(|e| {
+                    log::error!("dup input fd: {e}");
+                    VmmError::BadFd()
+                })
+            })
+            .transpose()?;
+        let output = output_fd
+            .map(|fd| {
+                port_io::output_to_handle_dup(fd.as_raw_handle()).map_err(|e| {
+                    log::error!("dup output fd: {e}");
+                    VmmError::BadFd()
+                })
+            })
+            .transpose()?;
+        self.ports.push(PortDescription {
+            name: name.to_string().into(),
+            input,
+            output,
+            terminal: None,
+        });
+        Ok(index)
+    }
+
+    /// Build the console device. At least one port must have been added.
+    pub fn build(self) -> Result<ConsoleDevice<'a>, VmmError> {
+        if self.ports.is_empty() {
+            return Err(VmmError::MissingConfig("no ports added to console".into()));
+        }
+        Ok(ConsoleDevice {
+            ports: self.ports,
+            tty_fds: self.tty_fds,
+            _lifetime: PhantomData,
+        })
+    }
+
+    pub fn add_default_console(
+        &mut self,
+        stdin: Option<BorrowedHandle<'a>>,
+        stdout: Option<BorrowedHandle<'a>>,
+        stderr: Option<BorrowedHandle<'a>>,
+    ) -> Result<(), VmmError> {
+        let stdin_is_tty = stdin.as_ref().is_some_and(|fd| fd.is_terminal());
+        let stdout_is_tty = stdout.as_ref().is_some_and(|fd| fd.is_terminal());
+        let stderr_is_tty = stderr.as_ref().is_some_and(|fd| fd.is_terminal());
+
+        let term_handle = if stdin_is_tty {
+            stdin
+        } else if stdout_is_tty {
+            stdout
+        } else if stderr_is_tty {
+            stderr
+        } else {
+            None
+        };
+
+        let console_input = if stdin_is_tty {
+            if let Some(ref fd) = stdin {
+                Some(
+                    port_io::input_to_handle_dup(fd.as_raw_handle()).map_err(|e| {
+                        log::error!("dup input fd: {e}");
+                        VmmError::BadFd()
+                    })?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let console_output = if stdout_is_tty {
+            if let Some(ref fd) = stdout {
+                Some(
+                    port_io::output_to_handle_dup(fd.as_raw_handle()).map_err(|e| {
+                        log::error!("dup output fd: {e}");
+                        VmmError::BadFd()
+                    })?,
+                )
+            } else {
+                Some(port_io::output_to_log_as_err())
+            }
+        } else {
+            Some(port_io::output_to_log_as_err())
+        };
+
+        let terminal: Option<Box<dyn devices::virtio::port_io::PortTerminalProperties>> =
+            if let Some(tfd) = term_handle {
+                // SAFETY: The caller guarantees via `'a` that the borrowed file descriptor outlasts
+                // the console device and VMM. Currently, the VMM runs until process termination via `_exit()`,
+                // so the host file descriptor is valid for the remainder of the process.
+                // TODO: remove this transmute once we get proper support for stopping the VMM instead of _exit().
+                let static_fd = unsafe {
+                    std::mem::transmute::<BorrowedHandle<'a>, BorrowedHandle<'static>>(tfd)
+                };
+                self.tty_fds.push(static_fd);
+                Some(port_io::term_handle(tfd.as_raw_handle()).map_err(|e| {
+                    log::error!("term fd: {e}");
+                    VmmError::BadFd()
+                })?)
+            } else {
+                Some(port_io::term_fixed_size(0, 0))
+            };
+
+        // Port 0: default console (hvc0)
+        self.ports.push(PortDescription {
+            name: "".into(),
+            input: console_input,
+            output: console_output,
+            terminal,
+        });
+
+        // Named redirect ports for non-terminal fds
+        if stdin.is_some() && !stdin_is_tty {
+            self.add_inout_port("krun-stdin", stdin, None)?;
+        }
+        if stdout.is_some() && !stdout_is_tty {
+            self.add_inout_port("krun-stdout", None, stdout)?;
+        }
+        if stderr.is_some() && !stderr_is_tty {
+            self.add_inout_port("krun-stderr", None, stderr)?;
+        }
+
+        Ok(())
+    }
+}
+
 #[allow(dead_code)]
 impl<'a> ConsoleBuilder<'a> {
     /// Add an output-only port (no input, no terminal).
@@ -808,6 +986,7 @@ impl<'a> ConsoleBuilder<'a> {
         index
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn add_tty_port_inner(&mut self, name: &str, tty_fd: BorrowedFd<'a>) -> Result<(), VmmError> {
         let raw_fd = tty_fd.as_raw_fd();
 
@@ -838,6 +1017,54 @@ impl<'a> ConsoleBuilder<'a> {
             // TODO: remove this transmute once we get proper support for stopping the VMM instead of _exit().
             let static_fd =
                 unsafe { std::mem::transmute::<BorrowedFd<'a>, BorrowedFd<'static>>(tty_fd) };
+            self.tty_fds.push(static_fd);
+        }
+
+        self.ports.push(PortDescription {
+            name: name.to_string().into(),
+            input,
+            output,
+            terminal,
+        });
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn add_tty_port_inner(
+        &mut self,
+        name: &str,
+        tty_fd: BorrowedHandle<'a>,
+    ) -> Result<(), VmmError> {
+        let handle = tty_fd.as_raw_handle();
+
+        let input = Some(port_io::input_to_handle_dup(handle).map_err(|e| {
+            log::error!("dup input fd: {e}");
+            VmmError::BadFd()
+        })?);
+        let output = Some(port_io::output_to_handle_dup(handle).map_err(|e| {
+            log::error!("dup output fd: {e}");
+            VmmError::BadFd()
+        })?);
+
+        let is_term = tty_fd.is_terminal();
+        let terminal: Option<Box<dyn devices::virtio::port_io::PortTerminalProperties>> = if is_term
+        {
+            Some(port_io::term_handle(handle).map_err(|e| {
+                log::error!("term fd: {e}");
+                VmmError::BadFd()
+            })?)
+        } else {
+            None
+        };
+
+        if is_term {
+            // SAFETY: The caller guarantees via `'a` that the borrowed handle outlasts
+            // the console device and VMM. Currently, the VMM runs until process termination via `_exit()`,
+            // so the host file descriptor is valid for the remainder of the process.
+            // TODO: remove this transmute once we get proper support for stopping the VMM instead of _exit().
+            let static_fd = unsafe {
+                std::mem::transmute::<BorrowedHandle<'a>, BorrowedHandle<'static>>(tty_fd)
+            };
             self.tty_fds.push(static_fd);
         }
 
@@ -1110,6 +1337,7 @@ pub struct NetDevice {
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"net\""))]
 #[cfg_attr(not(feature = "ffi"), cfg(feature = "net"))]
+#[cfg(not(target_os = "windows"))]
 impl NetDevice {
     /// Create a net device backed by a Unix datagram socket path.
     pub fn new_unixgram_path(
@@ -1204,6 +1432,47 @@ impl NetDevice {
             let _ = (id, tap_name, mac, features);
             Err(VmmError::FeatureDisabled())
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"net\""))]
+#[cfg_attr(not(feature = "ffi"), cfg(feature = "net"))]
+impl NetDevice {
+    /// Create a net device backed by a Unix stream socket path.
+    pub fn new_unixstream_path(
+        id: &str,
+        path: &str,
+        mac: &[u8],
+        features: u32,
+        flags: NetFlags,
+    ) -> Result<Self, VmmError> {
+        use devices::virtio::net::device::VirtioNetBackend;
+        let _ = flags;
+        Self::new_inner(
+            id,
+            VirtioNetBackend::UnixstreamPath(PathBuf::from(path)),
+            mac,
+            features,
+        )
+    }
+
+    pub fn new_unixstream_handle(
+        id: &str,
+        handle: OwnedHandle,
+        mac: &[u8],
+        features: u32,
+        flags: NetFlags,
+    ) -> Result<Self, VmmError> {
+        use devices::virtio::net::device::VirtioNetBackend;
+        use std::os::windows::io::RawSocket;
+        let _ = flags;
+        Self::new_inner(
+            id,
+            VirtioNetBackend::UnixstreamFd(handle.as_raw_handle() as RawSocket),
+            mac,
+            features,
+        )
     }
 }
 
