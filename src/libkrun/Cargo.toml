@@ -71,6 +71,7 @@ nitro-enclaves = { version = "0.5.0", optional = true }
 tdx = { version = "0.1.2", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+whp = { package = "krun-whp", version = "=0.1.0-2.0.0-dev", path = "../whp" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_Console",

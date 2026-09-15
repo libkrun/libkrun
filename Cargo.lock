@@ -926,6 +926,7 @@ dependencies = [
  "krun-kernel",
  "krun-polly",
  "krun-utils",
+ "krun-whp",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",

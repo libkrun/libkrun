@@ -49,7 +49,7 @@ impl super::Vmm {
             WorkerMessage::GpuAddMapping(s, h, g, l) => self.add_mapping(s, h, g, l),
             #[cfg(target_os = "macos")]
             WorkerMessage::GpuRemoveMapping(s, g, l) => self.remove_mapping(s, g, l),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
             WorkerMessage::GsiRoute(sender, entries) => {
                 let mut routing = kvm_bindings::KvmIrqRouting::new(entries.len()).unwrap();
                 let routing_entries = routing.as_mut_slice();
@@ -58,12 +58,13 @@ impl super::Vmm {
                     .send(self.vm.fd().set_gsi_routing(&routing).is_ok())
                     .unwrap();
             }
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
             WorkerMessage::IrqLine(sender, irq, active) => {
                 sender
                     .send(self.vm.fd().set_irq_line(irq, active).is_ok())
                     .unwrap();
             }
+            #[cfg(not(target_os = "windows"))]
             WorkerMessage::ConvertMemory(_sender, _properties) => {
                 #[cfg(all(feature = "tee", target_arch = "x86_64"))]
                 {
