@@ -143,6 +143,13 @@ impl EventFd {
             false
         }
     }
+
+    /// Returns `true` if the event is currently signaled (counter > 0)
+    /// without consuming it.
+    pub fn is_signaled(&self) -> bool {
+        let counter = self.inner.counter.lock().unwrap();
+        *counter > 0
+    }
 }
 
 impl AsRawFd for EventFd {
