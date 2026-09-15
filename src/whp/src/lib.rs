@@ -503,28 +503,26 @@ impl WhpVm {
     /// Tries CPUID 0x15, then 0x16 (Intel), then falls back to measuring
     /// via RDTSC over a short sleep (works on AMD and all other x86_64).
     fn detect_tsc_frequency() -> u64 {
-        unsafe {
-            // Leaf 0 returns the maximum supported standard leaf in EAX.
-            // leaves 0x15 and 0x16 may not be supported (like in non-Intel hardware (like AMD)
-            // or when using nested virtualization), so it's better to check first.
-            let max_leaf = core::arch::x86_64::__cpuid(0x0).eax;
+        // Leaf 0 returns the maximum supported standard leaf in EAX.
+        // leaves 0x15 and 0x16 may not be supported (like in non-Intel hardware (like AMD)
+        // or when using nested virtualization), so it's better to check first.
+        let max_leaf = core::arch::x86_64::__cpuid(0x0).eax;
 
-            if max_leaf >= 0x15 {
-                let cpuid15 = core::arch::x86_64::__cpuid(0x15);
-                if cpuid15.eax != 0 && cpuid15.ebx != 0 && cpuid15.ecx != 0 {
-                    let freq = (cpuid15.ecx as u64 * cpuid15.ebx as u64) / cpuid15.eax as u64;
-                    debug!("TSC frequency from CPUID 0x15: {} Hz", freq);
-                    return freq;
-                }
+        if max_leaf >= 0x15 {
+            let cpuid15 = core::arch::x86_64::__cpuid(0x15);
+            if cpuid15.eax != 0 && cpuid15.ebx != 0 && cpuid15.ecx != 0 {
+                let freq = (cpuid15.ecx as u64 * cpuid15.ebx as u64) / cpuid15.eax as u64;
+                debug!("TSC frequency from CPUID 0x15: {} Hz", freq);
+                return freq;
             }
+        }
 
-            if max_leaf >= 0x16 {
-                let cpuid16 = core::arch::x86_64::__cpuid(0x16);
-                if cpuid16.eax != 0 {
-                    let freq = cpuid16.eax as u64 * 1_000_000;
-                    debug!("TSC frequency from CPUID 0x16: {} Hz", freq);
-                    return freq;
-                }
+        if max_leaf >= 0x16 {
+            let cpuid16 = core::arch::x86_64::__cpuid(0x16);
+            if cpuid16.eax != 0 {
+                let freq = cpuid16.eax as u64 * 1_000_000;
+                debug!("TSC frequency from CPUID 0x16: {} Hz", freq);
+                return freq;
             }
         }
 
@@ -751,9 +749,10 @@ impl WhpEmulator {
         vp_context: *const WHV_VP_EXIT_CONTEXT,
         io_context: *const WHV_X64_IO_PORT_ACCESS_CONTEXT,
     ) -> Result<(), Error> {
-        let mut status: WHV_EMULATOR_STATUS = mem::zeroed();
-        let hr =
-            WHvEmulatorTryIoEmulation(self.handle, context, vp_context, io_context, &mut status);
+        let mut status: WHV_EMULATOR_STATUS = unsafe { mem::zeroed() };
+        let hr = unsafe {
+            WHvEmulatorTryIoEmulation(self.handle, context, vp_context, io_context, &mut status)
+        };
         Self::check_emulation_result(hr, status, Error::IoEmulation)
     }
 
@@ -771,14 +770,10 @@ impl WhpEmulator {
         vp_context: *const WHV_VP_EXIT_CONTEXT,
         mmio_context: *const WHV_MEMORY_ACCESS_CONTEXT,
     ) -> Result<(), Error> {
-        let mut status: WHV_EMULATOR_STATUS = mem::zeroed();
-        let hr = WHvEmulatorTryMmioEmulation(
-            self.handle,
-            context,
-            vp_context,
-            mmio_context,
-            &mut status,
-        );
+        let mut status: WHV_EMULATOR_STATUS = unsafe { mem::zeroed() };
+        let hr = unsafe {
+            WHvEmulatorTryMmioEmulation(self.handle, context, vp_context, mmio_context, &mut status)
+        };
         Self::check_emulation_result(hr, status, Error::MmioEmulation)
     }
 }
