@@ -16,11 +16,14 @@ pub struct ArchMemoryInfo {
     pub ram_start_addr: u64,
     pub ram_last_addr: u64,
     pub shm_start_addr: u64,
+    pub guest_last_addr: u64,
     pub page_size: usize,
     #[cfg(target_arch = "aarch64")]
     pub fdt_addr: u64,
     pub initrd_addr: u64,
     pub firmware_addr: u64,
+    #[cfg(target_os = "macos")]
+    pub ipa_size: u32,
 }
 
 /// Module for aarch64 related functionality.

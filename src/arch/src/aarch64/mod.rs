@@ -70,10 +70,14 @@ pub fn arch_memory_regions(
         ram_start_addr,
         ram_last_addr,
         shm_start_addr,
+        // To be filled later using GuestMemory.
+        guest_last_addr: 0,
         page_size,
         fdt_addr,
         initrd_addr: fdt_addr - initrd_size,
         firmware_addr: FIRMWARE_START,
+        #[cfg(target_os = "macos")]
+        ipa_size: 0,
     };
     let regions = if let Some(firmware_size) = firmware_size {
         vec![
