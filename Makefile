@@ -67,7 +67,7 @@ ARCH = $(shell uname -m)
 DEBIAN_DIST ?= bookworm
 ROOTFS_DIR = linux-sysroot
 GCC_VERSION ?= 12
-FREEBSD_VERSION ?= 14.3-RELEASE
+FREEBSD_VERSION ?= 14.5-RELEASE
 FREEBSD_ROOTFS_DIR = freebsd-sysroot
 
 KRUN_BINARY_Linux = libkrun$(VARIANT).so.$(FULL_VERSION)
