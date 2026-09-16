@@ -30,7 +30,7 @@ use super::{Error, Vmm};
 #[cfg(target_arch = "x86_64")]
 use crate::vmm::device_manager::legacy::PortIODeviceManager;
 use crate::vmm::device_manager::mmio::MMIODeviceManager;
-use crate::vmm::resources::VmResources;
+use crate::vmm::resources::{VirtioTransport, VmResources};
 use crate::vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(target_arch = "x86_64")]
 use devices::legacy::Cmos;
@@ -993,6 +993,40 @@ pub fn build_microvm(
         (arch::IRQ_BASE, arch::IRQ_MAX),
     );
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let pci_device_manager = if vm_resources.virtio_transport == VirtioTransport::Pci {
+        log::debug!(
+            target: "krun_vmm::pci",
+            "virtio-pci transport: BAR base={:#x} ECAM={:#x} MSI GSI {}..{}",
+            arch::x86_64::layout::PCI_MMIO_START,
+            arch::x86_64::layout::PCI_ECAM_START,
+            arch::x86_64::layout::PCI_MSI_GSI_BASE,
+            arch::x86_64::layout::PCI_MSI_GSI_MAX,
+        );
+        let mut mgr = device_manager::pci::PciDeviceManager::new(
+            arch::x86_64::layout::PCI_MMIO_START,
+            (
+                arch::x86_64::layout::PCI_MSI_GSI_BASE,
+                arch::x86_64::layout::PCI_MSI_GSI_MAX,
+            ),
+            _sender.clone(),
+            // In-kernel irqchip: MSI-X GSI updates must preserve PIC/IOAPIC defaults.
+            !vm_resources.split_irqchip,
+        );
+        mgr.register_ecam(
+            &mut mmio_device_manager.bus,
+            arch::x86_64::layout::PCI_ECAM_START,
+        )
+        .map_err(|e| {
+            StartMicrovmError::Internal(Error::EventFd(io::Error::other(e.to_string())))
+        })?;
+        Some(mgr)
+    } else {
+        None
+    };
+
+    let virtio_transport = vm_resources.virtio_transport;
+
     #[cfg(target_os = "macos")]
     let vcpu_list = {
         let cpu_count = vm_resources.vm_config().vcpu_count.unwrap();
@@ -1165,6 +1199,8 @@ pub fn build_microvm(
         exit_code: exit_code.clone(),
         vm,
         mmio_device_manager,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        pci_device_manager,
         #[cfg(target_os = "macos")]
         vm_ctl_tx,
         #[cfg(target_os = "macos")]
@@ -1232,6 +1268,7 @@ pub fn build_microvm(
     };
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     let virtio_mmio_devices: Vec<(u64, u32)> = vec![];
+    let virtio_pci = virtio_transport == VirtioTransport::Pci;
     vmm.configure_system(
         vcpus.as_slice(),
         &intc,
@@ -1239,6 +1276,7 @@ pub fn build_microvm(
         &vm_resources.smbios_oem_strings,
         vm_resources.acpi_enabled,
         &virtio_mmio_devices,
+        virtio_pci,
         payload_config.pvh,
     )
     .map_err(StartMicrovmError::Internal)?;
@@ -2233,6 +2271,46 @@ fn create_vcpus_riscv64(
     Ok(vcpus)
 }
 
+/// Attaches a virtio device using the configured transport.
+pub(crate) fn attach_virtio_device(
+    vmm: &mut Vmm,
+    id: String,
+    intc: IrqChip,
+    device: Arc<Mutex<dyn VirtioDevice>>,
+) -> std::result::Result<(), device_manager::mmio::Error> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if vmm.pci_device_manager.is_some() {
+        return attach_pci_device(vmm, id, device)
+            .map_err(|e| device_manager::mmio::Error::EventFd(io::Error::other(e.to_string())));
+    }
+    attach_mmio_device(vmm, id, intc, device)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[allow(unused)]
+fn attach_pci_device(
+    vmm: &mut Vmm,
+    id: String,
+    device: Arc<Mutex<dyn VirtioDevice>>,
+) -> std::result::Result<(), device_manager::pci::Error> {
+    let guest_mem = vmm.guest_memory().clone();
+    let vm_fd = vmm.vm.fd();
+    let pci_mgr = vmm
+        .pci_device_manager
+        .as_mut()
+        .expect("pci_device_manager must be initialized for PCI transport");
+    let type_id = device.lock().unwrap().device_type();
+    pci_mgr.register_pci_device(
+        vm_fd,
+        &mut vmm.mmio_device_manager.bus,
+        guest_mem,
+        device,
+        type_id,
+        id,
+    )?;
+    Ok(())
+}
+
 /// Attaches an virtio mmio device to the device manager.
 #[allow(unused)]
 pub(crate) fn attach_mmio_device(
@@ -2246,13 +2324,11 @@ pub(crate) fn attach_mmio_device(
     let type_id = mmio_device.locked_device().device_type();
 
     #[cfg(target_os = "linux")]
-    let (_mmio_base, _irq) =
-        vmm.mmio_device_manager
-            .register_mmio_device(vmm.vm.fd(), mmio_device, type_id, id)?;
+    vmm.mmio_device_manager
+        .register_mmio_device(vmm.vm.fd(), mmio_device, type_id, id)?;
     #[cfg(target_os = "macos")]
-    let (_mmio_base, _irq) =
-        vmm.mmio_device_manager
-            .register_mmio_device(mmio_device, type_id, id)?;
+    vmm.mmio_device_manager
+        .register_mmio_device(mmio_device, type_id, id)?;
 
     Ok(())
 }

@@ -84,6 +84,15 @@ pub struct SerialConsoleConfig {
     pub output_handle: SendHandle,
 }
 
+#[cfg_attr(feature = "ffi", ffier::export)]
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VirtioTransport {
+    #[default]
+    Mmio = 0,
+    Pci = 1,
+}
+
 /// A data structure that encapsulates the device configurations
 /// held in the Vmm.
 #[derive(Default)]
@@ -123,6 +132,8 @@ pub struct VmResources {
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
     pub serial_consoles: Vec<SerialConsoleConfig>,
+    /// Virtio device transport (MMIO or PCI).
+    pub virtio_transport: VirtioTransport,
 }
 
 impl VmResources {
@@ -240,7 +251,7 @@ impl VmResources {
 
 #[cfg(test)]
 mod tests {
-    use crate::vmm::resources::VmResources;
+    use crate::vmm::resources::{VirtioTransport, VmResources};
     use crate::vmm::vmm_config::kernel_cmdline::KernelCmdlineConfig;
     use crate::vmm::vmm_config::machine_config::{CpuFeaturesTemplate, VmConfig, VmConfigError};
     use crate::vmm::vstate::VcpuConfig;
@@ -266,6 +277,7 @@ mod tests {
             acpi_enabled: false,
             serial_consoles: Vec::new(),
             kernel_console: None,
+            virtio_transport: VirtioTransport::default(),
         }
     }
 

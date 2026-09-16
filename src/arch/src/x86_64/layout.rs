@@ -29,6 +29,12 @@ pub const IRQ_BASE: u32 = 5;
 /// Last usable IRQ ID for virtio device interrupts on x86_64.
 pub const IRQ_MAX: u32 = 23;
 
+/// First GSI for virtio-pci MSI-X vectors. Separate from the legacy virtio-mmio
+/// IRQ range because each PCI device needs one GSI per queue plus one for config.
+pub const PCI_MSI_GSI_BASE: u32 = 32;
+/// Last GSI available for virtio-pci MSI-X (KVM supports up to 4095).
+pub const PCI_MSI_GSI_MAX: u32 = 2047;
+
 /// Address for the TSS setup.
 pub const KVM_TSS_ADDRESS: u64 = 0xfffb_d000;
 
@@ -86,3 +92,13 @@ pub const FIRMWARE_SIZE: u64 = 65536;
 pub const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
 pub const MEM_32BIT_GAP_SIZE: u64 = 768 << 20;
 pub const MMIO_MEM_START: u64 = FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE;
+
+/// PCI ECAM base address for config space access.
+pub const PCI_ECAM_START: u64 = 0xe000_0000;
+/// Start of PCI virtio device BAR allocations.
+///
+/// Placed at the top of guest RAM (the start of the sub-4G MMIO hole) so BAR
+/// addresses do not overlap the E820 RAM region below.
+pub const PCI_MMIO_START: u64 = MMIO_MEM_START;
+/// Last guest address usable for PCI virtio BARs (ECAM follows).
+pub const PCI_MMIO_END: u64 = PCI_ECAM_START - 1;

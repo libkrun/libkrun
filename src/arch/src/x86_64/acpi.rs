@@ -5,7 +5,8 @@ use std::result;
 
 use acpi_tables::Aml;
 use acpi_tables::aml::{
-    Device, EISAName, IO, Interrupt, Memory32Fixed, Name, Path, ResourceTemplate, Scope,
+    AddressSpace, AddressSpaceCacheable, Device, EISAName, IO, Interrupt, Memory32Fixed, Name,
+    Path, ResourceTemplate, Scope,
 };
 use acpi_tables::fadt::{FADTBuilder, Flags};
 use acpi_tables::madt::{
@@ -18,7 +19,7 @@ use vm_memory::Bytes;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, Permissions};
 use zerocopy::IntoBytes;
 
-use crate::x86_64::layout::{HIMEM_START, RSDP_ADDR};
+use crate::x86_64::layout::{HIMEM_START, PCI_ECAM_START, PCI_MMIO_END, PCI_MMIO_START, RSDP_ADDR};
 
 /// Standard local APIC physical base address.
 const LOCAL_APIC_DEFAULT_PHYS_BASE: u32 = 0xfee0_0000;
@@ -35,7 +36,7 @@ fn build_rsdp(xsdt_addr: u64) -> Vec<u8> {
     Rsdp::new(*b"LIBKRN", xsdt_addr).as_bytes().to_vec()
 }
 
-fn build_dsdt(virtio_mmio_devices: &[(u64, u32)]) -> Vec<u8> {
+fn build_dsdt(virtio_mmio_devices: &[(u64, u32)], virtio_pci: bool) -> Vec<u8> {
     let mut aml_body = Vec::new();
 
     // (io_base, irq, acpi_device_name) — PC/AT standard COM port assignments
@@ -49,7 +50,7 @@ fn build_dsdt(virtio_mmio_devices: &[(u64, u32)]) -> Vec<u8> {
         let hid = Name::new(Path::new("_HID"), &EISAName::new("PNP0501"));
         let uid = Name::new(Path::new("_UID"), &(i as u32));
         let io_res = IO::new(io_base, io_base, 0x08, 0x08);
-        let irq_res = Interrupt::new(true, true, false, true, irq);
+        let irq_res = Interrupt::new(true, true, false, false, irq);
         let crs = Name::new(
             Path::new("_CRS"),
             &ResourceTemplate::new(vec![&io_res, &irq_res]),
@@ -70,17 +71,49 @@ fn build_dsdt(virtio_mmio_devices: &[(u64, u32)]) -> Vec<u8> {
         Device::new(Path::new("KBD0"), vec![&hid, &uid, &crs]).to_aml_bytes(&mut aml_body);
     }
 
-    for (i, &(mmio_base, irq)) in virtio_mmio_devices.iter().enumerate() {
-        let name = format!("VR{i:02X}");
-        let hid = Name::new(Path::new("_HID"), &"LNRO0005");
-        let uid = Name::new(Path::new("_UID"), &(i as u32));
-        let mem = Memory32Fixed::new(true, mmio_base as u32, 0x1000);
-        let irq_res = Interrupt::new(true, false, false, false, irq);
+    if !virtio_pci {
+        for (i, &(mmio_base, irq)) in virtio_mmio_devices.iter().enumerate() {
+            let name = format!("VR{i:02X}");
+            let hid = Name::new(Path::new("_HID"), &"LNRO0005");
+            let uid = Name::new(Path::new("_UID"), &(i as u32));
+            let mem = Memory32Fixed::new(true, mmio_base as u32, 0x1000);
+            let irq_res = Interrupt::new(true, false, false, false, irq);
+            let crs = Name::new(
+                Path::new("_CRS"),
+                &ResourceTemplate::new(vec![&mem, &irq_res]),
+            );
+            Device::new(Path::new(&name), vec![&hid, &uid, &crs]).to_aml_bytes(&mut aml_body);
+        }
+    }
+
+    if virtio_pci {
+        let bus_number = AddressSpace::<u16>::new_bus_number(0, 0xff);
+        let io_low = AddressSpace::<u16>::new_io(0x0000, 0x0cf7, None);
+        let io_high = AddressSpace::<u16>::new_io(0x0d00, 0xffff, None);
+        let pci_mmio = AddressSpace::<u32>::new_memory(
+            AddressSpaceCacheable::NotCacheable,
+            true,
+            PCI_MMIO_START as u32,
+            PCI_MMIO_END as u32,
+            None,
+        );
+        let hid = Name::new(Path::new("_HID"), &EISAName::new("PNP0A08"));
+        // PNP0A03 keeps legacy PCI enumeration working alongside PCIe PNP0A08.
+        let cid = Name::new(Path::new("_CID"), &EISAName::new("PNP0A03"));
+        let adr = Name::new(Path::new("_ADR"), &0u32);
+        let seg = Name::new(Path::new("_SEG"), &0u32);
+        let bbn = Name::new(Path::new("_BBN"), &0u32);
+        let uid = Name::new(Path::new("_UID"), &0u32);
+        let cca = Name::new(Path::new("_CCA"), &1u32);
         let crs = Name::new(
             Path::new("_CRS"),
-            &ResourceTemplate::new(vec![&mem, &irq_res]),
+            &ResourceTemplate::new(vec![&bus_number, &io_low, &io_high, &pci_mmio]),
         );
-        Device::new(Path::new(&name), vec![&hid, &uid, &crs]).to_aml_bytes(&mut aml_body);
+        Device::new(
+            Path::new("PCI0"),
+            vec![&hid, &cid, &adr, &seg, &bbn, &uid, &cca, &crs],
+        )
+        .to_aml_bytes(&mut aml_body);
     }
 
     let scope_bytes = Scope::raw(Path::new("\\_SB_"), aml_body);
@@ -156,22 +189,49 @@ pub enum Error {
 
 pub type Result<T> = result::Result<T, Error>;
 
+/// Builds an MCFG table describing the PCI ECAM region.
+fn build_mcfg(ecam_base: u64) -> Vec<u8> {
+    const MCFG_LEN: u32 = 60;
+
+    let mut mcfg = vec![0u8; MCFG_LEN as usize];
+    mcfg[0..4].copy_from_slice(b"MCFG");
+    mcfg[4..8].copy_from_slice(&MCFG_LEN.to_le_bytes());
+    mcfg[8] = 1;
+    mcfg[10..16].copy_from_slice(b"LIBKRN");
+    mcfg[16..24].copy_from_slice(b"KRUNMCFG");
+    mcfg[24..28].copy_from_slice(&1u32.to_le_bytes());
+    mcfg[44..52].copy_from_slice(&ecam_base.to_le_bytes());
+    mcfg[54] = 0;
+    mcfg[55] = 255;
+
+    let sum: u8 = mcfg.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    mcfg[9] = mcfg[9].wrapping_sub(sum);
+    mcfg
+}
+
 /// Builds and writes RSDP, XSDT, FADT, DSDT, and MADT into guest memory
-/// starting at `RSDP_ADDR`.
+/// starting at `RSDP_ADDR`. Must be called for every payload type, including TEE.
 pub fn setup_acpi(
     mem: &GuestMemoryMmap,
     num_cpus: u8,
     virtio_mmio_devices: &[(u64, u32)],
+    virtio_pci: bool,
 ) -> Result<()> {
     if u32::from(num_cpus) > MAX_SUPPORTED_CPUS {
         return Err(Error::TooManyCpus);
     }
 
-    let dsdt = build_dsdt(virtio_mmio_devices);
+    let dsdt = build_dsdt(virtio_mmio_devices, virtio_pci);
     let madt = build_madt(num_cpus);
+    let mcfg = if virtio_pci {
+        Some(build_mcfg(PCI_ECAM_START))
+    } else {
+        None
+    };
 
     const RSDP_SIZE: u64 = 36;
-    let xsdt_size = 36 + 2 * 8; // fixed SDT header + 2 entries (FADT + MADT)
+    let xsdt_entry_count = if virtio_pci { 3 } else { 2 };
+    let xsdt_size = 36 + xsdt_entry_count * 8;
     let fadt_size_placeholder = build_fadt(0).len() as u64;
 
     let rsdp_addr = RSDP_ADDR;
@@ -179,16 +239,25 @@ pub fn setup_acpi(
     let fadt_addr = xsdt_addr + xsdt_size as u64;
     let dsdt_addr = fadt_addr + fadt_size_placeholder;
     let madt_addr = dsdt_addr + dsdt.len() as u64;
+    let mcfg_addr = madt_addr + madt.len() as u64;
 
     let fadt = build_fadt(dsdt_addr);
-    let xsdt = build_xsdt(&[fadt_addr, madt_addr]);
+    let xsdt_entries: Vec<u64> = if virtio_pci {
+        vec![fadt_addr, madt_addr, mcfg_addr]
+    } else {
+        vec![fadt_addr, madt_addr]
+    };
+    let xsdt = build_xsdt(&xsdt_entries);
     let rsdp = build_rsdp(xsdt_addr);
 
-    let total_size = rsdp.len() as u64
+    let mut total_size = rsdp.len() as u64
         + xsdt.len() as u64
         + fadt.len() as u64
         + dsdt.len() as u64
         + madt.len() as u64;
+    if let Some(ref mcfg_table) = mcfg {
+        total_size += mcfg_table.len() as u64;
+    }
     if rsdp_addr + total_size > HIMEM_START
         || !mem.check_range(
             GuestAddress(rsdp_addr),
@@ -209,6 +278,10 @@ pub fn setup_acpi(
         .map_err(|_| Error::WriteFailed)?;
     mem.write_slice(&madt, GuestAddress(madt_addr))
         .map_err(|_| Error::WriteFailed)?;
+    if let Some(ref mcfg_table) = mcfg {
+        mem.write_slice(mcfg_table, GuestAddress(mcfg_addr))
+            .map_err(|_| Error::WriteFailed)?;
+    }
 
     Ok(())
 }
@@ -263,7 +336,7 @@ mod tests {
     #[test]
     fn dsdt_contains_device_nodes() {
         let devices = vec![(0xd000_0000u64, 5u32), (0xd000_1000, 6)];
-        let bytes = build_dsdt(&devices);
+        let bytes = build_dsdt(&devices, false);
 
         assert_eq!(&bytes[..4], b"DSDT");
 
@@ -277,8 +350,18 @@ mod tests {
     }
 
     #[test]
+    fn dsdt_pci_host_bridge_describes_pci_bus() {
+        let pci = build_dsdt(&[], true);
+        let mmio = build_dsdt(&[], false);
+
+        let sum: u8 = pci.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        assert_eq!(sum, 0);
+        assert!(pci.len() > mmio.len());
+    }
+
+    #[test]
     fn dsdt_empty_devices() {
-        let bytes = build_dsdt(&[]);
+        let bytes = build_dsdt(&[], false);
 
         assert_eq!(&bytes[..4], b"DSDT");
         let sum: u8 = bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b));
@@ -329,11 +412,37 @@ mod tests {
     }
 
     #[test]
+    fn mcfg_layout_and_checksum() {
+        use crate::x86_64::layout::PCI_ECAM_START;
+
+        let bytes = build_mcfg(PCI_ECAM_START);
+        assert_eq!(&bytes[0..4], b"MCFG");
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 60);
+        assert_eq!(&bytes[10..16], b"LIBKRN");
+
+        let sum: u8 = bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        assert_eq!(sum, 0);
+
+        let ecam_base = u64::from_le_bytes(bytes[44..52].try_into().unwrap());
+        assert_eq!(ecam_base, PCI_ECAM_START);
+        assert_eq!(bytes[54], 0);
+        assert_eq!(bytes[55], 255);
+    }
+
+    #[test]
+    fn setup_acpi_with_virtio_pci_fits_in_reserved_window() {
+        let window_size = (HIMEM_START - RSDP_ADDR) as usize;
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), window_size)]).unwrap();
+
+        setup_acpi(&mem, 4, &[], true).unwrap();
+    }
+
+    #[test]
     fn setup_acpi_fits_in_reserved_window() {
         let window_size = (HIMEM_START - RSDP_ADDR) as usize;
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), window_size)]).unwrap();
 
-        setup_acpi(&mem, 4, &[]).unwrap();
+        setup_acpi(&mem, 4, &[], false).unwrap();
 
         let rsdp: [u8; 8] = {
             let mut buf = [0u8; 8];
@@ -346,7 +455,7 @@ mod tests {
     #[test]
     fn setup_acpi_fails_if_window_too_small() {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), 8)]).unwrap();
-        assert!(setup_acpi(&mem, 4, &[]).is_err());
+        assert!(setup_acpi(&mem, 4, &[], false).is_err());
     }
 
     #[test]
@@ -354,6 +463,6 @@ mod tests {
         let window_size = (HIMEM_START - RSDP_ADDR) as usize;
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), window_size)]).unwrap();
 
-        assert_eq!(setup_acpi(&mem, 255, &[]), Err(Error::TooManyCpus));
+        assert_eq!(setup_acpi(&mem, 255, &[], false), Err(Error::TooManyCpus));
     }
 }

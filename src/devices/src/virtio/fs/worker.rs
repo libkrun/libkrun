@@ -262,7 +262,7 @@ impl FsWorker {
             }
 
             if queue.needs_notification(&self.mem).unwrap() {
-                self.interrupt.signal_used_queue();
+                self.interrupt.signal_used_queue_index(queue_index);
             }
         }
     }

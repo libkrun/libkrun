@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 
 use crate::vmm::Vmm;
-use crate::vmm::builder::{attach_mmio_device, setup_terminal_raw_mode};
+use crate::vmm::builder::{attach_virtio_device, setup_terminal_raw_mode};
 use crate::vmm::device_manager::shm::ShmManager;
 #[cfg(any(feature = "gpu", feature = "vhost-user"))]
 use devices::display::{DisplayInfo, DisplayInfoEdid, PhysicalSize};
@@ -90,7 +90,7 @@ impl<'a> AttachContext<'a> {
             intc,
             device_index,
             register_fn: Box::new(|vmm, id, intc, device| {
-                attach_mmio_device(vmm, id, intc, device)
+                attach_virtio_device(vmm, id, intc, device)
                     .map_err(|e| VmmError::Internal(format!("{e:?}")))?;
                 Ok(())
             }),

@@ -126,6 +126,11 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 #define KRUN_KERNEL_FORMAT_IMAGE_GZ 4
 #define KRUN_KERNEL_FORMAT_IMAGE_ZSTD 5
 
+/* VirtioTransport --------------------------------------------------- */
+
+#define KRUN_VIRTIO_TRANSPORT_MMIO 0
+#define KRUN_VIRTIO_TRANSPORT_PCI 1
+
 /* DiskFormat -------------------------------------------------------- */
 
 #define KRUN_DISK_FORMAT_RAW 0
@@ -412,6 +417,13 @@ typedef KrunResult (*krun_vmm_builder_split_irqchip_fn)(KrunVmmBuilder* handle, 
  */
 KrunResult krun_vmm_builder_acpi(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 typedef KrunResult (*krun_vmm_builder_acpi_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
+/**
+ * Configure the bus transport for virtio devices.
+ *
+ * Defaults to [`VirtioTransport::Mmio`].
+ */
+void krun_vmm_builder_virtio_transport(KrunVmmBuilder* handle, uint32_t transport);
+typedef void (*krun_vmm_builder_virtio_transport_fn)(KrunVmmBuilder* handle, uint32_t transport);
 void krun_vmm_builder_add_smbios_oem_string(KrunVmmBuilder* handle, KrunStr s);
 typedef void (*krun_vmm_builder_add_smbios_oem_string_fn)(KrunVmmBuilder* handle, KrunStr s);
 /**

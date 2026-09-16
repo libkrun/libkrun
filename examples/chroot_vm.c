@@ -63,6 +63,7 @@ static void print_help(char *const name)
         "              --vhost-user-vsock=PATH Use vhost-user vsock backend at socket PATH\n"
         "              --vhost-user-can=PATH Use vhost-user CAN backend at socket PATH\n"
         "              --vhost-user-console=PATH Use vhost-user console backend at socket PATH\n"
+        "              --virtio-pci            Use virtio-pci instead of virtio-mmio\n"
         "NET_MODE can be either TSI (default) or PASST\n"
         "\n"
         "NEWROOT:      the root directory of the vm\n"
@@ -132,6 +133,7 @@ static const struct option long_options[] = {
     { "vhost-user-can", required_argument, NULL, 'A' },
     { "vhost-user-console", required_argument, NULL, 'O' },
     { "vhost-user-media", required_argument, NULL, 'M' },
+    { "virtio-pci", no_argument, NULL, 'T' },
     { NULL, 0, NULL, 0 }
 };
 
@@ -150,6 +152,7 @@ struct cmdline {
     char const *vhost_user_can_socket;
     char const *vhost_user_console_socket;
     char const *vhost_user_media_socket;
+    bool virtio_pci;
     char const *new_root;
     char *const *guest_argv;
 };
@@ -185,6 +188,7 @@ bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
         .vhost_user_can_socket = NULL,
         .vhost_user_console_socket = NULL,
         .vhost_user_media_socket = NULL,
+        .virtio_pci = false,
         .new_root = NULL,
         .guest_argv = NULL,
         .log_target = -1,
@@ -246,6 +250,9 @@ bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
             break;
         case 'M':
             cmdline->vhost_user_media_socket = optarg;
+            break;
+        case 'T':
+            cmdline->virtio_pci = true;
             break;
         case '?':
             return false;
@@ -526,6 +533,9 @@ int main(int argc, char *const argv[])
 #if defined(__x86_64__)
     CHECK(krun_vmm_builder_acpi(&builder, false, &krun_err));
 #endif
+    if (cmdline.virtio_pci) {
+        krun_vmm_builder_virtio_transport(&builder, KRUN_VIRTIO_TRANSPORT_PCI);
+    }
 
     CHECK(KrunVmm vmm = krun_vmm_builder_build(&builder, &krun_err));
     krun_vmm_run(vmm); // never returns

@@ -313,6 +313,13 @@
         }
       }
     },
+    "VirtioTransport": {
+      "kind": {
+        "enum": {
+          "alias_of": "u32"
+        }
+      }
+    },
     "Vmm": {
       "kind": {
         "handle": {
@@ -1471,6 +1478,27 @@
           "ffi_name": "krun_vmm_builder_acpi"
         },
         {
+          "name": "virtio_transport",
+          "doc": [
+            " Configure the bus transport for virtio devices.",
+            "",
+            " Defaults to [`VirtioTransport::Mmio`]."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "transport",
+              "param_kind": "regular",
+              "type": "VirtioTransport"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_vmm_builder_virtio_transport"
+        },
+        {
           "name": "add_smbios_oem_string",
           "receiver": "value",
           "params": [
@@ -2562,6 +2590,21 @@
           "name": "ImageZstd",
           "c_name": "KRUN_KERNEL_FORMAT_IMAGE_ZSTD",
           "value": 5
+        }
+      ]
+    },
+    {
+      "name": "VirtioTransport",
+      "variants": [
+        {
+          "name": "Mmio",
+          "c_name": "KRUN_VIRTIO_TRANSPORT_MMIO",
+          "value": 0
+        },
+        {
+          "name": "Pci",
+          "c_name": "KRUN_VIRTIO_TRANSPORT_PCI",
+          "value": 1
         }
       ]
     },

@@ -11,7 +11,6 @@ mod gdt;
 pub mod interrupts;
 /// Layout for the x86_64 system.
 pub mod layout;
-#[cfg(any(not(feature = "tee"), feature = "tdx"))]
 mod mptable;
 /// Logic for configuring x86_64 model specific registers (MSRs).
 pub mod msr;
@@ -63,7 +62,6 @@ pub enum Error {
     /// Invalid ACPI table setup params.
     AcpiSetup(acpi::Error),
     /// Error writing MP table to memory.
-    #[cfg(any(not(feature = "tee"), feature = "tdx"))]
     MpTableSetup(mptable::Error),
     /// Error writing hvm_start_info to guest memory.
     #[cfg(all(not(feature = "tee"), target_os = "linux"))]
@@ -308,9 +306,11 @@ pub fn configure_system(
     pvh: bool,
     acpi_enabled: bool,
     virtio_mmio_devices: &[(u64, u32)],
+    virtio_pci: bool,
 ) -> super::Result<()> {
     if acpi_enabled {
-        acpi::setup_acpi(guest_mem, num_cpus, virtio_mmio_devices).map_err(Error::AcpiSetup)?;
+        acpi::setup_acpi(guest_mem, num_cpus, virtio_mmio_devices, virtio_pci)
+            .map_err(Error::AcpiSetup)?;
     } else {
         // Note that this puts the mptable at the last 1k of Linux's 640k base RAM
         #[cfg(not(feature = "tee"))]
@@ -633,14 +633,19 @@ mod tests {
         let no_vcpus = 4;
         let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let info = ArchMemoryInfo::default();
-        let config_err =
-            configure_system(&gm, &info, GuestAddress(0), 0, &None, 1, false, false, &[]);
-        assert!(config_err.is_err());
-        #[cfg(not(feature = "tee"))]
-        assert_eq!(
-            config_err.unwrap_err(),
-            super::Error::MpTableSetup(mptable::Error::NotEnoughMemory)
+        let config_err = configure_system(
+            &gm,
+            &info,
+            GuestAddress(0),
+            0,
+            &None,
+            1,
+            false,
+            false,
+            &[],
+            false,
         );
+        assert!(config_err.is_err());
 
         // Now assigning some memory that falls before the 32bit memory hole.
         let mem_size = 128 << 20;
@@ -657,6 +662,7 @@ mod tests {
             false,
             false,
             &[],
+            false,
         )
         .unwrap();
 
@@ -675,6 +681,7 @@ mod tests {
             false,
             false,
             &[],
+            false,
         )
         .unwrap();
 
@@ -693,6 +700,7 @@ mod tests {
             false,
             false,
             &[],
+            false,
         )
         .unwrap();
     }

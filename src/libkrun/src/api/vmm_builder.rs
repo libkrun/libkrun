@@ -8,6 +8,7 @@ use crate::vmm::VmCtl;
 use crate::vmm::Vmm as InnerVmm;
 #[cfg(unix)]
 use crate::vmm::resources::SerialConsoleConfig;
+pub use crate::vmm::resources::VirtioTransport;
 use crate::vmm::resources::VmResources;
 use crate::vmm::vmm_config::machine_config::VmConfig;
 use crossbeam_channel::unbounded;
@@ -33,6 +34,7 @@ pub struct VmmBuilder<'a> {
     nested_virt: bool,
     split_irqchip: bool,
     acpi: bool,
+    virtio_transport: VirtioTransport,
     smbios_oem_strings: Vec<String>,
     shutdown_support: bool,
 }
@@ -121,6 +123,14 @@ impl<'a> VmmBuilder<'a> {
         }
         self.acpi = enabled;
         Ok(self)
+    }
+
+    /// Configure the bus transport for virtio devices.
+    ///
+    /// Defaults to [`VirtioTransport::Mmio`].
+    pub fn virtio_transport(mut self, transport: VirtioTransport) -> Self {
+        self.virtio_transport = transport;
+        self
     }
 
     pub fn add_smbios_oem_string(mut self, s: &str) -> Self {
@@ -400,6 +410,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
     vm_resources.nested_enabled = builder_cfg.nested_virt;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
     vm_resources.acpi_enabled = builder_cfg.acpi;
+    vm_resources.virtio_transport = builder_cfg.virtio_transport;
     if !builder_cfg.smbios_oem_strings.is_empty() {
         vm_resources.smbios_oem_strings = Some(builder_cfg.smbios_oem_strings);
     }
@@ -450,7 +461,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         {
             #[cfg(target_arch = "x86_64")]
             {
-                builder_cfg.split_irqchip
+                builder_cfg.split_irqchip || builder_cfg.virtio_transport == VirtioTransport::Pci
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
