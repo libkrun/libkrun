@@ -1156,5 +1156,11 @@ pub fn virgl_flags_to_capsets(flags: u32) -> u64 {
         capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_DRM;
     }
 
+    if flags & VIRGLRENDERER_NO_VIRGL != 0 {
+        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_GFXSTREAM_VULKAN;
+        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_GFXSTREAM_GLES;
+        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_GFXSTREAM_COMPOSER;
+    }
+
     capset_mask
 }

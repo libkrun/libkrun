@@ -68,6 +68,9 @@ endif
 ifeq ($(GPU),1)
     FEATURE_FLAGS += --features gpu
 endif
+ifeq ($(GFXSTREAM),1)
+    FEATURE_FLAGS += --features gfxstream
+endif
 ifeq ($(INPUT),1)
     FEATURE_FLAGS += --features input
 endif
