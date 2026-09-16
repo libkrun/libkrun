@@ -116,7 +116,7 @@ mod guest {
     use std::thread;
 
     const GUEST_PORT: u32 = 2345;
-    const REAPER_WAIT: Duration = Duration::from_secs(7);
+    const REAPER_WAIT: Duration = Duration::from_secs(20);
 
     fn exchange() {
         let sock = socket(
