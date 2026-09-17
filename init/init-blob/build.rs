@@ -122,13 +122,15 @@ fn build_rust_init() -> PathBuf {
         // the per-target env vars take effect.
         cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
 
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
             let target_env_key = musl_target.to_uppercase().replace('-', "_");
             let linker_triple = musl_target.replace("-unknown", "").replace("-musl", "-gnu");
-            cmd.env(
-                format!("CARGO_TARGET_{target_env_key}_LINKER"),
-                "/usr/bin/clang",
-            );
+            let linker = if cfg!(target_os = "windows") {
+                "clang"
+            } else {
+                "/usr/bin/clang"
+            };
+            cmd.env(format!("CARGO_TARGET_{target_env_key}_LINKER"), linker);
             cmd.env(
                 format!("CARGO_TARGET_{target_env_key}_RUSTFLAGS"),
                 format!(
