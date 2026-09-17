@@ -764,6 +764,21 @@ pub struct WhpVcpu {
     exit_context: WHV_RUN_VP_EXIT_CONTEXT,
 }
 
+/*
+WHP API requires virtual processor register structures to be 16-byte aligned in memory.
+
+However, Rust's `windows-sys` metadata generator drops the DECLSPEC_ALIGN(16) attribute,
+causing `WHV_REGISTER_VALUE` to default to an 8-byte alignment.
+As a result, stack-allocated arrays `[WHV_REGISTER_VALUE; N]` can land on
+8-byte boundaries, triggering alignment faults or access violations in
+`winhvplatform.dll`.
+
+To fix this, we use a wrapper struct `AlignedRegisterValues<T>` to
+guarantee proper 16-byte stack alignment.
+*/
+#[repr(C, align(16))]
+struct AlignedRegisterValues<T>(T);
+
 impl WhpVcpu {
     /// Creates a new virtual processor within the given partition.
     pub fn new(vm: Arc<WhpVm>, index: u32) -> Result<Self, Error> {
@@ -885,8 +900,8 @@ impl WhpVcpu {
         &self,
         names: [WHV_REGISTER_NAME; N],
     ) -> Result<[WHV_REGISTER_VALUE; N], Error> {
-        // Create a zeroed array on the stack to hold the results
-        let mut values: [WHV_REGISTER_VALUE; N] = unsafe { mem::zeroed() };
+        // Create a 16-byte aligned zeroed array on the stack
+        let mut values = AlignedRegisterValues(unsafe { mem::zeroed::<[WHV_REGISTER_VALUE; N]>() });
 
         let hr = unsafe {
             WHvGetVirtualProcessorRegisters(
@@ -894,7 +909,7 @@ impl WhpVcpu {
                 self.index,
                 names.as_ptr(),
                 N as u32,
-                values.as_mut_ptr(),
+                values.0.as_mut_ptr(),
             )
         };
 
@@ -902,7 +917,7 @@ impl WhpVcpu {
             Err(Error::GetRegisters(hr))
         } else {
             // Return the array directly!
-            Ok(values)
+            Ok(values.0)
         }
     }
 
@@ -943,14 +958,14 @@ impl WhpVcpu {
         pairs: [(WHV_REGISTER_NAME, WHV_REGISTER_VALUE); N],
     ) -> Result<(), Error> {
         let mut names: [WHV_REGISTER_NAME; N] = unsafe { mem::zeroed() };
-        let mut values: [WHV_REGISTER_VALUE; N] = unsafe { mem::zeroed() };
+        let mut values = AlignedRegisterValues(unsafe { mem::zeroed::<[WHV_REGISTER_VALUE; N]>() });
 
         for i in 0..N {
             names[i] = pairs[i].0;
-            values[i] = pairs[i].1;
+            values.0[i] = pairs[i].1;
         }
 
-        self.set_whp_registers(&names, &values)
+        self.set_whp_registers(&names, &values.0)
     }
 
     pub fn set_registers64<const N: usize>(
@@ -958,14 +973,14 @@ impl WhpVcpu {
         pairs: [(WHV_REGISTER_NAME, u64); N],
     ) -> Result<(), Error> {
         let mut names: [WHV_REGISTER_NAME; N] = unsafe { mem::zeroed() };
-        let mut values: [WHV_REGISTER_VALUE; N] = unsafe { mem::zeroed() };
+        let mut values = AlignedRegisterValues(unsafe { mem::zeroed::<[WHV_REGISTER_VALUE; N]>() });
 
         for i in 0..N {
             names[i] = pairs[i].0;
-            values[i].Reg64 = pairs[i].1;
+            values.0[i].Reg64 = pairs[i].1;
         }
 
-        self.set_whp_registers(&names, &values)
+        self.set_whp_registers(&names, &values.0)
     }
 
     pub fn vm(&self) -> &Arc<WhpVm> {
