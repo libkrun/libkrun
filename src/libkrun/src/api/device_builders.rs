@@ -1026,6 +1026,7 @@ pub struct BlockDevice {
     is_read_only: bool,
     direct_io: bool,
     sync_mode: SyncMode,
+    parallel_reads: bool,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
@@ -1034,7 +1035,7 @@ impl BlockDevice {
     /// Create a new block device.
     ///
     /// Defaults to read-write (`read_only = false`), cached I/O (`direct_io = false`),
-    /// and [`SyncMode::Relaxed`].
+    /// [`SyncMode::Relaxed`], and serialized reads (`parallel_reads = false`).
     pub fn new(id: &str, disk_image_path: &str, format: DiskFormat) -> Result<Self, VmmError> {
         Ok(Self {
             id: id.to_string(),
@@ -1043,6 +1044,7 @@ impl BlockDevice {
             is_read_only: false,
             direct_io: false,
             sync_mode: SyncMode::default(),
+            parallel_reads: false,
         })
     }
 
@@ -1063,6 +1065,13 @@ impl BlockDevice {
     pub fn set_sync_mode(&mut self, sync_mode: SyncMode) {
         self.sync_mode = sync_mode;
     }
+
+    /// Serve guest reads on a host thread pool with out-of-order completion.
+    ///
+    /// Disabled by default. Writes, flushes, and discards stay on the device thread.
+    pub fn set_parallel_reads(&mut self, enabled: bool) {
+        self.parallel_reads = enabled;
+    }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
@@ -1081,6 +1090,7 @@ impl<'a> AttachDevice<'a> for BlockDevice {
             self.is_read_only,
             self.direct_io,
             self.sync_mode,
+            self.parallel_reads,
         )
         .map_err(|e| VmmError::Internal(format!("block: {e}")))?;
 
