@@ -1,13 +1,22 @@
 use super::scanout_paintable::ScanoutPaintable;
 use crate::{Axis, DisplayEvent, DisplayInputOptions, TouchArea, TouchScreenOptions};
+use krun_display::DisplayBackendError;
+#[cfg(target_os = "linux")]
+use krun_display::DmabufExport;
 use krun_display::Rect;
 use krun_input::{InputEvent, InputEventType};
 use log::{debug, trace, warn};
 use std::cell::RefCell;
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::iter;
+#[cfg(target_os = "linux")]
+use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::time::Duration;
 
 use utils::pollable_channel::{PollableChannelReciever, PollableChannelSender};
@@ -313,6 +322,10 @@ struct ScanoutWindow {
     height: i32,
     format: MemoryFormat,
     scanout_paintable: ScanoutPaintable,
+    #[cfg(target_os = "linux")]
+    current_dmabuf_id: Option<u32>,
+    #[cfg(target_os = "linux")]
+    last_displayed_dmabuf_id: Option<u32>,
 }
 
 impl ScanoutWindow {
@@ -404,6 +417,10 @@ impl ScanoutWindow {
             height,
             format,
             scanout_paintable,
+            #[cfg(target_os = "linux")]
+            current_dmabuf_id: None,
+            #[cfg(target_os = "linux")]
+            last_displayed_dmabuf_id: None,
         }
     }
 
@@ -416,6 +433,28 @@ impl ScanoutWindow {
     pub fn update(&self, buffer: Bytes, rect: Option<Rect>) {
         self.scanout_paintable
             .update(buffer, self.width, self.height, self.format, rect);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn set_dmabuf(
+        &mut self,
+        dmabuf: SharedDmabuf,
+        _src_rect: Option<Rect>,
+        damage_area: Option<Rect>,
+    ) -> bool {
+        // Build texture immediately and return success/failure
+        self.scanout_paintable
+            .configure_dmabuf(dmabuf, None, damage_area)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn set_current_dmabuf_id(&mut self, dmabuf_id: u32) {
+        self.current_dmabuf_id = Some(dmabuf_id);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn get_current_dmabuf_id(&self) -> Option<u32> {
+        self.current_dmabuf_id
     }
 }
 
@@ -654,6 +693,50 @@ fn build_overlay(window: &Window) -> Overlay {
     overlay
 }
 
+#[cfg(target_os = "linux")]
+struct DmabufInner(DmabufExport);
+
+#[cfg(target_os = "linux")]
+impl Drop for DmabufInner {
+    fn drop(&mut self) {
+        for &fd in self.0.dmabuf_fds.iter().take(self.0.n_planes as usize) {
+            debug!(
+                "Closing dmabuf fd {} (fourcc=0x{:08x}, modifier=0x{:016x})",
+                fd, self.0.fourcc, self.0.modifier
+            );
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub struct SharedDmabuf(Arc<DmabufInner>);
+
+#[cfg(target_os = "linux")]
+impl SharedDmabuf {
+    fn new(dmabuf_export: DmabufExport) -> Result<Self, DisplayBackendError> {
+        for &fd in dmabuf_export
+            .dmabuf_fds
+            .iter()
+            .take(dmabuf_export.n_planes as usize)
+        {
+            if fd < 0 {
+                return Err(DisplayBackendError::InvalidParam);
+            }
+        }
+        Ok(Self(Arc::new(DmabufInner(dmabuf_export))))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Deref for SharedDmabuf {
+    type Target = DmabufExport;
+    fn deref(&self) -> &Self::Target {
+        &self.0.0
+    }
+}
+
 pub struct DisplayWorker {
     app: Application,
     app_name: String,
@@ -661,6 +744,8 @@ pub struct DisplayWorker {
     keyboard_event_tx: Option<EventSender>,
     per_display_inputs: Vec<Vec<(PollableChannelSender<InputEvent>, DisplayInputOptions)>>,
     scanouts: RefCell<[Option<ScanoutWindow>; MAX_DISPLAYS]>,
+    #[cfg(target_os = "linux")]
+    imported_dmabufs: RefCell<HashMap<u32, SharedDmabuf>>,
 }
 
 impl DisplayWorker {
@@ -678,6 +763,8 @@ impl DisplayWorker {
             keyboard_event_tx,
             per_display_inputs,
             scanouts: Default::default(),
+            #[cfg(target_os = "linux")]
+            imported_dmabufs: RefCell::new(HashMap::new()),
         }
     }
 
@@ -735,6 +822,105 @@ impl DisplayWorker {
                         scanout.update(buffer, rect);
                     } else {
                         warn!("Attempted to update non-existent scanout: {scanout_id}");
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                DisplayEvent::ImportDmabuf {
+                    dmabuf_id,
+                    dmabuf_export,
+                } => {
+                    self.imported_dmabufs.borrow_mut().insert(
+                        dmabuf_id,
+                        SharedDmabuf::new(dmabuf_export).expect("invalid DMABUF FD"),
+                    );
+                }
+                #[cfg(target_os = "linux")]
+                DisplayEvent::UnrefDmabuf { dmabuf_id } => {
+                    self.imported_dmabufs.borrow_mut().remove(&dmabuf_id);
+                }
+                #[cfg(target_os = "linux")]
+                DisplayEvent::ConfigureScanoutDmabuf {
+                    scanout_id,
+                    display_width,
+                    display_height,
+                    dmabuf_id,
+                } => {
+                    let dmabuf = self
+                        .imported_dmabufs
+                        .borrow()
+                        .get(&dmabuf_id)
+                        .cloned()
+                        .expect("DMABUF ID not found");
+
+                    // Create scanout window if it doesn't exist (DMABUF-only path)
+                    if scanouts[scanout_id as usize].is_none() {
+                        debug!(
+                            "Enable DMABUF scanout {scanout_id} width={} height={}",
+                            dmabuf.width, dmabuf.height
+                        );
+                        scanouts[scanout_id as usize] = Some(ScanoutWindow::new(
+                            &self.app,
+                            &format!(
+                                "{name} - display {scanout_id} ({width}x{height})",
+                                name = self.app_name,
+                                width = dmabuf.width,
+                                height = dmabuf.height
+                            ),
+                            display_width as i32,
+                            display_height as i32,
+                            dmabuf.width as i32,
+                            dmabuf.height as i32,
+                            gtk::gdk::MemoryFormat::B8g8r8a8, // Default format, not used for DMABUF
+                            self.keyboard_event_tx.clone(),
+                            self.per_display_inputs
+                                .get(scanout_id as usize)
+                                .cloned()
+                                .unwrap_or_default(),
+                        ));
+                    }
+
+                    if let Some(scanout) = &mut scanouts[scanout_id as usize] {
+                        scanout.set_current_dmabuf_id(dmabuf_id);
+                    } else {
+                        warn!(
+                            "Attempted to configure DMABUF on non-existent scanout: {scanout_id}"
+                        );
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                DisplayEvent::UpdateScanoutDmabuf {
+                    scanout_id,
+                    rect,
+                    response_tx,
+                } => {
+                    if let Some(scanout) = &mut scanouts[scanout_id as usize] {
+                        if let Some(dmabuf_id) = scanout.get_current_dmabuf_id() {
+                            let dmabuf = self
+                                .imported_dmabufs
+                                .borrow()
+                                .get(&dmabuf_id)
+                                .cloned()
+                                .expect("DMABUF ID not found");
+
+                            let success = scanout.set_dmabuf(dmabuf, None, rect);
+
+                            if success {
+                                if let Some(old_id) = scanout.last_displayed_dmabuf_id
+                                    && old_id != dmabuf_id
+                                {
+                                    self.imported_dmabufs.borrow_mut().remove(&old_id);
+                                }
+                                scanout.last_displayed_dmabuf_id = Some(dmabuf_id);
+                            }
+
+                            let _ = response_tx.send(success);
+                        } else {
+                            warn!("Attempted to update DMABUF scanout without a configured DMABUF");
+                            let _ = response_tx.send(false);
+                        }
+                    } else {
+                        warn!("Attempted to update non-existent DMABUF scanout: {scanout_id}");
+                        let _ = response_tx.send(false);
                     }
                 }
             }

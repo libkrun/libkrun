@@ -40,6 +40,13 @@ extern "C" {
 #define KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER 1
 
 /**
+ * Indicates support for zero-copy DMABUF display.
+ * If supported, the implementation must provide `disable_scanout`, `import_dmabuf`, `unref_dmabuf`,
+ * `configure_scanout_dmabuf`, and `present_dmabuf`.
+ */
+#define KRUN_DISPLAY_FEATURE_DMABUF_CONSUMER 2
+
+/**
  * Called to create a display instance.
  *
  * Arguments:
@@ -146,6 +153,73 @@ struct krun_rect {
 typedef int32_t (*krun_display_present_frame_fn)(void *instance, uint32_t scanout_id, uint32_t frame_id, const struct krun_rect* damage_area);
 
 /**
+ * DMABUF export descriptor for zero-copy GPU memory sharing.
+ */
+struct krun_display_dmabuf_export {
+    int32_t  dmabuf_fds[4];     // File descriptors for each plane
+    uint32_t n_planes;           // Number of planes (1-4)
+    uint32_t width;              // Width in pixels
+    uint32_t height;             // Height in pixels
+    uint32_t fourcc;             // DRM fourcc format code
+    uint64_t modifier;           // DRM format modifier
+    uint32_t strides[4];         // Stride for each plane
+    uint32_t offsets[4];         // Offset for each plane
+};
+
+/**
+ * Import a DMABUF for zero-copy display.
+ *
+ * Arguments:
+ *  "instance"       - userdata set by `krun_display_create`
+ *  "dmabuf_export"  - DMABUF descriptor to import
+ *
+ * Returns:
+ *  DMABUF ID (>= 0) on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise.
+ */
+typedef int32_t (*krun_display_import_dmabuf_fn)(void *instance, const struct krun_display_dmabuf_export *dmabuf_export);
+
+/**
+ * Release a reference to a DMABUF.
+ *
+ * Arguments:
+ *  "instance"   - userdata set by `krun_display_create`
+ *  "dmabuf_id"  - DMABUF ID returned by import_dmabuf
+ *
+ * Returns:
+ *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise.
+ */
+typedef int32_t (*krun_display_unref_dmabuf_fn)(void *instance, uint32_t dmabuf_id);
+
+/**
+ * Configure a scanout to use a DMABUF.
+ *
+ * Arguments:
+ *  "instance"       - userdata set by `krun_display_create`
+ *  "scanout_id"     - The identifier of the scanout
+ *  "display_width"  - The original width of the display
+ *  "display_height" - The original height of the display
+ *  "dmabuf_id"      - DMABUF ID returned by import_dmabuf
+ *  "src_rect"       - (Optional) Source rectangle to display
+ *
+ * Returns:
+ *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise.
+ */
+typedef int32_t (*krun_display_configure_scanout_dmabuf_fn)(void *instance, uint32_t scanout_id, uint32_t display_width, uint32_t display_height, uint32_t dmabuf_id, const struct krun_rect *src_rect);
+
+/**
+ * Present a DMABUF scanout.
+ *
+ * Arguments:
+ *  "instance"    - userdata set by `krun_display_create`
+ *  "scanout_id"  - The identifier of the scanout
+ *  "damage_area" - (Optional) Damage rectangle
+ *
+ * Returns:
+ *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise.
+ */
+typedef int32_t (*krun_display_present_dmabuf_fn)(void *instance, uint32_t scanout_id, const struct krun_rect *damage_area);
+
+/**
  * Defines the set of callbacks for a display implementation.
  * This structure holds function pointers that a display backend implements to integrate with the libkrun.
  *
@@ -168,10 +242,25 @@ struct krun_display_basic_framebuffer_vtable {
     krun_display_configure_scanout_fn   configure_scanout; // Required by KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER
     krun_display_alloc_frame_fn         alloc_frame; // Required by KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER
     krun_display_present_frame_fn       present_frame; // Required by KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER
+    // DMABUF extension methods (optional, only required if KRUN_DISPLAY_FEATURE_DMABUF_CONSUMER is set)
+    krun_display_import_dmabuf_fn              import_dmabuf; // Required by KRUN_DISPLAY_FEATURE_DMABUF_CONSUMER
+    krun_display_unref_dmabuf_fn               unref_dmabuf; // Required by KRUN_DISPLAY_FEATURE_DMABUF_CONSUMER
+    krun_display_configure_scanout_dmabuf_fn   configure_scanout_dmabuf; // Required by KRUN_DISPLAY_FEATURE_DMABUF_CONSUMER
+    krun_display_present_dmabuf_fn             present_dmabuf; // Required by KRUN_DISPLAY_FEATURE_DMABUF_CONSUMER
+};
+
+struct krun_display_dmabuf_vtable {
+    krun_display_destroy_fn                    destroy; // (optional)
+    krun_display_disable_scanout_fn            disable_scanout; // Required by KRUN_DISPLAY_FEATURE_DMABUF_CONSUMER
+    krun_display_import_dmabuf_fn              import_dmabuf; // Required by KRUN_DISPLAY_FEATURE_DMABUF_CONSUMER
+    krun_display_unref_dmabuf_fn               unref_dmabuf; // Required by KRUN_DISPLAY_FEATURE_DMABUF_CONSUMER
+    krun_display_configure_scanout_dmabuf_fn   configure_scanout_dmabuf; // Required by KRUN_DISPLAY_FEATURE_DMABUF_CONSUMER
+    krun_display_present_dmabuf_fn             present_dmabuf; // Required by KRUN_DISPLAY_FEATURE_DMABUF_CONSUMER
 };
 
 union krun_display_vtable {
     struct krun_display_basic_framebuffer_vtable basic_framebuffer;
+    struct krun_display_dmabuf_vtable dmabuf;
 };
 
 struct krun_display_backend {
