@@ -4,9 +4,10 @@ use nix::sys::termios::{LocalFlags, SetArg, Termios, cfmakeraw, tcgetattr, tcset
 use std::os::fd::BorrowedFd;
 
 #[cfg(windows)]
-use std::io;
-#[cfg(windows)]
-use utils::windows::SendHandle;
+use std::{
+    io,
+    os::windows::io::{AsRawHandle, BorrowedHandle},
+};
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{
     CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
@@ -45,13 +46,12 @@ pub fn term_restore_mode(term: BorrowedFd, restore: &TerminalMode) -> Result<(),
 
 #[cfg(windows)]
 pub fn term_set_raw_mode(
-    term: SendHandle,
+    term: BorrowedHandle<'_>,
     handle_signals_by_terminal: bool,
 ) -> Result<TerminalMode, io::Error> {
-    let handle = term.as_raw_handle();
     let mut mode: CONSOLE_MODE = 0;
 
-    let ret = unsafe { GetConsoleMode(handle, &mut mode) };
+    let ret = unsafe { GetConsoleMode(term.as_raw_handle(), &mut mode) };
     if ret == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -68,7 +68,7 @@ pub fn term_set_raw_mode(
 
     mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
 
-    let ret = unsafe { SetConsoleMode(handle, mode) };
+    let ret = unsafe { SetConsoleMode(term.as_raw_handle(), mode) };
     if ret == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -77,9 +77,11 @@ pub fn term_set_raw_mode(
 }
 
 #[cfg(windows)]
-pub fn term_restore_mode(term: SendHandle, restore: &TerminalMode) -> Result<(), io::Error> {
-    let handle = term.as_raw_handle();
-    let ret = unsafe { SetConsoleMode(handle, restore.0) };
+pub fn term_restore_mode(
+    term: BorrowedHandle<'_>,
+    restore: &TerminalMode,
+) -> Result<(), io::Error> {
+    let ret = unsafe { SetConsoleMode(term.as_raw_handle(), restore.0) };
     if ret == 0 {
         return Err(io::Error::last_os_error());
     }

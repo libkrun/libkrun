@@ -8,7 +8,7 @@
 #![deny(missing_docs)]
 //! Utility for configuring the CPUID (CPU identification) for the guest microVM.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
 use kvm_bindings::CpuId;
 

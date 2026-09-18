@@ -70,12 +70,6 @@ pub const RESET_VECTOR: u64 = 0xfff0;
 pub const RESET_VECTOR: u64 = 0xffff_fff0;
 pub const RESET_VECTOR_SEV_AP: u64 = 0xfff3;
 
-/// Address of the AP idle trampoline (`cli; hlt; jmp` loop) used during
-/// SMP boot on WHP. APs park here in real mode until the BSP sends
-/// INIT + SIPI through the emulated local APIC.
-#[cfg(target_os = "windows")]
-pub const AP_TRAMPOLINE_START: u64 = 0x1000;
-
 /// The address to load the firmware, if present.
 pub const FIRMWARE_START: u64 = 0xffff_0000;
 

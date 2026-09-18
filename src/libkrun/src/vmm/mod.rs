@@ -33,16 +33,24 @@ pub mod worker;
 #[cfg(target_os = "macos")]
 use macos::vstate;
 
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+use crate::vmm::windows::vstate;
+
 use std::fmt::{Display, Formatter};
 use std::io;
+#[cfg(not(target_os = "windows"))]
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::time::Duration;
+#[cfg(target_os = "windows")]
+use utils::windows::AsRawFd;
 
 use crate::vmm::device_manager::mmio::MMIODeviceManager;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::vmm::vstate::VcpuEvent;
 use crate::vmm::vstate::{Vcpu, VcpuHandle, VcpuResponse, Vm};
 
@@ -217,6 +225,25 @@ impl Vmm {
 
     #[cfg(target_os = "macos")]
     pub fn resume_vcpus(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn resume_vcpus(&mut self) -> Result<()> {
+        for handle in self.vcpus_handles.iter() {
+            handle
+                .send_event(VcpuEvent::Resume)
+                .map_err(Error::VcpuEvent)?;
+        }
+        for handle in self.vcpus_handles.iter() {
+            match handle
+                .response_receiver()
+                .recv_timeout(Duration::from_millis(1000))
+            {
+                Ok(VcpuResponse::Resumed) => (),
+                _ => return Err(Error::VcpuResume),
+            }
+        }
         Ok(())
     }
 

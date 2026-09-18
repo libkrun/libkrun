@@ -1,5 +1,5 @@
 use std::marker::PhantomData;
-#[cfg(unix)]
+#[cfg(not(target_os = "windows"))]
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 
@@ -82,7 +82,7 @@ impl<'a> VmmBuilder<'a> {
     ///
     /// The descriptors are borrowed, not duplicated. They must remain open and valid
     /// until the VMM exits.
-    #[cfg(unix)]
+    #[cfg(not(target_os = "windows"))]
     pub fn add_serial_console(
         mut self,
         input_fd: Option<BorrowedFd<'a>>,
@@ -305,6 +305,10 @@ pub fn check_nested_virt() -> bool {
                 val == "1" || val.eq_ignore_ascii_case("Y")
             })
         })
+    }
+    #[cfg(target_os = "windows")]
+    {
+        false
     }
 }
 

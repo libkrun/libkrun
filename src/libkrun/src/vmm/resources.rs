@@ -9,6 +9,8 @@ use std::fs::File;
 use std::io::BufReader;
 #[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(target_os = "windows")]
+use std::os::windows::raw::HANDLE;
 #[cfg(feature = "tee")]
 use std::path::PathBuf;
 #[cfg(target_os = "windows")]
@@ -80,8 +82,8 @@ pub struct SerialConsoleConfig {
 
 #[cfg(target_os = "windows")]
 pub struct SerialConsoleConfig {
-    pub input_handle: SendHandle,
-    pub output_handle: SendHandle,
+    pub input_handle: HANDLE,
+    pub output_handle: HANDLE,
 }
 
 /// A data structure that encapsulates the device configurations
@@ -132,7 +134,9 @@ impl VmResources {
         // supplied by the user.
         VcpuConfig {
             vcpu_count: self.vm_config().vcpu_count.unwrap(),
+            #[cfg(not(target_os = "windows"))]
             ht_enabled: self.vm_config().ht_enabled.unwrap(),
+            #[cfg(not(target_os = "windows"))]
             cpu_template: self.vm_config().cpu_template,
             #[cfg(target_os = "linux")]
             nested_enabled: self.nested_enabled,
@@ -274,7 +278,9 @@ mod tests {
         let vm_resources = default_vm_resources();
         let expected_vcpu_config = VcpuConfig {
             vcpu_count: vm_resources.vm_config().vcpu_count.unwrap(),
+            #[cfg(not(target_os = "windows"))]
             ht_enabled: vm_resources.vm_config().ht_enabled.unwrap(),
+            #[cfg(not(target_os = "windows"))]
             cpu_template: vm_resources.vm_config().cpu_template,
             #[cfg(target_os = "linux")]
             nested_enabled: vm_resources.nested_enabled,
