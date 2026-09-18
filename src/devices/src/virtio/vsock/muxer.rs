@@ -611,8 +611,14 @@ impl VsockMuxer {
     fn process_op_shutdown(&self, pkt: &VsockPacket) {
         debug!("OP_SHUTDOWN");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
-            proxy.lock().unwrap().shutdown(pkt);
+        let update = self
+            .proxy_map
+            .read()
+            .unwrap()
+            .get(&id)
+            .map(|proxy| proxy.lock().unwrap().shutdown(pkt));
+        if let Some(update) = update {
+            self.process_proxy_update(id, update);
         }
     }
 

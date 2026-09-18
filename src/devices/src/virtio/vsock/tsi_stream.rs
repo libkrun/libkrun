@@ -55,6 +55,7 @@ pub struct TsiStreamProxy {
     last_tx_cnt_sent: Wrapping<u32>,
     peer_buf_alloc: u32,
     peer_fwd_cnt: Wrapping<u32>,
+    peer_shutdown: u32,
     push_cnt: Wrapping<u32>,
     pending_accepts: u64,
     unixsock_path: Option<PathBuf>,
@@ -135,6 +136,7 @@ impl TsiStreamProxy {
             last_tx_cnt_sent: Wrapping(0),
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
+            peer_shutdown: 0,
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
@@ -173,6 +175,7 @@ impl TsiStreamProxy {
             last_tx_cnt_sent: Wrapping(0),
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
+            peer_shutdown: 0,
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
@@ -454,6 +457,23 @@ impl TsiStreamProxy {
         }
 
         None
+    }
+
+    fn do_shutdown(&self, pkt: &VsockPacket) {
+        let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
+        let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
+
+        let how = if recv_off && send_off {
+            Shutdown::Both
+        } else if recv_off {
+            Shutdown::Read
+        } else {
+            Shutdown::Write
+        };
+
+        if let Err(e) = shutdown(self.fd.as_raw_fd(), how) {
+            warn!("error sending shutdown to socket: {e}");
+        }
     }
 }
 
@@ -765,21 +785,26 @@ impl Proxy for TsiStreamProxy {
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
 
-    fn shutdown(&mut self, pkt: &VsockPacket) {
-        let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
-        let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
+    fn shutdown(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
+        const SHUTDOWN_MASK: u32 = uapi::VSOCK_FLAGS_SHUTDOWN_RCV | uapi::VSOCK_FLAGS_SHUTDOWN_SEND;
 
-        let how = if recv_off && send_off {
-            Shutdown::Both
-        } else if recv_off {
-            Shutdown::Read
-        } else {
-            Shutdown::Write
-        };
-
-        if let Err(e) = shutdown(self.fd.as_raw_fd(), how) {
-            warn!("error sending shutdown to socket: {e}");
+        let shutdown = pkt.flags() & SHUTDOWN_MASK;
+        if shutdown == 0 || self.peer_shutdown == SHUTDOWN_MASK {
+            return ProxyUpdate::default();
         }
+
+        self.peer_shutdown |= shutdown;
+        self.do_shutdown(pkt);
+
+        if self.peer_shutdown != SHUTDOWN_MASK {
+            return ProxyUpdate::default();
+        }
+
+        self.push_reset();
+        let mut update = self.release();
+        self.status = ProxyStatus::Closed;
+        update.signal_queue = true;
+        update
     }
 
     fn release(&mut self) -> ProxyUpdate {

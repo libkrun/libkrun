@@ -39,6 +39,7 @@ pub struct UnixProxy {
     peer_port: u32,
     local_port: u32,
     control_port: u32,
+    peer_shutdown: u32,
     peer_fwd_cnt: Wrapping<u32>,
     peer_buf_alloc: u32,
     tx_cnt: Wrapping<u32>,
@@ -107,6 +108,7 @@ impl UnixProxy {
             local_port,
             peer_port: 0,
             control_port,
+            peer_shutdown: 0,
             fd,
             status: ProxyStatus::Idle,
             mem,
@@ -140,6 +142,7 @@ impl UnixProxy {
             local_port,
             peer_port,
             control_port: 0,
+            peer_shutdown: 0,
             fd,
             status: ProxyStatus::ReverseInit,
             mem,
@@ -308,6 +311,23 @@ impl UnixProxy {
             .set_type(uapi::VSOCK_TYPE_STREAM)
             .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
             .set_fwd_cnt(self.tx_cnt.0);
+    }
+
+    fn do_shutdown(&self, pkt: &VsockPacket) {
+        let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
+        let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
+
+        let how = if recv_off && send_off {
+            Shutdown::Both
+        } else if recv_off {
+            Shutdown::Read
+        } else {
+            Shutdown::Write
+        };
+
+        if let Err(e) = shutdown(self.fd.as_raw_fd(), how) {
+            warn!("error sending shutdown to socket: {e}");
+        }
     }
 }
 
@@ -512,21 +532,26 @@ impl Proxy for UnixProxy {
         todo!();
     }
 
-    fn shutdown(&mut self, pkt: &VsockPacket) {
-        let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
-        let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
+    fn shutdown(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
+        const SHUTDOWN_MASK: u32 = uapi::VSOCK_FLAGS_SHUTDOWN_RCV | uapi::VSOCK_FLAGS_SHUTDOWN_SEND;
 
-        let how = if recv_off && send_off {
-            Shutdown::Both
-        } else if recv_off {
-            Shutdown::Read
-        } else {
-            Shutdown::Write
-        };
-
-        if let Err(e) = shutdown(self.fd.as_raw_fd(), how) {
-            warn!("error sending shutdown to socket: {e}");
+        let shutdown = pkt.flags() & SHUTDOWN_MASK;
+        if shutdown == 0 || self.peer_shutdown == SHUTDOWN_MASK {
+            return ProxyUpdate::default();
         }
+
+        self.peer_shutdown |= shutdown;
+        self.do_shutdown(pkt);
+
+        if self.peer_shutdown != SHUTDOWN_MASK {
+            return ProxyUpdate::default();
+        }
+
+        self.push_reset();
+        let mut update = self.release();
+        self.status = ProxyStatus::Closed;
+        update.signal_queue = true;
+        update
     }
 
     fn release(&mut self) -> ProxyUpdate {
