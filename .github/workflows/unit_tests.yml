@@ -3,6 +3,7 @@ on: [pull_request]
 
 jobs:
   unit-tests-linux-x86_64:
+    if: ${{ !contains(github.event.pull_request.title, '[CI:docs]') }}
     name: Unit tests (Linux x86_64)
     runs-on: ubuntu-26.04
     steps:
@@ -25,6 +26,7 @@ jobs:
         run: cargo test
 
   unit-tests-linux-aarch64:
+    if: ${{ !contains(github.event.pull_request.title, '[CI:docs]') }}
     name: Unit tests (Linux aarch64)
     runs-on: self-hosted
     steps:
