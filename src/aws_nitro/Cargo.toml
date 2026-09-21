@@ -13,7 +13,6 @@ aws-nitro = []
 libc = "0.2"
 nix = { version = "0.30", features = ["poll"] }
 tar = "0.4"
-vsock = "0.5"
 
 devices = { package = "krun-devices", version = "=0.1.0-2.0.0-dev", path = "../devices" }
 log = "0.4"
@@ -21,3 +20,4 @@ signal-hook = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nitro-enclaves = "0.6.0"
+vsock = "0.5"
