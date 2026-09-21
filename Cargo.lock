@@ -813,17 +813,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "krun-init"
-version = "0.1.0-2.0.0-dev"
-dependencies = [
- "anyhow",
- "libc",
- "nix 0.30.1",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "krun-init-blob"
 version = "0.1.0-2.0.0-dev"
 dependencies = [

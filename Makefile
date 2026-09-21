@@ -190,7 +190,7 @@ $(INIT_BINARY_BSD): $(shell find init/init-binary/src -name '*.rs') init/init-bi
 		$(CARGO_BSD_EXTRA_FLAGS) \
 		--manifest-path init/init-binary/Cargo.toml \
 		--target $(FREEBSD_RUST_TARGET)
-	cp target/$(FREEBSD_RUST_TARGET)/release/krun-init $@
+	cp init/init-binary/target/$(FREEBSD_RUST_TARGET)/release/krun-init $@
 endif
 
 # FreeBSD sysroot preparation rules for cross-compilation on macOS
