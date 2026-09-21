@@ -818,7 +818,7 @@ checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
 name = "libkrun"
-version = "1.19.4"
+version = "1.19.5"
 dependencies = [
  "crossbeam-channel",
  "env_logger",

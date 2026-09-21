@@ -1,6 +1,6 @@
 [package]
 name = "libkrun"
-version = "1.19.4"
+version = "1.19.5"
 authors = ["The libkrun Authors"]
 edition = "2021"
 description = "A dynamic library providing Virtualization-based process isolation capabilities"
