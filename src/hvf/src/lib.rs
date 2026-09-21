@@ -1,6 +1,8 @@
 // Copyright 2021 Red Hat, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(target_os = "macos")]
+
 #[allow(non_camel_case_types)]
 #[allow(improper_ctypes)]
 #[allow(dead_code)]
