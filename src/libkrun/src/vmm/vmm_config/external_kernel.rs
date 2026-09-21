@@ -25,6 +25,7 @@ pub enum KernelFormat {
 
 /// Data structure holding the attributes read from the `libkrunfw` kernel config.
 #[derive(Clone, Debug, Default)]
+#[allow(unused)]
 pub struct ExternalKernel {
     pub path: PathBuf,
     pub format: KernelFormat,

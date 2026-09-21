@@ -1,4 +1,5 @@
 use std::cmp;
+#[cfg(not(target_os = "windows"))]
 use std::convert::TryInto;
 use std::io::Write;
 

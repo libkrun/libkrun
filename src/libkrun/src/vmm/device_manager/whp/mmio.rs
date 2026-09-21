@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
-use devices::{BusDevice, DeviceType};
+use devices::DeviceType;
 use kernel::cmdline as kernel_cmdline;
 
 /// Errors for MMIO device manager.
@@ -114,7 +114,6 @@ impl MMIODeviceManager {
             (DeviceType::Virtio(type_id), device_id),
             MMIODeviceInfo {
                 addr: self.mmio_base,
-                len: MMIO_LEN,
                 irq: self.irq,
             },
         );
@@ -175,23 +174,6 @@ impl MMIODeviceManager {
         devices.sort_unstable_by_key(|(addr, _)| *addr);
         devices
     }
-
-    /// Gets the specified device.
-    pub fn get_device(
-        &self,
-        device_type: DeviceType,
-        device_id: &str,
-    ) -> Option<&Mutex<dyn BusDevice>> {
-        if let Some(dev_info) = self
-            .id_to_dev_info
-            .get(&(device_type, device_id.to_string()))
-        {
-            if let Some((_, device)) = self.bus.get_device(dev_info.addr) {
-                return Some(device);
-            }
-        }
-        None
-    }
 }
 
 /// Private structure for storing information about the MMIO device registered at some address on the bus.
@@ -199,7 +181,6 @@ impl MMIODeviceManager {
 pub struct MMIODeviceInfo {
     addr: u64,
     irq: u32,
-    len: u64,
 }
 
 #[cfg(test)]

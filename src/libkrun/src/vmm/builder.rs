@@ -11,7 +11,9 @@ use kernel::cmdline::Cmdline;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
-use std::io::{self, IsTerminal, Read};
+#[cfg(not(target_os = "windows"))]
+use std::io::Read;
+use std::io::{self, IsTerminal};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -31,6 +33,7 @@ use super::{Error, Vmm};
 use crate::vmm::device_manager::legacy::PortIODeviceManager;
 use crate::vmm::device_manager::mmio::MMIODeviceManager;
 use crate::vmm::resources::VmResources;
+#[cfg(not(target_os = "windows"))]
 use crate::vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(target_arch = "x86_64")]
 use devices::legacy::Cmos;
@@ -69,6 +72,7 @@ use crate::vmm::vstate::MeasuredRegion;
 use crate::vmm::vstate::{Error as VstateError, Vcpu, VcpuConfig, Vm};
 use arch::{ArchMemoryInfo, InitrdConfig};
 use device_manager::shm::ShmManager;
+#[cfg(not(target_os = "windows"))]
 use flate2::read::GzDecoder;
 #[cfg(feature = "amd-sev")]
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
@@ -1241,6 +1245,7 @@ pub fn build_microvm(
         exit_evt,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
+        #[cfg(not(target_os = "windows"))]
         vm,
         mmio_device_manager,
         #[cfg(target_os = "macos")]
@@ -1817,6 +1822,7 @@ pub fn create_guest_memory(
 > {
     let mem_size = mem_size << 20;
 
+    #[allow(unused)]
     let (firmware_data, _firmware_size) = if let Some(firmware) = firmware_config {
         let data = std::fs::read(firmware.path.clone()).map_err(StartMicrovmError::FirmwareRead)?;
         let len = data.len();

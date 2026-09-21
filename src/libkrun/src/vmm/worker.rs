@@ -19,7 +19,7 @@ use vm_memory::{
     Address, GuestAddress, GuestMemoryRegion, MemoryRegionAddress, guest_memory::GuestMemoryBackend,
 };
 
-#[allow(dead_code)]
+#[allow(dead_code, unused)]
 pub fn start_worker_thread(
     vmm: Arc<Mutex<super::Vmm>>,
     receiver: Receiver<WorkerMessage>,

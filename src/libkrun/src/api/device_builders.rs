@@ -9,10 +9,10 @@ use std::os::fd::OwnedFd;
 use std::os::fd::RawFd;
 #[cfg(not(target_os = "windows"))]
 use std::os::fd::{AsRawFd, BorrowedFd};
-#[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+#[cfg(all(feature = "net", target_os = "windows"))]
+use std::os::windows::io::OwnedHandle;
 #[cfg(target_os = "windows")]
-use std::os::windows::io::{AsRawSocket, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};

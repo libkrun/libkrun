@@ -13,8 +13,6 @@ use std::os::fd::RawFd;
 use std::os::windows::raw::HANDLE;
 #[cfg(feature = "tee")]
 use std::path::PathBuf;
-#[cfg(target_os = "windows")]
-use utils::windows::SendHandle;
 
 #[cfg(feature = "tee")]
 use serde::{Deserialize, Serialize};

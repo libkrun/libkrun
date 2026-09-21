@@ -1,6 +1,5 @@
 use std::io;
 use std::os::windows::io::{FromRawSocket, OwnedSocket, RawSocket};
-use std::sync::mpsc;
 use std::thread;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};

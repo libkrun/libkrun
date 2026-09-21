@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 const LINUX_EPERM: i32 = 1;
 const LINUX_ENOENT: i32 = 2;
 const LINUX_ESRCH: i32 = 3;

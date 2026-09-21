@@ -52,7 +52,9 @@ use utils::windows::AsRawFd;
 use crate::vmm::device_manager::mmio::MMIODeviceManager;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::vmm::vstate::VcpuEvent;
-use crate::vmm::vstate::{Vcpu, VcpuHandle, VcpuResponse, Vm};
+#[cfg(not(target_os = "windows"))]
+use crate::vmm::vstate::Vm;
+use crate::vmm::vstate::{Vcpu, VcpuHandle, VcpuResponse};
 
 use arch::{ArchMemoryInfo, InitrdConfig};
 #[cfg(target_os = "macos")]
@@ -150,6 +152,7 @@ pub struct Vmm {
 
     pub(crate) vcpus_handles: Vec<VcpuHandle>,
     pub(crate) exit_evt: EventFd,
+    #[cfg(not(target_os = "windows"))]
     pub(crate) vm: Vm,
     pub(crate) exit_observers: Vec<Arc<Mutex<dyn VmmExitObserver>>>,
     pub(crate) exit_code: Arc<AtomicI32>,

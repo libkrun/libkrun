@@ -43,10 +43,12 @@ pub struct PortIODeviceManager {
     pub stdio_serial: Vec<Arc<Mutex<devices::legacy::Serial>>>,
     pub i8042: Arc<Mutex<devices::legacy::I8042Device>>,
 
+    #[cfg(not(windows))]
     pub com_evt_1: EventFd,
     pub com_evt_2: EventFd,
     pub com_evt_3: EventFd,
     pub com_evt_4: EventFd,
+    #[cfg(not(windows))]
     pub kbd_evt: EventFd,
 }
 
@@ -84,10 +86,12 @@ impl PortIODeviceManager {
             cmos,
             stdio_serial,
             i8042,
+            #[cfg(not(windows))]
             com_evt_1: evts[0].try_clone().map_err(Error::EventFd)?,
             com_evt_2: evts[1].try_clone().map_err(Error::EventFd)?,
             com_evt_3: evts[2].try_clone().map_err(Error::EventFd)?,
             com_evt_4: evts[3].try_clone().map_err(Error::EventFd)?,
+            #[cfg(not(windows))]
             kbd_evt,
         })
     }

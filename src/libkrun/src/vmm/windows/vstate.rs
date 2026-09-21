@@ -21,8 +21,8 @@ use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use utils::eventfd::EventFd;
 use vm_memory::{
-    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryBackend, GuestMemoryError,
-    GuestMemoryMmap, GuestMemoryRegion,
+    Address, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap,
+    GuestMemoryRegion,
 };
 use whp::{self, VcpuExitReason, WhpEmulator, WhpVcpu, WhpVm};
 use windows_sys::Win32::Foundation::S_OK;
