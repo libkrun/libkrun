@@ -2177,7 +2177,8 @@ impl FileSystem for PassthroughFs {
                 ret.extend_from_slice(&handle.to_ne_bytes());
                 Ok(ret)
             }
-            _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+            // OverlayFS treats ENOTTY as an unsupported lower fileattr query.
+            _ => Err(io::Error::from_raw_os_error(libc::ENOTTY)),
         }
     }
 }
