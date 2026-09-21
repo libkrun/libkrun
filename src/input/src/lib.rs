@@ -1,3 +1,5 @@
+#![cfg(not(target_os = "windows"))]
+
 mod rust_to_c;
 
 use bitflags::bitflags;
