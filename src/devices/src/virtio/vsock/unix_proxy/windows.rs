@@ -1,6 +1,6 @@
 use std::num::Wrapping;
 use std::os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket, RawSocket};
-use std::path::PathBuf;
+use std::path::Path;
 use windows_sys::Win32::Networking::WinSock::{
     AF_UNIX, FIONBIO, INVALID_SOCKET, SD_BOTH, SD_RECEIVE, SD_SEND, SOCK_STREAM, SOCKADDR,
     SOCKADDR_UN, SOCKET, SOCKET_ERROR, WSAECONNREFUSED, WSAEWOULDBLOCK, WSAGetLastError, accept,
@@ -115,7 +115,7 @@ pub(crate) fn do_connect(
         }
     };
 
-    let (sa, sa_len) = unix_sockaddr(&path_str);
+    let (sa, sa_len) = unix_sockaddr(path_str);
     let res = unsafe {
         connect(
             proxy.fd.as_raw_socket() as SOCKET,
@@ -377,13 +377,11 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
         }
     }
 
-    if evset.contains(EventSet::OUT) {
-        if proxy.status == ProxyStatus::Connecting {
-            switch_to_connected(proxy);
-            push_connect_rsp(proxy, 0);
-            update.signal_queue = true;
-            update.polling = Some((proxy.id, proxy.fd.as_raw_socket() as RawFd, EventSet::IN));
-        }
+    if evset.contains(EventSet::OUT) && proxy.status == ProxyStatus::Connecting {
+        switch_to_connected(proxy);
+        push_connect_rsp(proxy, 0);
+        update.signal_queue = true;
+        update.polling = Some((proxy.id, proxy.fd.as_raw_socket() as RawFd, EventSet::IN));
     }
 
     update
@@ -395,7 +393,7 @@ pub(crate) fn as_raw_fd(proxy: &super::UnixProxy) -> RawFd {
 
 pub(crate) fn new_acceptor_proxy(
     id: u64,
-    path: &PathBuf,
+    path: &Path,
     peer_port: u32,
 ) -> Result<super::UnixAcceptorProxy, ProxyError> {
     let sock = unsafe { socket(AF_UNIX as i32, SOCK_STREAM, 0) };
@@ -418,7 +416,7 @@ pub(crate) fn new_acceptor_proxy(
         }
     };
 
-    let (sa, sa_len) = unix_sockaddr(&path_str);
+    let (sa, sa_len) = unix_sockaddr(path_str);
 
     if unsafe { bind(raw_sock, &sa as *const _ as *const SOCKADDR, sa_len) } == SOCKET_ERROR {
         return Err(ProxyError::CreatingSocket(

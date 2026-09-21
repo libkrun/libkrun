@@ -26,11 +26,11 @@ pub fn input_to_handle_dup(
 pub fn term_handle(
     handle: *mut core::ffi::c_void,
 ) -> io::Result<Box<dyn PortTerminalProperties + Send + Sync>> {
-    assert!(
-        unsafe { BorrowedHandle::borrow_raw(handle).is_terminal() },
-        "Expected handle {handle:?}, to be a tty, to query the window size!"
-    );
     let handle = dup_handle(handle)?;
+    assert!(
+        handle.is_terminal(),
+        "Expected handle to be a tty, to query the window size!"
+    );
     Ok(Box::new(PortTerminalPropertiesHandle(handle)))
 }
 

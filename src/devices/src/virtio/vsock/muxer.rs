@@ -306,12 +306,14 @@ impl VsockMuxer {
                 defs::SOCK_STREAM => {
                     debug!("proxy create stream");
                     let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+                    #[allow(clippy::unnecessary_cast)]
                     if req.family == AF_UNIX as u16
                         && !self.tsi_flags.contains(TsiFlags::HIJACK_UNIX)
                     {
                         warn!("rejecting stream unix proxy because HIJACK_UNIX is disabled");
                         return;
                     }
+                    #[allow(clippy::unnecessary_cast)]
                     if (req.family == AF_INET as u16 || req.family == AF_INET6 as u16)
                         && !self.tsi_flags.contains(TsiFlags::HIJACK_INET)
                     {
@@ -341,12 +343,14 @@ impl VsockMuxer {
                 defs::SOCK_DGRAM => {
                     debug!("proxy create dgram");
                     let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+                    #[allow(clippy::unnecessary_cast)]
                     if req.family == AF_UNIX as u16
                         && !self.tsi_flags.contains(TsiFlags::HIJACK_UNIX)
                     {
                         warn!("rejecting dgram unix proxy because HIJACK_UNIX is disabled");
                         return;
                     }
+                    #[allow(clippy::unnecessary_cast)]
                     if (req.family == AF_INET as u16 || req.family == AF_INET6 as u16)
                         && !self.tsi_flags.contains(TsiFlags::HIJACK_INET)
                     {

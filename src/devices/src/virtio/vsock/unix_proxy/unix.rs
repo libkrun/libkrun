@@ -1,7 +1,7 @@
 use std::num::Wrapping;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::Path;
 
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -419,7 +419,7 @@ pub(crate) fn as_raw_fd(proxy: &super::UnixProxy) -> RawFd {
 
 pub(crate) fn new_acceptor_proxy(
     id: u64,
-    path: &PathBuf,
+    path: &Path,
     peer_port: u32,
 ) -> Result<super::UnixAcceptorProxy, ProxyError> {
     let fd = socket(

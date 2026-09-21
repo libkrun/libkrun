@@ -118,10 +118,10 @@ fn try_listen(
         None
     };
 
-    if let Some(path) = &unixsock_path {
-        if let Err(e) = std::fs::remove_file(path) {
-            debug!("error removing previous socket path: {e}");
-        }
+    if let Some(path) = &unixsock_path
+        && let Err(e) = std::fs::remove_file(path)
+    {
+        debug!("error removing previous socket path: {e}");
     }
 
     let (sa_bytes, sa_len) = match storage_to_winsock(&effective_addr) {
@@ -142,7 +142,7 @@ fn try_listen(
 
     // Fixed: Constrain the network queue size utilizing the configuration parameters sent by the guest
     let clamped_backlog = req.backlog.clamp(0, 0x7fff_ffff);
-    let listen_res = unsafe { listen(sock(proxy), clamped_backlog as i32) };
+    let listen_res = unsafe { listen(sock(proxy), clamped_backlog) };
     if listen_res == SOCKET_ERROR {
         let e = unsafe { WSAGetLastError() };
         warn!("listen failed: id={} err={e}", proxy.id);
@@ -462,13 +462,11 @@ pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) 
         }
     }
 
-    if evset.contains(EventSet::OUT) {
-        if proxy.status == ProxyStatus::Connecting {
-            proxy.status = ProxyStatus::Connected;
-            proxy.push_connect_rsp(0);
-            update.signal_queue = true;
-            update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-        }
+    if evset.contains(EventSet::OUT) && proxy.status == ProxyStatus::Connecting {
+        proxy.status = ProxyStatus::Connected;
+        proxy.push_connect_rsp(0);
+        update.signal_queue = true;
+        update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
     }
 
     update

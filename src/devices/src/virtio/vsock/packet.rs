@@ -691,6 +691,7 @@ impl VsockPacket {
             byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
             byte_order::write_le_u32(&mut buf[4..], rsp.addr_len);
             let addr_ptr = rsp.addr.as_ptr();
+            #[allow(clippy::unnecessary_cast)]
             let slice = unsafe {
                 std::slice::from_raw_parts(addr_ptr as *const u8, rsp.addr.len() as usize)
             };

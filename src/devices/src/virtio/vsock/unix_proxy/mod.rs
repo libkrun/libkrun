@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::num::Wrapping;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::super::Queue as VirtQueue;
@@ -303,7 +303,7 @@ pub struct UnixAcceptorProxy {
 }
 
 impl UnixAcceptorProxy {
-    pub fn new(id: u64, path: &PathBuf, peer_port: u32) -> Result<Self, ProxyError> {
+    pub fn new(id: u64, path: &Path, peer_port: u32) -> Result<Self, ProxyError> {
         sys::new_acceptor_proxy(id, path, peer_port)
     }
 }

@@ -347,22 +347,21 @@ fn get_file_info_by_handle(handle: HANDLE) -> io::Result<FileInfo> {
 
         // if it's a reparse point, get the tag info so we know what kind of reparse point it is
         let mut tag_info: FILE_ATTRIBUTE_TAG_INFO = mem::zeroed();
-        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            if GetFileInformationByHandleEx(
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            && GetFileInformationByHandleEx(
                 handle,
                 FileAttributeTagInfo,
                 &mut tag_info as *mut _ as *mut core::ffi::c_void,
                 mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
             ) == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
+        {
+            return Err(io::Error::last_os_error());
         }
         let idx = (info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64;
         Ok(FileInfo {
             file_index: idx,
             raw_info: info,
-            tag_info: tag_info,
+            tag_info,
         })
     }
 }
@@ -517,10 +516,7 @@ fn read_lx_symlink_by_handle(handle: HANDLE) -> io::Result<Vec<u8>> {
     // Inspect ReparseTag (first 4 bytes)
     let tag = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
     if tag != IO_REPARSE_TAG_LX_SYMLINK as u32 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Not an LX_SYMLINK reparse point",
-        ));
+        return Err(io::Error::other("Not an LX_SYMLINK reparse point"));
     }
 
     let data_len = u16::from_le_bytes(buffer[4..6].try_into().unwrap()) as usize;
@@ -570,9 +566,11 @@ fn write_override_stat(
     owner: Option<(u32, u32)>,
     mode: Option<u32>,
 ) -> io::Result<()> {
-    let buf = if is_valid_owner(owner) && mode.is_some() {
+    let buf = if is_valid_owner(owner)
+        && let Some(m) = mode
+    {
         let (uid, gid) = owner.unwrap();
-        format!("{}:{}:0{:o}", uid, gid, mode.unwrap())
+        format!("{}:{}:0{:o}", uid, gid, m)
     } else {
         let (orig_uid, orig_gid, orig_mode) = read_override_stat(path)?;
         let (uid, gid) = match owner {
@@ -759,7 +757,7 @@ fn clear_suid_sgid(mode: u32) -> u32 {
 fn ads_xattr_path(base: &Path, name: &CStr) -> PathBuf {
     let attr_name = name.to_string_lossy();
     let mut s = base.as_os_str().to_os_string();
-    s.push(&format!(":{}", attr_name));
+    s.push(format!(":{}", attr_name));
     PathBuf::from(s)
 }
 
@@ -795,14 +793,12 @@ fn ads_list_streams(path: &Path) -> io::Result<Vec<String>> {
             .to_string_lossy()
             .to_string();
 
-        if name != "::$DATA" {
-            if let Some(stripped) = name.strip_prefix(':') {
-                if let Some(attr) = stripped.strip_suffix(":$DATA") {
-                    if !attr.is_empty() {
-                        out.push(attr.to_string());
-                    }
-                }
-            }
+        if name != "::$DATA"
+            && let Some(stripped) = name.strip_prefix(':')
+            && let Some(attr) = stripped.strip_suffix(":$DATA")
+            && !attr.is_empty()
+        {
+            out.push(attr.to_string());
         }
 
         if unsafe { FindNextStreamW(h, &mut fsd as *mut _ as *mut _) } == 0 {
@@ -1056,8 +1052,7 @@ pub fn openat(path: &str) -> io::Result<HANDLE> {
         }
         if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
             CloseHandle(h);
-            return Err(linux_error(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(linux_error(io::Error::other(
                 "Reparse point detected — path is not safe",
             )));
         }
@@ -1284,12 +1279,11 @@ impl PassthroughFs {
             && self.announce_submounts.load(Ordering::Relaxed)
         {
             // Different volume ⟹ submount
-            if let Ok(parent_file_info) = get_file_info(&parent_data.get_path()) {
-                if file_info.raw_info.dwVolumeSerialNumber
+            if let Ok(parent_file_info) = get_file_info(&parent_data.get_path())
+                && file_info.raw_info.dwVolumeSerialNumber
                     != parent_file_info.raw_info.dwVolumeSerialNumber
-                {
-                    attr_flags |= fuse::ATTR_SUBMOUNT;
-                }
+            {
+                attr_flags |= fuse::ATTR_SUBMOUNT;
             }
         }
 
@@ -1368,9 +1362,8 @@ impl PassthroughFs {
         if is_dir {
             let handle_id = self.next_handle.fetch_add(1, Ordering::Relaxed) | (1 << 63);
             let mut opts = OpenOptions::empty();
-            match self.cfg.cache_policy {
-                CachePolicy::Always => opts |= OpenOptions::CACHE_DIR,
-                _ => {}
+            if let CachePolicy::Always = self.cfg.cache_policy {
+                opts |= OpenOptions::CACHE_DIR;
             }
             return Ok((Some(handle_id), opts));
         }
@@ -1386,10 +1379,10 @@ impl PassthroughFs {
             remove_security_capability(&path);
             if let Ok((_, _, Some(mode))) = read_override_stat(&path) {
                 let new_mode = clear_suid_sgid(mode);
-                if new_mode != mode {
-                    if let Err(e) = write_override_stat(&path, None, Some(new_mode)) {
-                        error!("clear suid/sgid for inode {inode}: {e}");
-                    }
+                if new_mode != mode
+                    && let Err(e) = write_override_stat(&path, None, Some(new_mode))
+                {
+                    error!("clear suid/sgid for inode {inode}: {e}");
                 }
             }
         }
@@ -1964,13 +1957,13 @@ impl FileSystem for PassthroughFs {
                     if needs_suid_clear {
                         remove_security_capability(&path);
 
-                        if !valid.contains(SetattrValid::MODE) {
-                            if let Some(mode) = current_mode {
-                                let new_mode = clear_suid_sgid(mode);
-                                if new_mode != mode {
-                                    current_mode = Some(new_mode);
-                                    override_changed = true;
-                                }
+                        if !valid.contains(SetattrValid::MODE)
+                            && let Some(mode) = current_mode
+                        {
+                            let new_mode = clear_suid_sgid(mode);
+                            if new_mode != mode {
+                                current_mode = Some(new_mode);
+                                override_changed = true;
                             }
                         }
                     }
@@ -2790,7 +2783,7 @@ impl FileSystem for PassthroughFs {
         unsafe { GetSystemInfo(&mut sys_info) };
         let granularity = sys_info.dwAllocationGranularity as u64;
 
-        if foffset % granularity != 0 {
+        if !foffset.is_multiple_of(granularity) {
             error!("foffset {foffset} is not aligned to {granularity}");
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
@@ -2799,7 +2792,7 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
 
-        let is_write = (flags & (fuse::SetupmappingFlags::WRITE.bits() as u64)) != 0;
+        let is_write = (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0;
         let page_flags = if is_write {
             PAGE_READWRITE
         } else {

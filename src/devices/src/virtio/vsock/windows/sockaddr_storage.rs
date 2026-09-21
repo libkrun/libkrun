@@ -238,7 +238,7 @@ pub fn winsock_to_storage(buf: &[u8], len: i32) -> Option<SockaddrStorage> {
 
     let win_family = u16::from_ne_bytes([buf[0], buf[1]]);
     match win_family {
-        v if v == AF_INET as u16 => {
+        v if v == AF_INET => {
             if len < std::mem::size_of::<SOCKADDR_IN>() as i32 {
                 return None;
             }
@@ -248,7 +248,7 @@ pub fn winsock_to_storage(buf: &[u8], len: i32) -> Option<SockaddrStorage> {
             let ip = Ipv4Addr::from(addr_bytes);
             Some(SocketAddrV4::new(ip, port).into())
         }
-        v if v == AF_INET6 as u16 => {
+        v if v == AF_INET6 => {
             if len < std::mem::size_of::<SOCKADDR_IN6>() as i32 {
                 return None;
             }
@@ -270,12 +270,9 @@ pub fn winsock_to_storage(buf: &[u8], len: i32) -> Option<SockaddrStorage> {
             );
             Some(SocketAddrV6::new(ip, port, sa.sin6_flowinfo, scope_id).into())
         }
-        v if v == AF_UNIX as u16 => {
+        v if v == AF_UNIX => {
             let path_end = (len as usize).min(110);
-            let path_bytes = match buf.get(2..path_end) {
-                Some(bytes) => bytes,
-                None => return None,
-            };
+            let path_bytes = buf.get(2..path_end)?;
 
             let mut storage_buf = [0u8; 128];
             utils::byte_order::write_le_u16(&mut storage_buf[0..2], defs::LINUX_AF_UNIX);

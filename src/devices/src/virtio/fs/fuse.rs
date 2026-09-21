@@ -566,6 +566,7 @@ impl From<bindings::stat64> for Attr {
 }
 
 impl Attr {
+    #[allow(clippy::unnecessary_cast)]
     pub fn with_flags(st: bindings::stat64, flags: u32) -> Attr {
         Attr {
             ino: st.st_ino,
@@ -641,6 +642,7 @@ impl From<bindings::statvfs64> for Kstatfs {
     }
 }
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+#[allow(clippy::unnecessary_cast)]
 impl From<bindings::statvfs64> for Kstatfs {
     fn from(st: bindings::statvfs64) -> Self {
         Kstatfs {

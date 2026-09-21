@@ -174,7 +174,7 @@ pub(crate) fn do_getpeername(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket
         )
     };
 
-    let (result, addr) = if res == 0 && sa_len >= 0 && sa_len <= 128 {
+    let (result, addr) = if res == 0 && (0..=128).contains(&sa_len) {
         // Adjust the method slice match based on your tsi_stream implementation format
         match winsock_to_storage(&sa_buf, sa_len) {
             Some(storage) => (0, storage),
@@ -252,26 +252,25 @@ pub(crate) fn sendto_data(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) {
     proxy.peer_buf_alloc = pkt.buf_alloc();
     proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
-    if let Some(addr) = &proxy.sendto_addr {
-        if let Some(buf) = pkt.buf() {
-            if let Some((sa_bytes, sa_len)) = storage_to_winsock(addr) {
-                let res = unsafe {
-                    sendto(
-                        sock(proxy),
-                        buf.as_ptr() as _,
-                        buf.len() as i32,
-                        0,
-                        sa_bytes.as_ptr() as *const SOCKADDR,
-                        sa_len,
-                    )
-                };
-                if res >= 0 {
-                    proxy.tx_cnt += Wrapping(res as u32);
-                } else {
-                    let e = unsafe { WSAGetLastError() };
-                    debug!("error in sendto: {e}");
-                }
-            }
+    if let Some(addr) = &proxy.sendto_addr
+        && let Some(buf) = pkt.buf()
+        && let Some((sa_bytes, sa_len)) = storage_to_winsock(addr)
+    {
+        let res = unsafe {
+            sendto(
+                sock(proxy),
+                buf.as_ptr() as _,
+                buf.len() as i32,
+                0,
+                sa_bytes.as_ptr() as *const SOCKADDR,
+                sa_len,
+            )
+        };
+        if res >= 0 {
+            proxy.tx_cnt += Wrapping(res as u32);
+        } else {
+            let e = unsafe { WSAGetLastError() };
+            debug!("error in sendto: {e}");
         }
     }
     // sendto_addr is retained to preserve multi-packet stream integration mirrored from unix.rs

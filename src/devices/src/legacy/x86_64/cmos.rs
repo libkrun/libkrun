@@ -14,7 +14,7 @@ const DATA_LEN: usize = 128;
 
 #[cfg(target_os = "windows")]
 fn bcd(value: u64) -> u8 {
-    ((value / 10) << 4 | value % 10) as u8
+    (((value / 10) << 4) | (value % 10)) as u8
 }
 
 #[cfg(target_os = "windows")]
