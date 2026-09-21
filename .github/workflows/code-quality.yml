@@ -64,6 +64,21 @@ jobs:
         env:
           KRUN_INIT_BINARY_PATH: ${{ github.workspace }}/init/init
 
+  code-quality-windows-x86_64:
+    name: libkrun (Windows x86_64)
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build-env
+
+      - name: Clippy (default)
+        run: cargo clippy --locked --target=x86_64-pc-windows-gnu -- -D warnings
+
+      - name: Clippy (net+blk)
+        run: cargo clippy --locked --features net,blk --target=x86_64-pc-windows-gnu -- -D warnings
+
   verify-bindings:
     name: Verify bindings up-to-date
     runs-on: ubuntu-26.04

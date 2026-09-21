@@ -10,6 +10,7 @@ runs:
         rustup default stable
         rustup component add rustfmt clippy
         rustup target add x86_64-unknown-freebsd
+        rustup target add x86_64-pc-windows-gnu
         rustup toolchain install nightly
         rustup component add rust-src --toolchain nightly
 
@@ -69,7 +70,8 @@ runs:
           libclang-dev \
           meson \
           ninja-build \
-          python3-yaml
+          python3-yaml \
+          gcc-mingw-w64-x86-64
 
     - name: Build and install virglrenderer 1.3.0 (Linux)
       if: runner.os == 'Linux'
