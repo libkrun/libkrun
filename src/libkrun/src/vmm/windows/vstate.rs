@@ -526,6 +526,7 @@ impl Vcpu {
                 }
                 Ok(VcpuEmulation::Handled)
             }
+            VcpuExitReason::ApicEoi => Ok(VcpuEmulation::Handled),
             _ => {
                 error!(
                     "vCPU {} unhandled or unexpected exit reason: {:?}",
