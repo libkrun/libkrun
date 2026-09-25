@@ -6,6 +6,7 @@ use krun_display::{
 };
 use log::error;
 use std::mem;
+use std::sync::mpsc::{SyncSender, sync_channel};
 use utils::pollable_channel::PollableChannelSender;
 
 // We try to push the maximum amount of data to the GTK thread. Currently, we want the display thread
@@ -36,6 +37,7 @@ pub enum DisplayEvent {
         scanout_id: u32,
         buffer: Bytes,
         rect: Option<Rect>,
+        response_tx: SyncSender<bool>,
     },
 }
 
@@ -146,14 +148,23 @@ impl DisplayBackendBasicFramebuffer for GtkDisplayBackend {
         let buffer = scanout.take_buffer();
         let rect = rect.copied();
 
+        // Synchronously wait for frame to be painted
+        let (response_tx, response_rx) = sync_channel(0);
+
         self.channel
             .send(DisplayEvent::UpdateScanout {
                 scanout_id,
                 buffer,
                 rect,
+                response_tx,
             })
             .unwrap();
-        Ok(())
+
+        match response_rx.recv() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(DisplayBackendError::InternalError),
+            Err(_) => Err(DisplayBackendError::InternalError),
+        }
     }
 }
 

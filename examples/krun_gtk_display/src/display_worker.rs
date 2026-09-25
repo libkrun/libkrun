@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::iter;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
+use std::sync::mpsc::SyncSender;
 use std::time::Duration;
 
 use utils::pollable_channel::{PollableChannelReciever, PollableChannelSender};
@@ -313,6 +314,8 @@ struct ScanoutWindow {
     height: i32,
     format: MemoryFormat,
     scanout_paintable: ScanoutPaintable,
+    pending_frame_response: Rc<RefCell<Option<SyncSender<bool>>>>,
+    frame_in_flight: Rc<RefCell<bool>>,
 }
 
 impl ScanoutWindow {
@@ -404,6 +407,8 @@ impl ScanoutWindow {
             height,
             format,
             scanout_paintable,
+            pending_frame_response: Rc::new(RefCell::new(None)),
+            frame_in_flight: Rc::new(RefCell::new(false)),
         }
     }
 
@@ -416,6 +421,29 @@ impl ScanoutWindow {
     pub fn update(&self, buffer: Bytes, rect: Option<Rect>) {
         self.scanout_paintable
             .update(buffer, self.width, self.height, self.format, rect);
+    }
+
+    /// Defer response until frame is displayed, synchronized to display refresh.
+    /// Provides backpressure by blocking guest until frame is shown.
+    pub fn schedule_frame_response(&mut self, response_tx: SyncSender<bool>) {
+        if *self.frame_in_flight.borrow() {
+            *self.pending_frame_response.borrow_mut() = Some(response_tx);
+        } else {
+            *self.frame_in_flight.borrow_mut() = true;
+            *self.pending_frame_response.borrow_mut() = Some(response_tx);
+
+            let pending_response = Rc::clone(&self.pending_frame_response);
+            let frame_flag = Rc::clone(&self.frame_in_flight);
+            let window = self.window.clone();
+
+            window.add_tick_callback(move |_widget, _clock| {
+                if let Some(response) = pending_response.borrow_mut().take() {
+                    let _ = response.send(true);
+                }
+                *frame_flag.borrow_mut() = false;
+                ControlFlow::Break
+            });
+        }
     }
 }
 
@@ -729,12 +757,15 @@ impl DisplayWorker {
                     scanout_id,
                     buffer,
                     rect,
+                    response_tx,
                 } => {
                     if let Some(scanout) = &mut scanouts[scanout_id as usize] {
                         trace!("Update scanout {scanout_id}");
                         scanout.update(buffer, rect);
+                        scanout.schedule_frame_response(response_tx);
                     } else {
                         warn!("Attempted to update non-existent scanout: {scanout_id}");
+                        let _ = response_tx.send(false);
                     }
                 }
             }
