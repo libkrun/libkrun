@@ -12,8 +12,9 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read};
-use std::os::fd::AsRawFd;
-use std::os::fd::{BorrowedFd, FromRawFd};
+#[cfg(feature = "gpu")]
+use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
@@ -1025,6 +1026,7 @@ pub fn build_microvm(
             export_table.clone(),
             intc.clone(),
             virgl_flags,
+            vm_resources.gpu_render_server_fd,
             Box::from(&vm_resources.displays[..]),
             display_backend,
             #[cfg(target_os = "macos")]
@@ -2275,6 +2277,7 @@ fn attach_gpu_device(
     #[cfg(not(feature = "tee"))] mut export_table: Option<ExportTable>,
     intc: IrqChip,
     virgl_flags: u32,
+    render_server_fd: Option<RawFd>,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
     #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
@@ -2284,6 +2287,7 @@ fn attach_gpu_device(
     let gpu = Arc::new(Mutex::new(
         devices::virtio::Gpu::new(
             virgl_flags,
+            render_server_fd,
             displays,
             display_backend,
             #[cfg(target_os = "macos")]

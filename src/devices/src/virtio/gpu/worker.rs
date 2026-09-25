@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -37,6 +37,7 @@ pub struct Worker {
     interrupt: InterruptTransport,
     shm_region: VirtioShmRegion,
     virgl_flags: u32,
+    render_server_fd: Option<RawFd>,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     export_table: Option<ExportTable>,
@@ -52,6 +53,7 @@ impl Worker {
         interrupt: InterruptTransport,
         shm_region: VirtioShmRegion,
         virgl_flags: u32,
+        render_server_fd: Option<RawFd>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
@@ -72,6 +74,7 @@ impl Worker {
             interrupt,
             shm_region,
             virgl_flags,
+            render_server_fd,
             #[cfg(target_os = "macos")]
             map_sender,
             export_table,
@@ -93,6 +96,7 @@ impl Worker {
             self.control_queue.clone(),
             self.interrupt.clone(),
             self.virgl_flags,
+            self.render_server_fd,
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
             self.export_table.take(),
