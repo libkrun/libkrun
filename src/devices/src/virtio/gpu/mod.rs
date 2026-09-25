@@ -1,6 +1,7 @@
 mod device;
 pub mod display;
 mod edid;
+mod mapping;
 mod protocol;
 mod virtio_gpu;
 mod worker;
@@ -9,6 +10,7 @@ use super::descriptor_utils::Error as DescriptorError;
 
 pub use self::defs::uapi::VIRTIO_ID_GPU as TYPE_GPU;
 pub use self::device::Gpu;
+pub use self::mapping::supports_virgl_renderer_resource_map_fixed;
 
 mod defs {
     pub const GPU_DEV_ID: &str = "virtio_gpu";
