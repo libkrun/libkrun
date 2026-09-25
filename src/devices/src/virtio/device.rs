@@ -6,6 +6,7 @@
 // found in the THIRD-PARTY file.
 
 use std::io;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{ActivateResult, Queue, device_status};
@@ -92,6 +93,7 @@ pub(crate) struct VirtioTransportState {
     pub(crate) queues: Option<Vec<Queue>>,
     queue_evts: Vec<Arc<EventFd>>,
     pub(crate) queue_config: Vec<QueueConfig>,
+    bus_master_gate: Option<Arc<AtomicBool>>,
 }
 
 impl VirtioTransportState {
@@ -118,6 +120,7 @@ impl VirtioTransportState {
             queues: Some(queues),
             queue_evts,
             queue_config,
+            bus_master_gate: None,
         })
     }
 
@@ -144,6 +147,15 @@ impl VirtioTransportState {
 
     pub(crate) fn queue_evts(&self) -> &[Arc<EventFd>] {
         &self.queue_evts
+    }
+
+    pub(crate) fn set_bus_master_gate(&mut self, gate: Arc<AtomicBool>) {
+        self.bus_master_gate = Some(gate.clone());
+        if let Some(queues) = &mut self.queues {
+            for queue in queues {
+                queue.set_bus_master_gate(gate.clone());
+            }
+        }
     }
 
     pub(crate) fn queue_max_size(&self, queue_select: u32) -> u16 {
@@ -185,7 +197,13 @@ impl VirtioTransportState {
         self.queue_select = 0;
         self.device_status = device_status::INIT;
         // Keep config_generation monotonic and reuse queue eventfds across reset.
-        self.queues = Some(Self::create_queues(&self.queue_config));
+        let mut queues = Self::create_queues(&self.queue_config);
+        if let Some(gate) = &self.bus_master_gate {
+            for queue in &mut queues {
+                queue.set_bus_master_gate(gate.clone());
+            }
+        }
+        self.queues = Some(queues);
     }
 
     pub(crate) fn activate(&mut self, interrupt: InterruptTransport) {
@@ -210,7 +228,12 @@ impl VirtioTransportState {
             .expect("Failed to activate device");
     }
 
-    pub(crate) fn set_device_status(&mut self, status: u32, interrupt: InterruptTransport) -> bool {
+    pub(crate) fn set_device_status(
+        &mut self,
+        status: u32,
+        interrupt: InterruptTransport,
+        allow_activation: bool,
+    ) -> bool {
         use device_status::*;
 
         match !self.device_status & status {
@@ -225,7 +248,7 @@ impl VirtioTransportState {
             }
             DRIVER_OK if self.device_status == (ACKNOWLEDGE | DRIVER | FEATURES_OK) => {
                 self.device_status = status;
-                if !self.locked_device().is_activated() {
+                if allow_activation && !self.locked_device().is_activated() {
                     self.activate(interrupt);
                 }
             }

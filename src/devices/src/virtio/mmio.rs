@@ -226,7 +226,7 @@ impl MmioTransport {
     fn set_device_status(&mut self, status: u32) {
         if self
             .state
-            .set_device_status(status, self.device_interrupt.clone())
+            .set_device_status(status, self.device_interrupt.clone(), true)
         {
             self.interrupt.reset_status();
         }

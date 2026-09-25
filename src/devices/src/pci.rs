@@ -77,8 +77,17 @@ impl PciAddress {
 pub trait PciFunction: Send {
     fn read_config(&mut self, offset: u16, data: &mut [u8]);
     fn write_config(&mut self, offset: u16, data: &[u8]);
-    fn read_bar(&mut self, address: u64, data: &mut [u8]) -> bool;
-    fn write_bar(&mut self, address: u64, data: &[u8]) -> bool;
+    fn read_bar(&mut self, address: u64, data: &mut [u8]) -> PciBarAccess;
+    fn write_bar(&mut self, address: u64, data: &[u8]) -> PciBarAccess;
+}
+
+/// Whether a PCI function claimed an access to its BAR window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PciBarAccess {
+    /// The function consumed the access; device semantics may still ignore a write.
+    Handled,
+    /// The function does not decode this address, so the root may try another function.
+    Unhandled,
 }
 
 pub trait PciIntxLine: Send + Sync {
@@ -155,6 +164,7 @@ impl PciRoot {
                 .lock()
                 .expect("Poisoned PCI function lock")
                 .read_bar(address, data)
+                == PciBarAccess::Handled
             {
                 return;
             }
@@ -168,6 +178,7 @@ impl PciRoot {
                 .lock()
                 .expect("Poisoned PCI function lock")
                 .write_bar(address, data)
+                == PciBarAccess::Handled
             {
                 return;
             }
@@ -392,34 +403,34 @@ mod tests {
             destination.copy_from_slice(data);
         }
 
-        fn read_bar(&mut self, address: u64, data: &mut [u8]) -> bool {
+        fn read_bar(&mut self, address: u64, data: &mut [u8]) -> PciBarAccess {
             let Some(offset) = address.checked_sub(self.bar_base) else {
-                return false;
+                return PciBarAccess::Unhandled;
             };
             let start = offset as usize;
             let Some(end) = start.checked_add(data.len()) else {
-                return false;
+                return PciBarAccess::Unhandled;
             };
             let Some(source) = self.bar.get(start..end) else {
-                return false;
+                return PciBarAccess::Unhandled;
             };
             data.copy_from_slice(source);
-            true
+            PciBarAccess::Handled
         }
 
-        fn write_bar(&mut self, address: u64, data: &[u8]) -> bool {
+        fn write_bar(&mut self, address: u64, data: &[u8]) -> PciBarAccess {
             let Some(offset) = address.checked_sub(self.bar_base) else {
-                return false;
+                return PciBarAccess::Unhandled;
             };
             let start = offset as usize;
             let Some(end) = start.checked_add(data.len()) else {
-                return false;
+                return PciBarAccess::Unhandled;
             };
             let Some(destination) = self.bar.get_mut(start..end) else {
-                return false;
+                return PciBarAccess::Unhandled;
             };
             destination.copy_from_slice(data);
-            true
+            PciBarAccess::Handled
         }
     }
 

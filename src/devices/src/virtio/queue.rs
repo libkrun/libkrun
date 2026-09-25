@@ -8,7 +8,8 @@
 use std::cmp::min;
 use std::fmt::{self, Debug, Display};
 use std::num::Wrapping;
-use std::sync::atomic::{Ordering, fence};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering, fence};
 use virtio_bindings::virtio_ring::VRING_USED_F_NO_NOTIFY;
 use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryError,
@@ -70,6 +71,8 @@ pub enum Error {
     GuestMemoryError(GuestMemoryError),
     /// DescriptorChain split is out of bounds.
     SplitOutOfBounds(usize),
+    /// PCI bus mastering is disabled.
+    BusMasterDisabled,
 }
 
 impl Display for Error {
@@ -109,6 +112,7 @@ impl Display for Error {
             FindMemoryRegion => write!(f, "no memory region for this address range"),
             GuestMemoryError(e) => write!(f, "descriptor guest memory error: {e}"),
             SplitOutOfBounds(off) => write!(f, "`DescriptorChain` split is out of bounds: {off}"),
+            BusMasterDisabled => write!(f, "PCI bus mastering is disabled"),
         }
     }
 }
@@ -315,7 +319,7 @@ impl<'a> DescriptorChain<'a> {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 /// A virtio queue's parameters.
 pub struct Queue {
     /// The maximal size in elements offered by the device
@@ -342,10 +346,35 @@ pub struct Queue {
     /// VIRTIO_F_RING_EVENT_IDX negotiated.
     event_idx_enabled: bool,
 
+    /// PCI queue memory accesses are allowed while the Command register's master bit is set.
+    bus_master_gate: Option<Arc<AtomicBool>>,
+
     /// The number of descriptor chains placed in the used ring via `add_used`
     /// since the last time `needs_notification` was called on the associated queue.
     num_added: Wrapping<u16>,
 }
+
+impl PartialEq for Queue {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_size == other.max_size
+            && self.size == other.size
+            && self.ready == other.ready
+            && self.desc_table == other.desc_table
+            && self.avail_ring == other.avail_ring
+            && self.used_ring == other.used_ring
+            && self.next_avail == other.next_avail
+            && self.next_used == other.next_used
+            && self.event_idx_enabled == other.event_idx_enabled
+            && self.num_added == other.num_added
+            && match (&self.bus_master_gate, &other.bus_master_gate) {
+                (None, None) => true,
+                (Some(gate), Some(other_gate)) => Arc::ptr_eq(gate, other_gate),
+                _ => false,
+            }
+    }
+}
+
+impl Eq for Queue {}
 
 impl Queue {
     /// Constructs an empty virtio queue with the given `max_size`.
@@ -360,8 +389,19 @@ impl Queue {
             next_avail: Wrapping(0),
             next_used: Wrapping(0),
             event_idx_enabled: false,
+            bus_master_gate: None,
             num_added: Wrapping(0),
         }
+    }
+
+    pub(crate) fn set_bus_master_gate(&mut self, gate: Arc<AtomicBool>) {
+        self.bus_master_gate = Some(gate);
+    }
+
+    fn bus_master_enabled(&self) -> bool {
+        self.bus_master_gate
+            .as_ref()
+            .is_none_or(|gate| gate.load(Ordering::Acquire))
     }
 
     pub fn get_max_size(&self) -> u16 {
@@ -436,6 +476,9 @@ impl Queue {
     /// Returns the number of yet-to-be-popped descriptor chains in the avail ring.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self, mem: &GuestMemoryMmap) -> u16 {
+        if !self.bus_master_enabled() {
+            return 0;
+        }
         (self.avail_idx(mem, Ordering::Acquire).unwrap() - self.next_avail).0
     }
 
@@ -446,6 +489,9 @@ impl Queue {
 
     /// Pop the first available descriptor chain from the avail ring.
     pub fn pop<'b>(&mut self, mem: &'b GuestMemoryMmap) -> Option<DescriptorChain<'b>> {
+        if !self.bus_master_enabled() {
+            return None;
+        }
         if self.len(mem) == 0 || self.actual_size() == 0 {
             return None;
         }
@@ -501,6 +547,9 @@ impl Queue {
         head_index: u16,
         len: u32,
     ) -> Result<(), Error> {
+        if !self.bus_master_enabled() {
+            return Err(Error::BusMasterDisabled);
+        }
         if head_index >= self.size {
             error!("attempted to add out of bounds descriptor to used ring: {head_index}");
             return Err(Error::InvalidDescriptorIndex);
@@ -595,6 +644,9 @@ impl Queue {
     // Every access in this method uses `Relaxed` ordering because a fence is added by the caller
     // when appropriate.
     fn set_notification(&mut self, mem: &GuestMemoryMmap, enable: bool) -> Result<(), Error> {
+        if !self.bus_master_enabled() {
+            return Ok(());
+        }
         if enable {
             if self.event_idx_enabled {
                 // We call `set_avail_event` using the `next_avail` value, instead of reading
@@ -634,6 +686,9 @@ impl Queue {
     //     }
     // }
     pub fn enable_notification(&mut self, mem: &GuestMemoryMmap) -> Result<bool, Error> {
+        if !self.bus_master_enabled() {
+            return Ok(false);
+        }
         self.set_notification(mem, true)?;
         // Ensures the following read is not reordered before any previous write operation.
         fence(Ordering::SeqCst);
@@ -649,10 +704,16 @@ impl Queue {
     }
 
     pub fn disable_notification(&mut self, mem: &GuestMemoryMmap) -> Result<(), Error> {
+        if !self.bus_master_enabled() {
+            return Ok(());
+        }
         self.set_notification(mem, false)
     }
 
     pub fn needs_notification(&mut self, mem: &GuestMemoryMmap) -> Result<bool, Error> {
+        if !self.bus_master_enabled() {
+            return Ok(false);
+        }
         let used_idx = self.next_used;
 
         // Complete all the writes in add_used() before reading the event.
@@ -711,9 +772,28 @@ impl Queue {
 pub(crate) mod tests {
     use std::marker::PhantomData;
     use std::mem;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     pub use super::*;
     use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    #[test]
+    fn bus_master_gate_blocks_queue_guest_memory_accesses() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1)]).unwrap();
+        let mut queue = Queue::new(8);
+        queue.set_bus_master_gate(Arc::new(AtomicBool::new(false)));
+
+        assert_eq!(queue.len(&mem), 0);
+        assert!(queue.pop(&mem).is_none());
+        assert!(matches!(
+            queue.add_used(&mem, 0, 0),
+            Err(Error::BusMasterDisabled)
+        ));
+        assert!(!queue.enable_notification(&mem).unwrap());
+        assert!(queue.disable_notification(&mem).is_ok());
+        assert!(!queue.needs_notification(&mem).unwrap());
+    }
 
     // Represents a location in GuestMemoryMmap which holds a given type.
     pub struct SomeplaceInMemory<'a, T> {
