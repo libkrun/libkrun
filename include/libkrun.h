@@ -173,6 +173,7 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 /* NetFlags ---------------------------------------------------------- */
 
 #define KRUN_NET_FLAGS_VFKIT 1
+#define KRUN_NET_FLAGS_INCLUDE_VNET_HEADER 4
 
 /* VmmError ---------------------------------------------------------- */
 
