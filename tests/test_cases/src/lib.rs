@@ -68,6 +68,11 @@ mod test_virtiofs_misc;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_virtiofs_misc::TestVirtioFsMisc;
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod test_virtio_pci;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use test_virtio_pci::TestVirtioPci;
+
 pub enum TestOutcome {
     Pass,
     Fail(String),
@@ -154,6 +159,8 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("root-disk-remount", Box::new(TestRootDiskRemount)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-misc", Box::new(TestVirtioFsMisc)),
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        TestCase::new("virtio-pci", Box::new(TestVirtioPci)),
         TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
         TestCase::new("perf-net-passt-tx", Box::new(TestNetPerf::new_passt_tx())),
         TestCase::new("perf-net-passt-rx", Box::new(TestNetPerf::new_passt_rx())),

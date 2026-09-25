@@ -34,6 +34,8 @@ pub use device_builders::InputDevice;
 pub use device_builders::NetDevice;
 #[cfg(feature = "net")]
 pub use device_builders::NetFlags;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub use device_builders::PciDeviceManager;
 #[cfg(not(feature = "tee"))]
 pub use device_builders::RngDevice;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
@@ -63,6 +65,8 @@ ffier::library_definition!("krun", library_tag = 1,
     primitives_prefix = "krun",
     crate::api::error::VmmError = 1,
     crate::api::device_builders::MmioDeviceManager<'_> = 2,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    crate::api::device_builders::PciDeviceManager<'_> = 25,
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     crate::api::device_builders::FsDevice<'_> = 3,
     crate::api::device_builders::ConsoleDevice<'_> = 4,

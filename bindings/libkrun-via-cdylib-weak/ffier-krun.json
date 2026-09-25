@@ -251,6 +251,17 @@
       },
       "type_tag": 16777224
     },
+    "PciDeviceManager": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunPciDeviceManager"
+        }
+      },
+      "type_tag": 16777241,
+      "lifetime_params": [
+        "a"
+      ]
+    },
     "PushStr": {
       "kind": {
         "trait": {
@@ -474,6 +485,46 @@
           "ffi_name": "krun_mmio_device_manager_add"
         }
       ]
+    },
+    {
+      "name": "PciDeviceManager",
+      "destroy_ffi_name": "krun_pci_device_manager_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "new",
+          "receiver": "none",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "PciDeviceManager",
+            "type_args": [
+              "a"
+            ]
+          },
+          "ffi_name": "krun_pci_device_manager_new"
+        },
+        {
+          "name": "add",
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "device",
+              "param_kind": "impl_trait",
+              "trait_name": "AttachDevice",
+              "type_args": [
+                "a"
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_pci_device_manager_add"
+        }
+      ],
+      "cfg": "all(target_arch = \"x86_64\", target_os = \"linux\")"
     },
     {
       "name": "FsDevice",
@@ -1348,6 +1399,31 @@
           "ffi_name": "krun_vmm_builder_devices"
         },
         {
+          "name": "pci_devices",
+          "doc": [
+            " Add devices using the modern virtio-pci transport.",
+            "",
+            " PCI devices require ACPI to be enabled with [`VmmBuilder::acpi`]."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "devices",
+              "param_kind": "regular",
+              "type": "PciDeviceManager",
+              "type_args": [
+                "a"
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_vmm_builder_pci_devices",
+          "cfg": "all(target_arch = \"x86_64\", target_os = \"linux\")"
+        },
+        {
           "name": "set_kernel_console",
           "receiver": "value",
           "params": [
@@ -1450,8 +1526,8 @@
             " Enable ACPI table generation for x86_64 guests.",
             "",
             " When disabled (the default), virtio-mmio devices are passed on the kernel",
-            " command line and SMP uses the MP table. When enabled, devices are described",
-            " in the ACPI DSDT and the RSDP is published in boot parameters."
+            " command line and SMP uses the MP table. When enabled, devices and the PCI",
+            " host bridge are described in ACPI and the RSDP is published in boot parameters."
           ],
           "receiver": "value",
           "params": [

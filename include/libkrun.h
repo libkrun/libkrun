@@ -9,6 +9,7 @@
 
 typedef void* KrunVmmError;
 typedef void* KrunMmioDeviceManager;
+typedef void* KrunPciDeviceManager;
 typedef void* KrunFsDevice;
 typedef void* KrunConsoleDevice;
 typedef void* KrunConsoleBuilder;
@@ -35,7 +36,7 @@ typedef void* KrunPushStr; /* KrunVtablePushStr */
 #ifndef KRUN_PRIMITIVES_DEFINED
 #define KRUN_PRIMITIVES_DEFINED
 
-typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice */
+typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice */
 
 typedef uint64_t KrunResult;
 #define KRUN_RESULT_SUCCESS 0
@@ -202,6 +203,15 @@ void krun_mmio_device_manager_add(KrunMmioDeviceManager handle, KrunAttachDevice
 typedef void (*krun_mmio_device_manager_add_fn)(KrunMmioDeviceManager handle, KrunAttachDevice device);
 void krun_mmio_device_manager_destroy(KrunMmioDeviceManager handle);
 typedef void (*krun_mmio_device_manager_destroy_fn)(KrunMmioDeviceManager handle);
+
+/* PciDeviceManager --------------------------------------------------- */
+
+KrunPciDeviceManager krun_pci_device_manager_new();
+typedef KrunPciDeviceManager (*krun_pci_device_manager_new_fn)();
+void krun_pci_device_manager_add(KrunPciDeviceManager handle, KrunAttachDevice device);
+typedef void (*krun_pci_device_manager_add_fn)(KrunPciDeviceManager handle, KrunAttachDevice device);
+void krun_pci_device_manager_destroy(KrunPciDeviceManager handle);
+typedef void (*krun_pci_device_manager_destroy_fn)(KrunPciDeviceManager handle);
 
 /* FsDevice ---------------------------------------------------------- */
 
@@ -385,6 +395,8 @@ void krun_vmm_builder_payload(KrunVmmBuilder* handle, KrunPayload payload);
 typedef void (*krun_vmm_builder_payload_fn)(KrunVmmBuilder* handle, KrunPayload payload);
 void krun_vmm_builder_devices(KrunVmmBuilder* handle, KrunMmioDeviceManager devices);
 typedef void (*krun_vmm_builder_devices_fn)(KrunVmmBuilder* handle, KrunMmioDeviceManager devices);
+void krun_vmm_builder_pci_devices(KrunVmmBuilder* handle, KrunPciDeviceManager devices);
+typedef void (*krun_vmm_builder_pci_devices_fn)(KrunVmmBuilder* handle, KrunPciDeviceManager devices);
 void krun_vmm_builder_set_kernel_console(KrunVmmBuilder* handle, KrunStr console);
 typedef void (*krun_vmm_builder_set_kernel_console_fn)(KrunVmmBuilder* handle, KrunStr console);
 /**

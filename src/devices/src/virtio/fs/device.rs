@@ -2,6 +2,7 @@
 use crossbeam_channel::Sender;
 use std::cmp;
 use std::io::Write;
+use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -171,6 +172,10 @@ impl VirtioDevice for Fs {
 
     fn queue_config(&self) -> &[QueueConfig] {
         &defs::QUEUE_CONFIG
+    }
+
+    fn config_len(&self) -> Option<u32> {
+        Some(size_of::<VirtioFsConfig>() as u32)
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {

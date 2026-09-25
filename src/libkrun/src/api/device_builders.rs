@@ -18,6 +18,8 @@ use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 
 use crate::vmm::Vmm;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use crate::vmm::builder::attach_pci_device;
 use crate::vmm::builder::{attach_mmio_device, setup_terminal_raw_mode};
 use crate::vmm::device_manager::shm::ShmManager;
 #[cfg(any(feature = "gpu", feature = "vhost-user"))]
@@ -104,9 +106,33 @@ impl<'a> AttachContext<'a> {
         }
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    pub(crate) fn new_pci(
+        vmm: &'a mut Vmm,
+        event_manager: &'a mut EventManager,
+        shm_manager: &'a ShmManager,
+        intc: IrqChip,
+        device_index: usize,
+    ) -> Self {
+        Self {
+            vmm,
+            event_manager,
+            shm_manager,
+            intc,
+            device_index,
+            register_fn: Box::new(|vmm, id, intc, device| {
+                attach_pci_device(vmm, id, intc, device)
+                    .map_err(|e| VmmError::Internal(format!("{e:?}")))?;
+                Ok(())
+            }),
+            #[cfg(target_os = "macos")]
+            map_sender: None,
+        }
+    }
+
     /// Register a virtio device on the transport bus.
     ///
-    /// The actual transport (MMIO, future PCIe) is determined by which
+    /// The actual transport (MMIO or PCI) is determined by which
     /// [`DeviceManager`] the device was added to.
     pub fn register(
         &mut self,
@@ -272,7 +298,7 @@ mod sealed {
 }
 
 /// A device manager that owns a set of devices and knows how to attach them
-/// to a VM using a specific transport (e.g. MMIO, future PCIe).
+/// to a VM using a specific transport (MMIO or PCI).
 ///
 /// This trait is sealed — only libkrun-provided managers can implement it.
 /// The seal may be lifted in a future major version.
@@ -280,6 +306,12 @@ pub trait DeviceManager<'a>: sealed::Sealed + Send + 'a {
     /// Collect requirements from all devices (called before guest memory creation).
     #[doc(hidden)]
     fn requirements(&self) -> Vec<DeviceRequirements>;
+
+    /// Whether this manager registers devices on the PCI bus.
+    #[doc(hidden)]
+    fn uses_pci(&self) -> bool {
+        false
+    }
 
     /// Attach all devices using the given VMM context.
     #[doc(hidden)]
@@ -301,6 +333,16 @@ pub trait DeviceManager<'a>: sealed::Sealed + Send + 'a {
 /// during VM construction.
 #[derive(Default)]
 pub struct MmioDeviceManager<'a> {
+    devices: Vec<Box<dyn AttachDevice<'a> + 'a>>,
+}
+
+/// Device manager using the modern virtio-pci transport.
+///
+/// Available on x86_64 Linux hosts. The VM must enable ACPI with
+/// [`VmmBuilder::acpi`](crate::api::vmm_builder::VmmBuilder::acpi).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[derive(Default)]
+pub struct PciDeviceManager<'a> {
     devices: Vec<Box<dyn AttachDevice<'a> + 'a>>,
 }
 
@@ -349,6 +391,60 @@ impl<'a> DeviceManager<'a> for MmioDeviceManager<'a> {
                 #[cfg(target_os = "macos")]
                 map_sender.clone(),
             );
+            device.attach(&mut ctx)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(cfg = "all(target_arch = \"x86_64\", target_os = \"linux\")")
+)]
+#[cfg_attr(
+    not(feature = "ffi"),
+    cfg(all(target_arch = "x86_64", target_os = "linux"))
+)]
+impl<'a> PciDeviceManager<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, device: impl AttachDevice<'a>) -> &mut Self {
+        self.devices.push(Box::new(device));
+        self
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl sealed::Sealed for PciDeviceManager<'_> {}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl<'a> DeviceManager<'a> for PciDeviceManager<'a> {
+    fn requirements(&self) -> Vec<DeviceRequirements> {
+        self.devices
+            .iter()
+            .map(|device| device.requirements())
+            .collect()
+    }
+
+    fn uses_pci(&self) -> bool {
+        true
+    }
+
+    fn attach_all(
+        self: Box<Self>,
+        vmm: &mut Vmm,
+        event_manager: &mut EventManager,
+        shm_manager: &ShmManager,
+        intc: IrqChip,
+        #[cfg(target_os = "macos")] _map_sender: Option<
+            crossbeam_channel::Sender<utils::worker_message::WorkerMessage>,
+        >,
+    ) -> Result<(), VmmError> {
+        for (index, device) in self.devices.into_iter().enumerate() {
+            let mut ctx =
+                AttachContext::new_pci(vmm, event_manager, shm_manager, intc.clone(), index);
             device.attach(&mut ctx)?;
         }
         Ok(())

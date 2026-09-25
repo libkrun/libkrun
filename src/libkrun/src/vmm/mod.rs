@@ -50,6 +50,8 @@ use std::time::Duration;
 use utils::windows::AsRawFd;
 
 use crate::vmm::device_manager::mmio::MMIODeviceManager;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use crate::vmm::device_manager::pci::PciHostManager;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::vmm::vstate::VcpuEvent;
 #[cfg(not(target_os = "windows"))]
@@ -159,6 +161,8 @@ pub struct Vmm {
 
     // Guest VM devices.
     pub(crate) mmio_device_manager: MMIODeviceManager,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    pub(crate) pci_device_manager: Option<PciHostManager>,
 
     // Out-of-band live pause/resume requests: the C API sends `VmCtl` from
     // another thread; the event loop freezes or wakes the vCPUs. A single
@@ -328,7 +332,15 @@ impl Vmm {
                 self.kernel_cmdline.len() + 1
             };
 
-            arch::x86_64::configure_system(
+            #[cfg(target_os = "linux")]
+            let pci_host_info = self
+                .pci_device_manager
+                .as_ref()
+                .map(PciHostManager::acpi_info);
+            #[cfg(not(target_os = "linux"))]
+            let pci_host_info = None;
+
+            arch::x86_64::configure_system_with_pci(
                 &self.guest_memory,
                 &self.arch_memory_info,
                 vm_memory::GuestAddress(arch::x86_64::layout::CMDLINE_START),
@@ -338,6 +350,7 @@ impl Vmm {
                 _pvh,
                 _acpi_enabled,
                 _virtio_mmio_devices,
+                pci_host_info.as_ref(),
             )
             .map_err(Error::ConfigureSystem)?;
         }

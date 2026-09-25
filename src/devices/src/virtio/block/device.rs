@@ -9,6 +9,7 @@ use std::cmp;
 use std::convert::From;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::mem::size_of;
 #[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt;
 #[cfg(target_os = "macos")]
@@ -392,6 +393,10 @@ impl VirtioDevice for Block {
 
     fn queue_config(&self) -> &[QueueConfig] {
         &QUEUE_CONFIG
+    }
+
+    fn config_len(&self) -> Option<u32> {
+        Some(size_of::<VirtioBlkConfig>() as u32)
     }
 
     fn avail_features(&self) -> u64 {

@@ -23,6 +23,7 @@ use std::os::windows::io::RawSocket;
 
 use std::cmp;
 use std::io::Write;
+use std::mem::size_of;
 use std::path::PathBuf;
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -155,6 +156,10 @@ impl VirtioDevice for Net {
 
     fn queue_config(&self) -> &[QueueConfig] {
         &QUEUE_CONFIG
+    }
+
+    fn config_len(&self) -> Option<u32> {
+        Some(size_of::<VirtioNetConfig>() as u32)
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {

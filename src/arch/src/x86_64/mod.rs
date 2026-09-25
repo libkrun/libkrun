@@ -6,6 +6,7 @@
 // found in the THIRD-PARTY file.
 
 mod acpi;
+pub use self::acpi::{PciFunctionInfo, PciHostInfo};
 mod gdt;
 /// Contains logic for setting up Advanced Programmable Interrupt Controller (local version).
 pub mod interrupts;
@@ -309,8 +310,45 @@ pub fn configure_system(
     acpi_enabled: bool,
     virtio_mmio_devices: &[(u64, u32)],
 ) -> super::Result<()> {
+    configure_system_with_pci(
+        guest_mem,
+        arch_memory_info,
+        cmdline_addr,
+        cmdline_size,
+        initrd,
+        num_cpus,
+        pvh,
+        acpi_enabled,
+        virtio_mmio_devices,
+        None,
+    )
+}
+
+/// Configures the system, including an optional PCI host bridge.
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn configure_system_with_pci(
+    guest_mem: &GuestMemoryMmap,
+    arch_memory_info: &ArchMemoryInfo,
+    cmdline_addr: GuestAddress,
+    cmdline_size: usize,
+    initrd: &Option<InitrdConfig>,
+    num_cpus: u8,
+    pvh: bool,
+    acpi_enabled: bool,
+    virtio_mmio_devices: &[(u64, u32)],
+    pci_host: Option<&PciHostInfo>,
+) -> super::Result<()> {
     if acpi_enabled {
-        acpi::setup_acpi(guest_mem, num_cpus, virtio_mmio_devices).map_err(Error::AcpiSetup)?;
+        match pci_host {
+            Some(pci_host) => {
+                acpi::setup_acpi_with_pci(guest_mem, num_cpus, virtio_mmio_devices, Some(pci_host))
+                    .map_err(Error::AcpiSetup)?;
+            }
+            None => {
+                acpi::setup_acpi(guest_mem, num_cpus, virtio_mmio_devices)
+                    .map_err(Error::AcpiSetup)?;
+            }
+        }
     } else {
         // Note that this puts the mptable at the last 1k of Linux's 640k base RAM
         #[cfg(not(feature = "tee"))]

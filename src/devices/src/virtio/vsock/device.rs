@@ -205,6 +205,10 @@ impl VirtioDevice for Vsock {
         &defs::QUEUE_CONFIG
     }
 
+    fn config_len(&self) -> Option<u32> {
+        Some(8)
+    }
+
     fn read_config(&self, offset: u64, data: &mut [u8]) {
         match offset {
             0 if data.len() == 8 => byte_order::write_le_u64(data, self.cid()),

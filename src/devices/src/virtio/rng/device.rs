@@ -108,6 +108,10 @@ impl VirtioDevice for Rng {
         &defs::QUEUE_CONFIG
     }
 
+    fn config_len(&self) -> Option<u32> {
+        Some(0)
+    }
+
     fn read_config(&self, _offset: u64, _data: &mut [u8]) {
         error!("rng: invalid request to read config space");
     }

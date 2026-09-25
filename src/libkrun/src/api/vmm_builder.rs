@@ -17,6 +17,8 @@ use utils::eventfd::EventFd;
 #[cfg(target_os = "macos")]
 use utils::pollable_channel::PollableChannelSender;
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use super::device_builders::PciDeviceManager;
 use super::device_builders::{DeviceManager, MmioDeviceManager};
 use super::error::VmmError;
 use super::payload::Payload;
@@ -69,6 +71,15 @@ impl<'a> VmmBuilder<'a> {
         self
     }
 
+    /// Add devices using the modern virtio-pci transport.
+    ///
+    /// PCI devices require ACPI to be enabled with [`VmmBuilder::acpi`].
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    pub fn pci_devices(mut self, devices: PciDeviceManager<'a>) -> Self {
+        self.device_manager = Some(Box::new(devices));
+        self
+    }
+
     pub fn set_kernel_console(mut self, console: &str) -> Self {
         self.kernel_console = Some(console.to_string());
         self
@@ -113,8 +124,8 @@ impl<'a> VmmBuilder<'a> {
     /// Enable ACPI table generation for x86_64 guests.
     ///
     /// When disabled (the default), virtio-mmio devices are passed on the kernel
-    /// command line and SMP uses the MP table. When enabled, devices are described
-    /// in the ACPI DSDT and the RSDP is published in boot parameters.
+    /// command line and SMP uses the MP table. When enabled, devices and the PCI
+    /// host bridge are described in ACPI and the RSDP is published in boot parameters.
     pub fn acpi(mut self, enabled: bool) -> Result<Self, VmmError> {
         if enabled && !cfg!(target_arch = "x86_64") {
             return Err(VmmError::InvalidParam());
@@ -336,9 +347,17 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         });
     }
 
+    let pci_enabled = builder_cfg
+        .device_manager
+        .as_ref()
+        .is_some_and(|manager| manager.uses_pci());
+    if pci_enabled && !builder_cfg.acpi {
+        return Err(VmmError::InvalidParam());
+    }
+
     let device_manager = builder_cfg
         .device_manager
-        .ok_or_else(|| VmmError::MissingConfig("no device manager set (call .devices())".into()))?;
+        .ok_or_else(|| VmmError::MissingConfig("no device manager set".into()))?;
 
     let mut vm_resources = VmResources::default();
     vm_resources

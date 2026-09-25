@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::mem::size_of;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
@@ -157,6 +158,10 @@ impl VirtioDevice for Gpu {
 
     fn queue_config(&self) -> &[QueueConfig] {
         &QUEUE_CONFIG
+    }
+
+    fn config_len(&self) -> Option<u32> {
+        Some(size_of::<virtio_gpu_config>() as u32)
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
