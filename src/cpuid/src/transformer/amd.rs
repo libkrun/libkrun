@@ -9,8 +9,8 @@ use crate::bit_helper::BitHelper;
 use crate::cpu_leaf::*;
 use crate::transformer::common::use_host_cpuid_function;
 
-// Largest extended function. It has to be larger then 0x8000001d (Extended Cache Topology).
-const LARGEST_EXTENDED_FN: u32 = 0x8000_001f;
+// Include the extended topology leaves added by this transformer.
+const MIN_EXTENDED_FN: u32 = 0x8000_001f;
 // This value allows at most 64 logical threads within a package.
 // See also the documentation for leaf_0x80000008::ecx::THREAD_ID_SIZE_BITRANGE
 const THREAD_ID_MAX_SIZE: u32 = 6;
@@ -40,11 +40,12 @@ pub fn update_largest_extended_fn_entry(
 ) -> Result<(), Error> {
     use crate::cpu_leaf::leaf_0x80000000::*;
 
-    // KVM sets the largest extended function to 0x80000000. Change it to 0x8000001f
-    // Since we also use the leaf 0x8000001d (Extended Cache Topology).
+    // Older KVM versions need the topology range extended. Preserve newer
+    // KVM-supported leaves, including mitigation capabilities in 0x80000021.
+    let largest_extended_fn = entry.eax.max(MIN_EXTENDED_FN);
     entry
         .eax
-        .write_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE, LARGEST_EXTENDED_FN);
+        .write_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE, largest_extended_fn);
 
     Ok(())
 }
@@ -208,8 +209,21 @@ mod tests {
             entry
                 .eax
                 .read_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE),
-            LARGEST_EXTENDED_FN
+            MIN_EXTENDED_FN
         );
+    }
+
+    #[test]
+    fn test_preserve_supported_extended_fn_range() {
+        let vm_spec = VmSpec::new(0, 1, false, false).expect("Error creating vm_spec");
+        let mut entry = kvm_cpuid_entry2 {
+            function: leaf_0x80000000::LEAF_NUM,
+            eax: 0x8000_0022,
+            ..Default::default()
+        };
+
+        update_largest_extended_fn_entry(&mut entry, &vm_spec).unwrap();
+        assert_eq!(entry.eax, 0x8000_0022);
     }
 
     #[test]
