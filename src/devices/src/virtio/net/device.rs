@@ -16,10 +16,12 @@ use crate::virtio::{
 use super::backend::{ReadError, WriteError};
 use super::worker::NetWorker;
 
+#[cfg(windows)]
+use super::unixstream::Unixstream;
 #[cfg(unix)]
 use std::os::fd::RawFd;
 #[cfg(windows)]
-use std::os::windows::io::RawSocket;
+use std::os::windows::io::{AsSocket, BorrowedSocket, OwnedSocket, RawSocket};
 
 use std::cmp;
 use std::io::Write;
@@ -88,6 +90,9 @@ pub struct Net {
     pub(crate) device_state: DeviceState,
 
     config: VirtioNetConfig,
+
+    #[cfg(windows)]
+    worker_socket: Option<OwnedSocket>,
 }
 
 impl Net {
@@ -118,6 +123,8 @@ impl Net {
 
             device_state: DeviceState::Inactive,
             config,
+            #[cfg(windows)]
+            worker_socket: None,
         })
     }
 
@@ -190,12 +197,31 @@ impl VirtioDevice for Net {
             ActivateError::BadActivate
         })?;
 
+        #[cfg(windows)]
+        let worker_socket = match &self.cfg_backend {
+            VirtioNetBackend::UnixstreamFd(fd) => unsafe { BorrowedSocket::borrow_raw(*fd) },
+            VirtioNetBackend::UnixstreamPath(path) => {
+                if self.worker_socket.is_none() {
+                    let stream =
+                        Unixstream::open(path.clone()).map_err(|_| ActivateError::BadActivate)?;
+                    self.worker_socket = Some(stream.fd);
+                }
+                self.worker_socket
+                    .as_ref()
+                    .expect("worker_socket is initialized")
+                    .as_socket()
+            }
+        };
+
         match NetWorker::new(
             rx_q,
             tx_q,
             interrupt.clone(),
             mem.clone(),
             self.acked_features,
+            #[cfg(windows)]
+            worker_socket,
+            #[cfg(not(windows))]
             self.cfg_backend.clone(),
         ) {
             Ok(worker) => {

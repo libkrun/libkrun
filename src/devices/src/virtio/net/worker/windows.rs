@@ -1,5 +1,5 @@
 use std::io;
-use std::os::windows::io::{FromRawSocket, OwnedSocket, RawSocket};
+use std::os::windows::io::{BorrowedSocket, FromRawSocket, OwnedSocket, RawSocket};
 use std::thread;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -34,35 +34,23 @@ impl NetWorker {
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
         _vnet_features: u64,
-        cfg_backend: VirtioNetBackend,
+        socket: BorrowedSocket<'_>,
     ) -> Result<Self, ConnectError> {
         let map_clone_error = ConnectError::CreateSocket;
-        let (backend_rx, backend_tx) = match cfg_backend {
-            VirtioNetBackend::UnixstreamFd(fd) => {
-                let owned_socket = unsafe { OwnedSocket::from_raw_socket(fd) };
-                let stream_rx = Unixstream::new(owned_socket)?;
-                let owned_socket_tx = stream_rx.fd.try_clone().map_err(map_clone_error)?;
-                (
-                    Box::new(stream_rx) as Box<dyn NetBackend + Send>,
-                    Box::new(Unixstream::new(owned_socket_tx)?) as Box<dyn NetBackend + Send>,
-                )
-            }
-            VirtioNetBackend::UnixstreamPath(path) => {
-                let stream_rx = Unixstream::open(path)?;
-                let owned_socket_tx = stream_rx.fd.try_clone().map_err(map_clone_error)?;
-                (
-                    Box::new(stream_rx) as Box<dyn NetBackend + Send>,
-                    Box::new(Unixstream::new(owned_socket_tx)?) as Box<dyn NetBackend + Send>,
-                )
-            }
-        };
+
+        let rx_owned_socket: OwnedSocket = socket.try_clone_to_owned().map_err(map_clone_error)?;
+
+        let tx_owned_socket: OwnedSocket = socket.try_clone_to_owned().map_err(map_clone_error)?;
+
+        let backend_rx = Unixstream::new(rx_owned_socket)?;
+        let backend_tx = Unixstream::new(tx_owned_socket)?;
 
         Ok(Self {
             rx_q,
             tx_q,
             mem,
-            backend_rx,
-            backend_tx,
+            backend_rx: Box::new(backend_rx) as Box<dyn NetBackend + Send>,
+            backend_tx: Box::new(backend_tx) as Box<dyn NetBackend + Send>,
             interrupt,
         })
     }
