@@ -871,9 +871,7 @@ impl<'a> ConsoleBuilder<'a> {
         let stdout_is_tty = stdout.as_ref().is_some_and(|fd| fd.is_terminal());
         let stderr_is_tty = stderr.as_ref().is_some_and(|fd| fd.is_terminal());
 
-        let term_handle = if stdin_is_tty {
-            stdin
-        } else if stdout_is_tty {
+        let term_handle = if stdout_is_tty {
             stdout
         } else if stderr_is_tty {
             stderr
@@ -913,14 +911,6 @@ impl<'a> ConsoleBuilder<'a> {
 
         let terminal: Option<Box<dyn devices::virtio::port_io::PortTerminalProperties>> =
             if let Some(tfd) = term_handle {
-                // SAFETY: The caller guarantees via `'a` that the borrowed file descriptor outlasts
-                // the console device and VMM. Currently, the VMM runs until process termination via `_exit()`,
-                // so the host file descriptor is valid for the remainder of the process.
-                // TODO: remove this transmute once we get proper support for stopping the VMM instead of _exit().
-                let static_fd = unsafe {
-                    std::mem::transmute::<BorrowedHandle<'a>, BorrowedHandle<'static>>(tfd)
-                };
-                self.tty_fds.push(static_fd);
                 Some(port_io::term_handle(tfd.as_raw_handle()).map_err(|e| {
                     log::error!("term fd: {e}");
                     VmmError::BadFd()
@@ -928,6 +918,18 @@ impl<'a> ConsoleBuilder<'a> {
             } else {
                 Some(port_io::term_fixed_size(0, 0))
             };
+
+        if stdin_is_tty && let Some(tfd) = stdin {
+            // Raw input mode applies to the console input buffer, not the
+            // screen-buffer handle used above to determine window size.
+            // SAFETY: The caller guarantees via `'a` that the borrowed handle outlasts
+            // the console device and VMM. Currently, the VMM runs until process termination via `_exit()`,
+            // so the host handle is valid for the remainder of the process.
+            // TODO: remove this transmute once we get proper support for stopping the VMM instead of _exit().
+            let static_fd =
+                unsafe { std::mem::transmute::<BorrowedHandle<'a>, BorrowedHandle<'static>>(tfd) };
+            self.tty_fds.push(static_fd);
+        }
 
         // Port 0: default console (hvc0)
         self.ports.push(PortDescription {
