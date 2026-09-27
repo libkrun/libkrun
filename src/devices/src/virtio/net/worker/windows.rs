@@ -1,14 +1,18 @@
 use std::io;
-use std::os::windows::io::{BorrowedSocket, FromRawSocket, OwnedSocket, RawSocket};
+use std::os::windows::io::{BorrowedSocket, RawSocket};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::thread::JoinHandle;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use utils::windows::AsRawFd;
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
-use crate::virtio::net::backend::ConnectError;
+use crate::virtio::ActivateError;
 use crate::virtio::net::backend::{NetBackend, ReadError, WriteError, WriteStatus};
-use crate::virtio::net::device::{TxError, VirtioNetBackend};
+use crate::virtio::net::device::TxError;
 use crate::virtio::net::unixstream::Unixstream;
 use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE, VNET_HDR_LEN};
 use crate::virtio::{DeviceQueue, InterruptTransport};
@@ -16,70 +20,86 @@ use crate::virtio::{DeviceQueue, InterruptTransport};
 const RX_TOKEN: u64 = 1;
 const TX_TOKEN: u64 = 2;
 const BACKEND_TOKEN: u64 = 3;
+const STOP_TOKEN: u64 = 4;
 const MAX_PROXY_PAYLOAD_SIZE: usize = MAX_BUFFER_SIZE - VNET_HDR_LEN;
 
 pub struct NetWorker {
-    rx_q: DeviceQueue,
-    tx_q: DeviceQueue,
-    interrupt: InterruptTransport,
-    mem: GuestMemoryMmap,
-    backend_rx: Box<dyn NetBackend + Send>,
-    backend_tx: Box<dyn NetBackend + Send>,
+    exit_flag: Arc<AtomicBool>,
+    stop_events: [EventFd; 2],
+    worker_threads: [JoinHandle<()>; 2],
 }
 
 impl NetWorker {
-    pub fn new(
+    pub fn start(
         rx_q: DeviceQueue,
         tx_q: DeviceQueue,
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
-        _vnet_features: u64,
+        _acked_features: u64,
         socket: BorrowedSocket<'_>,
-    ) -> Result<Self, ConnectError> {
-        let map_clone_error = ConnectError::CreateSocket;
+    ) -> Result<Self, ActivateError> {
+        let exit_flag = Arc::new(AtomicBool::new(false));
+        let stop_events = [
+            EventFd::new(EFD_NONBLOCK).map_err(|_| ActivateError::BadActivate)?,
+            EventFd::new(EFD_NONBLOCK).map_err(|_| ActivateError::BadActivate)?,
+        ];
 
-        let rx_owned_socket: OwnedSocket = socket.try_clone_to_owned().map_err(map_clone_error)?;
-
-        let tx_owned_socket: OwnedSocket = socket.try_clone_to_owned().map_err(map_clone_error)?;
-
-        let backend_rx = Unixstream::new(rx_owned_socket)?;
-        let backend_tx = Unixstream::new(tx_owned_socket)?;
+        let rx_stop_event = stop_events[0]
+            .try_clone()
+            .map_err(|_| ActivateError::BadActivate)?;
+        let tx_stop_event = stop_events[1]
+            .try_clone()
+            .map_err(|_| ActivateError::BadActivate)?;
+        let rx_socket = socket
+            .try_clone_to_owned()
+            .map_err(|_| ActivateError::BadActivate)?;
+        let tx_socket = socket
+            .try_clone_to_owned()
+            .map_err(|_| ActivateError::BadActivate)?;
+        let rx_worker = NetRxWorker {
+            rx_q,
+            interrupt: interrupt.clone(),
+            mem: mem.clone(),
+            backend: Box::new(Unixstream::new(rx_socket).map_err(|_| ActivateError::BadActivate)?),
+            exit_flag: exit_flag.clone(),
+            stop_event: rx_stop_event,
+        };
+        let tx_worker = NetTxWorker {
+            tx_q,
+            interrupt,
+            mem,
+            backend: Box::new(Unixstream::new(tx_socket).map_err(|_| ActivateError::BadActivate)?),
+            tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
+            pending_indices: Vec::new(),
+            exit_flag: exit_flag.clone(),
+            stop_event: tx_stop_event,
+        };
+        let worker_threads = [
+            thread::Builder::new()
+                .name("virtio-net rx worker".into())
+                .spawn(move || rx_worker.work())
+                .unwrap(),
+            thread::Builder::new()
+                .name("virtio-net tx worker".into())
+                .spawn(move || tx_worker.work())
+                .unwrap(),
+        ];
 
         Ok(Self {
-            rx_q,
-            tx_q,
-            mem,
-            backend_rx: Box::new(backend_rx) as Box<dyn NetBackend + Send>,
-            backend_tx: Box::new(backend_tx) as Box<dyn NetBackend + Send>,
-            interrupt,
+            exit_flag,
+            stop_events,
+            worker_threads,
         })
     }
 
-    pub fn run(self) {
-        let rx_worker = NetRxWorker {
-            rx_q: self.rx_q,
-            interrupt: self.interrupt.clone(),
-            mem: self.mem.clone(),
-            backend: self.backend_rx,
-        };
-        let tx_worker = NetTxWorker {
-            tx_q: self.tx_q,
-            interrupt: self.interrupt,
-            mem: self.mem,
-            backend: self.backend_tx,
-            tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
-            pending_indices: Vec::new(),
-        };
-
-        thread::Builder::new()
-            .name("virtio-net rx worker".into())
-            .spawn(move || rx_worker.work())
-            .unwrap();
-
-        thread::Builder::new()
-            .name("virtio-net tx worker".into())
-            .spawn(move || tx_worker.work())
-            .unwrap();
+    pub fn stop(self) {
+        self.exit_flag.store(true, Ordering::SeqCst);
+        for stop_event in &self.stop_events {
+            let _ = stop_event.write(1);
+        }
+        for thread in self.worker_threads {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -88,6 +108,8 @@ struct NetRxWorker {
     interrupt: InterruptTransport,
     mem: GuestMemoryMmap,
     backend: Box<dyn NetBackend + Send>,
+    exit_flag: Arc<AtomicBool>,
+    stop_event: EventFd,
 }
 
 impl NetRxWorker {
@@ -100,11 +122,17 @@ impl NetRxWorker {
     fn run(&mut self) -> io::Result<()> {
         let queue_event = self.rx_q.event.as_raw_fd();
         let backend_socket = self.backend.raw_socket_fd();
+        let stop_event = self.stop_event.as_raw_fd();
         let mut epoll = Epoll::new()?;
         epoll.ctl(
             ControlOperation::Add,
             queue_event,
             &EpollEvent::new(EventSet::IN, RX_TOKEN),
+        )?;
+        epoll.ctl(
+            ControlOperation::Add,
+            stop_event,
+            &EpollEvent::new(EventSet::IN, STOP_TOKEN),
         )?;
         epoll.ctl_socket(
             ControlOperation::Add,
@@ -120,6 +148,12 @@ impl NetRxWorker {
         loop {
             let event_count = epoll.wait(events.len(), -1, &mut events)?;
             let mut needs_interrupt = false;
+
+            if self.exit_flag.load(Ordering::Relaxed) {
+                log::trace!("virtio-net RX worker stopping via exit flag");
+                return Ok(());
+            }
+
             for event in &events[..event_count] {
                 match event.data() {
                     RX_TOKEN => {
@@ -139,6 +173,11 @@ impl NetRxWorker {
                             self.signal_if_needed(needs_interrupt)?;
                             return Ok(());
                         }
+                    }
+                    STOP_TOKEN => {
+                        let _ = self.stop_event.read();
+                        log::trace!("virtio-net RX worker stopping");
+                        return Ok(());
                     }
                     token => log::warn!("unexpected virtio-net RX event token: {token}"),
                 }
@@ -236,6 +275,8 @@ struct NetTxWorker {
     backend: Box<dyn NetBackend + Send>,
     tx_iovec: Vec<(GuestAddress, usize)>,
     pending_indices: Vec<u16>,
+    exit_flag: Arc<AtomicBool>,
+    stop_event: EventFd,
 }
 
 impl NetTxWorker {
@@ -254,12 +295,20 @@ impl NetTxWorker {
     fn run(&mut self) -> Result<(), TxError> {
         let queue_event = self.tx_q.event.as_raw_fd();
         let backend_socket = self.backend.raw_socket_fd();
+        let stop_event = self.stop_event.as_raw_fd();
         let mut epoll = Epoll::new().map_err(io_tx_error)?;
         epoll
             .ctl(
                 ControlOperation::Add,
                 queue_event,
                 &EpollEvent::new(EventSet::IN, TX_TOKEN),
+            )
+            .map_err(io_tx_error)?;
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                stop_event,
+                &EpollEvent::new(EventSet::IN, STOP_TOKEN),
             )
             .map_err(io_tx_error)?;
         epoll
@@ -275,6 +324,12 @@ impl NetTxWorker {
             let count = epoll
                 .wait(events.len(), -1, &mut events)
                 .map_err(io_tx_error)?;
+
+            if self.exit_flag.load(Ordering::Relaxed) {
+                log::trace!("virtio-net TX worker stopping via exit flag");
+                return Ok(());
+            }
+
             for event in &events[..count] {
                 match event.data() {
                     TX_TOKEN => {
@@ -291,6 +346,11 @@ impl NetTxWorker {
                         if event_set.contains(EventSet::READ_HANG_UP) {
                             return Err(TxError::Backend(WriteError::ProcessNotRunning));
                         }
+                    }
+                    STOP_TOKEN => {
+                        let _ = self.stop_event.read();
+                        log::trace!("virtio-net TX worker stopping");
+                        return Ok(());
                     }
                     token => log::warn!("unexpected virtio-net TX event token: {token}"),
                 }
