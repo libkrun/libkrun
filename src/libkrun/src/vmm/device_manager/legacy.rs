@@ -47,7 +47,6 @@ pub struct PortIODeviceManager {
     pub i8042: Arc<Mutex<devices::legacy::I8042Device>>,
     #[cfg(windows)]
     pub pit: Arc<Mutex<devices::legacy::Pit>>,
-    #[cfg(not(windows))]
     pub com_evt_1: EventFd,
     pub com_evt_2: EventFd,
     pub com_evt_3: EventFd,
@@ -123,7 +122,6 @@ impl PortIODeviceManager {
             i8042,
             #[cfg(windows)]
             pit,
-            #[cfg(not(windows))]
             com_evt_1: evts[0].try_clone().map_err(Error::EventFd)?,
             com_evt_2: evts[1].try_clone().map_err(Error::EventFd)?,
             com_evt_3: evts[2].try_clone().map_err(Error::EventFd)?,
@@ -159,6 +157,18 @@ impl PortIODeviceManager {
                 5,
             )
             .map_err(Error::BusError)?;
+        #[cfg(windows)]
+        if self.stdio_serial.is_empty() {
+            self.io_bus
+                .insert(
+                    Arc::new(Mutex::new(devices::legacy::Serial::new_sink(
+                        self.com_evt_1.try_clone().map_err(Error::EventFd)?,
+                    ))),
+                    0x3f8,
+                    0x8,
+                )
+                .map_err(Error::BusError)?;
+        }
         self.io_bus
             .insert(
                 self.stdio_serial
