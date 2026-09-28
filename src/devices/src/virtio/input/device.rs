@@ -92,9 +92,14 @@ impl InputConfig {
                 self.repr.select = select;
                 self.repr.subsel = subsel;
             }
+            // The driver writes select and subsel separately, so a failed
+            // query can pair a new select with a stale subsel. Keep both, so
+            // the write that follows queries the intended pair.
             Err(e) => {
-                error!("Failed to query config select={select}, subsel={subsel}: {e:?}");
-                self.invalidate();
+                debug!("Failed to query config select={select}, subsel={subsel}: {e:?}");
+                self.repr.size = 0;
+                self.repr.select = select;
+                self.repr.subsel = subsel;
             }
         };
     }
@@ -259,5 +264,91 @@ impl VirtioDevice for Input {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use krun_input::{InputBackendError, IntoInputConfig, ObjectNew};
+
+    /// A tablet with a single absolute axis, ABS_X.
+    struct Tablet;
+
+    const ABS_X: u8 = 0x00;
+    const ABS_X_INFO: InputAbsInfo = InputAbsInfo {
+        min: 0,
+        max: 1920,
+        fuzz: 1,
+        flat: 2,
+        res: 3,
+    };
+
+    impl ObjectNew<()> for Tablet {
+        fn new(_userdata: Option<&()>) -> Self {
+            Tablet
+        }
+    }
+
+    impl InputQueryConfig for Tablet {
+        fn query_device_name(&self, _name_buf: &mut [u8]) -> Result<u8, InputBackendError> {
+            Ok(0)
+        }
+
+        fn query_serial_name(&self, _name_buf: &mut [u8]) -> Result<u8, InputBackendError> {
+            Ok(0)
+        }
+
+        fn query_device_ids(&self, _ids: &mut InputDeviceIds) -> Result<(), InputBackendError> {
+            Ok(())
+        }
+
+        fn query_event_capabilities(
+            &self,
+            _event_type: u8,
+            _bitmap_buf: &mut [u8],
+        ) -> Result<u8, InputBackendError> {
+            Ok(0)
+        }
+
+        fn query_abs_info(
+            &self,
+            abs_axis: u8,
+            abs_info: &mut InputAbsInfo,
+        ) -> Result<(), InputBackendError> {
+            if abs_axis != ABS_X {
+                return Err(InputBackendError::InvalidParam);
+            }
+            *abs_info = ABS_X_INFO;
+            Ok(())
+        }
+
+        fn query_properties(&self, _properties: &mut [u8]) -> Result<u8, InputBackendError> {
+            Ok(0)
+        }
+    }
+
+    // The Linux driver writes select and subsel separately. Querying ABS_X
+    // right after an EV_BITS query first pairs ABS_INFO with the stale
+    // event type in subsel, an axis the device doesn't have.
+    #[test]
+    fn test_abs_info_after_stale_subsel() {
+        let backend = <Tablet as IntoInputConfig<()>>::into_input_config(None);
+        let instance = backend.create_instance().unwrap();
+        let mut config = InputConfig::new();
+
+        config.update_select(&instance, config_select::VIRTIO_INPUT_CFG_EV_BITS, 0x03);
+        config.update_select(
+            &instance,
+            config_select::VIRTIO_INPUT_CFG_ABS_INFO,
+            config.subsel(),
+        );
+        assert_eq!(unsafe { config.repr.size }, 0);
+        config.update_select(&instance, config.select(), ABS_X);
+
+        assert_eq!(config.select(), config_select::VIRTIO_INPUT_CFG_ABS_INFO);
+        assert_eq!(config.subsel(), ABS_X);
+        let abs = unsafe { config.repr.payload.abs };
+        assert_eq!(abs.max, ABS_X_INFO.max);
     }
 }
