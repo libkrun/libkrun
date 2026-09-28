@@ -407,6 +407,11 @@ impl VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_NO_VIRGL, !v)
     }
 
+    /// Whether virgl (the GL renderer) is enabled
+    pub fn uses_virgl(self) -> bool {
+        self.0 & VIRGLRENDERER_NO_VIRGL == 0
+    }
+
     /// Enable venus support
     pub fn use_venus(self, v: bool) -> VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_VENUS, v)

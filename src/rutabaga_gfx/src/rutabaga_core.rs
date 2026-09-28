@@ -566,7 +566,18 @@ impl Rutabaga {
                 .get_mut(&self.default_component)
                 .ok_or(RutabagaError::InvalidComponent)?;
 
-            component.create_fence(fence)?;
+            // A renderer without GL rejects global fences, which then only
+            // cover 2D resources: Rutabaga2D's copies are done, so it signals.
+            if let Err(e) = component.create_fence(fence) {
+                match self.components.get_mut(&RutabagaComponentType::Rutabaga2D) {
+                    Some(component_2d)
+                        if self.default_component != RutabagaComponentType::Rutabaga2D =>
+                    {
+                        component_2d.create_fence(fence)?
+                    }
+                    _ => return Err(e),
+                }
+            }
         }
 
         Ok(())
@@ -586,6 +597,17 @@ impl Rutabaga {
         component.poll_descriptor()
     }
 
+    /// The component that owns a resource: Rutabaga2D for the 2D resources a
+    /// renderer without GL (Venus only) cannot create, otherwise the default.
+    fn component_type_of(&self, resource_id: u32) -> RutabagaComponentType {
+        match self.resources.get(&resource_id) {
+            Some(r) if r.component_mask == 1 << (RutabagaComponentType::Rutabaga2D as u8) => {
+                RutabagaComponentType::Rutabaga2D
+            }
+            _ => self.default_component,
+        }
+    }
+
     /// Creates a resource with the `resource_create_3d` metadata.
     pub fn resource_create_3d(
         &mut self,
@@ -601,7 +623,17 @@ impl Rutabaga {
             return Err(RutabagaError::InvalidResourceId);
         }
 
-        let resource = component.create_3d(resource_id, resource_create_3d)?;
+        let resource = match component.create_3d(resource_id, resource_create_3d) {
+            Err(e) if self.default_component != RutabagaComponentType::Rutabaga2D => {
+                match self.components.get_mut(&RutabagaComponentType::Rutabaga2D) {
+                    Some(component_2d) => {
+                        component_2d.create_3d(resource_id, resource_create_3d)?
+                    }
+                    None => return Err(e),
+                }
+            }
+            result => result?,
+        };
         self.resources.insert(resource_id, resource);
         Ok(())
     }
@@ -614,7 +646,7 @@ impl Rutabaga {
     ) -> RutabagaResult<()> {
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(&self.component_type_of(resource_id))
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -631,7 +663,7 @@ impl Rutabaga {
     pub fn detach_backing(&mut self, resource_id: u32) -> RutabagaResult<()> {
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(&self.component_type_of(resource_id))
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -648,7 +680,7 @@ impl Rutabaga {
     pub fn unref_resource(&mut self, resource_id: u32) -> RutabagaResult<()> {
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(&self.component_type_of(resource_id))
             .ok_or(RutabagaError::InvalidComponent)?;
 
         self.resources
@@ -669,7 +701,7 @@ impl Rutabaga {
     ) -> RutabagaResult<()> {
         let component = self
             .components
-            .get(&self.default_component)
+            .get(&self.component_type_of(resource_id))
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -693,7 +725,7 @@ impl Rutabaga {
     ) -> RutabagaResult<()> {
         let component = self
             .components
-            .get(&self.default_component)
+            .get(&self.component_type_of(resource_id))
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -707,7 +739,7 @@ impl Rutabaga {
     pub fn resource_flush(&mut self, resource_id: u32) -> RutabagaResult<()> {
         let component = self
             .components
-            .get(&self.default_component)
+            .get(&self.component_type_of(resource_id))
             .ok_or(RutabagaError::Unsupported)?;
 
         let resource = self
@@ -1268,6 +1300,14 @@ impl RutabagaBuilder {
                     rutabaga_server_descriptor,
                 )?;
                 rutabaga_components.insert(RutabagaComponentType::VirglRenderer, virgl);
+                // For the 2D resources (dumb framebuffers) a renderer without
+                // GL cannot create; see resource_create_3d.
+                if !self.virglrenderer_flags.uses_virgl() {
+                    rutabaga_components.insert(
+                        RutabagaComponentType::Rutabaga2D,
+                        Rutabaga2D::init(fence_handler.clone())?,
+                    );
+                }
 
                 push_capset(RUTABAGA_CAPSET_VIRGL);
                 push_capset(RUTABAGA_CAPSET_VIRGL2);
@@ -1383,5 +1423,88 @@ mod tests {
         );
         // NOTE: We attached an backing iovec, but it should be gone post-restore.
         assert!(rutabaga_resource.backing_iovecs.is_none());
+    }
+
+    // virglrenderer can only be initialized once per process, so this is the
+    // only test that uses it.
+    #[cfg(feature = "virgl_renderer")]
+    #[test]
+    fn virgl_without_gl_2d_resources_and_global_fences() {
+        use std::io::IoSliceMut;
+        use std::sync::{Arc, Mutex};
+
+        const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
+
+        let signaled = Arc::new(Mutex::new(Vec::new()));
+        let signaled_by_handler = signaled.clone();
+        let mut rutabaga = RutabagaBuilder::new(
+            RutabagaComponentType::VirglRenderer,
+            VIRGLRENDERER_NO_VIRGL,
+            0,
+        )
+        .build(
+            RutabagaHandler::new(move |fence: RutabagaFence| {
+                signaled_by_handler.lock().unwrap().push(fence.fence_id)
+            }),
+            None,
+        )
+        .unwrap();
+
+        let (width, height) = (2, 2);
+        rutabaga
+            .resource_create_3d(
+                1,
+                ResourceCreate3D {
+                    target: RUTABAGA_PIPE_TEXTURE_2D,
+                    format: 1,
+                    bind: RUTABAGA_PIPE_BIND_RENDER_TARGET,
+                    width,
+                    height,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: 0,
+                },
+            )
+            .unwrap();
+        let mut guest: Vec<u8> = (0..width * height * 4).map(|b| b as u8).collect();
+        rutabaga
+            .attach_backing(
+                1,
+                vec![RutabagaIovec {
+                    base: guest.as_mut_ptr().cast(),
+                    len: guest.len(),
+                }],
+            )
+            .unwrap();
+        let transfer = Transfer3D::new_2d(0, 0, width, height);
+        rutabaga.transfer_write(0, 1, transfer).unwrap();
+        let mut host = vec![0u8; guest.len()];
+        rutabaga
+            .transfer_read(
+                0,
+                1,
+                Transfer3D {
+                    stride: width * 4,
+                    ..transfer
+                },
+                Some(IoSliceMut::new(&mut host)),
+            )
+            .unwrap();
+        assert_eq!(host, guest);
+
+        rutabaga
+            .create_fence(RutabagaFence {
+                flags: 0,
+                fence_id: 7,
+                ctx_id: 0,
+                ring_idx: 0,
+            })
+            .unwrap();
+        assert_eq!(*signaled.lock().unwrap(), [7]);
+
+        rutabaga.detach_backing(1).unwrap();
+        rutabaga.unref_resource(1).unwrap();
     }
 }
