@@ -6,6 +6,8 @@ fn musl_target_for_host() -> &'static str {
     let host = env::var("TARGET").unwrap_or_default();
     if host.starts_with("aarch64") {
         "aarch64-unknown-linux-musl"
+    } else if host.starts_with("riscv64") {
+        "riscv64gc-unknown-linux-musl"
     } else {
         "x86_64-unknown-linux-musl"
     }
