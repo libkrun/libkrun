@@ -67,6 +67,12 @@ ffier::library_definition!("krun", library_tag = 1,
     crate::api::device_builders::MmioDeviceManager<'_> = 2,
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     crate::api::device_builders::PciDeviceManager<'_> = 25,
+    trait crate::api::device_builders::DeviceManager = 26,
+    crate::api::device_builders::DeviceManager
+        for crate::api::device_builders::MmioDeviceManager,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    crate::api::device_builders::DeviceManager
+        for crate::api::device_builders::PciDeviceManager,
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     crate::api::device_builders::FsDevice<'_> = 3,
     crate::api::device_builders::ConsoleDevice<'_> = 4,

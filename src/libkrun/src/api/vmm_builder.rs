@@ -17,10 +17,7 @@ use utils::eventfd::EventFd;
 #[cfg(target_os = "macos")]
 use utils::pollable_channel::PollableChannelSender;
 
-// Under `ffi`, ffier's VmmBuilder helper alias names this type unconditionally.
-#[cfg(any(all(target_arch = "x86_64", target_os = "linux"), feature = "ffi"))]
-use super::device_builders::PciDeviceManager;
-use super::device_builders::{DeviceManager, MmioDeviceManager};
+use super::device_builders::DeviceManager;
 use super::error::VmmError;
 use super::payload::Payload;
 
@@ -67,16 +64,10 @@ impl<'a> VmmBuilder<'a> {
         self
     }
 
-    pub fn devices(mut self, devices: MmioDeviceManager<'a>) -> Self {
-        self.device_manager = Some(Box::new(devices));
-        self
-    }
-
-    /// Add devices using the modern virtio-pci transport.
+    /// Add devices using their manager's transport.
     ///
     /// PCI devices require ACPI to be enabled with [`VmmBuilder::acpi`].
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    pub fn pci_devices(mut self, devices: PciDeviceManager<'a>) -> Self {
+    pub fn devices(mut self, devices: impl DeviceManager<'a>) -> Self {
         self.device_manager = Some(Box::new(devices));
         self
     }

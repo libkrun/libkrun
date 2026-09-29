@@ -170,47 +170,16 @@ struct cmdline {
     char *const *guest_argv;
 };
 
-struct virtio_devices {
-    enum transport_mode transport_mode;
-    KrunMmioDeviceManager mmio;
-#if KRUN_PCI_TRANSPORT_SUPPORTED
-    KrunPciDeviceManager pci;
-#endif
-};
-
-static struct virtio_devices virtio_devices_new(enum transport_mode transport_mode)
+static KrunDeviceManager virtio_devices_new(enum transport_mode transport_mode)
 {
-    struct virtio_devices devices = { .transport_mode = transport_mode };
 #if KRUN_PCI_TRANSPORT_SUPPORTED
     if (transport_mode == TRANSPORT_MODE_PCI) {
-        devices.pci = krun_pci_device_manager_new();
-        return devices;
+        return krun_pci_device_manager_new();
     }
+#else
+    (void)transport_mode;
 #endif
-    devices.mmio = krun_mmio_device_manager_new();
-    return devices;
-}
-
-static void virtio_devices_add(struct virtio_devices *devices, KrunAttachDevice device)
-{
-#if KRUN_PCI_TRANSPORT_SUPPORTED
-    if (devices->transport_mode == TRANSPORT_MODE_PCI) {
-        krun_pci_device_manager_add(devices->pci, device);
-        return;
-    }
-#endif
-    krun_mmio_device_manager_add(devices->mmio, device);
-}
-
-static void virtio_devices_attach(struct virtio_devices *devices, KrunVmmBuilder *builder)
-{
-#if KRUN_PCI_TRANSPORT_SUPPORTED
-    if (devices->transport_mode == TRANSPORT_MODE_PCI) {
-        krun_vmm_builder_pci_devices(builder, devices->pci);
-        return;
-    }
-#endif
-    krun_vmm_builder_devices(builder, devices->mmio);
+    return krun_mmio_device_manager_new();
 }
 
 bool cmdline_set_log_target(struct cmdline *cmdline, const char *arg) {
@@ -462,14 +431,14 @@ int main(int argc, char *const argv[])
     }
 
     // Create the device manager.
-    struct virtio_devices devices = virtio_devices_new(cmdline.transport_mode);
+    KrunDeviceManager devices = virtio_devices_new(cmdline.transport_mode);
 
     // Configure the console.
     {
         KrunConsoleBuilder cb = krun_console_device_builder();
         CHECK(krun_console_builder_add_default_console(cb, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO, &krun_err));
         KrunConsoleDevice console = krun_console_builder_build(cb, &krun_err);
-        virtio_devices_add(&devices, console);
+        krun_device_manager_add(devices, console);
     }
 
     // Configure vhost-user RNG if requested
@@ -478,7 +447,7 @@ int main(int argc, char *const argv[])
         uint16_t custom_sizes[] = {512};
         CHECK(KrunVhostUserDevice rng = krun_vhost_user_device_new(VIRTIO_DEVICE_RNG,
             KRUN_STR(cmdline.vhost_user_rng_socket), KRUN_STR(""), 0, custom_sizes, 1, &krun_err));
-        virtio_devices_add(&devices, rng);
+        krun_device_manager_add(devices, rng);
         printf("Using vhost-user RNG backend at %s (custom queue size: 512)\n", cmdline.vhost_user_rng_socket);
     }
 
@@ -486,7 +455,7 @@ int main(int argc, char *const argv[])
     if (cmdline.vhost_user_rtc_socket != NULL) {
         CHECK(KrunVhostUserDevice rtc = krun_vhost_user_device_new(VIRTIO_DEVICE_RTC,
             KRUN_STR(cmdline.vhost_user_rtc_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
-        virtio_devices_add(&devices, rtc);
+        krun_device_manager_add(devices, rtc);
         printf("Using vhost-user RTC backend at %s (available as /dev/ptp* and /dev/rtc* in guest)\n", cmdline.vhost_user_rtc_socket);
     }
 
@@ -494,7 +463,7 @@ int main(int argc, char *const argv[])
     if (cmdline.vhost_user_input_socket != NULL) {
         CHECK(KrunVhostUserDevice input = krun_vhost_user_device_new(VIRTIO_DEVICE_INPUT,
             KRUN_STR(cmdline.vhost_user_input_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
-        virtio_devices_add(&devices, input);
+        krun_device_manager_add(devices, input);
         printf("Using vhost-user input backend at %s\n", cmdline.vhost_user_input_socket);
     }
 
@@ -505,7 +474,7 @@ int main(int argc, char *const argv[])
     if (cmdline.vhost_user_gpu_socket != NULL) {
         CHECK(KrunVhostUserDevice gpu = krun_vhost_user_device_new(VIRTIO_DEVICE_GPU,
             KRUN_STR(cmdline.vhost_user_gpu_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
-        virtio_devices_add(&devices, gpu);
+        krun_device_manager_add(devices, gpu);
         printf("Using vhost-user GPU backend at %s\n", cmdline.vhost_user_gpu_socket);
     }
 
@@ -513,7 +482,7 @@ int main(int argc, char *const argv[])
     if (cmdline.vhost_user_snd_socket != NULL) {
         CHECK(KrunVhostUserDevice snd = krun_vhost_user_device_new(VIRTIO_DEVICE_SND,
             KRUN_STR(cmdline.vhost_user_snd_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
-        virtio_devices_add(&devices, snd);
+        krun_device_manager_add(devices, snd);
         printf("Using vhost-user sound backend at %s\n", cmdline.vhost_user_snd_socket);
     }
 
@@ -521,7 +490,7 @@ int main(int argc, char *const argv[])
     if (cmdline.vhost_user_vsock_socket != NULL) {
         CHECK(KrunVhostUserDevice vsock_vu = krun_vhost_user_device_new(VIRTIO_DEVICE_VSOCK,
             KRUN_STR(cmdline.vhost_user_vsock_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
-        virtio_devices_add(&devices, vsock_vu);
+        krun_device_manager_add(devices, vsock_vu);
         printf("Using vhost-user vsock backend at %s\n", cmdline.vhost_user_vsock_socket);
     }
 
@@ -529,7 +498,7 @@ int main(int argc, char *const argv[])
     if (cmdline.vhost_user_can_socket != NULL) {
         CHECK(KrunVhostUserDevice can = krun_vhost_user_device_new(VIRTIO_DEVICE_CAN,
             KRUN_STR(cmdline.vhost_user_can_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
-        virtio_devices_add(&devices, can);
+        krun_device_manager_add(devices, can);
         printf("Using vhost-user CAN backend at %s\n", cmdline.vhost_user_can_socket);
     }
 
@@ -537,7 +506,7 @@ int main(int argc, char *const argv[])
     if (cmdline.vhost_user_console_socket != NULL) {
         CHECK(KrunVhostUserDevice vu_console = krun_vhost_user_device_new(VIRTIO_DEVICE_CONSOLE,
             KRUN_STR(cmdline.vhost_user_console_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
-        virtio_devices_add(&devices, vu_console);
+        krun_device_manager_add(devices, vu_console);
         printf("Using vhost-user console backend at %s (available as /dev/hvc1 in guest)\n", cmdline.vhost_user_console_socket);
         printf("Test with: echo 'hello' > /dev/hvc1\n");
     }
@@ -546,7 +515,7 @@ int main(int argc, char *const argv[])
     if (cmdline.vhost_user_media_socket != NULL) {
         CHECK(KrunVhostUserDevice media = krun_vhost_user_device_new(VIRTIO_DEVICE_MEDIA,
             KRUN_STR(cmdline.vhost_user_media_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
-        virtio_devices_add(&devices, media);
+        krun_device_manager_add(devices, media);
         printf("Using vhost-user media backend at %s\n", cmdline.vhost_user_media_socket);
     }
 
@@ -559,7 +528,7 @@ int main(int argc, char *const argv[])
     {
         CHECK(KrunFsDevice rootfs = krun_fs_device_new(KRUN_STR("/dev/root"), KRUN_STR(cmdline.new_root), &krun_err));
         krun_fs_device_set_overlay(rootfs, overlay);
-        virtio_devices_add(&devices, rootfs);
+        krun_device_manager_add(devices, rootfs);
     }
 
     // Add built-in vsock with TSI when not using vhost-user-vsock
@@ -571,7 +540,7 @@ int main(int argc, char *const argv[])
             CHECK(krun_vsock_device_add_port_forward(vsock, KRUN_STR("8000:18000"), &krun_err));
         }
 
-        virtio_devices_add(&devices, vsock);
+        krun_device_manager_add(devices, vsock);
     }
 
     // Configure network
@@ -594,15 +563,15 @@ int main(int argc, char *const argv[])
             krun_error_destroy(krun_err);
             return -1;
         }
-        virtio_devices_add(&devices, net);
+        krun_device_manager_add(devices, net);
     }
 
     {
         CHECK(KrunRngDevice rng = krun_rng_device_new(&krun_err));
-        virtio_devices_add(&devices, rng);
+        krun_device_manager_add(devices, rng);
 
         CHECK(KrunBalloonDevice balloon = krun_balloon_device_new(&krun_err));
-        virtio_devices_add(&devices, balloon);
+        krun_device_manager_add(devices, balloon);
     }
 
     // Build the VM.
@@ -610,7 +579,7 @@ int main(int argc, char *const argv[])
     CHECK(krun_vmm_builder_vcpus(&builder, 4, &krun_err));
     CHECK(krun_vmm_builder_ram_mib(&builder, 4096, &krun_err));
     krun_vmm_builder_payload(&builder, payload);
-    virtio_devices_attach(&devices, &builder);
+    krun_vmm_builder_devices(&builder, devices);
     CHECK(krun_vmm_builder_split_irqchip(&builder, false, &krun_err));
 #if defined(__x86_64__)
     CHECK(krun_vmm_builder_acpi(&builder,

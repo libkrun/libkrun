@@ -24,6 +24,8 @@ fn stream_set_timeouts(stream: &UnixStream) {
 #[host]
 mod host {
     use super::*;
+    #[cfg(feature = "dynamic-linking")]
+    use krun::DeviceManager;
 
     use anyhow::{bail, ensure};
     use nix::sys::prctl::set_pdeathsig;

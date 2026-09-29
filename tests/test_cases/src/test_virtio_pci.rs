@@ -5,6 +5,8 @@ pub struct TestVirtioPci;
 #[host]
 mod host {
     use super::*;
+    #[cfg(feature = "dynamic-linking")]
+    use krun::DeviceManager;
 
     use std::os::fd::AsFd;
 
@@ -20,7 +22,7 @@ mod host {
                 krun::Symbol::KrunPciDeviceManagerNew,
                 krun::Symbol::KrunPciDeviceManagerDestroy,
                 krun::Symbol::KrunPciDeviceManagerAdd,
-                krun::Symbol::KrunVmmBuilderPciDevices,
+                krun::Symbol::KrunVmmBuilderDevices,
                 krun::Symbol::KrunVmmBuilderAcpi,
             ],
         )
@@ -85,7 +87,7 @@ mod host {
                 .payload(payload)
                 .acpi(true)
                 .map_err(|err| anyhow::anyhow!("acpi: {err:?}"))?
-                .pci_devices(devices)
+                .devices(devices)
                 .build()
                 .map_err(|err| anyhow::anyhow!("VmmBuilder::build: {err:?}"))?;
 

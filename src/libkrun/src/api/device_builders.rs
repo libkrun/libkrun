@@ -294,7 +294,29 @@ pub trait AttachDevice<'a>: Send + 'a {
 }
 
 mod sealed {
-    pub trait Sealed {}
+    use super::{DeviceRequirements, EventManager, IrqChip, ShmManager, Vmm, VmmError};
+
+    pub trait Sealed {
+        /// Collect requirements from all devices (called before guest memory creation).
+        fn requirements(&self) -> Vec<DeviceRequirements>;
+
+        /// Whether this manager registers devices on the PCI bus.
+        fn uses_pci(&self) -> bool {
+            false
+        }
+
+        /// Attach all devices using the given VMM context.
+        fn attach_all(
+            self: Box<Self>,
+            vmm: &mut Vmm,
+            event_manager: &mut EventManager,
+            shm_manager: &ShmManager,
+            intc: IrqChip,
+            #[cfg(target_os = "macos")] map_sender: Option<
+                crossbeam_channel::Sender<utils::worker_message::WorkerMessage>,
+            >,
+        ) -> Result<(), VmmError>;
+    }
 }
 
 /// A device manager that owns a set of devices and knows how to attach them
@@ -302,29 +324,13 @@ mod sealed {
 ///
 /// This trait is sealed — only libkrun-provided managers can implement it.
 /// The seal may be lifted in a future major version.
+#[cfg_attr(feature = "ffi", ffier::export(no_vtable))]
 pub trait DeviceManager<'a>: sealed::Sealed + Send + 'a {
-    /// Collect requirements from all devices (called before guest memory creation).
-    #[doc(hidden)]
-    fn requirements(&self) -> Vec<DeviceRequirements>;
-
-    /// Whether this manager registers devices on the PCI bus.
-    #[doc(hidden)]
-    fn uses_pci(&self) -> bool {
-        false
-    }
-
-    /// Attach all devices using the given VMM context.
-    #[doc(hidden)]
-    fn attach_all(
-        self: Box<Self>,
-        vmm: &mut Vmm,
-        event_manager: &mut EventManager,
-        shm_manager: &ShmManager,
-        intc: IrqChip,
-        #[cfg(target_os = "macos")] map_sender: Option<
-            crossbeam_channel::Sender<utils::worker_message::WorkerMessage>,
-        >,
-    ) -> Result<(), VmmError>;
+    /// Add a device to this manager, preserving the order devices are added.
+    #[cfg_attr(feature = "ffi", ffier(index = 0))]
+    fn add(&mut self, device: impl AttachDevice<'a>)
+    where
+        Self: Sized;
 }
 
 /// Device manager using the virtio-mmio transport.
@@ -340,17 +346,9 @@ pub struct MmioDeviceManager<'a> {
 ///
 /// Available on x86_64 Linux hosts. The VM must enable ACPI with
 /// [`VmmBuilder::acpi`](crate::api::vmm_builder::VmmBuilder::acpi).
-///
-/// Also compiled under `feature = "ffi"` on other targets: `VmmBuilder` is
-/// exported from an ungated impl, and ffier names this type in a helper alias
-/// for `pci_devices` even when that method is cfg-gated.
-#[cfg(any(all(target_arch = "x86_64", target_os = "linux"), feature = "ffi"))]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[derive(Default)]
 pub struct PciDeviceManager<'a> {
-    #[cfg_attr(
-        not(all(target_arch = "x86_64", target_os = "linux")),
-        allow(dead_code)
-    )]
     devices: Vec<Box<dyn AttachDevice<'a> + 'a>>,
 }
 
@@ -360,7 +358,9 @@ impl<'a> MmioDeviceManager<'a> {
     pub fn new() -> Self {
         Self::default()
     }
+}
 
+impl<'a> MmioDeviceManager<'a> {
     /// Add a device to this manager.
     ///
     /// Devices are attached in the order they are added. The device must
@@ -372,9 +372,14 @@ impl<'a> MmioDeviceManager<'a> {
     }
 }
 
-impl sealed::Sealed for MmioDeviceManager<'_> {}
-
+#[cfg_attr(feature = "ffi", ffier::export)]
 impl<'a> DeviceManager<'a> for MmioDeviceManager<'a> {
+    fn add(&mut self, device: impl AttachDevice<'a>) {
+        self.add(device);
+    }
+}
+
+impl sealed::Sealed for MmioDeviceManager<'_> {
     fn requirements(&self) -> Vec<DeviceRequirements> {
         self.devices.iter().map(|d| d.requirements()).collect()
     }
@@ -417,18 +422,32 @@ impl<'a> PciDeviceManager<'a> {
     pub fn new() -> Self {
         Self::default()
     }
+}
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl<'a> PciDeviceManager<'a> {
     pub fn add(&mut self, device: impl AttachDevice<'a>) -> &mut Self {
         self.devices.push(Box::new(device));
         self
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-impl sealed::Sealed for PciDeviceManager<'_> {}
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(cfg = "all(target_arch = \"x86_64\", target_os = \"linux\")")
+)]
+#[cfg_attr(
+    not(feature = "ffi"),
+    cfg(all(target_arch = "x86_64", target_os = "linux"))
+)]
+impl<'a> DeviceManager<'a> for PciDeviceManager<'a> {
+    fn add(&mut self, device: impl AttachDevice<'a>) {
+        self.add(device);
+    }
+}
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-impl<'a> DeviceManager<'a> for PciDeviceManager<'a> {
+impl sealed::Sealed for PciDeviceManager<'_> {
     fn requirements(&self) -> Vec<DeviceRequirements> {
         self.devices
             .iter()

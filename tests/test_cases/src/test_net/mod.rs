@@ -108,6 +108,8 @@ mod host {
     use super::*;
     use crate::common::{init_config_builder, init_krun, setup_standard_devices_from};
     use crate::{Test, TestOutcome, TestSetup};
+    #[cfg(feature = "dynamic-linking")]
+    use krun::DeviceManager;
 
     use std::thread;
 
