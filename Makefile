@@ -30,9 +30,6 @@ ifeq ($(TDX),1)
     VARIANT = -tdx
     FEATURE_FLAGS := --features tdx
 endif
-ifeq ($(VIRGL_RESOURCE_MAP2),1)
-	FEATURE_FLAGS += --features virgl_resource_map2
-endif
 ifeq ($(INIT_BLOB),0)
     FEATURE_FLAGS += --no-default-features
 endif

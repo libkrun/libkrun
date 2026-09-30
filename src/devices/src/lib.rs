@@ -20,6 +20,8 @@ pub mod legacy;
 pub mod virtio;
 
 pub use self::bus::{Bus, BusDevice, Error as BusError};
+#[cfg(feature = "gpu")]
+pub use self::virtio::gpu::supports_virgl_renderer_resource_map_fixed;
 
 #[derive(Debug)]
 pub enum Error {
