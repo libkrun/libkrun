@@ -25,7 +25,8 @@ pub(crate) const AVAIL_FEATURES: u64 = (1u64 << uapi::VIRTIO_F_VERSION_1)
     | (1u64 << uapi::VIRTIO_GPU_F_EDID)
     | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_UUID)
     | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_BLOB)
-    | (1u64 << uapi::VIRTIO_GPU_F_CONTEXT_INIT);
+    | (1u64 << uapi::VIRTIO_GPU_F_CONTEXT_INIT)
+    | (1u64 << uapi::VIRTIO_GPU_F_BLOB_ALIGNMENT);
 
 const QUEUE_SIZE: u16 = 256;
 static QUEUE_CONFIG: [QueueConfig; defs::NUM_QUEUES] =
@@ -42,6 +43,7 @@ pub struct Gpu {
     export_table: Option<ExportTable>,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
+    blob_alignment: u32,
 }
 
 impl Gpu {
@@ -62,6 +64,9 @@ impl Gpu {
             export_table: None,
             displays,
             display_backend,
+            // Blobs are mapped into the guest in host pages, which can be
+            // larger than the guest's (16 KiB on Apple silicon).
+            blob_alignment: unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32,
         })
     }
 
@@ -165,6 +170,7 @@ impl VirtioDevice for Gpu {
             events_clear: 0,
             num_scanouts: self.displays.len() as u32,
             num_capsets: virgl_flags_to_capsets(self.virgl_flags).count_ones(),
+            blob_alignment: self.blob_alignment,
         };
 
         let config_slice = config.as_slice();
@@ -234,5 +240,32 @@ impl VirtioDevice for Gpu {
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         debug!("virtio_gpu: GET_shm_region");
         self.shm_region.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::display::NoopDisplayBackend;
+    use krun_display::IntoDisplayBackend;
+
+    #[test]
+    fn blob_alignment_offered() {
+        let gpu = Gpu::new(
+            0,
+            Box::new([]),
+            NoopDisplayBackend::into_display_backend(None),
+            #[cfg(target_os = "macos")]
+            crossbeam_channel::unbounded().0,
+        )
+        .unwrap();
+        assert_ne!(
+            gpu.avail_features() & (1 << uapi::VIRTIO_GPU_F_BLOB_ALIGNMENT),
+            0
+        );
+        let mut data = [0u8; 4];
+        gpu.read_config(16, &mut data);
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
+        assert_eq!(u32::from_le_bytes(data), page_size);
     }
 }

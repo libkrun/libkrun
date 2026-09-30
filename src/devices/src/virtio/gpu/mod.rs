@@ -24,8 +24,8 @@ mod defs {
         pub const VIRTIO_GPU_F_RESOURCE_UUID: u32 = 2;
         pub const VIRTIO_GPU_F_RESOURCE_BLOB: u32 = 3;
         pub const VIRTIO_GPU_F_CONTEXT_INIT: u32 = 4;
+        pub const VIRTIO_GPU_F_BLOB_ALIGNMENT: u32 = 5;
         /* The following capabilities are not upstreamed. */
-        pub const VIRTIO_GPU_F_RESOURCE_SYNC: u32 = 5;
         pub const VIRTIO_GPU_F_CREATE_GUEST_HANDLE: u32 = 6;
 
         #[derive(Copy, Clone, Debug, Default)]
@@ -35,6 +35,7 @@ mod defs {
             pub events_clear: u32,
             pub num_scanouts: u32,
             pub num_capsets: u32,
+            pub blob_alignment: u32,
         }
         unsafe impl ByteValued for virtio_gpu_config {}
     }
