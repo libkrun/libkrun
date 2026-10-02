@@ -23,6 +23,8 @@ pub(crate) const COMPAT_NET_FEATURES: u32 = (1 << 0)  // CSUM
 pub(crate) mod gvproxy;
 #[cfg(feature = "host")]
 pub(crate) mod passt;
+#[cfg(all(feature = "host", target_os = "linux"))]
+pub(crate) mod passt_vhost_user;
 #[cfg(feature = "host")]
 pub(crate) mod tap;
 #[cfg(feature = "host")]
@@ -31,6 +33,7 @@ pub(crate) mod vmnet_helper;
 /// Virtio-net test with configurable backend
 pub struct TestNet {
     tcp_tester: TcpTester,
+    test_bulk: bool,
     #[cfg(feature = "host")]
     should_run: fn() -> ShouldRun,
     #[cfg(feature = "host")]
@@ -42,6 +45,7 @@ pub struct TestNet {
 impl TestNet {
     pub fn new_passt() -> Self {
         Self {
+            test_bulk: false,
             tcp_tester: TcpTester::new([169, 254, 2, 2].into(), 9000),
             #[cfg(feature = "host")]
             should_run: passt::should_run,
@@ -52,8 +56,27 @@ impl TestNet {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn new_passt_vhost_user(path: bool) -> Self {
+        #[cfg(not(feature = "host"))]
+        let _ = path;
+        Self {
+            test_bulk: true,
+            #[cfg(feature = "host")]
+            should_run: passt_vhost_user::should_run,
+            #[cfg(feature = "host")]
+            setup_backend: if path {
+                passt_vhost_user::setup_path
+            } else {
+                passt_vhost_user::setup_fd
+            },
+            ..Self::new_passt()
+        }
+    }
+
     pub fn new_tap() -> Self {
         Self {
+            test_bulk: false,
             tcp_tester: TcpTester::new([10, 0, 0, 1].into(), 9001),
             #[cfg(feature = "host")]
             should_run: tap::should_run,
@@ -66,6 +89,7 @@ impl TestNet {
 
     pub fn new_gvproxy() -> Self {
         Self {
+            test_bulk: false,
             tcp_tester: TcpTester::new([192, 168, 127, 254].into(), 9002),
             #[cfg(feature = "host")]
             should_run: gvproxy::should_run,
@@ -78,6 +102,7 @@ impl TestNet {
 
     pub fn new_vmnet_helper() -> Self {
         Self {
+            test_bulk: false,
             tcp_tester: TcpTester::new([192, 168, 105, 1].into(), 9003),
             #[cfg(feature = "host")]
             should_run: vmnet_helper::should_run,
@@ -92,6 +117,7 @@ impl TestNet {
     /// ENAMETOOLONG bug when the local socket was derived from the peer path.
     pub fn new_gvproxy_long_path() -> Self {
         Self {
+            test_bulk: false,
             tcp_tester: TcpTester::new([192, 168, 127, 254].into(), 9004),
             #[cfg(feature = "host")]
             should_run: gvproxy::should_run,
@@ -108,7 +134,8 @@ mod host {
     use super::*;
     use crate::common::{init_config_builder, init_krun, setup_standard_devices_from};
     use crate::{Test, TestOutcome, TestSetup};
-
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, UdpSocket};
     use std::thread;
 
     #[cfg(feature = "dynamic-linking")]
@@ -149,6 +176,24 @@ mod host {
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            if self.test_bulk {
+                let listener = TcpListener::bind(("0.0.0.0", 9005))?;
+                thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut buffer = [0; 65536];
+                    for _ in 0..64 {
+                        stream.read_exact(&mut buffer).unwrap();
+                        stream.write_all(&buffer).unwrap();
+                    }
+                });
+                let socket = UdpSocket::bind(("0.0.0.0", 9000))?;
+                thread::spawn(move || {
+                    let mut buffer = [0; 65536];
+                    while let Ok((len, peer)) = socket.recv_from(&mut buffer) {
+                        socket.send_to(&buffer[..len], peer).unwrap();
+                    }
+                });
+            }
             let tcp_tester = self.tcp_tester;
             let listener = tcp_tester.create_server_socket();
             thread::spawn(move || tcp_tester.run_server(listener));
@@ -187,10 +232,41 @@ mod host {
 mod guest {
     use super::*;
     use crate::Test;
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, UdpSocket};
+    use std::time::Duration;
 
     impl Test for TestNet {
         fn in_guest(self: Box<Self>) {
             self.tcp_tester.run_client();
+            if self.test_bulk {
+                let socket = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                socket.connect(("169.254.2.2", 9000)).unwrap();
+                for size in [0, 1, 1400, 60000] {
+                    let payload = vec![0xa5; size];
+                    socket.send(&payload).unwrap();
+                    let mut received = vec![0; 65536];
+                    let len = socket.recv(&mut received).unwrap();
+                    assert_eq!(&received[..len], &payload);
+                }
+                let mut stream = TcpStream::connect(("169.254.2.2", 9005)).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut received = [0; 65536];
+                for pattern in 0..64 {
+                    let payload = [pattern; 65536];
+                    stream.write_all(&payload).unwrap();
+                    stream.read_exact(&mut received).unwrap();
+                    assert_eq!(received, payload);
+                }
+            }
 
             println!("OK");
         }

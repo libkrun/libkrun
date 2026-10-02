@@ -9,6 +9,13 @@ use std::os::fd::OwnedFd;
 use std::os::fd::RawFd;
 #[cfg(not(target_os = "windows"))]
 use std::os::fd::{AsRawFd, BorrowedFd};
+#[cfg(all(
+    feature = "net",
+    feature = "vhost-user",
+    target_os = "linux",
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
+use std::os::unix::net::UnixStream;
 #[cfg(all(feature = "net", target_os = "windows"))]
 use std::os::windows::io::OwnedHandle;
 #[cfg(target_os = "windows")]
@@ -1332,13 +1339,115 @@ export_bitflags! {
 /// A virtio network device.
 #[cfg(feature = "net")]
 pub struct NetDevice {
-    pub(crate) inner: Arc<Mutex<devices::virtio::Net>>,
+    inner: NetDeviceInner,
+}
+
+#[cfg(feature = "net")]
+enum NetDeviceInner {
+    InProcess(Arc<Mutex<devices::virtio::Net>>),
+    #[cfg(all(
+        feature = "vhost-user",
+        target_os = "linux",
+        not(any(feature = "tee", feature = "aws-nitro"))
+    ))]
+    VhostUser {
+        id: String,
+        device: Arc<Mutex<devices::virtio::VhostUserDevice>>,
+    },
+}
+
+#[cfg(all(
+    feature = "net",
+    feature = "vhost-user",
+    target_os = "linux",
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
+impl NetDevice {
+    fn vhost_user_mac(mac: &[u8]) -> Result<[u8; 6], VmmError> {
+        let mac: [u8; 6] = mac.try_into().map_err(|_| VmmError::InvalidParam())?;
+        if mac == [0; 6] || mac[0] & 1 != 0 {
+            return Err(VmmError::InvalidParam());
+        }
+        Ok(mac)
+    }
+
+    fn new_vhost_user_inner(id: &str, stream: UnixStream, mac: [u8; 6]) -> Result<Self, VmmError> {
+        use devices::virtio::VhostUserDevice;
+
+        let device = VhostUserDevice::new_net(stream, id.to_string(), mac)
+            .map_err(|e| VmmError::Internal(format!("vhost-user net: {e}")))?;
+        Ok(Self {
+            inner: NetDeviceInner::VhostUser {
+                id: id.to_string(),
+                device: Arc::new(Mutex::new(device)),
+            },
+        })
+    }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"net\""))]
 #[cfg_attr(not(feature = "ffi"), cfg(feature = "net"))]
 #[cfg(not(target_os = "windows"))]
 impl NetDevice {
+    /// Create a network device backed by a vhost-user socket, such as passt.
+    ///
+    /// Requires the `vhost-user` feature on Linux without TEE or Nitro.
+    ///
+    /// Uses one RX/TX queue pair and requires a nonzero unicast MAC address.
+    pub fn new_vhost_user_path(id: &str, path: &str, mac: &[u8]) -> Result<Self, VmmError> {
+        #[cfg(all(
+            feature = "vhost-user",
+            target_os = "linux",
+            not(any(feature = "tee", feature = "aws-nitro"))
+        ))]
+        {
+            let mac = Self::vhost_user_mac(mac)?;
+            if path.is_empty() {
+                return Err(VmmError::InvalidParam());
+            }
+            let stream = UnixStream::connect(path)
+                .map_err(|e| VmmError::Internal(format!("vhost-user net socket: {e}")))?;
+            Self::new_vhost_user_inner(id, stream, mac)
+        }
+        #[cfg(not(all(
+            feature = "vhost-user",
+            target_os = "linux",
+            not(any(feature = "tee", feature = "aws-nitro"))
+        )))]
+        {
+            let _ = (id, path, mac);
+            Err(VmmError::FeatureDisabled())
+        }
+    }
+
+    /// Create a network device from a connected vhost-user Unix stream socket.
+    ///
+    /// Requires the `vhost-user` feature on Linux without TEE or Nitro.
+    ///
+    /// Duplicates `fd`; the caller retains ownership and may close it after this call.
+    /// Uses one RX/TX queue pair and requires a nonzero unicast MAC address.
+    pub fn new_vhost_user_fd(id: &str, fd: BorrowedFd<'_>, mac: &[u8]) -> Result<Self, VmmError> {
+        #[cfg(all(
+            feature = "vhost-user",
+            target_os = "linux",
+            not(any(feature = "tee", feature = "aws-nitro"))
+        ))]
+        {
+            let mac = Self::vhost_user_mac(mac)?;
+            let fd = fd.try_clone_to_owned().map_err(|_| VmmError::BadFd())?;
+            Self::new_vhost_user_inner(id, UnixStream::from(fd), mac)
+        }
+        #[cfg(not(all(
+            feature = "vhost-user",
+            target_os = "linux",
+            not(any(feature = "tee", feature = "aws-nitro"))
+        )))]
+        {
+            let _ = (id, fd, mac);
+            Err(VmmError::FeatureDisabled())
+        }
+    }
+
     /// Create a net device backed by a Unix datagram socket path.
     pub fn new_unixgram_path(
         id: &str,
@@ -1488,7 +1597,7 @@ impl NetDevice {
         let net = devices::virtio::Net::new(id.to_string(), backend, mac, features)
             .map_err(|e| VmmError::Internal(format!("net: {e:?}")))?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(net)),
+            inner: NetDeviceInner::InProcess(Arc::new(Mutex::new(net))),
         })
     }
 }
@@ -1497,9 +1606,30 @@ impl NetDevice {
 #[cfg_attr(not(feature = "ffi"), cfg(feature = "net"))]
 impl<'a> AttachDevice<'a> for NetDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
+    fn requirements(&self) -> DeviceRequirements {
+        DeviceRequirements {
+            process_shareable_memory: !matches!(self.inner, NetDeviceInner::InProcess(_)),
+            ..Default::default()
+        }
+    }
+
+    #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
-        let id = self.inner.lock().unwrap().id().to_string();
-        ctx.register(&id, self.inner)
+        match self.inner {
+            NetDeviceInner::InProcess(inner) => {
+                let id = inner.lock().unwrap().id().to_string();
+                ctx.register(&id, inner)
+            }
+            #[cfg(all(
+                feature = "vhost-user",
+                target_os = "linux",
+                not(any(feature = "tee", feature = "aws-nitro"))
+            ))]
+            NetDeviceInner::VhostUser { id, device } => {
+                ctx.subscribe_events(device.clone())?;
+                ctx.register(&id, device)
+            }
+        }
     }
 }
 
@@ -1915,4 +2045,69 @@ fn resolve_parent_dirs<'a, 'b>(
         }
     }
     Ok(current)
+}
+
+#[cfg(all(
+    test,
+    feature = "net",
+    feature = "vhost-user",
+    target_os = "linux",
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
+mod vhost_user_net_tests {
+    use super::*;
+    use std::os::fd::AsFd;
+
+    #[test]
+    fn rejects_invalid_mac_and_empty_path_before_handshake() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        for mac in [&[][..], &[2; 5], &[2; 7], &[0; 6], &[1; 6]] {
+            assert!(matches!(
+                NetDevice::new_vhost_user_fd("net0", stream.as_fd(), mac),
+                Err(VmmError::InvalidParam())
+            ));
+            assert!(matches!(
+                NetDevice::new_vhost_user_path("net0", "/not/a/socket", mac),
+                Err(VmmError::InvalidParam())
+            ));
+        }
+        assert!(matches!(
+            NetDevice::new_vhost_user_path("net0", "", &[2; 6]),
+            Err(VmmError::InvalidParam())
+        ));
+        assert!(stream.take_error().is_ok());
+    }
+
+    #[test]
+    fn failed_handshake_preserves_borrowed_fd() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        assert!(NetDevice::new_vhost_user_fd("net0", stream.as_fd(), &[2; 6]).is_err());
+        assert!(stream.take_error().is_ok());
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "net",
+    not(feature = "vhost-user"),
+    not(target_os = "windows")
+))]
+mod disabled_vhost_user_net_tests {
+    use super::*;
+    use std::os::fd::AsFd;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn constructors_require_vhost_user_feature() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        assert!(matches!(
+            NetDevice::new_vhost_user_path("net0", "/not/a/socket", &[2; 6]),
+            Err(VmmError::FeatureDisabled())
+        ));
+        assert!(matches!(
+            NetDevice::new_vhost_user_fd("net0", stream.as_fd(), &[2; 6]),
+            Err(VmmError::FeatureDisabled())
+        ));
+    }
 }

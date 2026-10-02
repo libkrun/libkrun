@@ -524,6 +524,25 @@ typedef void (*krun_block_device_destroy_fn)(KrunBlockDevice handle);
 
 /* NetDevice --------------------------------------------------------- */
 
+/**
+ * Create a network device backed by a vhost-user socket, such as passt.
+ *
+ * Requires the `vhost-user` feature on Linux without TEE or Nitro.
+ *
+ * Uses one RX/TX queue pair and requires a nonzero unicast MAC address.
+ */
+KrunNetDevice krun_net_device_new_vhost_user_path(KrunStr id, KrunStr path, KrunBytes mac, KrunError* err_out);
+typedef KrunNetDevice (*krun_net_device_new_vhost_user_path_fn)(KrunStr id, KrunStr path, KrunBytes mac, KrunError* err_out);
+/**
+ * Create a network device from a connected vhost-user Unix stream socket.
+ *
+ * Requires the `vhost-user` feature on Linux without TEE or Nitro.
+ *
+ * Duplicates `fd`; the caller retains ownership and may close it after this call.
+ * Uses one RX/TX queue pair and requires a nonzero unicast MAC address.
+ */
+KrunNetDevice krun_net_device_new_vhost_user_fd(KrunStr id, int fd, KrunBytes mac, KrunError* err_out);
+typedef KrunNetDevice (*krun_net_device_new_vhost_user_fd_fn)(KrunStr id, int fd, KrunBytes mac, KrunError* err_out);
 /** Create a net device backed by a Unix datagram socket path. */
 KrunNetDevice krun_net_device_new_unixgram_path(KrunStr id, KrunStr path, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
 typedef KrunNetDevice (*krun_net_device_new_unixgram_path_fn)(KrunStr id, KrunStr path, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);

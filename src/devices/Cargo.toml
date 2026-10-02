@@ -20,7 +20,7 @@ virgl_resource_map2 = []
 aws-nitro = []
 test_utils = []
 timesync = []
-vhost-user = ["vhost", "vmm-sys-util", "krun_display"]
+vhost-user = ["vhost", "krun_display"]
 ffi = ["dep:ffier"]
 
 [dependencies]
@@ -33,7 +33,6 @@ log = "0.4.0"
 rand = "0.10.2"
 thiserror = { version = "2.0", optional = true }
 vhost = { version = "0.17", optional = true, features = ["vhost-user-frontend"] }
-vmm-sys-util = { version = "0.15", optional = true }
 virtio-bindings = "0.2.0"
 zerocopy = { version = "0.8.26", optional = true, features = ["derive"] }
 krun_display = { package = "krun-display", version = "0.1.0", path = "../display", optional = true, features = ["bindgen_clang_runtime"] }

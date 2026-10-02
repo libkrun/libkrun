@@ -58,6 +58,30 @@ impl TestNetPerf {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn new_passt_vhost_user_tx() -> Self {
+        Self {
+            port: 15104,
+            #[cfg(feature = "host")]
+            should_run: crate::test_net::passt_vhost_user::should_run,
+            #[cfg(feature = "host")]
+            setup_backend: crate::test_net::passt_vhost_user::setup_fd,
+            ..Self::new_passt_tx()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn new_passt_vhost_user_rx() -> Self {
+        Self {
+            port: 15114,
+            #[cfg(feature = "host")]
+            should_run: crate::test_net::passt_vhost_user::should_run,
+            #[cfg(feature = "host")]
+            setup_backend: crate::test_net::passt_vhost_user::setup_fd,
+            ..Self::new_passt_rx()
+        }
+    }
+
     pub fn new_tap_tx() -> Self {
         Self {
             #[cfg(feature = "guest")]

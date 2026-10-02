@@ -1859,6 +1859,89 @@
       "is_builder_type": false,
       "methods": [
         {
+          "name": "new_vhost_user_path",
+          "doc": [
+            " Create a network device backed by a vhost-user socket, such as passt.",
+            "",
+            " Requires the `vhost-user` feature on Linux without TEE or Nitro.",
+            "",
+            " Uses one RX/TX queue pair and requires a nonzero unicast MAC address."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "id",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "mac",
+              "param_kind": "regular",
+              "type": "[u8]",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "NetDevice"
+            },
+            "err_type": "VmmError",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_net_device_new_vhost_user_path"
+        },
+        {
+          "name": "new_vhost_user_fd",
+          "doc": [
+            " Create a network device from a connected vhost-user Unix stream socket.",
+            "",
+            " Requires the `vhost-user` feature on Linux without TEE or Nitro.",
+            "",
+            " Duplicates `fd`; the caller retains ownership and may close it after this call.",
+            " Uses one RX/TX queue pair and requires a nonzero unicast MAC address."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "id",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "fd",
+              "param_kind": "regular",
+              "type": "BorrowedFd",
+              "type_args": [
+                "_"
+              ]
+            },
+            {
+              "name": "mac",
+              "param_kind": "regular",
+              "type": "[u8]",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "NetDevice"
+            },
+            "err_type": "VmmError",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_net_device_new_vhost_user_fd"
+        },
+        {
           "name": "new_unixgram_path",
           "doc": [
             " Create a net device backed by a Unix datagram socket path."

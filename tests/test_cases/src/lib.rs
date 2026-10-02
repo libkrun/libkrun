@@ -144,6 +144,16 @@ pub fn test_cases() -> Vec<TestCase> {
         ),
         TestCase::new("tsi-tcp-half-close", Box::new(TestTsiTcpHalfClose)),
         TestCase::new("net-passt", Box::new(TestNet::new_passt())),
+        #[cfg(target_os = "linux")]
+        TestCase::new(
+            "net-passt-vhost-user-fd",
+            Box::new(TestNet::new_passt_vhost_user(false)),
+        ),
+        #[cfg(target_os = "linux")]
+        TestCase::new(
+            "net-passt-vhost-user-path",
+            Box::new(TestNet::new_passt_vhost_user(true)),
+        ),
         TestCase::new("net-tap", Box::new(TestNet::new_tap())),
         TestCase::new("net-gvproxy", Box::new(TestNet::new_gvproxy())),
         TestCase::new(
@@ -161,6 +171,16 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
         TestCase::new("perf-net-passt-tx", Box::new(TestNetPerf::new_passt_tx())),
         TestCase::new("perf-net-passt-rx", Box::new(TestNetPerf::new_passt_rx())),
+        #[cfg(target_os = "linux")]
+        TestCase::new(
+            "perf-net-passt-vhost-user-tx",
+            Box::new(TestNetPerf::new_passt_vhost_user_tx()),
+        ),
+        #[cfg(target_os = "linux")]
+        TestCase::new(
+            "perf-net-passt-vhost-user-rx",
+            Box::new(TestNetPerf::new_passt_vhost_user_rx()),
+        ),
         TestCase::new("perf-net-tap-tx", Box::new(TestNetPerf::new_tap_tx())),
         TestCase::new("perf-net-tap-rx", Box::new(TestNetPerf::new_tap_rx())),
         TestCase::new(

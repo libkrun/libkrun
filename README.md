@@ -90,6 +90,61 @@ A conventional virtual interface that allows the guest to communicate with the o
 
 Use `krun_add_net_unixstream` and/or `krun_add_net_unixdgram` to add a virtio-net interface connected to the userspace network proxy.
 
+#### vhost-user networking with passt (Linux)
+
+With `NET=1 VHOST_USER=1`, a virtio-net device can use passt's vhost-user backend. This moves
+virtqueue processing and packet transfers to passt while the VM continues to
+see a virtio-net interface. Start passt before creating the device, since the
+constructor connects to its socket and negotiates the vhost-user protocol:
+
+```sh
+passt --vhost-user --socket /tmp/krun-passt.socket --one-off
+```
+
+In Rust, create the device and add it to the MMIO device manager:
+
+```rust
+let mut devices = MmioDeviceManager::new();
+let net = NetDevice::new_vhost_user_path(
+    "net0",
+    "/tmp/krun-passt.socket",
+    &[0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+)?;
+devices.add(net);
+```
+
+The C API provides the corresponding path constructor. Add the resulting
+device to the MMIO device manager and pass that manager to the VMM builder:
+
+```c
+const uint8_t mac[] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+KrunError err = NULL;
+KrunNetDevice net = krun_net_device_new_vhost_user_path(
+    KRUN_STR("net0"), KRUN_STR("/tmp/krun-passt.socket"), KRUN_BYTES(mac), &err);
+if (err != NULL) {
+    /* Handle the error before building the VM. */
+}
+KrunMmioDeviceManager devices = krun_mmio_device_manager_new();
+krun_mmio_device_manager_add(devices, net);
+KrunVmmBuilder builder = krun_vmm_builder_new();
+krun_vmm_builder_devices(&builder, devices);
+```
+
+Rust callers can also construct the device from an already connected Unix
+stream with `NetDevice::new_vhost_user_fd`; it borrows and duplicates the file
+descriptor. The vhost-user protocol is incompatible with the framed Ethernet
+stream used by `NetDevice::new_unixstream_path`.
+
+The device uses one RX/TX queue pair and negotiates virtio-net features with the
+backend. It is unavailable on TEE and AWS Nitro builds and on non-Linux hosts.
+The backend can access shared guest RAM and must be trusted. Backend
+reconnection and live migration are not supported.
+
+Run the passt vhost-user integration tests with
+`make test NET=1 VHOST_USER=1 TEST='net-passt-vhost-user-*'`. The performance cases
+`perf-net-passt-vhost-user-tx` and `perf-net-passt-vhost-user-rx` use the existing
+iperf3 harness (`IPERF_DURATION=10 make test NET=1 VHOST_USER=1 TEST='perf-net-passt-vhost-user-*'`).
+
 ## Security model
 
 The libkrun security model is primarily defined by the consideration that both the guest and the VMM pertain to the same security context. For many operations, the VMM acts as a proxy for the guest within the host. Host resources that are accessible to the VMM can potentially be accessed by the guest through it.
