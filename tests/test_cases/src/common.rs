@@ -5,6 +5,8 @@ use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+#[cfg(feature = "dynamic-linking")]
+use krun::DeviceManager;
 
 use crate::TestSetup;
 

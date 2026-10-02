@@ -1,5 +1,6 @@
 use std::cmp;
 use std::io::Write;
+use std::mem::size_of;
 use std::thread::JoinHandle;
 
 use log::{debug, error};
@@ -178,6 +179,10 @@ impl VirtioDevice for Input {
 
     fn queue_config(&self) -> &[QueueConfig] {
         &defs::QUEUE_CONFIG
+    }
+
+    fn config_len(&self) -> Option<u32> {
+        Some(size_of::<InputConfigRepr>() as u32)
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {

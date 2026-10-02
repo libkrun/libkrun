@@ -19,6 +19,8 @@ impl TestTsiTcpGuestListen {
 #[host]
 mod host {
     use super::*;
+    #[cfg(feature = "dynamic-linking")]
+    use krun::DeviceManager;
     use std::thread;
 
     use crate::common::{build_init_config, init_krun, setup_standard_devices};

@@ -30,6 +30,7 @@ pub mod linux_errno;
 mod mmio;
 #[cfg(feature = "net")]
 pub mod net;
+mod pci;
 mod queue;
 #[cfg(not(feature = "tee"))]
 pub mod rng;
@@ -50,6 +51,7 @@ pub use self::gpu::*;
 pub use self::mmio::*;
 #[cfg(feature = "net")]
 pub use self::net::Net;
+pub use self::pci::*;
 pub use self::queue::{Descriptor, DescriptorChain, Queue};
 #[cfg(not(feature = "tee"))]
 pub use self::rng::*;

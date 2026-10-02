@@ -2,6 +2,7 @@ use std::cmp;
 #[cfg(not(target_os = "windows"))]
 use std::convert::TryInto;
 use std::io::Write;
+use std::mem::size_of;
 
 use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, GuestMemoryBackend, GuestMemoryMmap};
@@ -147,6 +148,10 @@ impl VirtioDevice for Balloon {
 
     fn queue_config(&self) -> &[QueueConfig] {
         &defs::QUEUE_CONFIG
+    }
+
+    fn config_len(&self) -> Option<u32> {
+        Some(size_of::<VirtioBalloonConfig>() as u32)
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {

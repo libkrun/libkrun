@@ -6,6 +6,7 @@
 // found in the THIRD-PARTY file.
 
 mod acpi;
+pub use self::acpi::{PciFunctionInfo, PciHostInfo};
 mod gdt;
 /// Contains logic for setting up Advanced Programmable Interrupt Controller (local version).
 pub mod interrupts;
@@ -297,6 +298,7 @@ pub fn setup_mptable_for_tdshim(guest_mem: &GuestMemoryMmap, num_cpus: u8) -> su
 /// * `initrd` - Information about where the ramdisk image was loaded in the `guest_mem`.
 /// * `num_cpus` - Number of virtual CPUs the guest will have.
 /// * `pvh` - Whether to use the PVH boot protocol.
+/// * `pci_host` - The PCI host configuration if enabled.
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn configure_system(
     guest_mem: &GuestMemoryMmap,
@@ -308,9 +310,11 @@ pub fn configure_system(
     pvh: bool,
     acpi_enabled: bool,
     virtio_mmio_devices: &[(u64, u32)],
+    pci_host: Option<&PciHostInfo>,
 ) -> super::Result<()> {
     if acpi_enabled {
-        acpi::setup_acpi(guest_mem, num_cpus, virtio_mmio_devices).map_err(Error::AcpiSetup)?;
+        acpi::setup_acpi(guest_mem, num_cpus, virtio_mmio_devices, pci_host)
+            .map_err(Error::AcpiSetup)?;
     } else {
         // Note that this puts the mptable at the last 1k of Linux's 640k base RAM
         #[cfg(not(feature = "tee"))]
@@ -633,8 +637,18 @@ mod tests {
         let no_vcpus = 4;
         let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let info = ArchMemoryInfo::default();
-        let config_err =
-            configure_system(&gm, &info, GuestAddress(0), 0, &None, 1, false, false, &[]);
+        let config_err = configure_system(
+            &gm,
+            &info,
+            GuestAddress(0),
+            0,
+            &None,
+            1,
+            false,
+            false,
+            &[],
+            None,
+        );
         assert!(config_err.is_err());
         #[cfg(not(feature = "tee"))]
         assert_eq!(
@@ -657,6 +671,7 @@ mod tests {
             false,
             false,
             &[],
+            None,
         )
         .unwrap();
 
@@ -675,6 +690,7 @@ mod tests {
             false,
             false,
             &[],
+            None,
         )
         .unwrap();
 
@@ -693,6 +709,7 @@ mod tests {
             false,
             false,
             &[],
+            None,
         )
         .unwrap();
     }

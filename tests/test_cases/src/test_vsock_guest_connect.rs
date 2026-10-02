@@ -34,6 +34,8 @@ const VSOCK_PORT: u32 = 1234;
 #[host]
 mod host {
     use super::*;
+    #[cfg(feature = "dynamic-linking")]
+    use krun::DeviceManager;
 
     use std::io::Write;
     use std::mem;

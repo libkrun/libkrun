@@ -10,10 +10,7 @@ use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use utils::eventfd::EFD_NONBLOCK;
-use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-
-use super::device_status;
+use super::device::{InterruptHandler, InterruptType, VirtioTransportState};
 use super::*;
 use crate::bus::BusDevice;
 use crate::legacy::IrqChip;
@@ -59,106 +56,92 @@ impl Display for CreateMmioTransportError {
 /// Typically one page (4096 bytes) of MMIO address space is sufficient to handle this transport
 /// and inner virtio device.
 pub struct MmioTransport {
-    device: Arc<Mutex<dyn VirtioDevice>>,
-    // The register where feature bits are stored.
-    pub(crate) features_select: u32,
-    // The register where features page is selected.
-    pub(crate) acked_features_select: u32,
-    pub(crate) queue_select: u32,
-    pub(crate) device_status: u32,
-    pub(crate) config_generation: u32,
-    mem: GuestMemoryMmap,
-    // Queues owned by the transport during negotiation.
-    // These are moved to the device on activation.
-    queues: Option<Vec<Queue>>,
-    // Queue eventfds - kept by transport to send notifications.
-    // Arc clones are passed to the device on activation.
-    queue_evts: Vec<Arc<EventFd>>,
-    // Stored queue config from device for recreating queues after reset.
-    queue_config: Vec<QueueConfig>,
+    state: VirtioTransportState,
     shm_region_select: u32,
-    interrupt: InterruptTransport,
+    interrupt: MmioInterrupt,
+    device_interrupt: InterruptTransport,
 }
 
-struct InterruptTransportInner {
+struct MmioInterruptInner {
     log_target: String,
     status: AtomicUsize,
     event: EventFd,
     intc: IrqChip,
-    irq_line: Option<u32>,
+    irq_line: Mutex<Option<u32>>,
 }
 
 #[derive(Clone)]
-pub struct InterruptTransport(Arc<InterruptTransportInner>);
+struct MmioInterrupt(Arc<MmioInterruptInner>);
 
-impl InterruptTransport {
-    pub fn new(intc: IrqChip, log_target: String) -> Result<Self, CreateMmioTransportError> {
-        Ok(Self(Arc::new(InterruptTransportInner {
+impl MmioInterrupt {
+    fn new(intc: IrqChip, log_target: String) -> Result<Self, CreateMmioTransportError> {
+        Ok(Self(Arc::new(MmioInterruptInner {
             log_target,
             status: AtomicUsize::new(0),
             event: EventFd::new(0).map_err(CreateMmioTransportError::CreateInterruptEventFd)?,
             intc,
-            irq_line: None,
+            irq_line: Mutex::new(None),
         })))
     }
 
-    pub fn status(&self) -> &AtomicUsize {
+    fn device_interrupt(&self) -> InterruptTransport {
+        InterruptTransport::from_handler(Arc::new(self.clone()))
+    }
+
+    fn status(&self) -> &AtomicUsize {
         &self.0.status
     }
 
-    pub fn event(&self) -> &EventFd {
+    fn event(&self) -> &EventFd {
         &self.0.event
     }
 
-    pub fn intc(&self) -> &IrqChip {
+    fn intc(&self) -> &IrqChip {
         &self.0.intc
     }
 
-    pub fn irq_line(&self) -> Option<u32> {
-        self.0.irq_line
+    fn irq_line(&self) -> Option<u32> {
+        *self.0.irq_line.lock().unwrap()
     }
 
     fn set_irq_line(&mut self, irq_line: u32) {
         debug!(target: &self.0.log_target, "set_irq_line: {irq_line}");
-        match Arc::get_mut(&mut self.0) {
-            None => {
-                error!("Cannot change irq_line of activated device");
-            }
-            Some(interrupt) => {
-                interrupt.irq_line = Some(irq_line);
-            }
-        }
+        *self.0.irq_line.lock().unwrap() = Some(irq_line);
     }
 
-    fn try_signal(&self, status: u32) -> Result<(), crate::Error> {
+    fn try_signal_status(&self, status: u32) -> Result<(), crate::Error> {
         self.status().fetch_or(status as usize, Ordering::SeqCst);
         self.intc()
             .lock()
             .unwrap()
-            .set_irq(self.0.irq_line, Some(&self.0.event))?;
+            .set_irq(self.irq_line(), Some(&self.0.event))?;
         Ok(())
     }
 
-    pub fn try_signal_used_queue(&self) -> Result<(), crate::Error> {
-        debug!(target: &self.0.log_target, "interrupt: signal_used_queue");
-        self.try_signal(VIRTIO_MMIO_INT_VRING)
+    fn reset_status(&self) {
+        self.status().store(0, Ordering::SeqCst);
     }
 
-    pub fn try_signal_config_change(&self) -> Result<(), crate::Error> {
-        debug!(target: &self.0.log_target, "interrupt: signal_config_change");
-        self.try_signal(VIRTIO_MMIO_INT_CONFIG)
+    fn signal_bus_interrupt(&self, irq_mask: u32) -> io::Result<()> {
+        self.status().fetch_or(irq_mask as usize, Ordering::SeqCst);
+        self.event().write(1)
     }
+}
 
-    pub fn signal_used_queue(&self) {
-        if let Err(e) = self.try_signal_used_queue() {
-            warn!(target: &self.0.log_target, "Failed to signal used queue: {e:?}");
-        }
+impl InterruptHandler for MmioInterrupt {
+    fn try_signal(&self, interrupt: InterruptType) -> Result<(), crate::Error> {
+        let (status, name) = match interrupt {
+            InterruptType::UsedQueue => (VIRTIO_MMIO_INT_VRING, "signal_used_queue"),
+            InterruptType::ConfigChange => (VIRTIO_MMIO_INT_CONFIG, "signal_config_change"),
+        };
+        debug!(target: &self.0.log_target, "interrupt: {name}");
+        self.try_signal_status(status)
     }
+}
 
-    pub fn signal_config_change(&self) {
-        if let Err(e) = self.try_signal_config_change() {
-            warn!(target: &self.0.log_target, "Failed to signal config change: {e:?}");
-        }
+impl InterruptTransport {
+    pub fn new(intc: IrqChip, log_target: String) -> Result<Self, CreateMmioTransportError> {
+        Ok(MmioInterrupt::new(intc, log_target)?.device_interrupt())
     }
 }
 
@@ -169,48 +152,23 @@ impl MmioTransport {
         intc: IrqChip,
         device: Arc<Mutex<dyn VirtioDevice>>,
     ) -> Result<MmioTransport, CreateMmioTransportError> {
-        let locked = device
+        let device_name = device
             .try_lock()
-            .expect("Mutex of VirtioDevice should not be locked when calling MmioTransport::new");
-
-        let debug_log_target = format!("{}[{}]", module_path!(), locked.device_name());
-        let queue_config: Vec<QueueConfig> = locked.queue_config().to_vec();
-        drop(locked);
-
-        let queues = Self::create_queues(&queue_config);
-        let queue_evts = Self::create_queue_evts(queue_config.len())?;
+            .expect("Mutex of VirtioDevice should not be locked when calling MmioTransport::new")
+            .device_name()
+            .to_string();
+        let debug_log_target = format!("{}[{device_name}]", module_path!());
+        let state = VirtioTransportState::new(mem, device)
+            .map_err(CreateMmioTransportError::CreateInterruptEventFd)?;
+        let interrupt = MmioInterrupt::new(intc, debug_log_target)?;
+        let device_interrupt = interrupt.device_interrupt();
 
         Ok(MmioTransport {
-            interrupt: InterruptTransport::new(intc, debug_log_target)?,
-            device,
-            features_select: 0,
-            acked_features_select: 0,
-            queue_select: 0,
-            device_status: device_status::INIT,
-            config_generation: 0,
-            mem,
-            queues: Some(queues),
-            queue_evts,
-            queue_config,
+            state,
+            interrupt,
+            device_interrupt,
             shm_region_select: 0,
         })
-    }
-
-    /// Create queues from queue configuration.
-    fn create_queues(queue_config: &[QueueConfig]) -> Vec<Queue> {
-        queue_config.iter().map(|c| Queue::new(c.size)).collect()
-    }
-
-    /// Create eventfds for queue notifications.
-    fn create_queue_evts(count: usize) -> Result<Vec<Arc<EventFd>>, CreateMmioTransportError> {
-        let mut queue_evts = Vec::with_capacity(count);
-        for _ in 0..count {
-            queue_evts.push(Arc::new(
-                EventFd::new(EFD_NONBLOCK)
-                    .map_err(CreateMmioTransportError::CreateInterruptEventFd)?,
-            ));
-        }
-        Ok(queue_evts)
     }
 
     /// Set the irq line for the device.
@@ -224,49 +182,26 @@ impl MmioTransport {
     }
 
     pub fn locked_device(&self) -> MutexGuard<'_, dyn VirtioDevice + 'static> {
-        self.device.lock().expect("Poisoned device lock")
+        self.state.locked_device()
     }
 
     // Gets the encapsulated VirtioDevice.
     pub fn device(&self) -> Arc<Mutex<dyn VirtioDevice>> {
-        self.device.clone()
+        self.state.device()
     }
 
     /// Returns a reference to the queue eventfds. Used by the VMM to register
     /// queue notifications with KVM.
     pub fn queue_evts(&self) -> &[Arc<EventFd>] {
-        &self.queue_evts
+        self.state.queue_evts()
     }
 
     fn check_device_status(&self, set: u32, clr: u32) -> bool {
-        self.device_status & (set | clr) == set
-    }
-
-    fn with_queue<U, F>(&self, d: U, f: F) -> U
-    where
-        F: FnOnce(&Queue) -> U,
-    {
-        match &self.queues {
-            Some(queues) => match queues.get(self.queue_select as usize) {
-                Some(queue) => f(queue),
-                None => d,
-            },
-            None => d,
-        }
+        self.state.device_status & (set | clr) == set
     }
 
     fn with_queue_mut<F: FnOnce(&mut Queue)>(&mut self, f: F) -> bool {
-        match &mut self.queues {
-            Some(queues) => {
-                if let Some(queue) = queues.get_mut(self.queue_select as usize) {
-                    f(queue);
-                    true
-                } else {
-                    false
-                }
-            }
-            None => false,
-        }
+        self.state.with_queue_mut(self.state.queue_select, f)
     }
 
     fn update_queue_field<F: FnOnce(&mut Queue)>(&mut self, f: F) {
@@ -276,48 +211,9 @@ impl MmioTransport {
         } else {
             warn!(
                 "update virtio queue in invalid state 0x{:x}",
-                self.device_status
+                self.state.device_status
             );
         }
-    }
-
-    fn reset(&mut self) {
-        if self.locked_device().is_activated() {
-            debug!("reset device while it's still in active state");
-        }
-        self.features_select = 0;
-        self.acked_features_select = 0;
-        self.queue_select = 0;
-        self.interrupt.0.status.store(0, Ordering::SeqCst);
-        self.device_status = device_status::INIT;
-        // Do not reset config_generation and keep it monotonically increasing.
-        // Recreate queues from queue_config for the next negotiation cycle.
-        // Keep queue_evts as is - they are reused across reset cycles.
-        // TODO: consider resting the events when we refactor event handling
-        self.queues = Some(Self::create_queues(&self.queue_config));
-        // . Do not reset config_generation and keep it monotonically increasing
-    }
-
-    fn activate(&mut self) {
-        let Some(queues) = self.queues.take() else {
-            return;
-        };
-
-        let mut device_queues: Vec<DeviceQueue> = queues
-            .into_iter()
-            .zip(self.queue_evts.iter().cloned())
-            .map(|(queue, event)| DeviceQueue::new(queue, event))
-            .collect();
-
-        let mut locked_device = self.locked_device();
-        let event_idx_enabled =
-            (locked_device.acked_features() & (1 << VIRTIO_RING_F_EVENT_IDX)) != 0;
-        for dq in &mut device_queues {
-            dq.queue.set_event_idx(event_idx_enabled);
-        }
-        locked_device
-            .activate(self.mem.clone(), self.interrupt.clone(), device_queues)
-            .expect("Failed to activate device");
     }
 
     /// Update device status according to the state machine defined by VirtIO Spec 1.0.
@@ -327,48 +223,12 @@ impl MmioTransport {
     /// of the driver initialization sequence specified in 3.1. The driver MUST NOT clear
     /// a device status bit. If the driver sets the FAILED bit, the driver MUST later reset
     /// the device before attempting to re-initialize.
-    #[allow(unused_assignments)]
     fn set_device_status(&mut self, status: u32) {
-        use device_status::*;
-        // match changed bits
-        match !self.device_status & status {
-            ACKNOWLEDGE if self.device_status == INIT => {
-                self.device_status = status;
-            }
-            DRIVER if self.device_status == ACKNOWLEDGE => {
-                self.device_status = status;
-            }
-            FEATURES_OK if self.device_status == (ACKNOWLEDGE | DRIVER) => {
-                self.device_status = status;
-            }
-            DRIVER_OK if self.device_status == (ACKNOWLEDGE | DRIVER | FEATURES_OK) => {
-                self.device_status = status;
-                let device_activated = self.locked_device().is_activated();
-                if !device_activated {
-                    self.activate();
-                }
-            }
-            _ if (status & FAILED) != 0 => {
-                // TODO: notify backend driver to stop the device
-                self.device_status |= FAILED;
-            }
-            _ if status == 0 => {
-                if self.locked_device().is_activated() && !self.locked_device().reset() {
-                    self.device_status |= FAILED;
-                }
-
-                // If the backend device driver doesn't support reset,
-                // just leave the device marked as FAILED.
-                if self.device_status & FAILED == 0 {
-                    self.reset();
-                }
-            }
-            _ => {
-                warn!(
-                    "invalid virtio driver status transition: 0x{:x} -> 0x{:x}",
-                    self.device_status, status
-                );
-            }
+        if self
+            .state
+            .set_device_status(status, self.device_interrupt.clone(), true)
+        {
+            self.interrupt.reset_status();
         }
     }
 }
@@ -385,20 +245,19 @@ impl BusDevice for MmioTransport {
                     0x10 => {
                         let mut features = self
                             .locked_device()
-                            .avail_features_by_page(self.features_select);
-                        if self.features_select == 1 {
+                            .avail_features_by_page(self.state.features_select);
+                        if self.state.features_select == 1 {
                             features |= 0x1; // enable support of VirtIO Version 1
                         }
                         features
                     }
-                    0x34 => self
-                        .queue_config
-                        .get(self.queue_select as usize)
-                        .map_or(0, |c| c.size as u32),
-                    0x44 => self.with_queue(0, |q| q.ready as u32),
+                    0x34 => self.state.queue_max_size(self.state.queue_select) as u32,
+                    0x44 => self
+                        .state
+                        .with_queue(self.state.queue_select, 0, |q| q.ready as u32),
                     0x60 => self.interrupt.status().load(Ordering::SeqCst) as u32,
-                    0x70 => self.device_status,
-                    0xfc => self.config_generation,
+                    0x70 => self.state.device_status,
+                    0xfc => self.state.config_generation,
                     0xb0..=0xbc => {
                         // For no SHM region or invalid region the kernel looks for length of -1
                         let (shm_base, shm_len) = if self.shm_region_select > 1 {
@@ -451,28 +310,28 @@ impl BusDevice for MmioTransport {
             0x00..=0xff if data.len() == 4 => {
                 let v = byte_order::read_le_u32(data);
                 match offset {
-                    0x14 => self.features_select = v,
+                    0x14 => self.state.features_select = v,
                     0x20 => {
                         if self.check_device_status(
                             device_status::DRIVER,
                             device_status::FEATURES_OK | device_status::FAILED,
                         ) {
                             self.locked_device()
-                                .ack_features_by_page(self.acked_features_select, v);
+                                .ack_features_by_page(self.state.acked_features_select, v);
                         } else {
                             warn!(
                                 "ack virtio features in invalid state 0x{:x}",
-                                self.device_status
+                                self.state.device_status
                             );
                         }
                     }
-                    0x24 => self.acked_features_select = v,
-                    0x30 => self.queue_select = v,
+                    0x24 => self.state.acked_features_select = v,
+                    0x30 => self.state.queue_select = v,
                     0x38 => self.update_queue_field(|q| q.size = v as u16),
                     0x44 => self.update_queue_field(|q| q.ready = v == 1),
                     0x50 => {
                         // Queue notification - write to the eventfd for the specified queue.
-                        if let Some(eventfd) = self.queue_evts.get(v as usize) {
+                        if let Some(eventfd) = self.state.queue_evts().get(v as usize) {
                             eventfd.write(1).unwrap();
                         } else {
                             warn!("invalid queue index for notification: {v}");
@@ -516,14 +375,7 @@ impl BusDevice for MmioTransport {
     }
 
     fn interrupt(&self, irq_mask: u32) -> std::io::Result<()> {
-        self.interrupt
-            .status()
-            .fetch_or(irq_mask as usize, Ordering::SeqCst);
-        // interrupt_evt() is safe to unwrap because the inner interrupt_evt is initialized in the
-        // constructor.
-        // write() is safe to unwrap because the inner syscall is tailored to be safe as well.
-        self.interrupt.event().write(1).unwrap();
-        Ok(())
+        self.interrupt.signal_bus_interrupt(irq_mask)
     }
 }
 
@@ -628,19 +480,63 @@ pub(crate) mod tests {
         // Transport now owns the queue_evts.
         assert_eq!(d.queue_evts().len(), 2);
 
-        d.queue_select = 0;
-        assert_eq!(d.with_queue(0, Queue::get_max_size), 16);
+        d.state.queue_select = 0;
+        assert_eq!(
+            d.state
+                .with_queue(d.state.queue_select, 0, Queue::get_max_size),
+            16
+        );
         assert!(d.with_queue_mut(|q| q.size = 16));
-        assert_eq!(d.queues.as_ref().unwrap()[d.queue_select as usize].size, 16);
+        assert_eq!(
+            d.state.queues.as_ref().unwrap()[d.state.queue_select as usize].size,
+            16
+        );
 
-        d.queue_select = 1;
-        assert_eq!(d.with_queue(0, Queue::get_max_size), 32);
+        d.state.queue_select = 1;
+        assert_eq!(
+            d.state
+                .with_queue(d.state.queue_select, 0, Queue::get_max_size),
+            32
+        );
         assert!(d.with_queue_mut(|q| q.size = 16));
-        assert_eq!(d.queues.as_ref().unwrap()[d.queue_select as usize].size, 16);
+        assert_eq!(
+            d.state.queues.as_ref().unwrap()[d.state.queue_select as usize].size,
+            16
+        );
 
-        d.queue_select = 2;
-        assert_eq!(d.with_queue(0, Queue::get_max_size), 0);
+        d.state.queue_select = 2;
+        assert_eq!(
+            d.state
+                .with_queue(d.state.queue_select, 0, Queue::get_max_size),
+            0
+        );
         assert!(!d.with_queue_mut(|q| q.size = 16));
+    }
+
+    #[test]
+    fn interrupt_transport_forwards_notifications_to_mmio() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let transport = MmioTransport::new(
+            mem,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(DummyDevice::new())),
+        )
+        .unwrap();
+
+        transport.device_interrupt.try_signal_used_queue().unwrap();
+        assert_eq!(
+            transport.interrupt.status().load(Ordering::SeqCst),
+            VIRTIO_MMIO_INT_VRING as usize
+        );
+
+        transport
+            .device_interrupt
+            .try_signal_config_change()
+            .unwrap();
+        assert_eq!(
+            transport.interrupt.status().load(Ordering::SeqCst),
+            (VIRTIO_MMIO_INT_VRING | VIRTIO_MMIO_INT_CONFIG) as usize
+        );
     }
 
     #[test]
@@ -678,14 +574,14 @@ pub(crate) mod tests {
         d.read(0, 0x0c, &mut buf[..]);
         assert_eq!(read_le_u32(&buf[..]), VENDOR_ID);
 
-        d.features_select = 0;
+        d.state.features_select = 0;
         d.read(0, 0x10, &mut buf[..]);
         assert_eq!(
             read_le_u32(&buf[..]),
             d.locked_device().avail_features_by_page(0)
         );
 
-        d.features_select = 1;
+        d.state.features_select = 1;
         d.read(0, 0x10, &mut buf[..]);
         assert_eq!(
             read_le_u32(&buf[..]),
@@ -705,7 +601,7 @@ pub(crate) mod tests {
         d.read(0, 0x70, &mut buf[..]);
         assert_eq!(read_le_u32(&buf[..]), 0);
 
-        d.config_generation = 5;
+        d.state.config_generation = 5;
         d.read(0, 0xfc, &mut buf[..]);
         assert_eq!(read_le_u32(&buf[..]), 5);
 
@@ -735,18 +631,18 @@ pub(crate) mod tests {
         write_le_u32(&mut buf[..4], 1);
 
         // Nothing should happen, because the slice len > 4.
-        d.features_select = 0;
+        d.state.features_select = 0;
         d.write(0, 0x14, &buf[..]);
-        assert_eq!(d.features_select, 0);
+        assert_eq!(d.state.features_select, 0);
 
         buf.pop();
 
-        assert_eq!(d.device_status, device_status::INIT);
+        assert_eq!(d.state.device_status, device_status::INIT);
         set_device_status(&mut d, device_status::ACKNOWLEDGE);
 
         // Acking features in invalid state shouldn't take effect.
         assert_eq!(d.locked_device().acked_features(), 0x0);
-        d.acked_features_select = 0x0;
+        d.state.acked_features_select = 0x0;
         write_le_u32(&mut buf[..], 1);
         d.write(0, 0x20, &buf[..]);
         assert_eq!(d.locked_device().acked_features(), 0x0);
@@ -766,18 +662,18 @@ pub(crate) mod tests {
 
         set_device_status(&mut d, device_status::ACKNOWLEDGE | device_status::DRIVER);
         assert_eq!(
-            d.device_status,
+            d.state.device_status,
             device_status::ACKNOWLEDGE | device_status::DRIVER
         );
 
         // now writes should work
-        d.features_select = 0;
+        d.state.features_select = 0;
         write_le_u32(&mut buf[..], 1);
         d.write(0, 0x14, &buf[..]);
-        assert_eq!(d.features_select, 1);
+        assert_eq!(d.state.features_select, 1);
 
         // Test acknowledging features on bus.
-        d.acked_features_select = 0;
+        d.state.acked_features_select = 0;
         write_le_u32(&mut buf[..], 0x124);
 
         // Set the device available features in order to make acknowledging possible.
@@ -785,10 +681,10 @@ pub(crate) mod tests {
         d.write(0, 0x20, &buf[..]);
         assert_eq!(d.locked_device().acked_features(), 0x124);
 
-        d.acked_features_select = 0;
+        d.state.acked_features_select = 0;
         write_le_u32(&mut buf[..], 2);
         d.write(0, 0x24, &buf[..]);
-        assert_eq!(d.acked_features_select, 2);
+        assert_eq!(d.state.acked_features_select, 2);
         set_device_status(
             &mut d,
             device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK,
@@ -796,54 +692,57 @@ pub(crate) mod tests {
 
         // Acking features in invalid state shouldn't take effect.
         assert_eq!(d.locked_device().acked_features(), 0x124);
-        d.acked_features_select = 0x0;
+        d.state.acked_features_select = 0x0;
         write_le_u32(&mut buf[..], 1);
         d.write(0, 0x20, &buf[..]);
         assert_eq!(d.locked_device().acked_features(), 0x124);
 
         // Setup queues
-        d.queue_select = 0;
+        d.state.queue_select = 0;
         write_le_u32(&mut buf[..], 3);
         d.write(0, 0x30, &buf[..]);
-        assert_eq!(d.queue_select, 3);
+        assert_eq!(d.state.queue_select, 3);
 
-        d.queue_select = 0;
-        assert_eq!(d.queues.as_ref().unwrap()[0].size, 0);
+        d.state.queue_select = 0;
+        assert_eq!(d.state.queues.as_ref().unwrap()[0].size, 0);
         write_le_u32(&mut buf[..], 16);
         d.write(0, 0x38, &buf[..]);
-        assert_eq!(d.queues.as_ref().unwrap()[0].size, 16);
+        assert_eq!(d.state.queues.as_ref().unwrap()[0].size, 16);
 
-        assert!(!d.queues.as_ref().unwrap()[0].ready);
+        assert!(!d.state.queues.as_ref().unwrap()[0].ready);
         write_le_u32(&mut buf[..], 1);
         d.write(0, 0x44, &buf[..]);
-        assert!(d.queues.as_ref().unwrap()[0].ready);
+        assert!(d.state.queues.as_ref().unwrap()[0].ready);
 
-        assert_eq!(d.queues.as_ref().unwrap()[0].desc_table.0, 0);
+        assert_eq!(d.state.queues.as_ref().unwrap()[0].desc_table.0, 0);
         write_le_u32(&mut buf[..], 123);
         d.write(0, 0x80, &buf[..]);
-        assert_eq!(d.queues.as_ref().unwrap()[0].desc_table.0, 123);
+        assert_eq!(d.state.queues.as_ref().unwrap()[0].desc_table.0, 123);
         d.write(0, 0x84, &buf[..]);
         assert_eq!(
-            d.queues.as_ref().unwrap()[0].desc_table.0,
+            d.state.queues.as_ref().unwrap()[0].desc_table.0,
             123 + (123 << 32)
         );
 
-        assert_eq!(d.queues.as_ref().unwrap()[0].avail_ring.0, 0);
+        assert_eq!(d.state.queues.as_ref().unwrap()[0].avail_ring.0, 0);
         write_le_u32(&mut buf[..], 124);
         d.write(0, 0x90, &buf[..]);
-        assert_eq!(d.queues.as_ref().unwrap()[0].avail_ring.0, 124);
+        assert_eq!(d.state.queues.as_ref().unwrap()[0].avail_ring.0, 124);
         d.write(0, 0x94, &buf[..]);
         assert_eq!(
-            d.queues.as_ref().unwrap()[0].avail_ring.0,
+            d.state.queues.as_ref().unwrap()[0].avail_ring.0,
             124 + (124 << 32)
         );
 
-        assert_eq!(d.queues.as_ref().unwrap()[0].used_ring.0, 0);
+        assert_eq!(d.state.queues.as_ref().unwrap()[0].used_ring.0, 0);
         write_le_u32(&mut buf[..], 125);
         d.write(0, 0xa0, &buf[..]);
-        assert_eq!(d.queues.as_ref().unwrap()[0].used_ring.0, 125);
+        assert_eq!(d.state.queues.as_ref().unwrap()[0].used_ring.0, 125);
         d.write(0, 0xa4, &buf[..]);
-        assert_eq!(d.queues.as_ref().unwrap()[0].used_ring.0, 125 + (125 << 32));
+        assert_eq!(
+            d.state.queues.as_ref().unwrap()[0].used_ring.0,
+            125 + (125 << 32)
+        );
 
         set_device_status(
             &mut d,
@@ -860,13 +759,13 @@ pub(crate) mod tests {
 
         // Write to an invalid address in generic register range.
         write_le_u32(&mut buf[..], 0xf);
-        d.config_generation = 0;
+        d.state.config_generation = 0;
         d.write(0, 0xfb, &buf[..]);
-        assert_eq!(d.config_generation, 0);
+        assert_eq!(d.state.config_generation, 0);
 
         // Write to an invalid length in generic register range.
         d.write(0, 0xfc, &buf[..2]);
-        assert_eq!(d.config_generation, 0);
+        assert_eq!(d.state.config_generation, 0);
 
         // Here we test writes/read into/from the device specific configuration space.
         let buf1 = vec![1; 0xeff];
@@ -895,12 +794,12 @@ pub(crate) mod tests {
         .unwrap();
 
         assert!(!d.locked_device().is_activated());
-        assert_eq!(d.device_status, device_status::INIT);
+        assert_eq!(d.state.device_status, device_status::INIT);
 
         set_device_status(&mut d, device_status::ACKNOWLEDGE);
         set_device_status(&mut d, device_status::ACKNOWLEDGE | device_status::DRIVER);
         assert_eq!(
-            d.device_status,
+            d.state.device_status,
             device_status::ACKNOWLEDGE | device_status::DRIVER
         );
 
@@ -910,7 +809,7 @@ pub(crate) mod tests {
             device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::DRIVER_OK,
         );
         assert_eq!(
-            d.device_status,
+            d.state.device_status,
             device_status::ACKNOWLEDGE | device_status::DRIVER
         );
 
@@ -919,14 +818,14 @@ pub(crate) mod tests {
             device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK,
         );
         assert_eq!(
-            d.device_status,
+            d.state.device_status,
             device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK
         );
 
         let mut buf = [0; 4];
-        let queue_len = d.queues.as_ref().unwrap().len();
+        let queue_len = d.state.queues.as_ref().unwrap().len();
         for q in 0..queue_len {
-            d.queue_select = q as u32;
+            d.state.queue_select = q as u32;
             write_le_u32(&mut buf[..], 16);
             d.write(0, 0x38, &buf[..]);
             write_le_u32(&mut buf[..], 1);
@@ -949,7 +848,7 @@ pub(crate) mod tests {
                 | device_status::DRIVER_OK,
         );
         assert_eq!(
-            d.device_status,
+            d.state.device_status,
             device_status::ACKNOWLEDGE
                 | device_status::DRIVER
                 | device_status::FEATURES_OK
@@ -968,9 +867,9 @@ pub(crate) mod tests {
 
         // Setup queue data structures
         let mut buf = [0; 4];
-        let queues_count = d.queues.as_ref().unwrap().len();
+        let queues_count = d.state.queues.as_ref().unwrap().len();
         for q in 0..queues_count {
-            d.queue_select = q as u32;
+            d.state.queue_select = q as u32;
             write_le_u32(&mut buf[..], 16);
             d.write(0, 0x38, &buf[..]);
             write_le_u32(&mut buf[..], 1);
@@ -987,7 +886,7 @@ pub(crate) mod tests {
                 | device_status::DRIVER_OK,
         );
         assert_eq!(
-            d.device_status,
+            d.state.device_status,
             device_status::ACKNOWLEDGE
                 | device_status::DRIVER
                 | device_status::FEATURES_OK
@@ -1009,19 +908,19 @@ pub(crate) mod tests {
         let mut buf = [0; 4];
 
         assert!(!d.locked_device().is_activated());
-        assert_eq!(d.device_status, 0);
+        assert_eq!(d.state.device_status, 0);
         activate_device(&mut d);
 
         // Marking device as FAILED should not affect device_activated state
         write_le_u32(&mut buf[..], 0x8f);
         d.write(0, 0x70, &buf[..]);
-        assert_eq!(d.device_status, 0x8f);
+        assert_eq!(d.state.device_status, 0x8f);
         assert!(d.locked_device().is_activated());
 
         // Nothing happens when backend driver doesn't support reset
         write_le_u32(&mut buf[..], 0x0);
         d.write(0, 0x70, &buf[..]);
-        assert_eq!(d.device_status, 0x8f);
+        assert_eq!(d.state.device_status, 0x8f);
         assert!(d.locked_device().is_activated());
     }
 

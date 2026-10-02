@@ -23,6 +23,8 @@ impl TestFreeBsdGvproxyTcpGuestConnect {
 #[host]
 mod host {
     use super::*;
+    #[cfg(feature = "dynamic-linking")]
+    use krun::DeviceManager;
 
     use crate::common::init_krun;
     #[cfg(feature = "dynamic-linking")]

@@ -19,7 +19,7 @@ use std::sync::{LazyLock, OnceLock};
 use std::thread;
 
 use anyhow::Context;
-use krun::VirglRendererFlags;
+use krun::{DeviceManager, VirglRendererFlags};
 use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
 
 static LIBKRUN: OnceLock<Library> = OnceLock::new();
