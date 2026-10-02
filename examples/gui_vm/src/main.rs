@@ -133,6 +133,10 @@ struct Args {
     #[arg(long)]
     acpi: bool,
 
+    /// Connect virtio-net to a passt Unix stream socket
+    #[arg(long)]
+    passt_socket: Option<CString>,
+
     // Display specifications in the format WIDTHxHEIGHT[@FPS][:DPIdpi|:PHYSICAL_WIDTHxPHYSICAL_HEIGHTmm]
     #[clap(long, value_parser = parse_display)]
     display: Vec<DisplayArg>,
@@ -248,6 +252,9 @@ fn load_krun(args: &Args) -> anyhow::Result<()> {
             symbols.push(KrunPayloadAppendCmdline);
         }
     }
+    if args.passt_socket.is_some() {
+        symbols.extend([KrunNetDeviceNewUnixstreamPath, KrunNetDeviceDestroy]);
+    }
     #[cfg(target_os = "linux")]
     if args.vhost_user_gpu.is_some() {
         symbols.extend([
@@ -356,6 +363,20 @@ fn krun_thread(
                 .map_err(|e| anyhow::anyhow!("BlockDevice::new: {e}"))?;
         devices.add(disk);
     }
+    if let Some(socket) = &args.passt_socket {
+        let mac = [0x52, 0x54, 0x00, 0x44, 0x00, 0x01];
+        let features = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 14);
+        let network = krun::NetDevice::new_unixstream_path(
+            "net0",
+            socket.to_str()?,
+            &mac,
+            features,
+            krun::NetFlags::empty(),
+        )
+        .map_err(|e| anyhow::anyhow!("NetDevice::new_unixstream_path: {e}"))?;
+        devices.add(network);
+    }
+
     let mut console_builder = krun::ConsoleDevice::builder();
     console_builder
         .add_default_console(
