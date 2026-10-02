@@ -74,8 +74,11 @@ endif
 ifeq ($(VHOST_USER),1)
     FEATURE_FLAGS += --features vhost-user
 endif
+
+INIT_BLOB_FEATURE_FLAGS = --features ffi
 ifeq ($(TIMESYNC),1)
     FEATURE_FLAGS += --features timesync
+    INIT_BLOB_FEATURE_FLAGS += --features timesync
 endif
 ifeq ($(FFI),1)
     FEATURE_FLAGS += --features ffi
@@ -216,7 +219,7 @@ clean-sysroot:
 
 $(LIBRARY_RELEASE_$(OS)): $(INIT_BINARY_BSD)
 	cargo build --release $(FEATURE_FLAGS)
-	cargo build --release -p krun-init-blob --features ffi
+	cargo build --release -p krun-init-blob $(INIT_BLOB_FEATURE_FLAGS)
 ifeq ($(SEV),1)
 	mv target/release/libkrun.so target/release/$(KRUN_BASE_$(OS))
 endif
@@ -234,7 +237,7 @@ endif
 
 $(LIBRARY_DEBUG_$(OS)): $(INIT_BINARY_BSD)
 	cargo build $(FEATURE_FLAGS)
-	cargo build -p krun-init-blob --features ffi
+	cargo build -p krun-init-blob $(INIT_BLOB_FEATURE_FLAGS)
 ifeq ($(SEV),1)
 	mv target/debug/libkrun.so target/debug/$(KRUN_BASE_$(OS))
 endif
