@@ -75,7 +75,7 @@ fn build_dsdt(virtio_mmio_devices: &[(u64, u32)]) -> Vec<u8> {
         let hid = Name::new(Path::new("_HID"), &"LNRO0005");
         let uid = Name::new(Path::new("_UID"), &(i as u32));
         let mem = Memory32Fixed::new(true, mmio_base as u32, 0x1000);
-        let irq_res = Interrupt::new(true, false, false, false, irq);
+        let irq_res = Interrupt::new(true, true, false, false, irq);
         let crs = Name::new(
             Path::new("_CRS"),
             &ResourceTemplate::new(vec![&mem, &irq_res]),
@@ -287,6 +287,22 @@ mod tests {
         // Even with no virtio devices, ISA devices are still present
         let length = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         assert!(length > 36);
+    }
+
+    #[test]
+    fn dsdt_virtio_interrupts_are_edge_triggered() {
+        let devices = [(0xd000_0000, 5u32), (0xd000_1000, 6)];
+        let bytes = build_dsdt(&devices);
+
+        for (_, irq) in devices {
+            let mut descriptor = vec![0x89, 6, 0, 0x03, 1];
+            descriptor.extend_from_slice(&irq.to_le_bytes());
+            assert!(
+                bytes
+                    .windows(descriptor.len())
+                    .any(|window| window == descriptor)
+            );
+        }
     }
 
     #[test]
