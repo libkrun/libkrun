@@ -39,6 +39,20 @@ struct DisplayArg {
     touch: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VirtiofsArg {
+    tag: String,
+    host_dir: String,
+}
+
+fn parse_virtiofs(value: &str) -> Result<VirtiofsArg, String> {
+    let (tag, host_dir) = value.split_once('=').ok_or("Expected TAG=HOST_DIR")?;
+    Ok(VirtiofsArg {
+        tag: tag.to_string(),
+        host_dir: host_dir.to_string(),
+    })
+}
+
 /// Parses a display settings string.
 /// The expected format is "WIDTHxHEIGHT[@FPS][:DPIdpi|:PHYSICAL_WIDTHxPHYSICAL_HEIGHTmm]".
 fn parse_display(display_string: &str) -> Result<DisplayArg, String> {
@@ -137,6 +151,19 @@ struct Args {
     #[arg(long)]
     passt_socket: Option<CString>,
 
+    /// Share a writable host directory over virtiofs; repeat for multiple shares
+    ///
+    /// Use TAG=HOST_DIR with a distinct tag for each share. Tags contain 1 to 36
+    /// bytes; /dev/root is reserved when using --root-dir. Quote the argument
+    /// when the host path contains spaces.
+    ///
+    /// Mount in the guest with: mount -t virtiofs TAG /mount/point
+    ///
+    /// The guest kernel needs virtiofs support. Guest writes modify host files
+    /// subject to host permissions; UID/GID values are not remapped.
+    #[arg(long, value_name = "TAG=HOST_DIR", value_parser = parse_virtiofs)]
+    virtiofs: Vec<VirtiofsArg>,
+
     // Display specifications in the format WIDTHxHEIGHT[@FPS][:DPIdpi|:PHYSICAL_WIDTHxPHYSICAL_HEIGHTmm]
     #[clap(long, value_parser = parse_display)]
     display: Vec<DisplayArg>,
@@ -231,7 +258,7 @@ fn load_krun(args: &Args) -> anyhow::Result<()> {
         KrunVmmDestroy,
         KrunVmmRun,
     ];
-    if args.root_dir.is_some() {
+    if args.root_dir.is_some() || !args.virtiofs.is_empty() {
         symbols.extend([KrunFsDeviceNew, KrunFsDeviceDestroy]);
     }
     if args.executable.is_some() {
@@ -363,6 +390,14 @@ fn krun_thread(
                 .map_err(|e| anyhow::anyhow!("BlockDevice::new: {e}"))?;
         devices.add(disk);
     }
+
+    for share in &args.virtiofs {
+        let filesystem = krun::FsDevice::new(&share.tag, &share.host_dir).map_err(|e| {
+            anyhow::anyhow!("Failed to share {} as {}: {e}", share.host_dir, share.tag)
+        })?;
+        devices.add(filesystem);
+    }
+
     if let Some(socket) = &args.passt_socket {
         let mac = [0x52, 0x54, 0x00, 0x44, 0x00, 0x01];
         let features = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 14);
