@@ -21,10 +21,9 @@ members = [
 exclude = [
     "examples/gtk_display",
     "init/init-binary",
+    "init/aws-nitro",
 ]
 resolver = "2"
-
-[profile.dev]
 #panic = "abort"
 
 [profile.release]

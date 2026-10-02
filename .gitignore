@@ -10,7 +10,7 @@ __pycache__
 /libkrun_init.pc
 init/init
 init/init-binary/init-*
-init/nitro/init
+init/aws-nitro/init
 examples/chroot_vm
 examples/launch-tee
 examples/boot_efi
