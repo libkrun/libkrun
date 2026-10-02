@@ -4,16 +4,19 @@
 // Portions Copyright 2017 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
+#[cfg(windows)]
 use crate::Error as DeviceError;
 use crate::virtio::net::Result;
 use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
+#[cfg(windows)]
 use crate::virtio::queue::Error as QueueError;
 use crate::virtio::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
     TYPE_NET, VirtioDevice,
 };
 
-use super::backend::{ReadError, WriteError};
+#[cfg(windows)]
+use super::backend::WriteError;
 use super::worker::NetWorker;
 
 #[cfg(unix)]
@@ -24,27 +27,12 @@ use std::os::windows::io::RawSocket;
 use std::cmp;
 use std::io::Write;
 use std::path::PathBuf;
-use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
-use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
+use virtio_bindings::{virtio_net::VIRTIO_NET_F_MAC, virtio_ring::VIRTIO_RING_F_EVENT_IDX};
+use vm_memory::{ByteValued, GuestMemoryMmap};
 
 const VIRTIO_F_VERSION_1: u32 = 32;
 
-#[derive(Debug)]
-pub enum FrontendError {
-    DescriptorChainTooSmall,
-    EmptyQueue,
-    GuestMemory(GuestMemoryError),
-    QueueError(QueueError),
-    ReadOnlyDescriptor,
-}
-
-#[derive(Debug)]
-pub enum RxError {
-    Backend(ReadError),
-    DeviceError(DeviceError),
-}
-
+#[cfg(windows)]
 #[derive(Debug)]
 pub enum TxError {
     Backend(WriteError),
@@ -84,6 +72,7 @@ pub struct Net {
 
     avail_features: u64,
     acked_features: u64,
+    include_vnet_header: bool,
 
     pub(crate) device_state: DeviceState,
 
@@ -97,6 +86,7 @@ impl Net {
         cfg_backend: VirtioNetBackend,
         mac: [u8; 6],
         features: u32,
+        include_vnet_header: bool,
     ) -> Result<Self> {
         let avail_features = features as u64
             | (1 << VIRTIO_NET_F_MAC)
@@ -115,6 +105,7 @@ impl Net {
 
             avail_features,
             acked_features: 0u64,
+            include_vnet_header,
 
             device_state: DeviceState::Inactive,
             config,
@@ -196,6 +187,7 @@ impl VirtioDevice for Net {
             interrupt.clone(),
             mem.clone(),
             self.acked_features,
+            self.include_vnet_header,
             self.cfg_backend.clone(),
         ) {
             Ok(worker) => {
