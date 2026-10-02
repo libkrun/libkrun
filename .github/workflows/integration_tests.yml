@@ -78,7 +78,7 @@ jobs:
         run: TAG=`curl -sL https://api.github.com/repos/containers/libkrunfw/releases/latest |jq -r .tag_name` && curl -L -o /tmp/libkrunfw-x86_64.tgz https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-x86_64.tgz && mkdir tmp && tar xf /tmp/libkrunfw-x86_64.tgz -C tmp && sudo mv tmp/lib/x86_64-linux-gnu/* /lib/x86_64-linux-gnu
       
       - name: Integration tests (static)
-        run: KRUN_ENOMEM_WORKAROUND=1 KRUN_TEST_BASE_DIR=/tmp/libkrun-tests-static make test NET=1 BLK=1 IPERF_DURATION=3 TEST_FLAGS="--keep-all --github-summary"
+        run: KRUN_ENOMEM_WORKAROUND=1 KRUN_TEST_BASE_DIR=/tmp/libkrun-tests-static make test FFI=0 NET=1 BLK=1 IPERF_DURATION=3 TEST_FLAGS="--keep-all --github-summary"
 
       - name: Integration tests (FFI)
         run: KRUN_ENOMEM_WORKAROUND=1 KRUN_TEST_BASE_DIR=/tmp/libkrun-tests-ffi make test FFI=1 NET=1 BLK=1 IPERF_DURATION=3 TEST_FLAGS="--keep-all --github-summary"
@@ -169,7 +169,7 @@ jobs:
         run: rm -fr /tmp/libkrun-tests-static /tmp/libkrun-tests-ffi
       
       - name: Integration tests (static)
-        run: KRUN_ENOMEM_WORKAROUND=1 KRUN_NO_UNSHARE=1 KRUN_TEST_BASE_DIR=/tmp/libkrun-tests-static make test NET=1 BLK=1 IPERF_DURATION=3 TEST_FLAGS="--keep-all --github-summary"
+        run: KRUN_ENOMEM_WORKAROUND=1 KRUN_NO_UNSHARE=1 KRUN_TEST_BASE_DIR=/tmp/libkrun-tests-static make test FFI=0 NET=1 BLK=1 IPERF_DURATION=3 TEST_FLAGS="--keep-all --github-summary"
 
       - name: Integration tests (FFI)
         run: KRUN_ENOMEM_WORKAROUND=1 KRUN_NO_UNSHARE=1 KRUN_TEST_BASE_DIR=/tmp/libkrun-tests-ffi make test FFI=1 NET=1 BLK=1 IPERF_DURATION=3 TEST_FLAGS="--keep-all --github-summary"
