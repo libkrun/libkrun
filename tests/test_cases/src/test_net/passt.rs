@@ -1,11 +1,18 @@
 //! Passt backend for virtio-net test
 
-use crate::{ShouldRun, TestSetup};
 use nix::libc;
+use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::process::{Command, Stdio};
 
-fn passt_available() -> bool {
+use super::NetBackend;
+#[cfg(feature = "dynamic-linking")]
+use super::require_net_symbols;
+use crate::{ShouldRun, TestSetup};
+
+pub(crate) struct Passt;
+
+pub(crate) fn passt_available() -> bool {
     Command::new("which")
         .arg("passt")
         .output()
@@ -14,7 +21,6 @@ fn passt_available() -> bool {
 }
 
 fn start_passt() -> std::io::Result<OwnedFd> {
-    use std::os::fd::FromRawFd;
     use std::os::unix::process::CommandExt;
 
     let mut fds = [0 as libc::c_int; 2];
@@ -60,26 +66,39 @@ fn start_passt() -> std::io::Result<OwnedFd> {
     }
 }
 
-pub(crate) fn should_run() -> ShouldRun {
-    if cfg!(target_os = "macos") {
-        return ShouldRun::No("passt not supported on macOS");
+impl NetBackend for Passt {
+    #[cfg(feature = "dynamic-linking")]
+    fn require_symbols(&self) -> Result<(), libloading::Error> {
+        require_net_symbols()
     }
-    if !passt_available() {
-        return ShouldRun::No("passt not installed");
+
+    fn should_run(&self) -> ShouldRun {
+        if cfg!(target_os = "macos") {
+            return ShouldRun::No("passt not supported on macOS");
+        }
+        if !passt_available() {
+            return ShouldRun::No("passt not installed");
+        }
+        ShouldRun::Yes
     }
-    ShouldRun::Yes
-}
 
-pub(crate) fn setup_backend(_test_setup: &TestSetup) -> anyhow::Result<krun::NetDevice> {
-    let passt_fd = start_passt()?;
-    let mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
+    fn setup_backend(
+        &self,
+        devices: &mut krun::MmioDeviceManager<'_>,
+        _test_setup: &TestSetup,
+    ) -> anyhow::Result<()> {
+        let passt_fd = start_passt()?;
+        let mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
 
-    krun::NetDevice::new_unixstream_fd(
-        "net0",
-        passt_fd,
-        &mac,
-        crate::test_net::COMPAT_NET_FEATURES,
-        krun::NetFlags::empty(),
-    )
-    .map_err(|e| anyhow::anyhow!("NetDevice: {e:?}"))
+        let net_device = krun::NetDevice::new_unixstream_fd(
+            "net0",
+            passt_fd,
+            &mac,
+            crate::test_net::COMPAT_NET_FEATURES,
+            krun::NetFlags::empty(),
+        )
+        .map_err(|e| anyhow::anyhow!("NetDevice: {e:?}"))?;
+        devices.add(net_device);
+        Ok(())
+    }
 }

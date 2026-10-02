@@ -7,6 +7,9 @@ use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
 
+use super::NetBackend;
+#[cfg(feature = "dynamic-linking")]
+use super::require_net_symbols;
 use crate::{ShouldRun, TestSetup};
 
 const DEFAULT_TAP_NAME: &str = "tap0";
@@ -111,37 +114,7 @@ fn dnsmasq_available() -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn should_run() -> ShouldRun {
-    if cfg!(target_os = "macos") {
-        return ShouldRun::No("TAP not supported on macOS");
-    }
-    if let Ok(tap_name) = std::env::var("LIBKRUN_TAP_NAME") {
-        if !interface_exists(&tap_name) {
-            return ShouldRun::No("TAP interface not found");
-        }
-    } else if !std::path::Path::new("/dev/net/tun").exists() {
-        return ShouldRun::No("/dev/net/tun not available");
-    }
-    if !dnsmasq_available() {
-        return ShouldRun::No("dnsmasq not installed");
-    }
-    ShouldRun::Yes
-}
-
-pub(crate) fn cleanup() {
-    if let Ok(tun) = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/net/tun")
-    {
-        let mut ifr: Ifreq = unsafe { std::mem::zeroed() };
-        set_interface_name(&mut ifr, DEFAULT_TAP_NAME);
-        ifr.ifr_ifru.ifru_flags = IFF_TAP | IFF_NO_PI;
-        if unsafe { ioctl_tunsetiff(tun.as_raw_fd(), &ifr) }.is_ok() {
-            let _ = unsafe { ioctl_tunsetpersist(tun.as_raw_fd(), 0) };
-        }
-    }
-}
+pub(crate) struct Tap;
 
 fn start_dhcp_server(tap_name: &str, test_setup: &TestSetup) -> anyhow::Result<()> {
     let lease_file = test_setup.tmp_dir.join("dnsmasq.leases");
@@ -174,24 +147,69 @@ fn start_dhcp_server(tap_name: &str, test_setup: &TestSetup) -> anyhow::Result<(
     anyhow::bail!("dnsmasq did not start in time");
 }
 
-pub(crate) fn setup_backend(test_setup: &TestSetup) -> anyhow::Result<krun::NetDevice> {
-    let tap_name = if let Ok(name) = std::env::var("LIBKRUN_TAP_NAME") {
-        name
-    } else {
-        create_tap(DEFAULT_TAP_NAME)?;
-        configure_host_interface(DEFAULT_TAP_NAME, HOST_IP, NETMASK)
-            .map_err(|e| anyhow::anyhow!("Failed to configure TAP: {}", e))?;
-        start_dhcp_server(DEFAULT_TAP_NAME, test_setup)?;
-        DEFAULT_TAP_NAME.to_string()
-    };
+impl NetBackend for Tap {
+    #[cfg(feature = "dynamic-linking")]
+    fn require_symbols(&self) -> Result<(), libloading::Error> {
+        require_net_symbols()
+    }
 
-    let mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
+    fn should_run(&self) -> ShouldRun {
+        if cfg!(target_os = "macos") {
+            return ShouldRun::No("TAP not supported on macOS");
+        }
+        if let Ok(tap_name) = std::env::var("LIBKRUN_TAP_NAME") {
+            if !interface_exists(&tap_name) {
+                return ShouldRun::No("TAP interface not found");
+            }
+        } else if !std::path::Path::new("/dev/net/tun").exists() {
+            return ShouldRun::No("/dev/net/tun not available");
+        }
+        if !dnsmasq_available() {
+            return ShouldRun::No("dnsmasq not installed");
+        }
+        ShouldRun::Yes
+    }
 
-    krun::NetDevice::new_tap(
-        "net0",
-        &tap_name,
-        &mac,
-        crate::test_net::COMPAT_NET_FEATURES,
-    )
-    .map_err(|e| anyhow::anyhow!("NetDevice: {e:?}"))
+    fn setup_backend(
+        &self,
+        devices: &mut krun::MmioDeviceManager<'_>,
+        test_setup: &TestSetup,
+    ) -> anyhow::Result<()> {
+        let tap_name = if let Ok(name) = std::env::var("LIBKRUN_TAP_NAME") {
+            name
+        } else {
+            create_tap(DEFAULT_TAP_NAME)?;
+            configure_host_interface(DEFAULT_TAP_NAME, HOST_IP, NETMASK)
+                .map_err(|e| anyhow::anyhow!("Failed to configure TAP: {}", e))?;
+            start_dhcp_server(DEFAULT_TAP_NAME, test_setup)?;
+            DEFAULT_TAP_NAME.to_string()
+        };
+
+        let mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
+
+        let net_device = krun::NetDevice::new_tap(
+            "net0",
+            &tap_name,
+            &mac,
+            crate::test_net::COMPAT_NET_FEATURES,
+        )
+        .map_err(|e| anyhow::anyhow!("NetDevice: {e:?}"))?;
+        devices.add(net_device);
+        Ok(())
+    }
+
+    fn cleanup(&self) {
+        if let Ok(tun) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")
+        {
+            let mut ifr: Ifreq = unsafe { std::mem::zeroed() };
+            set_interface_name(&mut ifr, DEFAULT_TAP_NAME);
+            ifr.ifr_ifru.ifru_flags = IFF_TAP | IFF_NO_PI;
+            if unsafe { ioctl_tunsetiff(tun.as_raw_fd(), &ifr) }.is_ok() {
+                let _ = unsafe { ioctl_tunsetpersist(tun.as_raw_fd(), 0) };
+            }
+        }
+    }
 }
