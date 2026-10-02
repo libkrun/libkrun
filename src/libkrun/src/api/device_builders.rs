@@ -1766,9 +1766,9 @@ impl<'a> AttachDevice<'a> for VhostUserDevice {
 
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
-        let (gpu_display, display_backend) = match self.backend {
-            Some(b) => (b.displays.first().cloned(), Some(b.inner)),
-            None => (None, None),
+        let (gpu_displays, display_backend) = match self.backend {
+            Some(b) => (b.displays, Some(b.inner)),
+            None => (Vec::new(), None),
         };
         let device = devices::virtio::VhostUserDevice::new(
             &self.socket_path,
@@ -1776,7 +1776,7 @@ impl<'a> AttachDevice<'a> for VhostUserDevice {
             self.name.clone(),
             self.num_queues,
             &self.queue_sizes,
-            gpu_display,
+            gpu_displays,
             display_backend,
         )
         .map_err(|e| VmmError::Internal(format!("vhost-user: {e}")))?;

@@ -254,8 +254,8 @@ pub struct VhostUserDevice {
     /// GPU socket for receiving GPU protocol messages (GPU devices only)
     gpu_socket: Option<UnixStream>,
 
-    /// User-configured display resolution for GPU devices (display size, not guest scanout).
-    gpu_display_info: Option<DisplayInfo>,
+    /// User-configured display resolutions for GPU devices (indexed by scanout_id).
+    gpu_display_info: Vec<DisplayInfo>,
 
     /// Shared memory region for devices that need it (e.g., media, GPU)
     shm_region: Option<VirtioShmRegion>,
@@ -308,7 +308,7 @@ impl VhostUserDevice {
         device_name: String,
         num_queues: u16,
         queue_sizes: &[u16],
-        gpu_display: Option<DisplayInfo>,
+        gpu_displays: Vec<DisplayInfo>,
         display_backend: Option<DisplayBackend<'static>>,
     ) -> IoResult<Self> {
         debug!(
@@ -388,9 +388,13 @@ impl VhostUserDevice {
             .collect();
 
         let gpu_display_info = if device_type == VIRTIO_ID_GPU {
-            Some(gpu_display.unwrap_or_else(|| DisplayInfo::new(1024, 768)))
+            if gpu_displays.is_empty() {
+                vec![DisplayInfo::new(1024, 768)]
+            } else {
+                gpu_displays
+            }
         } else {
-            None
+            Vec::new()
         };
 
         Ok(Self {
@@ -944,16 +948,21 @@ impl VhostUserDevice {
         let mut display_info = VirtioGpuRespDisplayInfo::default();
         display_info.hdr.type_ = VIRTIO_GPU_RESP_OK_DISPLAY_INFO;
 
-        display_info.pmodes[0] = VirtioGpuDisplayOne {
-            r: VirtioGpuRect {
-                x: 0,
-                y: 0,
-                width: self.gpu_display_info.as_ref().map_or(0, |d| d.width),
-                height: self.gpu_display_info.as_ref().map_or(0, |d| d.height),
-            },
-            enabled: 1,
-            flags: 0,
-        };
+        for (idx, display) in self.gpu_display_info.iter().enumerate() {
+            if idx >= display_info.pmodes.len() {
+                break;
+            }
+            display_info.pmodes[idx] = VirtioGpuDisplayOne {
+                r: VirtioGpuRect {
+                    x: 0,
+                    y: 0,
+                    width: display.width,
+                    height: display.height,
+                },
+                enabled: 1,
+                flags: 0,
+            };
+        }
 
         if let Err(e) = self.send_gpu_response(request, &display_info) {
             error!("{}: failed to send DISPLAY_INFO: {}", self.device_name, e);
@@ -991,11 +1000,12 @@ impl VhostUserDevice {
 
         let scanout_id = scanout.scanout_id;
 
-        // Validate scanout ID - frontend only advertises scanout 0
-        if scanout_id != 0 {
+        if scanout_id as usize >= self.gpu_display_info.len() {
             error!(
-                "{}: invalid scanout_id {} (only 0 is supported)",
-                self.device_name, scanout_id
+                "{}: invalid scanout_id {} (max {})",
+                self.device_name,
+                scanout_id,
+                self.gpu_display_info.len() - 1
             );
             return;
         }
@@ -1015,9 +1025,9 @@ impl VhostUserDevice {
             self.device_name, scanout.width, scanout.height
         );
 
-        let display_info = self.gpu_display_info.as_ref();
-        let display_width = display_info.map_or(scanout.width, |d| d.width);
-        let display_height = display_info.map_or(scanout.height, |d| d.height);
+        let display_info = &self.gpu_display_info[scanout_id as usize];
+        let display_width = display_info.width;
+        let display_height = display_info.height;
 
         if let Some(display) = self.get_display_instance()
             && let Err(e) = display.configure_scanout(
@@ -1052,10 +1062,12 @@ impl VhostUserDevice {
         let update_width = update.width as usize;
         let update_height = update.height as usize;
 
-        if scanout_id != 0 {
+        if scanout_id as usize >= self.gpu_display_info.len() {
             error!(
-                "{}: invalid scanout_id {} (only 0 is supported)",
-                self.device_name, scanout_id
+                "{}: invalid scanout_id {} (max {})",
+                self.device_name,
+                scanout_id,
+                self.gpu_display_info.len() - 1
             );
             return;
         }
@@ -1066,14 +1078,9 @@ impl VhostUserDevice {
             return;
         }
 
-        let scanout_width = self
-            .gpu_display_info
-            .as_ref()
-            .map_or(update_width, |d| d.width as usize);
-        let scanout_height = self
-            .gpu_display_info
-            .as_ref()
-            .map_or(update_height, |d| d.height as usize);
+        let display_info = &self.gpu_display_info[scanout_id as usize];
+        let scanout_width = display_info.width as usize;
+        let scanout_height = display_info.height as usize;
 
         if update_x + update_width > scanout_width || update_y + update_height > scanout_height {
             error!(
@@ -1118,22 +1125,29 @@ impl VhostUserDevice {
         }
     }
 
-    fn send_gpu_edid(&mut self, request: GpuBackendReq, _payload: &[u8]) {
+    fn send_gpu_edid(&mut self, request: GpuBackendReq, payload: &[u8]) {
         const VIRTIO_GPU_RESP_OK_EDID: u32 = 0x1104;
 
-        // EDID reflects the display (monitor) capabilities, not the current guest scanout.
-        // The same EDID is returned for all scanout IDs the backend queries.
-        let Some(ref display_info) = self.gpu_display_info else {
+        if payload.len() < 4 {
+            error!("{}: GET_EDID payload too short", self.device_name);
             return;
-        };
-        let edid_bytes = display_info.edid_bytes();
+        }
+
+        let scanout_id = u32::from_ne_bytes(payload[0..4].try_into().unwrap());
 
         let mut edid_resp = VirtioGpuRespGetEdid::default();
         edid_resp.hdr.type_ = VIRTIO_GPU_RESP_OK_EDID;
-        edid_resp.size = edid_bytes.len() as u32;
 
-        let copy_len = edid_bytes.len().min(edid_resp.edid.len());
-        edid_resp.edid[..copy_len].copy_from_slice(&edid_bytes[..copy_len]);
+        // Return empty EDID for scanouts beyond configured displays
+        if let Some(display_info) = self.gpu_display_info.get(scanout_id as usize) {
+            let edid_bytes = display_info.edid_bytes();
+            edid_resp.size = edid_bytes.len() as u32;
+            let copy_len = edid_bytes.len().min(edid_resp.edid.len());
+            edid_resp.edid[..copy_len].copy_from_slice(&edid_bytes[..copy_len]);
+        } else {
+            // size=0 indicates no EDID (scanout has no display)
+            edid_resp.size = 0;
+        }
 
         if let Err(e) = self.send_gpu_response(request, &edid_resp) {
             error!("{}: failed to send EDID: {}", self.device_name, e);
@@ -1159,10 +1173,12 @@ impl VhostUserDevice {
             .copy_from_slice(&payload[..header_size]);
 
         let scanout_id = scanout.scanout_id;
-        if scanout_id != 0 {
+        if scanout_id as usize >= self.gpu_display_info.len() {
             error!(
-                "{}: invalid scanout_id {} (only 0 is supported)",
-                self.device_name, scanout_id
+                "{}: invalid scanout_id {} (max {})",
+                self.device_name,
+                scanout_id,
+                self.gpu_display_info.len() - 1
             );
             close_fds_on_error(fds);
             return;
@@ -1205,14 +1221,9 @@ impl VhostUserDevice {
             0xffffffffffffffff // DRM_FORMAT_MOD_INVALID
         };
 
-        let display_width = self
-            .gpu_display_info
-            .as_ref()
-            .map_or(scanout.width, |d| d.width);
-        let display_height = self
-            .gpu_display_info
-            .as_ref()
-            .map_or(scanout.height, |d| d.height);
+        let display_info = &self.gpu_display_info[scanout_id as usize];
+        let display_width = display_info.width;
+        let display_height = display_info.height;
 
         let Some(display) = self.get_display_instance() else {
             close_fds_on_error(fds);
@@ -1261,10 +1272,12 @@ impl VhostUserDevice {
         rect.as_mut_slice()
             .copy_from_slice(&payload[4..4 + mem::size_of::<VirtioGpuRect>()]);
 
-        if scanout_id != 0 {
+        if scanout_id as usize >= self.gpu_display_info.len() {
             error!(
-                "{}: invalid scanout_id {} (only 0 is supported)",
-                self.device_name, scanout_id
+                "{}: invalid scanout_id {} (max {})",
+                self.device_name,
+                scanout_id,
+                self.gpu_display_info.len() - 1
             );
             self.send_gpu_empty_response(request);
             return;
