@@ -501,7 +501,7 @@ typedef void (*krun_vsock_device_destroy_fn)(KrunVsockDevice handle);
  * Create a new block device.
  *
  * Defaults to read-write (`read_only = false`), cached I/O (`direct_io = false`),
- * and [`SyncMode::Relaxed`].
+ * [`SyncMode::Relaxed`], and serialized reads (`parallel_reads = false`).
  */
 KrunBlockDevice krun_block_device_new(KrunStr id, KrunStr disk_image_path, uint32_t format, KrunError* err_out);
 typedef KrunBlockDevice (*krun_block_device_new_fn)(KrunStr id, KrunStr disk_image_path, uint32_t format, KrunError* err_out);
@@ -519,6 +519,13 @@ typedef void (*krun_block_device_set_direct_io_fn)(KrunBlockDevice handle, bool 
  */
 void krun_block_device_set_sync_mode(KrunBlockDevice handle, uint32_t sync_mode);
 typedef void (*krun_block_device_set_sync_mode_fn)(KrunBlockDevice handle, uint32_t sync_mode);
+/**
+ * Serve guest reads on a host thread pool with out-of-order completion.
+ *
+ * Disabled by default. Writes, flushes, and discards stay on the device thread.
+ */
+void krun_block_device_set_parallel_reads(KrunBlockDevice handle, bool enabled);
+typedef void (*krun_block_device_set_parallel_reads_fn)(KrunBlockDevice handle, bool enabled);
 void krun_block_device_destroy(KrunBlockDevice handle);
 typedef void (*krun_block_device_destroy_fn)(KrunBlockDevice handle);
 
