@@ -360,6 +360,9 @@ impl Vcpu {
             arch::x86_64::regs::setup_sregs(guest_mem, &self.whp_vcpu)
                 .map_err(Error::SREGSConfiguration)?;
             arch::x86_64::msr::setup_msrs(&self.whp_vcpu).map_err(Error::MSRSConfiguration)?;
+        } else {
+            arch::x86_64::regs::setup_firmware_regs(&self.whp_vcpu, kernel_start_addr.raw_value())
+                .map_err(Error::REGSConfiguration)?;
         }
 
         Ok(())
@@ -523,6 +526,7 @@ impl Vcpu {
                 }
                 Ok(VcpuEmulation::Handled)
             }
+            VcpuExitReason::ApicEoi => Ok(VcpuEmulation::Handled),
             _ => {
                 error!(
                     "vCPU {} unhandled or unexpected exit reason: {:?}",

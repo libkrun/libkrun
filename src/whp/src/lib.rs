@@ -27,10 +27,10 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks, WHvRequestInterrupt,
     WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
     WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException,
-    WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
-    WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64IoPortAccess,
-    WHvRunVpExitReasonX64MsrAccess, WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters,
-    WHvSetupPartition, WHvX64LocalApicEmulationModeXApic,
+    WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64ApicEoi, WHvRunVpExitReasonX64Cpuid,
+    WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64InterruptWindow,
+    WHvRunVpExitReasonX64IoPortAccess, WHvRunVpExitReasonX64MsrAccess, WHvSetPartitionProperty,
+    WHvSetVirtualProcessorRegisters, WHvSetupPartition, WHvX64LocalApicEmulationModeXApic,
     WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRax, WHvX64RegisterRbx,
     WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
 };
@@ -755,6 +755,7 @@ pub enum VcpuExitReason {
     UnrecoverableException,
     InvalidVpRegisterValue,
     UnsupportedFeature,
+    ApicEoi,
     Unknown(u32),
 }
 
@@ -1023,6 +1024,7 @@ impl WhpVcpu {
             WHvRunVpExitReasonUnrecoverableException => VcpuExitReason::UnrecoverableException,
             WHvRunVpExitReasonInvalidVpRegisterValue => VcpuExitReason::InvalidVpRegisterValue,
             WHvRunVpExitReasonUnsupportedFeature => VcpuExitReason::UnsupportedFeature,
+            WHvRunVpExitReasonX64ApicEoi => VcpuExitReason::ApicEoi,
             _ => VcpuExitReason::Unknown(ctx.ExitReason as u32),
         }
     }
