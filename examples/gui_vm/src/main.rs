@@ -110,8 +110,12 @@ struct Args {
     disk_format: Option<DiskFormat>,
 
     /// External kernel image
-    #[arg(long, required_unless_present = "root_dir")]
+    #[arg(long, required_unless_present_any = ["root_dir", "libkrunfw_kernel"], conflicts_with = "libkrunfw_kernel")]
     kernel: Option<CString>,
+
+    /// Use the embedded libkrunfw kernel with the root disk, without an initramfs
+    #[arg(long, requires = "root_disk", conflicts_with_all = ["kernel", "initrd", "kernel_format"])]
+    libkrunfw_kernel: bool,
 
     /// Kernel format: elf, raw, pe-gz, image-bz2, image-gz, or image-zstd
     #[arg(long, requires = "kernel", value_parser = parse_kernel_format)]
