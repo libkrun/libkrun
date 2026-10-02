@@ -9,7 +9,8 @@ use utils::windows::RawFd;
 
 use super::super::Queue as VirtQueue;
 use super::muxer::{MuxerRx, ProxyMap, push_packet};
-use super::muxer_rxq::MuxerRxQ;
+use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
+use super::packet::VsockPacket;
 use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
 use super::tsi_stream::TsiStreamProxy;
 
@@ -64,6 +65,31 @@ impl MuxerThread {
             .name("vsock muxer".into())
             .spawn(|| self.work())
             .unwrap();
+    }
+
+    fn drain_rxq(&self) -> bool {
+        let mut queue = self.queue.lock().unwrap();
+        let mut rxq = self.rxq.lock().unwrap();
+        let mut drained = false;
+
+        while let Some(rx) = rxq.pop() {
+            if let Some(head) = queue.pop(&self.mem) {
+                if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
+                    rx_to_pkt(self.cid, rx, &mut pkt);
+                    if let Err(e) =
+                        queue.add_used(&self.mem, head.index, pkt.hdr().len() as u32 + pkt.len())
+                    {
+                        error!("failed to add used elements to the queue: {e:?}");
+                    }
+                    drained = true;
+                }
+            } else {
+                rxq.push(rx);
+                break;
+            }
+        }
+
+        drained
     }
 
     fn send_credit_request(&self, credit_rx: MuxerRx) {
@@ -195,6 +221,10 @@ impl MuxerThread {
         self.create_listening_ipc_sockets();
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
+            if self.drain_rxq() {
+                self.interrupt.signal_used_queue();
+            }
+
             match self
                 .epoll
                 .wait(epoll_events.len(), -1, epoll_events.as_mut_slice())
