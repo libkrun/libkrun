@@ -9,7 +9,7 @@ use windows_sys::Win32::{
     Foundation::FALSE,
     Storage::FileSystem::{ReadFile, WriteFile},
     System::{
-        Console::{CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo},
+        Console::{CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetNumberOfConsoleInputEvents},
         Threading::{INFINITE, WaitForMultipleObjects, WaitForSingleObject},
     },
 };
@@ -60,6 +60,17 @@ impl AsRawHandle for PortInputHandle {
 
 impl PortInput for PortInputHandle {
     fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // A synchronous ReadFile on a console handle cannot be interrupted by
+        // the port stop event. Check first so the RX thread waits on both the
+        // console and stop handles instead of getting stuck during teardown.
+        let mut event_count = 0;
+        if unsafe { GetNumberOfConsoleInputEvents(self.as_raw_handle(), &mut event_count) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if event_count == 0 {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+
         let len = u32::try_from(buf.len()).map_err(|_| {
             io::Error::new(ErrorKind::InvalidInput, "buffer length exceeds u32::MAX")
         })?;
