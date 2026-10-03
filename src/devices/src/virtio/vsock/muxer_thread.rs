@@ -207,7 +207,13 @@ impl MuxerThread {
 
                         let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
                             let mut proxy = proxy_lock.lock().unwrap();
-                            proxy.process_event(evset)
+                            let mut update = proxy.process_event(evset);
+                            // Credit updates must not rearm polling before this
+                            // event's decision to stop polling has been applied.
+                            if let Some((id, fd, events)) = update.polling.take() {
+                                self.update_polling(id, fd, events);
+                            }
+                            update
                         });
 
                         if let Some(update) = update {

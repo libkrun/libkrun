@@ -123,7 +123,10 @@ pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> Re
             }
             Err(e) => {
                 debug!("recv_pkt: recv error: {e:?}");
-                RecvPkt::Error
+                match e {
+                    Errno::EAGAIN | Errno::EINTR => RecvPkt::Error,
+                    _ => RecvPkt::Close,
+                }
             }
         }
     } else {
@@ -264,6 +267,10 @@ pub(crate) fn update_peer_credit(proxy: &mut super::UnixProxy, pkt: &VsockPacket
     proxy.peer_buf_alloc = pkt.buf_alloc();
     proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
+    if proxy.status != ProxyStatus::WaitingCreditUpdate || proxy.peer_avail_credit() == 0 {
+        return ProxyUpdate::default();
+    }
+
     proxy.status = ProxyStatus::Connected;
 
     ProxyUpdate {
@@ -346,7 +353,14 @@ pub(crate) fn release(proxy: &mut super::UnixProxy) -> ProxyUpdate {
 pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
 
-    if evset.contains(EventSet::HANG_UP) {
+    // A hung-up stream can still contain data, including more than the guest
+    // currently has buffers or credit for. Only recv() can establish EOF.
+    if evset.contains(EventSet::HANG_UP)
+        && !matches!(
+            proxy.status,
+            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+        )
+    {
         debug!("process_event: HANG_UP");
 
         if proxy.status == ProxyStatus::Connecting {
@@ -363,7 +377,7 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
         return update;
     }
 
-    if evset.contains(EventSet::IN) {
+    if evset.intersects(EventSet::IN | EventSet::HANG_UP) {
         debug!("process_event: IN");
         if proxy.status == ProxyStatus::Connected {
             let (signal_queue, wait_credit) = proxy.recv_pkt();
@@ -388,6 +402,7 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
                 proxy.push_reset();
                 update.signal_queue = true;
                 update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
+                update.remove_proxy = ProxyRemoval::Deferred;
                 return update;
             } else if proxy.status == ProxyStatus::WaitingCreditUpdate {
                 debug!("process_event: WaitingCreditUpdate");
