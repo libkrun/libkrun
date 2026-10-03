@@ -9,7 +9,6 @@ use crate::DeviceType;
 use crate::legacy::IrqChip;
 use crate::legacy::aia::AIADevice;
 use arch::riscv64::get_fdt_addr;
-use arch::riscv64::layout::IRQ_BASE;
 use arch::{ArchMemoryInfo, InitrdConfig};
 use vm_fdt::{Error as FdtError, FdtWriter};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryError, GuestMemoryMmap};
@@ -230,7 +229,7 @@ fn create_virtio_node<T: DeviceInfoForFDT + Clone + Debug>(
 ) -> Result<()> {
     let device_reg_prop = [dev_info.addr(), dev_info.length()];
     #[cfg(target_os = "linux")]
-    let irq = [dev_info.irq() - IRQ_BASE, IRQ_TYPE_LEVEL_HI];
+    let irq = [dev_info.irq(), IRQ_TYPE_LEVEL_HI];
 
     let virtio_node = fdt.begin_node(&format!("virtio_mmio@{:x}", dev_info.addr()))?;
     fdt.property_string("compatible", "virtio,mmio")?;
@@ -247,7 +246,7 @@ fn create_serial_node<T: DeviceInfoForFDT + Clone + Debug>(
     dev_info: &T,
 ) -> Result<()> {
     let serial_reg_prop = [dev_info.addr(), dev_info.length()];
-    let irq = [dev_info.irq() - IRQ_BASE, IRQ_TYPE_LEVEL_HI];
+    let irq = [dev_info.irq(), IRQ_TYPE_LEVEL_HI];
 
     let serial_node = fdt.begin_node(&format!("serial@{:x}", dev_info.addr()))?;
     fdt.property_string("compatible", "ns16550a")?;

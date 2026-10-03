@@ -29,7 +29,7 @@ impl KvmAia {
         let device_fd = vm.create_device(&mut aia_device).unwrap();
 
         // Setting up the number of wired interrupt sources
-        let nr_irqs: u32 = arch::riscv64::layout::IRQ_MAX - arch::riscv64::layout::IRQ_BASE;
+        let nr_irqs: u32 = arch::riscv64::layout::IRQ_MAX - arch::riscv64::layout::IRQ_BASE + 1;
         let nr_irqs_ptr = &nr_irqs as *const u32;
         let attr = kvm_bindings::kvm_device_attr {
             group: kvm_bindings::KVM_DEV_RISCV_AIA_GRP_CONFIG,
