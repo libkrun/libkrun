@@ -1,5 +1,7 @@
 #[cfg(not(windows))]
 use std::io;
+#[cfg(windows)]
+use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -134,11 +136,13 @@ fn read_to_desc(
 ) -> Result<usize, GuestMemoryError> {
     // Read into a temp host buffer first and then copy to guest memory.
     // If we read directly into guest memory, ReadFile would block while holding
-    // a reference to it, which deadlocks WHP vCPUs trying to access that same memory.
+    // a reference to it, which deadlocks WHv vCPUs trying to access that same memory.
     let mut host_buf = vec![0; desc.len as usize];
-    let bytes_read = input
-        .read_bytes(&mut host_buf)
-        .map_err(GuestMemoryError::IOError)?;
+    let bytes_read = match input.read_bytes(&mut host_buf) {
+        Ok(bytes_read) => bytes_read,
+        Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(0),
+        Err(e) => return Err(GuestMemoryError::IOError(e)),
+    };
     if bytes_read == 0 {
         *eof = true;
         return Ok(0);
