@@ -38,13 +38,14 @@ impl fmt::Display for Error {
 type Result<T> = ::std::result::Result<T, Error>;
 
 /// The `PortIODeviceManager` is a wrapper that is used for registering legacy devices
-/// on an I/O Bus. It currently manages the uart and i8042 devices.
+/// on an I/O Bus. It currently manages the uart, i8042, and ACPI PM devices.
 /// The `LegacyDeviceManger` should be initialized only by using the constructor.
 pub struct PortIODeviceManager {
     pub io_bus: devices::Bus,
     pub cmos: Arc<Mutex<devices::legacy::Cmos>>,
     pub stdio_serial: Vec<Arc<Mutex<devices::legacy::Serial>>>,
     pub i8042: Arc<Mutex<devices::legacy::I8042Device>>,
+    pub acpi_pm: Arc<Mutex<devices::legacy::AcpiPm>>,
     #[cfg(windows)]
     pub pit: Arc<Mutex<devices::legacy::Pit>>,
     pub com_evt_1: EventFd,
@@ -81,7 +82,7 @@ impl BusDevice for PcControlPorts {
 }
 
 impl PortIODeviceManager {
-    /// Create a new DeviceManager handling legacy devices (uart, i8042).
+    /// Create a new DeviceManager handling legacy devices (uart, i8042, ACPI PM).
     pub fn new(
         cmos: Arc<Mutex<devices::legacy::Cmos>>,
         stdio_serial: Vec<Arc<Mutex<devices::legacy::Serial>>>,
@@ -105,9 +106,10 @@ impl PortIODeviceManager {
         let kbd_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
 
         let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(
-            i8042_reset_evfd,
+            i8042_reset_evfd.try_clone().map_err(Error::EventFd)?,
             kbd_evt.try_clone().map_err(Error::EventFd)?,
         )));
+        let acpi_pm = Arc::new(Mutex::new(devices::legacy::AcpiPm::new(i8042_reset_evfd)));
 
         #[cfg(windows)]
         let pit = {
@@ -120,6 +122,7 @@ impl PortIODeviceManager {
             cmos,
             stdio_serial,
             i8042,
+            acpi_pm,
             #[cfg(windows)]
             pit,
             com_evt_1: evts[0].try_clone().map_err(Error::EventFd)?,
@@ -135,6 +138,9 @@ impl PortIODeviceManager {
     pub fn register_devices(&mut self) -> Result<()> {
         self.io_bus
             .insert(self.cmos.clone(), 0x70, 0x8)
+            .map_err(Error::BusError)?;
+        self.io_bus
+            .insert(self.acpi_pm.clone(), 0x604, 2)
             .map_err(Error::BusError)?;
 
         if let Some(serial) = self.stdio_serial.first() {
