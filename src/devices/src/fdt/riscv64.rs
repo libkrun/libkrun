@@ -215,7 +215,7 @@ fn create_aia_node(fdt: &mut FdtWriter, aia_device: &IrqChip) -> Result<()> {
     fdt.property_array_u32("reg", &reg_cells)?;
     fdt.property_u32("#interrupt-cells", 2u32)?;
     fdt.property_null("interrupt-controller")?;
-    fdt.property_u32("riscv,num-sources", 96u32)?;
+    fdt.property_u32("riscv,num-sources", arch::riscv64::layout::IRQ_MAX)?;
     fdt.property_u32("phandle", AIA_APLIC_PHANDLE)?;
     fdt.property_u32("msi-parent", AIA_IMSIC_PHANDLE)?;
 
