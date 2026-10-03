@@ -5,6 +5,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+#[cfg(target_arch = "x86_64")]
+mod acpi_pm;
 pub mod aia;
 pub mod gic;
 #[cfg(target_os = "macos")]
@@ -49,6 +51,8 @@ mod riscv64;
 #[cfg(target_arch = "riscv64")]
 use riscv64::serial;
 
+#[cfg(target_arch = "x86_64")]
+pub use self::acpi_pm::AcpiPm;
 #[cfg(target_arch = "x86_64")]
 pub use self::cmos::Cmos;
 #[cfg(target_os = "macos")]
