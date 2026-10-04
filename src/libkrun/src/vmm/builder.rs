@@ -1041,6 +1041,10 @@ pub fn build_microvm(
     #[allow(unused_mut)]
     let mut mmio_device_manager = MMIODeviceManager::new(
         &mut (arch::MMIO_MEM_START.clone()),
+        #[cfg(target_arch = "riscv64")]
+        // Skip IRQ 1 reserved for IMSIC IPIs
+        (arch::IRQ_BASE + 1, arch::IRQ_MAX),
+        #[cfg(not(target_arch = "riscv64"))]
         (arch::IRQ_BASE, arch::IRQ_MAX),
     );
 
