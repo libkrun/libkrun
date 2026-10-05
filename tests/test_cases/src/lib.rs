@@ -19,6 +19,11 @@ use test_vm_pause::TestVmPause;
 mod test_acpi_smp;
 use test_acpi_smp::TestAcpiSmp;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod test_virtio_blk_irq;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use test_virtio_blk_irq::TestVirtioBlkIrq;
+
 #[cfg(any(feature = "host", target_os = "linux"))]
 mod test_vsock_guest_connect;
 #[cfg(any(feature = "host", target_os = "linux"))]
@@ -125,6 +130,16 @@ pub fn test_cases() -> Vec<TestCase> {
         #[cfg(any(feature = "guest", target_os = "macos"))]
         TestCase::new("vm-pause", Box::new(TestVmPause)),
         TestCase::new("acpi-smp-4cpu", Box::new(TestAcpiSmp { num_cpus: 4 })),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "virtio-blk-irq-acpi",
+            Box::new(TestVirtioBlkIrq { acpi: true }),
+        ),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "virtio-blk-irq-no-acpi",
+            Box::new(TestVirtioBlkIrq { acpi: false }),
+        ),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("vsock-guest-connect", Box::new(TestVsockGuestConnect)),
         #[cfg(any(feature = "host", target_os = "linux"))]
