@@ -143,7 +143,10 @@ fn create_memory_node(
     // for an explanation of this.
     let mem_reg_prop = [arch::riscv64::layout::DRAM_MEM_START, mem_size];
 
-    let mem_node = fdt.begin_node("memory")?;
+    let mem_node = fdt.begin_node(&format!(
+        "memory@{:x}",
+        arch::riscv64::layout::DRAM_MEM_START
+    ))?;
     fdt.property_string("device_type", "memory")?;
     fdt.property_array_u64("reg", &mem_reg_prop)?;
     fdt.end_node(mem_node)?;
