@@ -7,7 +7,6 @@
 
 use std::fmt::{Display, Formatter};
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use utils::eventfd::EFD_NONBLOCK;
@@ -82,7 +81,13 @@ pub struct MmioTransport {
 
 struct InterruptTransportInner {
     log_target: String,
-    status: AtomicUsize,
+    // Guards the device's interrupt status bits together with the irqchip's
+    // IRQ line level: `status` and the line level must be updated as a
+    // single atomic step, otherwise a concurrent `try_signal()`/`interrupt()`
+    // (raising a new interrupt) can race with `on_ack()` (deciding to lower
+    // the line because it last observed `status == 0`), leaving the line low
+    // while `status` is non-zero.
+    status: Mutex<usize>,
     event: EventFd,
     intc: IrqChip,
     irq_line: Option<u32>,
@@ -95,15 +100,15 @@ impl InterruptTransport {
     pub fn new(intc: IrqChip, log_target: String) -> Result<Self, CreateMmioTransportError> {
         Ok(Self(Arc::new(InterruptTransportInner {
             log_target,
-            status: AtomicUsize::new(0),
+            status: Mutex::new(0),
             event: EventFd::new(0).map_err(CreateMmioTransportError::CreateInterruptEventFd)?,
             intc,
             irq_line: None,
         })))
     }
 
-    pub fn status(&self) -> &AtomicUsize {
-        &self.0.status
+    pub fn status(&self) -> usize {
+        *self.0.status.lock().unwrap()
     }
 
     pub fn event(&self) -> &EventFd {
@@ -130,12 +135,17 @@ impl InterruptTransport {
         }
     }
 
+    /// Sets `status` bits and raises the IRQ line as a single critical
+    /// section, so that a concurrent `on_ack()` can never observe a `status`
+    /// that doesn't match the actual line level (see `InterruptTransportInner::status`).
     fn try_signal(&self, status: u32) -> Result<(), crate::Error> {
-        self.status().fetch_or(status as usize, Ordering::SeqCst);
+        let mut guard = self.0.status.lock().unwrap();
+        *guard |= status as usize;
         self.intc()
             .lock()
             .unwrap()
             .set_irq(self.0.irq_line, Some(&self.0.event))?;
+        drop(guard);
         Ok(())
     }
 
@@ -159,6 +169,30 @@ impl InterruptTransport {
         if let Err(e) = self.try_signal_config_change() {
             warn!(target: &self.0.log_target, "Failed to signal config change: {e:?}");
         }
+    }
+
+    /// Must be called whenever the guest writes to VIRTIO_MMIO_INTERRUPT_ACK,
+    /// with `acked` set to the bits the guest is acknowledging. Clears those
+    /// bits from `status` and, if the status register is now fully clear,
+    /// explicitly de-asserts the IRQ line, all under the same lock so that a
+    /// concurrent `try_signal()`/`interrupt()` can never observe or produce
+    /// a `status`/line-level mismatch (see `InterruptTransportInner::status`).
+    ///
+    /// De-asserting the line is a no-op for irqchip backends that deliver
+    /// interrupts as one-shot pulses through `register_irqfd()` (the
+    /// default `IrqChipT::clear_irq()` implementation), since those backends
+    /// do not track a persistent line level. It matters for backends that
+    /// use a direct, level-based injection (currently only riscv64's
+    /// `KvmAia`), mirroring how QEMU's `virtio_mmio_update_irq()` recomputes
+    /// and re-asserts the IRQ line's level on every ack.
+    fn on_ack(&self, acked: u32) -> Result<(), crate::Error> {
+        let mut guard = self.0.status.lock().unwrap();
+        *guard &= !(acked as usize);
+        if *guard == 0 {
+            self.intc().lock().unwrap().clear_irq(self.0.irq_line)?;
+        }
+        drop(guard);
+        Ok(())
     }
 }
 
@@ -288,7 +322,7 @@ impl MmioTransport {
         self.features_select = 0;
         self.acked_features_select = 0;
         self.queue_select = 0;
-        self.interrupt.0.status.store(0, Ordering::SeqCst);
+        *self.interrupt.0.status.lock().unwrap() = 0;
         self.device_status = device_status::INIT;
         // Do not reset config_generation and keep it monotonically increasing.
         // Recreate queues from queue_config for the next negotiation cycle.
@@ -396,7 +430,7 @@ impl BusDevice for MmioTransport {
                         .get(self.queue_select as usize)
                         .map_or(0, |c| c.size as u32),
                     0x44 => self.with_queue(0, |q| q.ready as u32),
-                    0x60 => self.interrupt.status().load(Ordering::SeqCst) as u32,
+                    0x60 => self.interrupt.status() as u32,
                     0x70 => self.device_status,
                     0xfc => self.config_generation,
                     0xb0..=0xbc => {
@@ -479,10 +513,10 @@ impl BusDevice for MmioTransport {
                         }
                     }
                     0x64 => {
-                        if self.check_device_status(device_status::DRIVER_OK, 0) {
-                            self.interrupt
-                                .status()
-                                .fetch_and(!(v as usize), Ordering::SeqCst);
+                        if self.check_device_status(device_status::DRIVER_OK, 0)
+                            && let Err(e) = self.interrupt.on_ack(v)
+                        {
+                            warn!("Failed to clear irq line on ack: {e:?}");
                         }
                     }
                     0x70 => self.set_device_status(v),
@@ -516,9 +550,9 @@ impl BusDevice for MmioTransport {
     }
 
     fn interrupt(&self, irq_mask: u32) -> std::io::Result<()> {
-        self.interrupt
-            .status()
-            .fetch_or(irq_mask as usize, Ordering::SeqCst);
+        if let Err(e) = self.interrupt.try_signal(irq_mask) {
+            warn!("Failed to signal interrupt: {e:?}");
+        }
         // interrupt_evt() is safe to unwrap because the inner interrupt_evt is initialized in the
         // constructor.
         // write() is safe to unwrap because the inner syscall is tailored to be safe as well.
@@ -698,7 +732,7 @@ pub(crate) mod tests {
         d.read(0, 0x44, &mut buf[..]);
         assert_eq!(read_le_u32(&buf[..]), false as u32);
 
-        d.interrupt.status().store(111, Ordering::SeqCst);
+        *d.interrupt.0.status.lock().unwrap() = 111;
         d.read(0, 0x60, &mut buf[..]);
         assert_eq!(read_le_u32(&buf[..]), 111);
 
@@ -853,10 +887,10 @@ pub(crate) mod tests {
                 | device_status::DRIVER_OK,
         );
 
-        d.interrupt.status().store(0b10_1010, Ordering::Relaxed);
+        *d.interrupt.0.status.lock().unwrap() = 0b10_1010;
         write_le_u32(&mut buf[..], 0b111);
         d.write(0, 0x64, &buf[..]);
-        assert_eq!(d.interrupt.status().load(Ordering::Relaxed), 0b10_1000);
+        assert_eq!(d.interrupt.status(), 0b10_1000);
 
         // Write to an invalid address in generic register range.
         write_le_u32(&mut buf[..], 0xf);

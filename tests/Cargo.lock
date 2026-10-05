@@ -595,6 +595,7 @@ dependencies = [
  "virtio-bindings",
  "vm-fdt",
  "vm-memory",
+ "vmm-sys-util",
  "windows-sys",
 ]
 

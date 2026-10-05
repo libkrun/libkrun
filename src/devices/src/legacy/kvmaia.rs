@@ -2,17 +2,30 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 
 use crate::Error as DeviceError;
 use crate::bus::BusDevice;
 use crate::legacy::aia::AIADevice;
 use crate::legacy::irqchip::IrqChipT;
 
+use kvm_bindings::kvm_irq_level;
 use kvm_ioctls::{DeviceFd, VmFd};
 use utils::eventfd::EventFd;
+use vmm_sys_util::ioctl_iow_nr;
+
+const KVMIO: u32 = 0xAE; // KVM's ioctl type/magic number
+const KVM_IRQ_LINE_NR: u32 = 0x61; // KVM_IRQ_LINE request number (include/uapi/linux/kvm.h)
+
+// kvm-ioctls keeps its own copy of this ioctl private to `VmFd`, so it is
+// redefined here (via the same macro kvm-ioctls itself uses) for direct use
+// on the VM's raw fd.
+ioctl_iow_nr!(KVM_IRQ_LINE, KVMIO, KVM_IRQ_LINE_NR, kvm_irq_level);
 
 pub struct KvmAia {
     _device_fd: DeviceFd,
+    /// Raw fd of the KVM VM this device belongs to.
+    vm_fd: RawFd,
 
     /// Number of CPUs handled by the device
     vcpu_count: u32,
@@ -89,8 +102,35 @@ impl KvmAia {
 
         Ok(Self {
             _device_fd: device_fd,
+            vm_fd: vm.as_raw_fd(),
             vcpu_count,
         })
+    }
+
+    /// Issues a KVM_IRQ_LINE ioctl, setting `irq` to `active`.
+    ///
+    /// This talks directly to KVM's in-kernel AIA/APLIC emulation
+    /// (`kvm_riscv_aia_aplic_inject()`), which treats the source as a
+    /// level signal: injecting an MSI only on an actual low-to-high
+    /// transition for level-triggered sources.
+    fn set_irq_line(&self, irq: u32, active: bool) -> Result<(), DeviceError> {
+        let mut irq_level = kvm_irq_level::default();
+        irq_level.__bindgen_anon_1.irq = irq;
+        irq_level.level = u32::from(active);
+
+        // SAFETY: `self.vm_fd` is the raw fd of the KVM VM that owns this
+        // device; it is guaranteed to stay open and valid for at least as
+        // long as `self` exists. `KVM_IRQ_LINE()` is the request number for
+        // a `kvm_irq_level`-sized argument, and we pass a valid pointer to
+        // one.
+        let ret = unsafe { libc::ioctl(self.vm_fd, KVM_IRQ_LINE() as _, &irq_level as *const _) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(DeviceError::FailedSignalingUsedQueue(
+                io::Error::last_os_error(),
+            ))
+        }
     }
 }
 
@@ -105,22 +145,24 @@ impl IrqChipT for KvmAia {
 
     fn set_irq(
         &self,
-        _irq_line: Option<u32>,
-        interrupt_evt: Option<&EventFd>,
+        irq_line: Option<u32>,
+        _interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError> {
-        if let Some(interrupt_evt) = interrupt_evt {
-            if let Err(e) = interrupt_evt.write(1) {
-                error!("Failed to signal used queue: {e:?}");
-                return Err(DeviceError::FailedSignalingUsedQueue(e));
-            }
-        } else {
-            error!("EventFd not set up for irq line");
+        let Some(irq_line) = irq_line else {
+            error!("IRQ line not configured");
             return Err(DeviceError::FailedSignalingUsedQueue(io::Error::new(
                 io::ErrorKind::NotFound,
-                "EventFd not set up for irq line".to_string(),
+                "IRQ line not configured".to_string(),
             )));
-        }
-        Ok(())
+        };
+        self.set_irq_line(irq_line, true)
+    }
+
+    fn clear_irq(&self, irq_line: Option<u32>) -> Result<(), DeviceError> {
+        let Some(irq_line) = irq_line else {
+            return Ok(());
+        };
+        self.set_irq_line(irq_line, false)
     }
 }
 
