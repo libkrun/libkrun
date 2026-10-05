@@ -57,10 +57,12 @@ impl From<FdtError> for Error {
 }
 
 /// Creates the flattened device tree for this riscv64 VM.
+#[allow(clippy::too_many_arguments)]
 pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     guest_mem: &GuestMemoryMmap,
     arch_memory_info: &ArchMemoryInfo,
     num_vcpu: u32,
+    timebase_frequency: u32,
     cmdline: &str,
     device_info: &HashMap<(DeviceType, String), T>,
     aia_device: &IrqChip,
@@ -80,7 +82,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     // Properties
     fdt.property_u32("#address-cells", ADDRESS_CELLS)?;
     fdt.property_u32("#size-cells", SIZE_CELLS)?;
-    create_cpu_nodes(&mut fdt, num_vcpu)?;
+    create_cpu_nodes(&mut fdt, num_vcpu, timebase_frequency)?;
     create_memory_node(&mut fdt, guest_mem, arch_memory_info)?;
     create_chosen_node(&mut fdt, cmdline, initrd)?;
     create_aia_node(&mut fdt, aia_device)?;
@@ -101,13 +103,13 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
 }
 
 // Following are the auxiliary function for creating the different nodes that we append to our FDT.
-fn create_cpu_nodes(fdt: &mut FdtWriter, num_cpus: u32) -> Result<()> {
+fn create_cpu_nodes(fdt: &mut FdtWriter, num_cpus: u32, timebase_frequency: u32) -> Result<()> {
     // See https://elixir.bootlin.com/linux/v6.10/source/Documentation/devicetree/bindings/riscv/cpus.yaml
     let cpus = fdt.begin_node("cpus")?;
     // As per documentation, on RISC-V 64-bit systems value should be set to 1.
     fdt.property_u32("#address-cells", 0x01)?;
     fdt.property_u32("#size-cells", 0x0)?;
-    fdt.property_u32("timebase-frequency", 0x989680)?;
+    fdt.property_u32("timebase-frequency", timebase_frequency)?;
 
     for cpu_index in 0..num_cpus {
         let cpu = fdt.begin_node(&format!("cpu@{cpu_index:x}"))?;
@@ -260,6 +262,23 @@ fn create_serial_node<T: DeviceInfoForFDT + Clone + Debug>(
     Ok(())
 }
 
+fn create_rtc_node<T: DeviceInfoForFDT + Clone + Debug>(
+    fdt: &mut FdtWriter,
+    dev_info: &T,
+) -> Result<()> {
+    let rtc_reg_prop = [dev_info.addr(), dev_info.length()];
+    let irq = [dev_info.irq(), IRQ_TYPE_LEVEL_HI];
+
+    let rtc_node = fdt.begin_node(&format!("rtc@{:x}", dev_info.addr()))?;
+    fdt.property_string("compatible", "google,goldfish-rtc")?;
+    fdt.property_array_u64("reg", &rtc_reg_prop)?;
+    fdt.property_u32("interrupt-parent", AIA_APLIC_PHANDLE)?;
+    fdt.property_array_u32("interrupts", &irq)?;
+    fdt.end_node(rtc_node)?;
+
+    Ok(())
+}
+
 fn create_devices_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt: &mut FdtWriter,
     dev_info: &HashMap<(DeviceType, String), T>,
@@ -270,6 +289,7 @@ fn create_devices_node<T: DeviceInfoForFDT + Clone + Debug>(
     for ((device_type, _device_id), info) in dev_info {
         match device_type {
             DeviceType::Serial => create_serial_node(fdt, info)?,
+            DeviceType::RTC => create_rtc_node(fdt, info)?,
             DeviceType::Virtio(_) => {
                 ordered_virtio_device.push(info);
             }
