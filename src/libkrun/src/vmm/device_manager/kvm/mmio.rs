@@ -268,6 +268,41 @@ impl MMIODeviceManager {
         Ok(())
     }
 
+    #[cfg(target_arch = "riscv64")]
+    /// Register a MMIO RTC device.
+    pub fn register_mmio_rtc(&mut self, intc: IrqChip) -> Result<()> {
+        if self.irq > self.last_irq {
+            return Err(Error::IrqsExhausted);
+        }
+
+        // Attaching the RTC device. RISC-V's in-kernel AIA/APLIC emulation
+        // does not support EOI-driven irqfd resampling, so the device drives
+        // its interrupt line directly through `intc` instead of
+        // `register_irqfd()` (see goldfish_rtc.rs).
+        let mut device = devices::legacy::GoldfishRtc::new();
+        device.set_intc(intc);
+        device.set_irq_line(self.irq);
+
+        self.bus
+            .insert(Arc::new(Mutex::new(device)), self.mmio_base, MMIO_LEN)
+            .map_err(Error::BusError)?;
+
+        let ret = self.mmio_base;
+        self.id_to_dev_info.insert(
+            (DeviceType::RTC, "rtc".to_string()),
+            MMIODeviceInfo {
+                addr: ret,
+                _len: MMIO_LEN,
+                _irq: self.irq,
+            },
+        );
+
+        self.mmio_base += MMIO_LEN;
+        self.irq += 1;
+
+        Ok(())
+    }
+
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     /// Gets the information of the devices registered up to some point in time.
     pub fn get_device_info(&self) -> &HashMap<(DeviceType, String), MMIODeviceInfo> {
