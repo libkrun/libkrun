@@ -319,6 +319,9 @@ impl Vmm {
         _acpi_enabled: bool,
         _virtio_mmio_devices: &[(u64, u32)],
         _pvh: bool,
+        #[cfg(target_arch = "riscv64")] riscv_isa_info: &Option<
+            arch::riscv64::linux::kvm::RiscvIsaInfo,
+        >,
     ) -> Result<()> {
         #[cfg(target_arch = "x86_64")]
         {
@@ -380,6 +383,7 @@ impl Vmm {
                 self.mmio_device_manager.get_device_info(),
                 _intc,
                 initrd,
+                riscv_isa_info,
             )
             .map_err(Error::SetupFDT)?;
 
