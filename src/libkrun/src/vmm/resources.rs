@@ -123,6 +123,9 @@ pub struct VmResources {
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
     pub serial_consoles: Vec<SerialConsoleConfig>,
+    /// RISC-V ISA information discovered from KVM
+    #[cfg(target_arch = "riscv64")]
+    pub riscv_isa_info: Option<arch::riscv64::linux::kvm::RiscvIsaInfo>,
 }
 
 impl VmResources {
@@ -268,6 +271,8 @@ mod tests {
             acpi_enabled: false,
             serial_consoles: Vec::new(),
             kernel_console: None,
+            #[cfg(target_arch = "riscv64")]
+            riscv_isa_info: None,
         }
     }
 
