@@ -114,7 +114,7 @@ fn create_cpu_nodes(fdt: &mut FdtWriter, num_cpus: u32) -> Result<()> {
         let cpu = fdt.begin_node(&format!("cpu@{cpu_index:x}"))?;
         fdt.property_string("device_type", "cpu")?;
         fdt.property_string("compatible", "riscv")?;
-        fdt.property_string("mmu-type", "sv48")?;
+        fdt.property_string("mmu-type", "riscv,sv48")?;
         fdt.property_string("riscv,isa", "rv64imafdc_smaia_ssaia")?;
         fdt.property_string("status", "okay")?;
         fdt.property_u32("reg", cpu_index)?;
