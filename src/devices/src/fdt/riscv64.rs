@@ -209,12 +209,15 @@ fn create_aia_node(fdt: &mut FdtWriter, aia_device: &IrqChip) -> Result<()> {
 
     // APLIC
     use arch::riscv64::layout::APLIC_START;
-    let aplic_name = format!("aplic@{APLIC_START:x}");
+    let aplic_name = format!("interrupt-controller@{APLIC_START:x}");
     let aplic_node = fdt.begin_node(&aplic_name)?;
 
-    fdt.property_string(
+    fdt.property_string_list(
         "compatible",
-        aia_device.lock().unwrap().aplic_compatibility(),
+        vec![
+            "qemu,aplic".to_string(),
+            aia_device.lock().unwrap().aplic_compatibility().to_string(),
+        ],
     )?;
     let reg_cells = aia_device.lock().unwrap().aplic_properties();
     fdt.property_array_u32("reg", &reg_cells)?;
