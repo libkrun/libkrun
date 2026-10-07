@@ -176,18 +176,22 @@ fn create_aia_node(fdt: &mut FdtWriter, aia_device: &IrqChip) -> Result<()> {
     // IMSIC
     if aia_device.lock().unwrap().msi_compatible() {
         use arch::riscv64::layout::IMSIC_START;
-        let imsic_name = format!("imsics@{IMSIC_START:x}");
+        let imsic_name = format!("interrupt-controller@{IMSIC_START:x}");
         let imsic_node = fdt.begin_node(&imsic_name)?;
 
-        fdt.property_string(
+        fdt.property_string_list(
             "compatible",
-            aia_device.lock().unwrap().imsic_compatibility(),
+            vec![
+                "qemu,imsics".to_string(),
+                aia_device.lock().unwrap().imsic_compatibility().to_string(),
+            ],
         )?;
         let imsic_reg_prop = aia_device.lock().unwrap().imsic_properties();
         fdt.property_array_u32("reg", &imsic_reg_prop)?;
         fdt.property_u32("#interrupt-cells", 0u32)?;
         fdt.property_null("interrupt-controller")?;
         fdt.property_null("msi-controller")?;
+        fdt.property_u32("#msi-cells", 0u32)?;
         // TODO complete num-ids
         fdt.property_u32("riscv,num-ids", 2047u32)?;
         fdt.property_u32("phandle", AIA_IMSIC_PHANDLE)?;
