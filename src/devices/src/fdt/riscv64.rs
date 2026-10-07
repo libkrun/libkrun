@@ -118,7 +118,7 @@ fn create_cpu_nodes(
         let cpu = fdt.begin_node(&format!("cpu@{cpu_index:x}"))?;
         fdt.property_string("device_type", "cpu")?;
         fdt.property_string("compatible", "riscv")?;
-        fdt.property_string("mmu-type", "sv48")?;
+        fdt.property_string("mmu-type", "riscv,sv48")?;
 
         // "riscv,isa" is deprecated by the kernel in favor of the
         // "riscv,isa-base" + "riscv,isa-extensions" pair; we only emit the
