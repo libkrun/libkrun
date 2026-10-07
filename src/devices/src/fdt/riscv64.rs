@@ -75,7 +75,8 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
 
     // Header or the root node as per above mentioned documentation.
     let root_node = fdt.begin_node("root")?;
-    fdt.property_string("compatible", "linux,dummy-virt")?;
+    fdt.property_string("compatible", "libkrun,riscv64")?;
+    fdt.property_string("model", "libkrun riscv64")?;
     // For info on #address-cells and size-cells resort to Table 3.1 Root Node
     // Properties
     fdt.property_u32("#address-cells", ADDRESS_CELLS)?;
