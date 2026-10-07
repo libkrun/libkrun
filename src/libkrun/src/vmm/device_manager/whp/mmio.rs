@@ -7,7 +7,6 @@
 //! no ioeventfd/irqfd mechanisms. Interrupt delivery goes through the
 //! userspace virtio transport layer instead.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
@@ -85,7 +84,7 @@ pub struct MMIODeviceManager {
     pub bus: devices::Bus,
     mmio_base: u64,
     irqs: IrqAllocator,
-    id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
+    device_info: Vec<(DeviceType, MMIODeviceInfo)>,
 }
 
 impl MMIODeviceManager {
@@ -95,7 +94,7 @@ impl MMIODeviceManager {
             mmio_base: *mmio_base,
             irqs,
             bus: devices::Bus::new(),
-            id_to_dev_info: HashMap::new(),
+            device_info: Vec::new(),
         }
     }
 
@@ -104,7 +103,6 @@ impl MMIODeviceManager {
         &mut self,
         mut mmio_device: devices::virtio::MmioTransport,
         type_id: u32,
-        device_id: String,
     ) -> Result<(u64, u32)> {
         let irq = self.irqs.alloc()?;
 
@@ -114,13 +112,13 @@ impl MMIODeviceManager {
             .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
         let ret = (self.mmio_base, irq);
-        self.id_to_dev_info.insert(
-            (DeviceType::Virtio(type_id), device_id),
+        self.device_info.push((
+            DeviceType::Virtio(type_id),
             MMIODeviceInfo {
                 addr: self.mmio_base,
                 irq,
             },
-        );
+        ));
         self.mmio_base += MMIO_LEN;
 
         Ok(ret)
@@ -168,9 +166,9 @@ impl MMIODeviceManager {
     /// Returns the address and interrupt assigned to each virtio-mmio device.
     pub fn virtio_mmio_devices(&self) -> Vec<(u64, u32)> {
         let mut devices = self
-            .id_to_dev_info
+            .device_info
             .iter()
-            .filter_map(|((device_type, _), info)| {
+            .filter_map(|(device_type, info)| {
                 matches!(device_type, DeviceType::Virtio(_)).then_some((info.addr, info.irq))
             })
             .collect::<Vec<_>>();
@@ -206,13 +204,11 @@ mod tests {
             device: Arc<Mutex<dyn devices::virtio::VirtioDevice>>,
             cmdline: &mut kernel_cmdline::Cmdline,
             type_id: u32,
-            device_id: &str,
         ) -> Result<u64> {
             let mmio_device =
                 devices::virtio::MmioTransport::new(guest_mem, DummyIrqChip::new().into(), device)
                     .unwrap();
-            let (mmio_base, irq) =
-                self.register_mmio_device(mmio_device, type_id, device_id.to_string())?;
+            let (mmio_base, irq) = self.register_mmio_device(mmio_device, type_id)?;
             self.add_device_to_cmdline(cmdline, mmio_base, irq)?;
             Ok(mmio_base)
         }
@@ -296,7 +292,7 @@ mod tests {
 
         assert!(
             device_manager
-                .register_virtio_device(guest_mem, dummy, &mut cmdline, 0, "dummy")
+                .register_virtio_device(guest_mem, dummy, &mut cmdline, 0)
                 .is_ok()
         );
     }
@@ -321,7 +317,6 @@ mod tests {
                     Arc::new(Mutex::new(DummyDevice::new())),
                     &mut cmdline,
                     0,
-                    "dummy1",
                 )
                 .unwrap();
         }
@@ -334,7 +329,6 @@ mod tests {
                         Arc::new(Mutex::new(DummyDevice::new())),
                         &mut cmdline,
                         0,
-                        "dummy2"
                     )
                     .unwrap_err()
             ),
@@ -412,33 +406,18 @@ mod tests {
             IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
         );
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
-        let dummy = Arc::new(Mutex::new(DummyDevice::new()));
-
-        let type_id = 0;
-        let id = String::from("foo");
-        if let Ok(addr) =
-            device_manager.register_virtio_device(guest_mem, dummy, &mut cmdline, type_id, &id)
-        {
-            assert!(
-                device_manager
-                    .get_device(DeviceType::Virtio(type_id), &id)
-                    .is_some()
-            );
-            assert_eq!(
-                addr,
-                device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id.clone())].addr
-            );
-            assert_eq!(
-                arch::IRQ_BASE,
-                device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id.clone())].irq
-            );
-        }
-        let id = "bar";
-        assert!(
-            device_manager
-                .get_device(DeviceType::Virtio(type_id), id)
-                .is_none()
-        );
+        let addr = device_manager
+            .register_virtio_device(
+                guest_mem,
+                Arc::new(Mutex::new(DummyDevice::new())),
+                &mut cmdline,
+                0,
+            )
+            .unwrap();
+        let (device_type, info) = &device_manager.device_info[0];
+        assert_eq!(*device_type, DeviceType::Virtio(0));
+        assert_eq!(info.addr, addr);
+        assert_eq!(info.irq, arch::IRQ_BASE);
     }
 
     #[test]
