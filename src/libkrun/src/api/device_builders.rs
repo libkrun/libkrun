@@ -85,10 +85,8 @@ pub struct AttachContext<'a> {
     shm_manager: &'a ShmManager,
     intc: IrqChip,
     device_index: usize,
-    register_fn: Box<
-        dyn Fn(&mut Vmm, String, IrqChip, Arc<Mutex<dyn VirtioDevice>>) -> Result<(), VmmError>
-            + 'a,
-    >,
+    register_fn:
+        Box<dyn Fn(&mut Vmm, IrqChip, Arc<Mutex<dyn VirtioDevice>>) -> Result<(), VmmError> + 'a>,
     #[cfg(target_os = "macos")]
     map_sender: Option<crossbeam_channel::Sender<utils::worker_message::WorkerMessage>>,
 }
@@ -110,8 +108,8 @@ impl<'a> AttachContext<'a> {
             shm_manager,
             intc,
             device_index,
-            register_fn: Box::new(|vmm, id, intc, device| {
-                attach_mmio_device(vmm, id, intc, device)
+            register_fn: Box::new(|vmm, intc, device| {
+                attach_mmio_device(vmm, intc, device)
                     .map_err(|e| VmmError::Internal(format!("{e:?}")))?;
                 Ok(())
             }),
@@ -137,8 +135,8 @@ impl<'a> AttachContext<'a> {
             shm_manager,
             intc,
             device_index,
-            register_fn: Box::new(|vmm, id, intc, device| {
-                attach_pci_device(vmm, id, intc, device)
+            register_fn: Box::new(|vmm, intc, device| {
+                attach_pci_device(vmm, intc, device)
                     .map_err(|e| VmmError::Internal(format!("{e:?}")))?;
                 Ok(())
             }),
@@ -151,12 +149,8 @@ impl<'a> AttachContext<'a> {
     ///
     /// The actual transport (MMIO or PCI) is determined by which
     /// [`DeviceManager`] the device was added to.
-    pub fn register(
-        &mut self,
-        id: &str,
-        device: Arc<Mutex<dyn VirtioDevice>>,
-    ) -> Result<(), VmmError> {
-        (self.register_fn)(self.vmm, id.to_string(), self.intc.clone(), device)
+    pub fn register(&mut self, device: Arc<Mutex<dyn VirtioDevice>>) -> Result<(), VmmError> {
+        (self.register_fn)(self.vmm, self.intc.clone(), device)
     }
 
     /// Subscribe a device to the event loop for epoll-based I/O.
@@ -833,7 +827,7 @@ impl<'a> AttachDevice<'a> for FsDevice<'a> {
             }
         }
 
-        ctx.register(&format!("virtiofs{}", ctx.device_index()), self.inner)
+        ctx.register(self.inner)
     }
 }
 
@@ -1347,7 +1341,7 @@ impl<'a> AttachDevice<'a> for ConsoleDevice<'a> {
         #[cfg(target_os = "linux")]
         ctx.register_sigwinch(console_dev.lock().unwrap().get_sigwinch_fd())?;
 
-        ctx.register(&format!("hvc{}", ctx.device_index()), console_dev)?;
+        ctx.register(console_dev)?;
 
         for fd in self.tty_fds {
             ctx.setup_terminal_raw_mode(fd);
@@ -1420,7 +1414,7 @@ impl<'a> AttachDevice<'a> for BalloonDevice {
                 .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
         }
         ctx.subscribe_events(self.inner.clone())?;
-        ctx.register("balloon", self.inner)
+        ctx.register(self.inner)
     }
 }
 
@@ -1448,7 +1442,7 @@ impl<'a> AttachDevice<'a> for RngDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         ctx.subscribe_events(self.inner.clone())?;
-        ctx.register("rng", self.inner)
+        ctx.register(self.inner)
     }
 }
 
@@ -1488,7 +1482,7 @@ impl<'a> AttachDevice<'a> for RtcDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         ctx.subscribe_events(self.inner.clone())?;
-        ctx.register("rtc", self.inner)
+        ctx.register(self.inner)
     }
 }
 
@@ -1604,8 +1598,7 @@ impl<'a> AttachDevice<'a> for VsockDevice {
         let inner = Arc::new(Mutex::new(vsock));
         ctx.subscribe_events(inner.clone())?;
 
-        let id = inner.lock().unwrap().id().to_string();
-        ctx.register(&id, inner)?;
+        ctx.register(inner)?;
 
         if self
             .tsi_flags
@@ -1715,8 +1708,7 @@ impl<'a> AttachDevice<'a> for BlockDevice {
         .map_err(|e| VmmError::Internal(format!("block: {e}")))?;
 
         let inner = Arc::new(Mutex::new(block));
-        let id = inner.lock().unwrap().id().to_string();
-        ctx.register(&id, inner)
+        ctx.register(inner)
     }
 }
 
@@ -1904,8 +1896,7 @@ impl NetDevice {
 impl<'a> AttachDevice<'a> for NetDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
-        let id = self.inner.lock().unwrap().id().to_string();
-        ctx.register(&id, self.inner)
+        ctx.register(self.inner)
     }
 }
 
@@ -2105,8 +2096,7 @@ impl<'a> AttachDevice<'a> for GpuDevice {
             inner.lock().unwrap().set_shm_region(region.into());
         }
 
-        let id = inner.lock().unwrap().id().to_string();
-        ctx.register(&id, inner)
+        ctx.register(inner)
     }
 }
 
@@ -2209,7 +2199,7 @@ impl<'a> AttachDevice<'a> for VhostUserDevice {
         .map_err(|e| VmmError::Internal(format!("vhost-user: {e}")))?;
         let inner = Arc::new(Mutex::new(device));
         ctx.subscribe_events(inner.clone())?;
-        ctx.register(&self.name, inner)
+        ctx.register(inner)
     }
 }
 
@@ -2318,8 +2308,7 @@ impl<'a> AttachDevice<'a> for InputDevice<'a> {
         let input = Input::new(config_backend, events_backend)
             .map_err(|e| VmmError::Internal(format!("input: {e:?}")))?;
         let inner = Arc::new(Mutex::new(input));
-        let id = inner.lock().unwrap().id().to_string();
-        ctx.register(&id, inner)
+        ctx.register(inner)
     }
 }
 
