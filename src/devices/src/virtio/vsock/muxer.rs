@@ -1,7 +1,14 @@
 use std::collections::HashMap;
 #[cfg(unix)]
+use std::ffi::OsStr;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 #[cfg(windows)]
 use utils::windows::RawFd;
@@ -21,7 +28,11 @@ use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
 use super::unix_proxy::UnixProxy;
+#[cfg(windows)]
+use super::windows::sockaddr_storage::SockaddrStorage;
 use crossbeam_channel::{Sender, unbounded};
+#[cfg(unix)]
+use nix::sys::socket::SockaddrStorage;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 
@@ -122,10 +133,23 @@ impl VsockMuxer {
     pub(crate) fn new(
         cid: u64,
         host_port_map: Option<HashMap<u16, u16>>,
-        unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+        mut unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
         tsi_flags: TsiFlags,
-    ) -> Self {
-        VsockMuxer {
+    ) -> super::Result<Self> {
+        if let Some(map) = &mut unix_ipc_port_map {
+            let needs_cwd = map
+                .values()
+                .any(|(path, listen)| *listen && path.is_relative());
+            if needs_cwd {
+                let cwd = std::env::current_dir().map_err(VsockError::CurrentDir)?;
+                for (path, listen) in map.values_mut() {
+                    if *listen && path.is_relative() {
+                        *path = cwd.join(&*path);
+                    }
+                }
+            }
+        }
+        Ok(VsockMuxer {
             cid,
             host_port_map,
             queue: None,
@@ -137,7 +161,7 @@ impl VsockMuxer {
             reaper_sender: None,
             unix_ipc_port_map,
             tsi_flags,
-        }
+        })
     }
 
     pub(crate) fn activate(
@@ -288,6 +312,11 @@ impl VsockMuxer {
                 "proxy create request: peer_port={}, type={}",
                 req.peer_port, req._type
             );
+            let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+            if self.is_host_listener_id(id) {
+                warn!("rejecting guest proxy creation on a host listening port");
+                return;
+            }
             let mem = match self.mem.as_ref() {
                 Some(m) => m,
                 None => {
@@ -305,7 +334,6 @@ impl VsockMuxer {
             match req._type {
                 defs::SOCK_STREAM => {
                     debug!("proxy create stream");
-                    let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
                     #[allow(clippy::unnecessary_cast)]
                     if req.family == AF_UNIX as u16
                         && !self.tsi_flags.contains(TsiFlags::HIJACK_UNIX)
@@ -332,6 +360,19 @@ impl VsockMuxer {
                         self.rxq.clone(),
                     ) {
                         Ok(proxy) => {
+                            #[cfg(target_os = "linux")]
+                            let proxy = {
+                                let mut proxy = proxy;
+                                proxy.protected_unix_paths = self
+                                    .unix_ipc_port_map
+                                    .as_ref()
+                                    .into_iter()
+                                    .flat_map(|map| map.values())
+                                    .filter(|(_, listen)| *listen)
+                                    .map(|(path, _)| path.clone())
+                                    .collect();
+                                proxy
+                            };
                             self.proxy_map
                                 .write()
                                 .unwrap()
@@ -342,7 +383,6 @@ impl VsockMuxer {
                 }
                 defs::SOCK_DGRAM => {
                     debug!("proxy create dgram");
-                    let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
                     #[allow(clippy::unnecessary_cast)]
                     if req.family == AF_UNIX as u16
                         && !self.tsi_flags.contains(TsiFlags::HIJACK_UNIX)
@@ -380,15 +420,52 @@ impl VsockMuxer {
         }
     }
 
+    fn is_host_listener_id(&self, id: u64) -> bool {
+        id as u32 == defs::TSI_PROXY_PORT
+            && self
+                .unix_ipc_port_map
+                .as_ref()
+                .and_then(|map| map.get(&((id >> 32) as u32)))
+                .is_some_and(|(_, listen)| *listen)
+    }
+
+    /// Unix sockets the VMM listens on for the host, such as the init control
+    /// endpoint, must stay out of reach of the guest: with AF_UNIX hijacking a
+    /// guest connect to that path would look like a host connection.
+    fn is_protected_unix_path(&self, addr: &SockaddrStorage) -> bool {
+        let Some(map) = &self.unix_ipc_port_map else {
+            return false;
+        };
+        let Some(path) = tsi_unix_path(addr) else {
+            return false;
+        };
+        map.values()
+            .filter(|(_, listen)| *listen)
+            .any(|(protected, _)| same_file(protected, &path))
+    }
+
     fn process_connect(&self, pkt: &VsockPacket) {
         debug!("proxy connect request");
         if let Some(req) = pkt.read_connect_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("proxy connect request: id={id}");
-            match self.proxy_map.read().unwrap().get(&id) {
-                Some(proxy) => {
-                    self.process_proxy_update(id, proxy.lock().unwrap().connect(pkt, req));
-                }
+            if self.is_host_listener_id(id) || self.is_protected_unix_path(&req.addr) {
+                warn!("rejecting guest connection to a host-side listening unix socket");
+                self.push_packet(MuxerRx::ConnResponse {
+                    local_port: pkt.dst_port(),
+                    peer_port: pkt.src_port(),
+                    result: -libc::EACCES,
+                });
+                return;
+            }
+            let update = self
+                .proxy_map
+                .read()
+                .unwrap()
+                .get(&id)
+                .map(|proxy| proxy.lock().unwrap().connect(pkt, req));
+            match update {
+                Some(update) => self.process_proxy_update(id, update),
                 None => self.push_packet(MuxerRx::ConnResponse {
                     local_port: pkt.dst_port(),
                     peer_port: pkt.src_port(),
@@ -407,7 +484,13 @@ impl VsockMuxer {
                 id, req.peer_port, req.local_port
             );
 
-            match self.proxy_map.read().unwrap().get(&id) {
+            match self
+                .proxy_map
+                .read()
+                .unwrap()
+                .get(&id)
+                .filter(|_| !self.is_host_listener_id(id))
+            {
                 Some(proxy) => proxy.lock().unwrap().getpeername(pkt),
                 None => self.push_packet(MuxerRx::GetnameResponse {
                     local_port: pkt.dst_port(),
@@ -432,6 +515,7 @@ impl VsockMuxer {
                 .read()
                 .unwrap()
                 .get(&id)
+                .filter(|_| !self.is_host_listener_id(id))
                 .map(|proxy| proxy.lock().unwrap().sendto_addr(req));
 
             if let Some(update) = update {
@@ -443,7 +527,13 @@ impl VsockMuxer {
     fn process_sendto_data(&self, pkt: &VsockPacket) {
         let id = ((pkt.src_port() as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
         debug!("DGRAM sendto data: id={} src={}", id, pkt.src_port());
-        if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
+        if let Some(proxy) = self
+            .proxy_map
+            .read()
+            .unwrap()
+            .get(&id)
+            .filter(|_| !self.is_host_listener_id(id))
+        {
             proxy.lock().unwrap().sendto_data(pkt);
         }
     }
@@ -452,6 +542,15 @@ impl VsockMuxer {
         debug!("DGRAM listen request: src={}", pkt.src_port());
         if let Some(req) = pkt.read_listen_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+            if self.is_host_listener_id(id) || self.is_protected_unix_path(&req.addr) {
+                warn!("rejecting guest listen on a host-side listening unix socket");
+                self.push_packet(MuxerRx::ListenResponse {
+                    local_port: pkt.dst_port(),
+                    peer_port: pkt.src_port(),
+                    result: -libc::EACCES,
+                });
+                return;
+            }
             debug!("DGRAM listen request: id={id}");
             match self.proxy_map.read().unwrap().get(&id) {
                 Some(proxy) => self.process_proxy_update(
@@ -472,7 +571,13 @@ impl VsockMuxer {
         if let Some(req) = pkt.read_accept_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("DGRAM accept request: id={id}");
-            match self.proxy_map.read().unwrap().get(&id) {
+            match self
+                .proxy_map
+                .read()
+                .unwrap()
+                .get(&id)
+                .filter(|_| !self.is_host_listener_id(id))
+            {
                 Some(proxy) => self.process_proxy_update(id, proxy.lock().unwrap().accept(req)),
                 None => self.push_packet(MuxerRx::AcceptResponse {
                     local_port: pkt.dst_port(),
@@ -491,7 +596,13 @@ impl VsockMuxer {
                 "DGRAM release request: id={} local_port={} peer_port={}",
                 id, req.local_port, req.peer_port
             );
-            let update = if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
+            let update = if let Some(proxy) = self
+                .proxy_map
+                .read()
+                .unwrap()
+                .get(&id)
+                .filter(|_| !self.is_host_listener_id(id))
+            {
                 Some(proxy.lock().unwrap().release())
             } else {
                 debug!(
@@ -516,7 +627,13 @@ impl VsockMuxer {
         debug!("DGRAM OP_RW");
         let id = ((pkt.src_port() as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
 
-        if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
+        if let Some(proxy_lock) = self
+            .proxy_map
+            .read()
+            .unwrap()
+            .get(&id)
+            .filter(|_| !self.is_host_listener_id(id))
+        {
             debug!("DGRAM allowing OP_RW for {}", pkt.src_port());
             let mut proxy = proxy_lock.lock().unwrap();
             let update = proxy.sendmsg(pkt);
@@ -775,6 +892,17 @@ impl VsockMuxer {
             return Ok(());
         }
 
+        let id = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
+        if self.is_host_listener_id(id) {
+            if matches!(pkt.op(), uapi::VSOCK_OP_REQUEST | uapi::VSOCK_OP_RW) {
+                self.push_packet(MuxerRx::Reset {
+                    local_port: pkt.dst_port(),
+                    peer_port: pkt.src_port(),
+                });
+            }
+            return Ok(());
+        }
+
         match pkt.op() {
             uapi::VSOCK_OP_REQUEST => self.process_op_request(pkt),
             uapi::VSOCK_OP_RESPONSE => self.process_op_response(pkt),
@@ -785,5 +913,255 @@ impl VsockMuxer {
             _ => warn!("stream: unhandled op={}", pkt.op()),
         }
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn tsi_unix_path(addr: &SockaddrStorage) -> Option<PathBuf> {
+    let path = addr.as_unix_addr()?.path()?;
+    let bytes = path.as_os_str().as_bytes();
+    let end = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len());
+    (end != 0).then(|| PathBuf::from(OsStr::from_bytes(&bytes[..end])))
+}
+
+#[cfg(windows)]
+fn tsi_unix_path(addr: &SockaddrStorage) -> Option<PathBuf> {
+    addr.unix_path()
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        match (fs::metadata(a), fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        match (fs::canonicalize(a), fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod protected_path_tests {
+    use super::*;
+    use crate::virtio::descriptor_utils::{DescriptorType, create_descriptor_chain};
+    use crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE;
+    use crate::virtio::vsock::unix_proxy::UnixAcceptorProxy;
+    use nix::sys::socket::SockaddrLike;
+    use std::mem;
+    use std::os::unix::net::UnixStream;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use vm_memory::{Bytes, GuestAddress};
+
+    fn guest_packet(
+        mem: &GuestMemoryMmap,
+        type_: u16,
+        op: u16,
+        src_port: u32,
+        dst_port: u32,
+        data: &[u8],
+    ) -> VsockPacket {
+        let chain = create_descriptor_chain(
+            mem,
+            GuestAddress(0),
+            GuestAddress(0x1000),
+            vec![
+                (DescriptorType::Readable, VSOCK_PKT_HDR_SIZE as u32),
+                (DescriptorType::Readable, data.len() as u32),
+            ],
+            0,
+        )
+        .unwrap();
+        let mut header = [0u8; VSOCK_PKT_HDR_SIZE];
+        header[8..16].copy_from_slice(&uapi::VSOCK_HOST_CID.to_le_bytes());
+        header[16..20].copy_from_slice(&src_port.to_le_bytes());
+        header[20..24].copy_from_slice(&dst_port.to_le_bytes());
+        header[24..28].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        header[28..30].copy_from_slice(&type_.to_le_bytes());
+        header[30..32].copy_from_slice(&op.to_le_bytes());
+        mem.write_slice(&header, GuestAddress(0x1000)).unwrap();
+        mem.write_slice(data, GuestAddress(0x1000 + VSOCK_PKT_HDR_SIZE as u64))
+            .unwrap();
+        VsockPacket::from_tx_virtq_head(&chain).unwrap()
+    }
+
+    fn guest_unix_addr(path: &[u8]) -> SockaddrStorage {
+        let mut raw: libc::sockaddr_un = unsafe { mem::zeroed() };
+        raw.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (dst, src) in raw.sun_path.iter_mut().zip(path) {
+            *dst = *src as libc::c_char;
+        }
+        unsafe {
+            SockaddrStorage::from_raw(
+                &raw as *const libc::sockaddr_un as *const libc::sockaddr,
+                Some(mem::size_of::<libc::sockaddr_un>() as libc::socklen_t),
+            )
+        }
+        .unwrap()
+    }
+
+    #[test]
+    fn guest_path_strips_padding_nuls() {
+        assert_eq!(
+            tsi_unix_path(&guest_unix_addr(b"/run/krun-init.sock")),
+            Some(PathBuf::from("/run/krun-init.sock"))
+        );
+    }
+
+    #[test]
+    fn guest_path_stops_at_first_nul() {
+        let path = PathBuf::from("/run/krun-init.sock");
+        let muxer = VsockMuxer::new(
+            3,
+            None,
+            Some(HashMap::from([(1234, (path.clone(), true))])),
+            TsiFlags::HIJACK_UNIX,
+        )
+        .unwrap();
+        let addr = guest_unix_addr(b"/run/krun-init.sock\0suffix");
+        assert_eq!(tsi_unix_path(&addr), Some(path));
+        assert!(muxer.is_protected_unix_path(&addr));
+    }
+
+    #[test]
+    fn guest_packets_cannot_dispatch_to_or_replace_host_listener() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "krun-protected-listener-{}-{nonce}.sock",
+            std::process::id()
+        ));
+        let port = 0x4b52554e;
+        let id = ((port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+        let mut muxer = VsockMuxer::new(
+            3,
+            None,
+            Some(HashMap::from([(port, (path.clone(), true))])),
+            TsiFlags::HIJACK_UNIX,
+        )
+        .unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x3000)]).unwrap();
+        muxer.mem = Some(mem.clone());
+        muxer.queue = Some(Arc::new(Mutex::new(VirtQueue::new(256))));
+        let listener = UnixAcceptorProxy::new(id, &path, port).unwrap();
+        muxer
+            .proxy_map
+            .write()
+            .unwrap()
+            .insert(id, Mutex::new(Box::new(listener)));
+
+        let mut connect = [0u8; 24];
+        connect[..4].copy_from_slice(&port.to_le_bytes());
+        connect[4..8].copy_from_slice(&16u32.to_le_bytes());
+        connect[8..10].copy_from_slice(&(libc::AF_INET as u16).to_le_bytes());
+        let packet = guest_packet(
+            &mem,
+            uapi::VSOCK_TYPE_DGRAM,
+            uapi::VSOCK_OP_RW,
+            4000,
+            defs::TSI_CONNECT,
+            &connect,
+        );
+        muxer.send_dgram_pkt(&packet).unwrap();
+        assert!(matches!(
+            muxer.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::ConnResponse { result, .. }) if result == -libc::EACCES
+        ));
+
+        let mut create = [0u8; 8];
+        create[..4].copy_from_slice(&port.to_le_bytes());
+        create[4..6].copy_from_slice(&(libc::AF_UNIX as u16).to_le_bytes());
+        create[6..8].copy_from_slice(&defs::SOCK_STREAM.to_le_bytes());
+        let packet = guest_packet(
+            &mem,
+            uapi::VSOCK_TYPE_DGRAM,
+            uapi::VSOCK_OP_RW,
+            4000,
+            defs::TSI_PROXY_CREATE,
+            &create,
+        );
+        muxer.send_dgram_pkt(&packet).unwrap();
+
+        let packet = guest_packet(
+            &mem,
+            uapi::VSOCK_TYPE_STREAM,
+            uapi::VSOCK_OP_RW,
+            port,
+            defs::TSI_PROXY_PORT,
+            b"x",
+        );
+        muxer.send_stream_pkt(&packet).unwrap();
+        assert!(matches!(
+            muxer.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::Reset { .. })
+        ));
+        assert_eq!(
+            muxer.proxy_map.read().unwrap()[&id]
+                .lock()
+                .unwrap()
+                .status(),
+            ProxyStatus::WaitingOnAccept
+        );
+        assert!(UnixStream::connect(&path).is_ok());
+    }
+
+    #[test]
+    fn same_file_matches_identical_and_aliased_paths() {
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!("krun-same-file-test-{}", std::process::id()));
+        fs::write(&a, b"").unwrap();
+        let b = dir.join(".").join(a.file_name().unwrap());
+        let hardlink = dir.join(format!("krun-same-file-link-{}", std::process::id()));
+        fs::hard_link(&a, &hardlink).unwrap();
+        assert!(same_file(&a, &b));
+        assert!(same_file(&a, &hardlink));
+        assert!(!same_file(&a, &dir.join("other")));
+        fs::remove_file(&hardlink).unwrap();
+        fs::remove_file(&a).unwrap();
+    }
+
+    #[test]
+    fn relative_listening_path_remains_protected_after_chdir() {
+        const CHILD: &str = "KRUN_VSOCK_RELATIVE_PATH_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "virtio::vsock::muxer::protected_path_tests::relative_listening_path_remains_protected_after_chdir",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let path = PathBuf::from("krun-relative-protected.sock");
+        let absolute = std::env::current_dir().unwrap().join(&path);
+        let muxer = VsockMuxer::new(
+            3,
+            None,
+            Some(HashMap::from([(1234, (path, true))])),
+            TsiFlags::HIJACK_UNIX,
+        )
+        .unwrap();
+        std::env::set_current_dir(std::env::temp_dir()).unwrap();
+        assert_eq!(muxer.unix_ipc_port_map.as_ref().unwrap()[&1234].0, absolute);
+        assert!(muxer.is_protected_unix_path(&guest_unix_addr(absolute.as_os_str().as_bytes())));
     }
 }
