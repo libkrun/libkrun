@@ -48,6 +48,7 @@ pub fn term_restore_mode(term: BorrowedFd, restore: &TerminalMode) -> Result<(),
 pub fn term_set_raw_mode(
     term: BorrowedHandle<'_>,
     handle_signals_by_terminal: bool,
+    enable_vt_translation: bool,
 ) -> Result<TerminalMode, io::Error> {
     let mut mode: CONSOLE_MODE = 0;
 
@@ -66,7 +67,11 @@ pub fn term_set_raw_mode(
         mode &= !ENABLE_PROCESSED_INPUT;
     }
 
-    mode &= !ENABLE_VIRTUAL_TERMINAL_INPUT;
+    if enable_vt_translation {
+        mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+    } else {
+        mode &= !ENABLE_VIRTUAL_TERMINAL_INPUT;
+    }
 
     let ret = unsafe { SetConsoleMode(term.as_raw_handle(), mode) };
     if ret == 0 {
