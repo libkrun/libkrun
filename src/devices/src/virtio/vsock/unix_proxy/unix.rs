@@ -1,5 +1,7 @@
+use std::fs;
 use std::num::Wrapping;
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 
@@ -444,19 +446,79 @@ pub(crate) fn new_acceptor_proxy(
         None,
     )
     .map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?;
-    bind(
-        fd.as_raw_fd(),
-        &UnixAddr::new(path)
-            .map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?,
-    )
-    .map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?;
+    let addr = UnixAddr::new(path)
+        .map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?;
+    let bound = bind(fd.as_raw_fd(), &addr);
+    let bound = if bound == Err(Errno::EADDRINUSE) && remove_stale_socket(path) {
+        bind(fd.as_raw_fd(), &addr)
+    } else {
+        bound
+    };
+    bound.map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?;
+    let metadata = fs::symlink_metadata(path).map_err(ProxyError::CreatingSocket)?;
+    let proxy = super::UnixAcceptorProxy {
+        id,
+        fd,
+        peer_port,
+        path: path.to_path_buf(),
+        identity: (metadata.dev(), metadata.ino()),
+    };
     listen(
-        &fd,
+        &proxy.fd,
         Backlog::new(5)
             .map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?,
     )
     .map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?;
-    Ok(super::UnixAcceptorProxy { id, fd, peer_port })
+    Ok(proxy)
+}
+
+fn remove_stale_socket(path: &Path) -> bool {
+    let Ok(original) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !original.file_type().is_socket() {
+        return false;
+    }
+    let Ok(probe) = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    ) else {
+        return false;
+    };
+    let Ok(flags) = fcntl(&probe, FcntlArg::F_GETFL) else {
+        return false;
+    };
+    let Some(flags) = OFlag::from_bits(flags) else {
+        return false;
+    };
+    if fcntl(&probe, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).is_err() {
+        return false;
+    }
+    let Ok(addr) = UnixAddr::new(path) else {
+        return false;
+    };
+    if connect(probe.as_raw_fd(), &addr) != Err(Errno::ECONNREFUSED) {
+        return false;
+    }
+    let Ok(current) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    original.dev() == current.dev()
+        && original.ino() == current.ino()
+        && fs::remove_file(path).is_ok()
+}
+
+impl Drop for super::UnixAcceptorProxy {
+    fn drop(&mut self) {
+        if let Ok(current) = fs::symlink_metadata(&self.path)
+            && current.dev() == self.identity.0
+            && current.ino() == self.identity.1
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 pub(crate) fn process_acceptor_event(
@@ -493,4 +555,95 @@ pub(crate) fn process_acceptor_event(
 
 pub(crate) fn as_raw_acceptor_fd(proxy: &super::UnixAcceptorProxy) -> RawFd {
     proxy.fd.as_raw_fd()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn socket_path(label: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("krun-{label}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn acceptor_replaces_stale_socket_and_cleans_up_on_drop() {
+        let path = socket_path("stale");
+        drop(UnixListener::bind(&path).unwrap());
+        let proxy = new_acceptor_proxy(1, &path, 1234).unwrap();
+        assert!(UnixStream::connect(&path).is_ok());
+        drop(proxy);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn acceptor_preserves_live_listener() {
+        let path = socket_path("live");
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(new_acceptor_proxy(1, &path, 1234).is_err());
+        assert!(UnixStream::connect(&path).is_ok());
+        drop(listener);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn acceptor_drop_preserves_replacement_file() {
+        let path = socket_path("replaced");
+        let proxy = new_acceptor_proxy(1, &path, 1234).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        drop(proxy);
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_live_backlog_does_not_block_acceptor_startup() {
+        let path = socket_path("full-backlog");
+        let listener = UnixListener::bind(&path).unwrap();
+        listen(&listener, Backlog::new(1).unwrap()).unwrap();
+        let addr = UnixAddr::new(&path).unwrap();
+        let mut clients = Vec::new();
+        let mut backlog_full = false;
+        for _ in 0..16 {
+            let client = socket(
+                AddressFamily::Unix,
+                SockType::Stream,
+                SockFlag::SOCK_NONBLOCK,
+                None,
+            )
+            .unwrap();
+            match connect(client.as_raw_fd(), &addr) {
+                Ok(()) => clients.push(client),
+                Err(Errno::EAGAIN) => {
+                    backlog_full = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected connect error: {e}"),
+            }
+        }
+        assert!(backlog_full);
+
+        let (tx, rx) = mpsc::channel();
+        let probe_path = path.clone();
+        let probe = thread::spawn(move || {
+            tx.send(new_acceptor_proxy(1, &probe_path, 1234).is_err())
+                .unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        probe.join().unwrap();
+        assert!(path.exists());
+        drop(clients);
+        drop(listener);
+        fs::remove_file(path).unwrap();
+    }
 }

@@ -177,6 +177,8 @@ pub enum VsockError {
     UnwritableDescriptor,
     /// EventFd error
     EventFd(std::io::Error),
+    /// Could not resolve a host listening socket against the current directory.
+    CurrentDir(std::io::Error),
 }
 
 type Result<T> = std::result::Result<T, VsockError>;

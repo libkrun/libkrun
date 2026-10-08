@@ -35,6 +35,33 @@ When TSI is enabled on `VsockDevice`:
 - **Network Context**: Proxied TSI socket calls use the VMM's host network context. Apply firewall, routing, or socket restrictions to the VMM process (e.g. by running it in a dedicated network namespace).
 - **AF_UNIX Access**: On Linux, enabling `AF_UNIX` socket hijacking allows the guest to connect to host Unix domain sockets accessible to the VMM process.
 
+### Guest init control socket
+
+On Unix hosts, when `Builder::control_socket` and `Config::apply_with_vsock`
+are used, the VMM listens on the configured host Unix socket and forwards
+connections to the guest init's vsock control server. Any local process
+allowed to connect can start a process in the guest or signal its main workload.
+An exec request runs
+with the guest init's identity (normally root) unless the caller supplies a
+different UID and GID. Put the socket in a directory accessible only to the
+intended runtime and its trusted controllers; Unix filesystem permissions on
+the path and its parent directories form the host access boundary.
+
+Guest init accepts control connections only from the host vsock CID. On Linux,
+the vsock muxer reserves host listener proxy IDs so guest TSI packets cannot
+claim or use them. It rejects guest TSI `AF_UNIX` connect and listen requests
+whose paths resolve to a host listening socket, including filesystem aliases.
+Relative listener paths are resolved before binding, so a later change to the
+VMM's working directory cannot bypass the checks.
+
+After an `AF_UNIX` connect, the muxer also checks the kernel-reported peer
+before reporting success. This catches a symlink changed between the pathname
+check and the connect. For a guest TSI listen, it pins the resolved parent
+directory before removing an existing socket and uses that directory and the
+socket's inode for cleanup; changing a parent symlink cannot redirect either
+unlink to the host listener. These checks protect the listener from the guest.
+They do not authenticate local host clients.
+
 ---
 
 ## Getting in contact

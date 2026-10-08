@@ -301,6 +301,10 @@ pub struct UnixAcceptorProxy {
     id: u64,
     fd: OwnedFd,
     peer_port: u32,
+    #[cfg(unix)]
+    path: PathBuf,
+    #[cfg(unix)]
+    identity: (u64, u64),
 }
 
 impl UnixAcceptorProxy {
