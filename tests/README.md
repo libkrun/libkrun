@@ -2,8 +2,17 @@
 The testing framework here allows you to write code to configure libkrun (using the public API) and run some specific code in the guest.
 
 ## Running the tests:
-The tests can be ran using `make test` (from the main libkrun directory).
-You can also run `./run.sh` inside the `test` directory. When using the `./run.sh` script you probably want specify the `PKG_CONFIG_PATH` enviroment variable, otherwise you will be testing the system wide installation of libkrun.
+The tests can be run using `make test` (from the main libkrun directory).
+You can also run `./run.sh` inside the `tests` directory. It uses static linking by default. To test the shared libraries directly on Linux, build the local prefix and set the library paths from inside `tests/`:
+
+```bash
+make test-prefix                 # from the repository root
+cd tests
+KRUN_TEST_FFI=1 \
+  PKG_CONFIG_PATH="$(realpath ../test-prefix/lib64/pkgconfig)" \
+  LIBKRUN_LIB_PATH="$(realpath ../test-prefix/lib64)" \
+  ./run.sh test
+```
 
 ## Running on macOS
 
@@ -15,26 +24,16 @@ You can also run `./run.sh` inside the `test` directory. When using the `./run.s
    rustup target add aarch64-unknown-linux-musl
    ```
 
-2. Install libkrunfw - either via homebrew:
+2. Install libkrunfw from the [libkrun Homebrew tap](https://github.com/libkrun/homebrew-krun):
    ```bash
+   brew tap libkrun/krun
+   brew trust libkrun/krun
    brew install libkrunfw
    ```
 
-   Or build from source:
-   ```bash
-   curl -LO https://github.com/containers/libkrunfw/releases/download/v5.2.0/libkrunfw-prebuilt-aarch64.tgz
-   tar -xzf libkrunfw-prebuilt-aarch64.tgz
-   cd libkrunfw
-   make
-   sudo make install
-   ```
+   For a source build, follow the [libkrunfw macOS instructions](https://github.com/libkrun/libkrunfw#macos), then run `make test LIBKRUNFW_SRC=/path/to/libkrunfw` to install that firmware into `test-prefix/` for the tests.
 
-   If installed from source, add `/usr/local/lib` to your library path:
-   ```bash
-   export DYLD_LIBRARY_PATH="/usr/local/lib:${DYLD_LIBRARY_PATH}"
-   ```
-
-   The test harness automatically handles the library path for homebrew installations.
+   `make test` includes the Homebrew libkrunfw path automatically.
 
 ### Running tests
 
@@ -43,7 +42,7 @@ make test
 ```
 
 ## Adding tests
-To add a test you need to add a new rust module in the `test_cases` directory, implement the  required host and guest side methods (see existing tests) and register the test in the `test_cases/src/lib.rs` to be ran.
+To add a test, add a Rust module under `tests/test_cases/src/`, implement the required host and guest methods (see existing tests), and register it in `tests/test_cases/src/lib.rs`.
 
 ## FreeBSD guest tests
 
@@ -66,12 +65,12 @@ FreeBSD guest tests run on Linux (amd64, arm64) and macOS (arm64) hosts. They re
 
 2. Build the FreeBSD sysroot and `init-freebsd` (from the libkrun root directory):
    ```bash
-   make BUILD_BSD_INIT=1 -- init/init-freebsd
+   make BUILD_BSD_INIT=1 -- init/init-binary/init-freebsd
    ```
-   This downloads `freebsd-sysroot/base.txz`, extracts it to `freebsd-sysroot/`, and compiles `init/init-freebsd`.
+   This downloads `freebsd-sysroot/base.txz`, extracts it to `freebsd-sysroot/`, and compiles `init/init-binary/init-freebsd`.
 
 3. The FreeBSD kernel is downloaded and cached automatically by `run.sh` (from
-   `download.freebsd.org`). To use a locally-provided kernel instead, set
+   a Firecracker-optimized release on x86_64 or `download.freebsd.org` on aarch64). To use a locally provided kernel instead, set
    `KRUN_TEST_FREEBSD_KERNEL_PATH` before running:
    ```bash
    export KRUN_TEST_FREEBSD_KERNEL_PATH="/path/to/boot/kernel/kernel"      # amd64
@@ -81,7 +80,7 @@ FreeBSD guest tests run on Linux (amd64, arm64) and macOS (arm64) hosts. They re
 ### Running FreeBSD tests
 
 With the sysroot/init assets built, `run.sh` (or `make test`) will automatically:
-- Download and cache `target/freebsd-kernel/boot/kernel/kernel[.bin]` if not already present
+- Cache the x86_64 kernel at `target/freebsd-kernel/freebsd-kern.bin` or the aarch64 kernel at `target/freebsd-kernel/boot/kernel/kernel.bin`
 - Cross-compile the `guest-agent` for FreeBSD
 - Build `target/freebsd-test-rootfs.iso` from `init-freebsd` + the FreeBSD `guest-agent`
 - Set `KRUN_TEST_FREEBSD_KERNEL_PATH` and `KRUN_TEST_FREEBSD_ISO_PATH` for the runner

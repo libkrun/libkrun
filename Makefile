@@ -32,6 +32,11 @@ AWS_NITRO_INIT_SRC = \
 
 AWS_NITRO_INIT_LD_FLAGS = -larchive -lnsm
 
+# Install prefix for `make test` and, going forward, the examples. Defined
+# early so goal names (e.g. `test-prefix`) and their recipes reference one
+# symbol; renaming the directory is a single-line change.
+TEST_PREFIX = test-prefix
+
 ifeq ($(SEV),1)
     VARIANT = -sev
     FEATURE_FLAGS := --features amd-sev
@@ -43,16 +48,17 @@ endif
 ifeq ($(VIRGL_RESOURCE_MAP2),1)
 	FEATURE_FLAGS += --features virgl_resource_map2
 endif
-# Test targets require the block device (BLK) feature for FreeBSD disk tests,
-# the NET feature for gvproxy-based network tests, and FFI for weak linking tests.
-# Enable automatically unless the user explicitly set them to a value.
+# Test targets require the block device (BLK) feature for FreeBSD disk tests
+# and the NET feature for gvproxy-based network tests. The FFI feature (weak
+# linking tests) is enabled by default (see FFI below). Enable BLK/NET
+# automatically unless the user explicitly set them to a value.
 ifeq ($(BLK),)
-    ifneq ($(filter test test-prefix,$(MAKECMDGOALS)),)
+    ifneq ($(filter test $(TEST_PREFIX),$(MAKECMDGOALS)),)
         BLK := 1
     endif
 endif
 ifeq ($(NET),)
-    ifneq ($(filter test test-prefix,$(MAKECMDGOALS)),)
+    ifneq ($(filter test $(TEST_PREFIX),$(MAKECMDGOALS)),)
         NET := 1
     endif
 endif
@@ -77,6 +83,9 @@ endif
 ifeq ($(TIMESYNC),1)
     FEATURE_FLAGS += --features timesync
 endif
+# The C ABI export bridge (ffier) is built by default so the installed
+# libkrun.so always carries its C API. Pass FFI=0 for a pure-Rust build.
+FFI ?= 1
 ifeq ($(FFI),1)
     FEATURE_FLAGS += --features ffi
 endif
@@ -112,7 +121,7 @@ ifeq ($(PREFIX),)
     PREFIX := /usr/local
 endif
 
-.PHONY: install clean test test-prefix gen-libkrun-bindings gen-init-blob-bindings $(LIBRARY_RELEASE_$(OS)) $(LIBRARY_DEBUG_$(OS)) libkrun.pc libkrun_init.pc clean-sysroot clean-all
+.PHONY: install clean test $(TEST_PREFIX) gen-libkrun-bindings gen-init-blob-bindings $(LIBRARY_RELEASE_$(OS)) $(LIBRARY_DEBUG_$(OS)) libkrun.pc libkrun_init.pc clean-sysroot clean-all
 
 all: $(LIBRARY_RELEASE_$(OS)) libkrun.pc libkrun_init.pc
 
@@ -284,31 +293,31 @@ ifeq ($(BUILD_BSD_INIT),1)
 	rm -f $(INIT_BINARY_BSD)
 endif
 	cargo clean
-	rm -rf test-prefix
+	rm -rf $(TEST_PREFIX)
 	cd tests; cargo clean
 
 clean-all: clean clean-sysroot
 
-test-prefix/$(LIBDIR_$(OS))/libkrun.pc: $(LIBRARY_RELEASE_$(OS))
-	mkdir -p test-prefix
-	PREFIX="$$(realpath test-prefix)" make install
+$(TEST_PREFIX)/$(LIBDIR_$(OS))/libkrun.pc: $(LIBRARY_RELEASE_$(OS))
+	mkdir -p $(TEST_PREFIX)
+	PREFIX="$$(realpath $(TEST_PREFIX))" make install
 
-# Build and install libkrunfw from a source tree into test-prefix.
+# Build and install libkrunfw from a source tree into $(TEST_PREFIX).
 # Usage: make test LIBKRUNFW_SRC=/path/to/libkrunfw
 ifdef LIBKRUNFW_SRC
-.PHONY: test-prefix-libkrunfw
-test-prefix-libkrunfw:
+.PHONY: $(TEST_PREFIX)-libkrunfw
+$(TEST_PREFIX)-libkrunfw:
 	$(MAKE) -C $(LIBKRUNFW_SRC)
-	mkdir -p test-prefix
-	PREFIX="$$(realpath test-prefix)" $(MAKE) -C $(LIBKRUNFW_SRC) install
+	mkdir -p $(TEST_PREFIX)
+	PREFIX="$$(realpath $(TEST_PREFIX))" $(MAKE) -C $(LIBKRUNFW_SRC) install
 
-test-prefix: test-prefix/$(LIBDIR_$(OS))/libkrun.pc test-prefix-libkrunfw
+$(TEST_PREFIX): $(TEST_PREFIX)/$(LIBDIR_$(OS))/libkrun.pc $(TEST_PREFIX)-libkrunfw
 else
-test-prefix: test-prefix/$(LIBDIR_$(OS))/libkrun.pc
-	@if ls test-prefix/$(LIBDIR_$(OS))/libkrunfw* >/dev/null 2>&1; then \
-		echo "WARNING: test-prefix contains a custom libkrunfw from a previous LIBKRUNFW_SRC= run." >&2; \
+$(TEST_PREFIX): $(TEST_PREFIX)/$(LIBDIR_$(OS))/libkrun.pc
+	@if ls $(TEST_PREFIX)/$(LIBDIR_$(OS))/libkrunfw* >/dev/null 2>&1; then \
+		echo "WARNING: $(TEST_PREFIX) contains a custom libkrunfw from a previous LIBKRUNFW_SRC= run." >&2; \
 		echo "         Tests will use it instead of the system libkrunfw." >&2; \
-		echo "         To reset, run: rm -rf test-prefix" >&2; \
+		echo "         To reset, run: rm -rf $(TEST_PREFIX)" >&2; \
 	fi
 endif
 
@@ -321,5 +330,25 @@ EXTRA_LIBPATH_Darwin = /opt/homebrew/opt/libkrunfw/lib:/opt/homebrew/opt/llvm/li
 
 # On macOS, SIP strips DYLD_LIBRARY_PATH when executing scripts via a shebang,
 # so we pass the path via LIBKRUN_LIB_PATH and let run.sh set the real variable.
-test: test-prefix
-	cd tests; RUST_LOG=trace KRUN_TEST_FFI=$(FFI) LIBKRUN_LIB_PATH="$$(realpath ../test-prefix/$(LIBDIR_$(OS))/):$(EXTRA_LIBPATH_$(OS))" PKG_CONFIG_PATH="$$(realpath ../test-prefix/$(LIBDIR_$(OS))/pkgconfig/)" ./run.sh test --test-case "$(TEST)" $(TEST_FLAGS)
+
+# Static test runs normally need no $(TEST_PREFIX) at all, but a custom
+# libkrunfw is still dlopen'd by libkrun at runtime. Include a copy already
+# installed in $(TEST_PREFIX), even when LIBKRUNFW_SRC is omitted later.
+ifdef LIBKRUNFW_SRC
+TEST_STATIC_DEPS = $(TEST_PREFIX)-libkrunfw
+endif
+ifneq ($(strip $(LIBKRUNFW_SRC) $(wildcard $(TEST_PREFIX)/$(LIBDIR_$(OS))/libkrunfw*)),)
+TEST_LIBPATH = $$(realpath ../$(TEST_PREFIX)/$(LIBDIR_$(OS)))/:$(EXTRA_LIBPATH_$(OS))
+else
+TEST_LIBPATH = $(EXTRA_LIBPATH_$(OS))
+endif
+
+ifeq ($(FFI),1)
+test: $(TEST_PREFIX)
+	cd tests; RUST_LOG=trace KRUN_TEST_FFI=$(FFI) LIBKRUN_LIB_PATH="$$(realpath ../$(TEST_PREFIX)/$(LIBDIR_$(OS)))/:$(EXTRA_LIBPATH_$(OS))" PKG_CONFIG_PATH="$$(realpath ../$(TEST_PREFIX)/$(LIBDIR_$(OS))/pkgconfig/)" ./run.sh test --test-case "$(TEST)" $(TEST_FLAGS)
+else
+# Static-linking test run: the runner links libkrun at compile time, so no
+# libkrun build/install into $(TEST_PREFIX) is needed (and libkrun.so is not built).
+test: $(TEST_STATIC_DEPS)
+	cd tests; RUST_LOG=trace KRUN_TEST_FFI=$(FFI) LIBKRUN_LIB_PATH="$(TEST_LIBPATH)" ./run.sh test --test-case "$(TEST)" $(TEST_FLAGS)
+endif
