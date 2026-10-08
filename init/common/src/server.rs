@@ -16,7 +16,6 @@ use std::io::{self, Read, Write};
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -26,30 +25,37 @@ use crate::control::{
 };
 
 pub struct Server {
-    workload: Arc<AtomicI32>,
+    listener: OwnedFd,
 }
 
 impl Server {
-    /// Bind `port` on the guest vsock and accept connections on a background
-    /// thread. Only the host CID is accepted.
-    pub fn start(port: u32) -> io::Result<Server> {
+    /// Listen before the workload fork so early host connections queue.
+    pub fn bind(port: u32) -> io::Result<Server> {
         let listener = vsock_listen(port)?;
-        let workload = Arc::new(AtomicI32::new(0));
-        let accepted = workload.clone();
-        thread::Builder::new()
-            .name("krun-control".into())
-            .spawn(move || accept_loop(listener, accepted))?;
-        Ok(Server { workload })
+        Ok(Server { listener })
     }
 
-    /// Tell the server which pid `SignalEntrypoint` requests should target.
-    pub fn set_workload(&self, pid: i32) {
-        self.workload.store(pid, Ordering::SeqCst);
+    /// Start accepting after the workload fork so init forks while
+    /// single-threaded. Only the host CID is accepted.
+    pub fn start(self, workload: i32) -> io::Result<()> {
+        let workload = Arc::new(pidfd_open(workload)?);
+        thread::Builder::new()
+            .name("krun-control".into())
+            .spawn(move || accept_loop(self.listener, workload))?;
+        Ok(())
     }
 }
 
 fn last_error() -> io::Error {
     io::Error::last_os_error()
+}
+
+fn pidfd_open(pid: i32) -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) as RawFd };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 fn vsock_listen(port: u32) -> io::Result<OwnedFd> {
@@ -78,7 +84,7 @@ fn vsock_listen(port: u32) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
-fn accept_loop(listener: OwnedFd, workload: Arc<AtomicI32>) {
+fn accept_loop(listener: OwnedFd, workload: Arc<OwnedFd>) {
     loop {
         let fd = unsafe {
             libc::accept4(
@@ -105,7 +111,7 @@ fn accept_loop(listener: OwnedFd, workload: Arc<AtomicI32>) {
         }
         let workload = workload.clone();
         thread::spawn(move || {
-            if let Err(e) = handle_connection(fd, workload) {
+            if let Err(e) = handle_connection(fd, Some(workload)) {
                 eprintln!("krun-init: control server: {e}");
             }
         });
@@ -177,7 +183,7 @@ fn failure(errno: i32, what: &str) -> Failure {
 }
 
 /// Serve one connection until its request is complete.
-pub fn handle_connection(sock: OwnedFd, workload: Arc<AtomicI32>) -> io::Result<()> {
+pub fn handle_connection(sock: OwnedFd, workload: Option<Arc<OwnedFd>>) -> io::Result<()> {
     let sock = Arc::new(sock);
     let mut io = FdIo(sock.as_fd());
 
@@ -204,13 +210,12 @@ pub fn handle_connection(sock: OwnedFd, workload: Arc<AtomicI32>) -> io::Result<
     };
     match request {
         Request::SignalEntrypoint { signal } => {
-            let pid = workload.load(Ordering::SeqCst);
-            let response = if pid <= 0 {
-                Response::Failed(failure(libc::ESRCH, "workload pid unknown"))
-            } else if unsafe { libc::kill(pid, signal) } < 0 {
-                Response::Failed(failure(last_error().raw_os_error().unwrap_or(0), "kill"))
-            } else {
-                Response::Ok
+            let response = match workload {
+                Some(pidfd) => match pidfd_send_signal(pidfd.as_fd(), signal) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => Response::Failed(io_failure(e, "signal workload")),
+                },
+                None => Response::Failed(failure(libc::ESRCH, "workload pid unknown")),
             };
             control::write(&mut io, &response)
         }
@@ -675,16 +680,20 @@ fn recv_pidfd(sock: &OwnedFd) -> io::Result<(OwnedFd, i32)> {
     ))
 }
 
-fn pidfd_send_signal(pidfd: BorrowedFd, signal: i32) {
-    unsafe {
+fn pidfd_send_signal(pidfd: BorrowedFd, signal: i32) -> io::Result<()> {
+    let ret = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
             pidfd.as_raw_fd(),
             signal,
             ptr::null::<libc::siginfo_t>(),
             0 as libc::c_uint,
-        );
+        )
+    };
+    if ret < 0 {
+        return Err(last_error());
     }
+    Ok(())
 }
 
 fn poll(fds: &mut [libc::pollfd]) -> io::Result<()> {
@@ -712,7 +721,7 @@ const READABLE: libc::c_short = libc::POLLIN | libc::POLLHUP | libc::POLLERR;
 
 fn hangup(input: &mut Input, pidfd: &OwnedFd) {
     input.eof();
-    pidfd_send_signal(pidfd.as_fd(), libc::SIGHUP);
+    let _ = pidfd_send_signal(pidfd.as_fd(), libc::SIGHUP);
 }
 
 fn relay(sock: Arc<OwnedFd>, child: Child) -> io::Result<()> {
@@ -948,7 +957,9 @@ fn host_to_guest(sock: &OwnedFd, mut input: Input, pidfd: &OwnedFd, writer: &Mut
                     unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ as _, &winsize) };
                 }
             }
-            Request::Signal { signal } => pidfd_send_signal(pidfd.as_fd(), signal),
+            Request::Signal { signal } => {
+                let _ = pidfd_send_signal(pidfd.as_fd(), signal);
+            }
             _ => {}
         }
     }
@@ -968,8 +979,8 @@ mod tests {
 
     fn connect(workload: Option<i32>) -> Connection {
         let (host, guest) = UnixStream::pair().unwrap();
-        let pid = Arc::new(AtomicI32::new(workload.unwrap_or(0)));
-        thread::spawn(move || handle_connection(OwnedFd::from(guest), pid));
+        let workload = workload.map(|pid| Arc::new(pidfd_open(pid).unwrap()));
+        thread::spawn(move || handle_connection(OwnedFd::from(guest), workload));
         Connection::from_stream(host).unwrap()
     }
 
@@ -1217,7 +1228,9 @@ mod tests {
                 ..sh("id -u")
             };
             match connect(None).exec(&spec) {
-                Err(crate::client::ClientError::SpawnFailed(f)) => assert_eq!(f.errno, libc::EINVAL),
+                Err(crate::client::ClientError::SpawnFailed(f)) => {
+                    assert_eq!(f.errno, libc::EINVAL)
+                }
                 other => panic!("unexpected result: {other:?}"),
             }
         }
@@ -1226,9 +1239,7 @@ mod tests {
     #[test]
     fn exec_rejects_stdin_beyond_credit_window() {
         let (mut host, guest) = UnixStream::pair().unwrap();
-        let server = thread::spawn(move || {
-            handle_connection(OwnedFd::from(guest), Arc::new(AtomicI32::new(0)))
-        });
+        let server = thread::spawn(move || handle_connection(OwnedFd::from(guest), None));
         control::write(
             &mut host,
             &Request::Hello {
@@ -1280,15 +1291,7 @@ mod tests {
     #[test]
     fn failed_stdin_credit_hangs_up_process() {
         let mut workload = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-        let pidfd = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_open,
-                workload.id() as i32,
-                0 as libc::c_uint,
-            ) as RawFd
-        };
-        assert!(pidfd >= 0);
-        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+        let pidfd = pidfd_open(workload.id() as i32).unwrap();
         let (mut host, guest) = UnixStream::pair().unwrap();
         let (input_read, input_write) = pipe_pair();
         control::write(&mut host, &Request::Stdin(b"x".to_vec())).unwrap();
@@ -1320,9 +1323,7 @@ mod tests {
     #[test]
     fn exec_flushes_queued_stdin_before_eof() {
         let (mut host, guest) = UnixStream::pair().unwrap();
-        let server = thread::spawn(move || {
-            handle_connection(OwnedFd::from(guest), Arc::new(AtomicI32::new(0)))
-        });
+        let server = thread::spawn(move || handle_connection(OwnedFd::from(guest), None));
         control::write(
             &mut host,
             &Request::Hello {
@@ -1483,11 +1484,25 @@ mod tests {
     }
 
     #[test]
+    fn signal_entrypoint_rejects_exited_workload() {
+        let mut workload = Command::new("/bin/true").spawn().unwrap();
+        let pidfd = Arc::new(pidfd_open(workload.id() as i32).unwrap());
+        assert!(workload.wait().unwrap().success());
+        let (host, guest) = UnixStream::pair().unwrap();
+        thread::spawn(move || handle_connection(OwnedFd::from(guest), Some(pidfd)));
+        match Connection::from_stream(host)
+            .unwrap()
+            .signal_entrypoint(libc::SIGTERM)
+        {
+            Err(crate::client::ClientError::Rejected(f)) => assert_eq!(f.errno, libc::ESRCH),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
     fn hanging_up_after_hello_is_not_an_error() {
         let (host, guest) = UnixStream::pair().unwrap();
-        let server = thread::spawn(move || {
-            handle_connection(OwnedFd::from(guest), Arc::new(AtomicI32::new(0)))
-        });
+        let server = thread::spawn(move || handle_connection(OwnedFd::from(guest), None));
         drop(Connection::from_stream(host).unwrap());
         server.join().unwrap().unwrap();
     }
