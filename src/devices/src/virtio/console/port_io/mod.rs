@@ -14,7 +14,11 @@ mod windows;
 pub use windows::*;
 
 pub trait PortInput {
+    #[cfg(not(windows))]
     fn read_volatile(&mut self, buf: &mut VolatileSlice) -> Result<usize, io::Error>;
+
+    #[cfg(windows)]
+    fn read_bytes(&mut self, buf: &mut [u8]) -> Result<usize, io::Error>;
 
     fn wait_until_readable(&self, stopfd: Option<&EventFd>);
 }

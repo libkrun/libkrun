@@ -29,6 +29,79 @@ pub fn setup_regs(vcpu: &whp::WhpVcpu, boot_ip: u64) -> Result<()> {
     .map_err(Error::SetWhpRegisters)
 }
 
+/// Configure the architectural reset state used to enter PC firmware.
+///
+/// Sets registers to the standard x86 real-mode CPU reset state as defined by the
+/// Intel 64 and IA-32 Architectures Software Developer's Manual (Volume 3A,
+/// Chapter "Processor State After Reset") and the AMD64 Architecture Programmer's Manual.
+///
+/// This setup mirrors standard VMM reset implementations, such as QEMU's reset logic in:
+/// `target/i386/cpu.c` -> `x86_cpu_reset_hold()`
+pub fn setup_firmware_regs(vcpu: &whp::WhpVcpu, boot_ip: u64) -> Result<()> {
+    let to_reg64 = |val: u64| -> WHV_REGISTER_VALUE {
+        let mut v: WHV_REGISTER_VALUE = unsafe { std::mem::zeroed() };
+        v.Reg64 = val;
+        v
+    };
+
+    let to_segment = |base: u64, selector: u16, attributes: u16| -> WHV_REGISTER_VALUE {
+        let mut v: WHV_REGISTER_VALUE = unsafe { std::mem::zeroed() };
+        let segment = unsafe { &mut v.Segment };
+        segment.Base = base;
+        segment.Limit = 0xffff;
+        segment.Selector = selector;
+        segment.Anonymous.Anonymous._bitfield = attributes;
+        v
+    };
+
+    let to_table = || -> WHV_REGISTER_VALUE {
+        let mut v: WHV_REGISTER_VALUE = unsafe { std::mem::zeroed() };
+        let table = unsafe { &mut v.Table };
+        table.Base = 0;
+        table.Limit = 0xffff;
+        v
+    };
+
+    let data_segment = to_segment(0, 0, 0x0093);
+
+    vcpu.set_registers([
+        (WHvX64RegisterRax, to_reg64(0)),
+        (WHvX64RegisterRbx, to_reg64(0)),
+        (WHvX64RegisterRcx, to_reg64(0)),
+        (WHvX64RegisterRdx, to_reg64(0x600)),
+        (WHvX64RegisterRsp, to_reg64(0)),
+        (WHvX64RegisterRbp, to_reg64(0)),
+        (WHvX64RegisterRsi, to_reg64(0)),
+        (WHvX64RegisterRdi, to_reg64(0)),
+        (WHvX64RegisterR8, to_reg64(0)),
+        (WHvX64RegisterR9, to_reg64(0)),
+        (WHvX64RegisterR10, to_reg64(0)),
+        (WHvX64RegisterR11, to_reg64(0)),
+        (WHvX64RegisterR12, to_reg64(0)),
+        (WHvX64RegisterR13, to_reg64(0)),
+        (WHvX64RegisterR14, to_reg64(0)),
+        (WHvX64RegisterR15, to_reg64(0)),
+        (WHvX64RegisterRip, to_reg64(boot_ip)),
+        (WHvX64RegisterRflags, to_reg64(0x2)),
+        (WHvX64RegisterEs, data_segment),
+        (WHvX64RegisterCs, to_segment(0xffff_0000, 0xf000, 0x009b)),
+        (WHvX64RegisterSs, data_segment),
+        (WHvX64RegisterDs, data_segment),
+        (WHvX64RegisterFs, data_segment),
+        (WHvX64RegisterGs, data_segment),
+        (WHvX64RegisterLdtr, to_segment(0, 0, 0x0082)),
+        (WHvX64RegisterTr, to_segment(0, 0, 0x008b)),
+        (WHvX64RegisterIdtr, to_table()),
+        (WHvX64RegisterGdtr, to_table()),
+        (WHvX64RegisterCr0, to_reg64(0x6000_0010)),
+        (WHvX64RegisterCr2, to_reg64(0)),
+        (WHvX64RegisterCr3, to_reg64(0)),
+        (WHvX64RegisterCr4, to_reg64(0)),
+        (WHvX64RegisterEfer, to_reg64(0)),
+    ])
+    .map_err(Error::SetWhpRegisters)
+}
+
 /// Configures the segment registers and system page tables for a given CPU.
 ///
 /// # Arguments

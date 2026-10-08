@@ -12,6 +12,9 @@ use std::sync::{Arc, Mutex};
 use devices;
 use utils::eventfd::EventFd;
 
+#[cfg(windows)]
+use devices::BusDevice;
+
 /// Errors corresponding to the `PortIODeviceManager`.
 #[derive(Debug)]
 pub enum Error {
@@ -35,15 +38,16 @@ impl fmt::Display for Error {
 type Result<T> = ::std::result::Result<T, Error>;
 
 /// The `PortIODeviceManager` is a wrapper that is used for registering legacy devices
-/// on an I/O Bus. It currently manages the uart and i8042 devices.
+/// on an I/O Bus. It currently manages the uart, i8042, and ACPI PM devices.
 /// The `LegacyDeviceManger` should be initialized only by using the constructor.
 pub struct PortIODeviceManager {
     pub io_bus: devices::Bus,
     pub cmos: Arc<Mutex<devices::legacy::Cmos>>,
     pub stdio_serial: Vec<Arc<Mutex<devices::legacy::Serial>>>,
     pub i8042: Arc<Mutex<devices::legacy::I8042Device>>,
-
-    #[cfg(not(windows))]
+    pub acpi_pm: Arc<Mutex<devices::legacy::AcpiPm>>,
+    #[cfg(windows)]
+    pub pit: Arc<Mutex<devices::legacy::Pit>>,
     pub com_evt_1: EventFd,
     pub com_evt_2: EventFd,
     pub com_evt_3: EventFd,
@@ -52,8 +56,33 @@ pub struct PortIODeviceManager {
     pub kbd_evt: EventFd,
 }
 
+#[cfg(windows)]
+struct PcControlPorts {
+    i8042: Arc<Mutex<devices::legacy::I8042Device>>,
+    pit: Arc<Mutex<devices::legacy::Pit>>,
+}
+
+#[cfg(windows)]
+impl BusDevice for PcControlPorts {
+    fn read(&mut self, vcpuid: u64, offset: u64, data: &mut [u8]) {
+        match offset {
+            0 | 4 => self.i8042.lock().unwrap().read(vcpuid, offset, data),
+            1 if data.len() == 1 => data[0] = self.pit.lock().unwrap().read_speaker_port(),
+            _ => {}
+        }
+    }
+
+    fn write(&mut self, vcpuid: u64, offset: u64, data: &[u8]) {
+        match offset {
+            0 | 4 => self.i8042.lock().unwrap().write(vcpuid, offset, data),
+            1 if data.len() == 1 => self.pit.lock().unwrap().write_speaker_port(data[0]),
+            _ => {}
+        }
+    }
+}
+
 impl PortIODeviceManager {
-    /// Create a new DeviceManager handling legacy devices (uart, i8042).
+    /// Create a new DeviceManager handling legacy devices (uart, i8042, ACPI PM).
     pub fn new(
         cmos: Arc<Mutex<devices::legacy::Cmos>>,
         stdio_serial: Vec<Arc<Mutex<devices::legacy::Serial>>>,
@@ -77,16 +106,25 @@ impl PortIODeviceManager {
         let kbd_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
 
         let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(
-            i8042_reset_evfd,
+            i8042_reset_evfd.try_clone().map_err(Error::EventFd)?,
             kbd_evt.try_clone().map_err(Error::EventFd)?,
         )));
+        let acpi_pm = Arc::new(Mutex::new(devices::legacy::AcpiPm::new(i8042_reset_evfd)));
+
+        #[cfg(windows)]
+        let pit = {
+            let pit_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
+            Arc::new(Mutex::new(devices::legacy::Pit::new(pit_evt)))
+        };
 
         Ok(PortIODeviceManager {
             io_bus,
             cmos,
             stdio_serial,
             i8042,
-            #[cfg(not(windows))]
+            acpi_pm,
+            #[cfg(windows)]
+            pit,
             com_evt_1: evts[0].try_clone().map_err(Error::EventFd)?,
             com_evt_2: evts[1].try_clone().map_err(Error::EventFd)?,
             com_evt_3: evts[2].try_clone().map_err(Error::EventFd)?,
@@ -101,10 +139,40 @@ impl PortIODeviceManager {
         self.io_bus
             .insert(self.cmos.clone(), 0x70, 0x8)
             .map_err(Error::BusError)?;
+        self.io_bus
+            .insert(self.acpi_pm.clone(), 0x604, 2)
+            .map_err(Error::BusError)?;
 
         if let Some(serial) = self.stdio_serial.first() {
             self.io_bus
                 .insert(serial.clone(), 0x3f8, 0x8)
+                .map_err(Error::BusError)?;
+        }
+        #[cfg(windows)]
+        self.io_bus
+            .insert(self.pit.clone(), 0x40, 4)
+            .map_err(Error::BusError)?;
+        #[cfg(windows)]
+        self.io_bus
+            .insert(
+                Arc::new(Mutex::new(PcControlPorts {
+                    i8042: self.i8042.clone(),
+                    pit: self.pit.clone(),
+                })),
+                0x60,
+                5,
+            )
+            .map_err(Error::BusError)?;
+        #[cfg(windows)]
+        if self.stdio_serial.is_empty() {
+            self.io_bus
+                .insert(
+                    Arc::new(Mutex::new(devices::legacy::Serial::new_sink(
+                        self.com_evt_1.try_clone().map_err(Error::EventFd)?,
+                    ))),
+                    0x3f8,
+                    0x8,
+                )
                 .map_err(Error::BusError)?;
         }
         self.io_bus
@@ -143,6 +211,7 @@ impl PortIODeviceManager {
                 0x8,
             )
             .map_err(Error::BusError)?;
+        #[cfg(not(windows))]
         self.io_bus
             .insert(self.i8042.clone(), 0x060, 0x5)
             .map_err(Error::BusError)?;

@@ -5,12 +5,13 @@ use std::os::windows::io::{AsRawHandle, BorrowedHandle, OwnedHandle, RawHandle};
 use utils::eventfd::EventFd;
 use utils::windows::AsRawFd;
 use vm_memory::VolatileSlice;
-use vm_memory::bitmap::Bitmap;
 use windows_sys::Win32::{
     Foundation::FALSE,
     Storage::FileSystem::{ReadFile, WriteFile},
     System::{
-        Console::{CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo},
+        Console::{
+            CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetNumberOfConsoleInputEvents,
+        },
         Threading::{INFINITE, WaitForMultipleObjects, WaitForSingleObject},
     },
 };
@@ -60,7 +61,18 @@ impl AsRawHandle for PortInputHandle {
 }
 
 impl PortInput for PortInputHandle {
-    fn read_volatile(&mut self, buf: &mut VolatileSlice) -> io::Result<usize> {
+    fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // A synchronous ReadFile on a console handle cannot be interrupted by
+        // the port stop event. Check first so the RX thread waits on both the
+        // console and stop handles instead of getting stuck during teardown.
+        let mut event_count = 0;
+        if unsafe { GetNumberOfConsoleInputEvents(self.as_raw_handle(), &mut event_count) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if event_count == 0 {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+
         let len = u32::try_from(buf.len()).map_err(|_| {
             io::Error::new(ErrorKind::InvalidInput, "buffer length exceeds u32::MAX")
         })?;
@@ -68,7 +80,7 @@ impl PortInput for PortInputHandle {
         let ret = unsafe {
             ReadFile(
                 self.as_raw_handle(),
-                buf.ptr_guard_mut().as_ptr(),
+                buf.as_mut_ptr(),
                 len,
                 &mut bytes_read,
                 std::ptr::null_mut(),
@@ -79,16 +91,10 @@ impl PortInput for PortInputHandle {
             if err.kind() == ErrorKind::BrokenPipe {
                 return Ok(0);
             }
-            if err.kind() != ErrorKind::WouldBlock {
-                // We don't know if a partial read might have happened, so mark everything as dirty
-                buf.bitmap().mark_dirty(0, buf.len());
-            }
-            Err(err)
-        } else {
-            let n = bytes_read as usize;
-            buf.bitmap().mark_dirty(0, n);
-            Ok(n)
+            return Err(err);
         }
+
+        Ok(bytes_read as usize)
     }
 
     fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
@@ -101,7 +107,7 @@ impl PortInput for PortInputHandle {
 }
 
 impl PortInput for PortInputEmpty {
-    fn read_volatile(&mut self, _buf: &mut VolatileSlice) -> Result<usize, io::Error> {
+    fn read_bytes(&mut self, _buf: &mut [u8]) -> Result<usize, io::Error> {
         Ok(0)
     }
 

@@ -2623,10 +2623,10 @@ impl FileSystem for PassthroughFs {
 
         let data = fs::read(&stream).map_err(|e| {
             let code = e.raw_os_error().unwrap_or(0) as u32;
-            if code == 2 || code == 3 {
-                // Windows treats ADS as part of the path, so if the ADS has not been set it
-                // returns ERROR_FILE_NOT_FOUND (2) or ERROR_PATH_NOT_FOUND (3).
-                // This is normally mapped to ENOENT, but we map it to ENODATA instead to match Linux behavior.
+            if code == 2 || code == 3 || code == 123 {
+                // Windows treats ADS as part of the path, If the ADS is missing (2, 3)
+                // or the guest requested an xattr name that is an illegal Windows name (123)
+                // We map them to ENODATA instead to match Linux behavior.
                 // If we return ENOENT, the guest will think the file does not exist, which is not what we want.
                 io::Error::from_raw_os_error(linux_errno_raw(libc::ENODATA))
             } else {
