@@ -443,6 +443,14 @@ typedef void (*krun_vmm_builder_set_kernel_console_fn)(KrunVmmBuilder* handle, K
  */
 KrunResult krun_vmm_builder_add_serial_console(KrunVmmBuilder* handle, int input_fd, int output_fd, KrunError* err_out);
 typedef KrunResult (*krun_vmm_builder_add_serial_console_fn)(KrunVmmBuilder* handle, int input_fd, int output_fd, KrunError* err_out);
+/**
+ * Add a legacy serial console device with the given Windows handles.
+ *
+ * Can be called multiple times to add multiple serial consoles (ttyS0, ttyS1, …).
+ * The handles are borrowed, not duplicated. They must remain valid until the VMM exits.
+ */
+KrunResult krun_vmm_builder_add_serial_console_windows(KrunVmmBuilder* handle, uint64_t input_handle, uint64_t output_handle, KrunError* err_out);
+typedef KrunResult (*krun_vmm_builder_add_serial_console_windows_fn)(KrunVmmBuilder* handle, uint64_t input_handle, uint64_t output_handle, KrunError* err_out);
 void krun_vmm_builder_nested_virt(KrunVmmBuilder* handle, bool enabled);
 typedef void (*krun_vmm_builder_nested_virt_fn)(KrunVmmBuilder* handle, bool enabled);
 KrunResult krun_vmm_builder_split_irqchip(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);

@@ -1514,6 +1514,38 @@
           "cfg": "not(target_os = \"windows\")"
         },
         {
+          "name": "add_serial_console_windows",
+          "doc": [
+            " Add a legacy serial console device with the given Windows handles.",
+            "",
+            " Can be called multiple times to add multiple serial consoles (ttyS0, ttyS1, …).",
+            " The handles are borrowed, not duplicated. They must remain valid until the VMM exits."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "input_handle",
+              "param_kind": "regular",
+              "type": "u64"
+            },
+            {
+              "name": "output_handle",
+              "param_kind": "regular",
+              "type": "u64"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vmm_builder_add_serial_console_windows",
+          "cfg": "target_os = \"windows\""
+        },
+        {
           "name": "nested_virt",
           "receiver": "value",
           "params": [
