@@ -634,6 +634,15 @@ impl VsockMuxer {
             unix.confirm_connect(pkt);
             proxy_map.insert(id, Mutex::new(Box::new(unix)));
             self.process_proxy_update(id, update);
+        } else {
+            debug!(
+                "no unix socket mapped for port {}, sending rst",
+                pkt.dst_port()
+            );
+            self.push_packet(MuxerRx::Reset {
+                local_port: pkt.dst_port(),
+                peer_port: pkt.src_port(),
+            });
         }
     }
 
