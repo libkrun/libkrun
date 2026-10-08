@@ -14,6 +14,14 @@ use utils::eventfd::EventFd;
 
 #[cfg(windows)]
 use devices::BusDevice;
+#[cfg(windows)]
+use devices::legacy::IrqChipDevice;
+#[cfg(windows)]
+use polly::event_manager::{EventManager, Subscriber};
+#[cfg(windows)]
+use utils::epoll::{EpollEvent, EventSet};
+#[cfg(windows)]
+use utils::windows::AsRawFd;
 
 /// Errors corresponding to the `PortIODeviceManager`.
 #[derive(Debug)]
@@ -22,6 +30,9 @@ pub enum Error {
     BusError(devices::BusError),
     /// Cannot create EventFd.
     EventFd(std::io::Error),
+    /// Cannot register an event subscriber.
+    #[cfg(windows)]
+    RegisterEvent(polly::event_manager::Error),
 }
 
 impl fmt::Display for Error {
@@ -31,6 +42,8 @@ impl fmt::Display for Error {
         match *self {
             BusError(ref err) => write!(f, "Failed to add legacy device to Bus: {err}"),
             EventFd(ref err) => write!(f, "Failed to create EventFd: {err}"),
+            #[cfg(windows)]
+            RegisterEvent(ref err) => write!(f, "Failed to register legacy device event: {err:?}"),
         }
     }
 }
@@ -216,6 +229,54 @@ impl PortIODeviceManager {
             .insert(self.i8042.clone(), 0x060, 0x5)
             .map_err(Error::BusError)?;
         Ok(())
+    }
+
+    #[cfg(windows)]
+    pub fn register_irq_events(
+        &self,
+        event_manager: &mut EventManager,
+        intc: Option<Arc<Mutex<IrqChipDevice>>>,
+    ) -> Result<()> {
+        if let Some(intc) = intc {
+            for (event, irq) in [
+                (&self.com_evt_1, 4),
+                (&self.com_evt_2, 3),
+                (&self.com_evt_3, 4),
+                (&self.com_evt_4, 3),
+            ] {
+                event_manager
+                    .add_subscriber(Arc::new(Mutex::new(SerialIrq {
+                        event: event.try_clone().map_err(Error::EventFd)?,
+                        intc: intc.clone(),
+                        irq,
+                    })))
+                    .map_err(Error::RegisterEvent)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+struct SerialIrq {
+    event: EventFd,
+    intc: Arc<Mutex<IrqChipDevice>>,
+    irq: u32,
+}
+
+#[cfg(windows)]
+impl Subscriber for SerialIrq {
+    fn process(&mut self, event: &EpollEvent, _: &mut EventManager) {
+        if event.event_set().contains(EventSet::IN) {
+            let _ = self.event.read();
+            if let Err(e) = self.intc.lock().unwrap().set_irq(Some(self.irq), None) {
+                log::error!("failed to deliver serial IRQ {}: {e:?}", self.irq);
+            }
+        }
+    }
+
+    fn interest_list(&self) -> Vec<EpollEvent> {
+        vec![EpollEvent::new(EventSet::IN, self.event.as_raw_fd() as u64)]
     }
 }
 

@@ -983,33 +983,59 @@ pub fn build_microvm(
 
     #[cfg(windows)]
     for s in &vm_resources.serial_consoles {
-        let input: Option<Box<dyn devices::legacy::ReadableFd + Send>> =
-            if is_valid_handle(s.input_handle) {
-                let handle = unsafe { BorrowedHandle::borrow_raw(s.input_handle) };
-                let owned_handle = handle
-                    .try_clone_to_owned()
-                    .map_err(StartMicrovmError::DuplicateSerialHandle)?;
-                if owned_handle.as_handle().is_terminal() {
-                    serial_ttys.push(
-                        owned_handle
-                            .try_clone()
-                            .map_err(StartMicrovmError::DuplicateSerialHandle)?,
-                    );
-                }
-                Some(Box::new(File::from(owned_handle)))
-            } else {
-                None
-            };
+        let mut terminal = None;
+        let input_file = if is_valid_handle(s.input_handle) {
+            let handle = unsafe { BorrowedHandle::borrow_raw(s.input_handle) };
+            let owned_handle = handle
+                .try_clone_to_owned()
+                .map_err(StartMicrovmError::DuplicateSerialHandle)?;
+            if owned_handle.as_handle().is_terminal() {
+                terminal = Some(
+                    owned_handle
+                        .try_clone()
+                        .map_err(StartMicrovmError::DuplicateSerialHandle)?,
+                );
+            }
+            Some(File::from(owned_handle))
+        } else {
+            None
+        };
 
-        let output: Option<Box<dyn io::Write + Send>> = if is_valid_handle(s.output_handle) {
+        let output_file = if is_valid_handle(s.output_handle) {
             let handle = unsafe { BorrowedHandle::borrow_raw(s.output_handle) };
             let owned_handle = handle
                 .try_clone_to_owned()
                 .map_err(StartMicrovmError::DuplicateSerialHandle)?;
-            Some(Box::new(File::from(owned_handle)))
+            Some(File::from(owned_handle))
         } else {
             None
         };
+
+        let is_interactive_console = terminal.is_some() && output_file.is_some();
+        let is_output_only_console =
+            input_file.is_none() && output_file.as_ref().is_some_and(File::is_terminal);
+        let (input, output) = match (input_file, output_file) {
+            (input, Some(output)) if is_interactive_console || is_output_only_console => {
+                let (input, output) = crate::vmm::windows::serial_console::serial_console_bridge(
+                    input,
+                    output,
+                    !is_interactive_console,
+                )
+                .map_err(StartMicrovmError::DuplicateSerialHandle)?;
+                (Some(input), Some(output))
+            }
+            (input, output) => (
+                input.map(|file| Box::new(file) as Box<dyn devices::legacy::ReadableFd + Send>),
+                output.map(|file| Box::new(file) as Box<dyn io::Write + Send>),
+            ),
+        };
+        if let Some(terminal) = terminal {
+            // Interactive consoles process raw INPUT_RECORDs in libkrun, so Windows VT
+            // translation must be disabled to avoid double-translating keys.
+            // Non-interactive paths keep VT translation enabled for byte-stream readers.
+            let enable_vt_translation = !is_interactive_console;
+            serial_ttys.push((terminal, enable_vt_translation));
+        }
 
         serial_devices.push(setup_serial_device(event_manager, input, output)?);
     }
@@ -1103,6 +1129,7 @@ pub fn build_microvm(
         )))));
 
         attach_legacy_devices_whp(
+            event_manager,
             &mut pio_device_manager,
             &mut mmio_device_manager,
             Some(intc.clone()),
@@ -1263,7 +1290,12 @@ pub fn build_microvm(
         #[cfg(unix)]
         setup_terminal_raw_mode(&mut vmm, Some(serial_tty), false);
         #[cfg(windows)]
-        setup_terminal_raw_mode(&mut vmm, Some(serial_tty.as_handle()), false);
+        setup_terminal_raw_mode(
+            &mut vmm,
+            Some(serial_tty.0.as_handle()),
+            false,
+            serial_tty.1,
+        );
     }
 
     device_manager
@@ -2173,6 +2205,7 @@ fn attach_legacy_devices(
 
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 fn attach_legacy_devices_whp(
+    event_manager: &mut EventManager,
     pio_device_manager: &mut PortIODeviceManager,
     mmio_device_manager: &mut MMIODeviceManager,
     intc: Option<Arc<Mutex<IrqChipDevice>>>,
@@ -2183,8 +2216,13 @@ fn attach_legacy_devices_whp(
         .map_err(StartMicrovmError::Internal)?;
 
     mmio_device_manager
-        .register_mmio_ioapic(intc)
+        .register_mmio_ioapic(intc.clone())
         .map_err(Error::RegisterMMIODevice)
+        .map_err(StartMicrovmError::Internal)?;
+
+    pio_device_manager
+        .register_irq_events(event_manager, intc)
+        .map_err(Error::LegacyIOBus)
         .map_err(StartMicrovmError::Internal)?;
 
     Ok(())
@@ -2475,9 +2513,14 @@ pub fn setup_terminal_raw_mode(
     vmm: &mut Vmm,
     term_handle: Option<BorrowedHandle<'_>>,
     handle_signals_by_terminal: bool,
+    enable_vt_translation: bool,
 ) {
     if let Some(term_handle) = term_handle {
-        match term_set_raw_mode(term_handle, handle_signals_by_terminal) {
+        match term_set_raw_mode(
+            term_handle,
+            handle_signals_by_terminal,
+            enable_vt_translation,
+        ) {
             Ok(old_mode) => {
                 if let Ok(owned_handle) = term_handle.try_clone_to_owned() {
                     vmm.exit_observers.push(Arc::new(Mutex::new(move || {

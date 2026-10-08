@@ -76,6 +76,7 @@ whp = { package = "krun-whp", version = "=0.1.0-2.0.0-dev", path = "../whp" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_Console",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 [dev-dependencies]

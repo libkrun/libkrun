@@ -199,7 +199,7 @@ impl<'a> AttachContext<'a> {
 
     #[cfg(windows)]
     pub fn setup_terminal_raw_mode(&mut self, handle: BorrowedHandle<'_>) {
-        setup_terminal_raw_mode(self.vmm, Some(handle), false);
+        setup_terminal_raw_mode(self.vmm, Some(handle), false, true);
     }
 
     /// Get the macOS memory mapping channel sender, if available.

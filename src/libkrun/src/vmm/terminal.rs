@@ -48,6 +48,7 @@ pub fn term_restore_mode(term: BorrowedFd, restore: &TerminalMode) -> Result<(),
 pub fn term_set_raw_mode(
     term: BorrowedHandle<'_>,
     handle_signals_by_terminal: bool,
+    enable_vt_translation: bool,
 ) -> Result<TerminalMode, io::Error> {
     let mut mode: CONSOLE_MODE = 0;
 
@@ -66,7 +67,19 @@ pub fn term_set_raw_mode(
         mode &= !ENABLE_PROCESSED_INPUT;
     }
 
-    mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+    // ENABLE_VIRTUAL_TERMINAL_INPUT tells Windows to translate raw keyboard input
+    // (like arrow keys or F-keys) into VT/ANSI escape sequences (\x1b[A, etc.).
+    //
+    // - Byte-oriented readers (hvc0) require this flag set so Windows
+    //   handles VT sequence generation automatically.
+    // - Raw event readers (ttyS0) fetch native INPUT_RECORD structs
+    //   and perform custom key mapping. If we leave it enabled it causes Windows
+    //   and libkrun to translate the same keys, resulting in duplicated or corrupted input.
+    if enable_vt_translation {
+        mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+    } else {
+        mode &= !ENABLE_VIRTUAL_TERMINAL_INPUT;
+    }
 
     let ret = unsafe { SetConsoleMode(term.as_raw_handle(), mode) };
     if ret == 0 {
