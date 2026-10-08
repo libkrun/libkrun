@@ -17,6 +17,7 @@ timesync = []
 
 [dependencies]
 anyhow = "1"
+krun-init-common = { path = "../common", default-features = false, features = ["server"] }
 libc = "0.2"
 nix = { version = "0.30", features = ["fs", "hostname", "ioctl", "mount", "net", "process", "reboot", "resource", "signal", "socket", "term", "time", "uio"] }
 serde = { version = "1", features = ["derive"] }

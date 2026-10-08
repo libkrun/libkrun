@@ -57,6 +57,7 @@ impl From<OciSchema> for ConfigSchema {
                     })
                 })
                 .collect(),
+            control_server: None,
         }
     }
 }

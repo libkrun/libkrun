@@ -39,6 +39,11 @@ mod test_vsock_host_connect_refused;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_vsock_host_connect_refused::TestVsockHostConnectRefused;
 
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_init_control;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_init_control::TestInitControl;
+
 mod test_tsi_tcp_guest_connect;
 use test_tsi_tcp_guest_connect::TestTsiTcpGuestConnect;
 
@@ -149,6 +154,8 @@ pub fn test_cases() -> Vec<TestCase> {
             "vsock-host-connect-refused",
             Box::new(TestVsockHostConnectRefused),
         ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("init-control", Box::new(TestInitControl)),
         TestCase::new(
             "tsi-tcp-guest-connect",
             Box::new(TestTsiTcpGuestConnect::new()),

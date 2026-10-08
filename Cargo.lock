@@ -107,6 +107,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
 dependencies = [
  "bincode_derive",
+ "serde",
  "unty",
 ]
 
@@ -817,6 +818,7 @@ name = "krun-init-blob"
 version = "0.1.0-2.0.0-dev"
 dependencies = [
  "ffier 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1)",
+ "krun-init-common",
  "krun-via-cdylib-weak",
  "libkrun",
  "serde",
@@ -833,6 +835,15 @@ dependencies = [
  "ffier-gen-rust-client",
  "krun-via-cdylib-weak",
  "pkg-config",
+]
+
+[[package]]
+name = "krun-init-common"
+version = "0.1.0-2.0.0-dev"
+dependencies = [
+ "bincode",
+ "libc",
+ "serde",
 ]
 
 [[package]]

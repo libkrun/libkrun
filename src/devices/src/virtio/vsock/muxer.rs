@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::fs;
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 #[cfg(windows)]
 use utils::windows::RawFd;
@@ -22,6 +23,7 @@ use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
 use super::unix_proxy::UnixProxy;
 use crossbeam_channel::{Sender, unbounded};
+use nix::sys::socket::SockaddrStorage;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 
@@ -380,11 +382,35 @@ impl VsockMuxer {
         }
     }
 
+    /// Unix sockets the VMM listens on for the host, such as the init control
+    /// endpoint, must stay out of reach of the guest: with AF_UNIX hijacking a
+    /// guest connect to that path would look like a host connection.
+    fn is_protected_unix_path(&self, addr: &SockaddrStorage) -> bool {
+        let Some(map) = &self.unix_ipc_port_map else {
+            return false;
+        };
+        let Some(path) = tsi_unix_path(addr) else {
+            return false;
+        };
+        map.values()
+            .filter(|(_, listen)| *listen)
+            .any(|(protected, _)| same_file(protected, &path))
+    }
+
     fn process_connect(&self, pkt: &VsockPacket) {
         debug!("proxy connect request");
         if let Some(req) = pkt.read_connect_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("proxy connect request: id={id}");
+            if self.is_protected_unix_path(&req.addr) {
+                warn!("rejecting guest connection to a host-side listening unix socket");
+                self.push_packet(MuxerRx::ConnResponse {
+                    local_port: pkt.dst_port(),
+                    peer_port: pkt.src_port(),
+                    result: -libc::EACCES,
+                });
+                return;
+            }
             match self.proxy_map.read().unwrap().get(&id) {
                 Some(proxy) => {
                     self.process_proxy_update(id, proxy.lock().unwrap().connect(pkt, req));
@@ -745,5 +771,57 @@ impl VsockMuxer {
             _ => warn!("stream: unhandled op={}", pkt.op()),
         }
         Ok(())
+    }
+}
+
+fn tsi_unix_path(addr: &SockaddrStorage) -> Option<PathBuf> {
+    let path = addr.as_unix_addr()?.path()?.to_str()?.replace('\0', "");
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || match (fs::canonicalize(a), fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod protected_path_tests {
+    use super::*;
+    use nix::sys::socket::SockaddrLike;
+    use std::mem;
+
+    #[test]
+    fn guest_path_strips_padding_nuls() {
+        // A guest sockaddr_un arrives NUL padded to its full size.
+        let mut raw: libc::sockaddr_un = unsafe { mem::zeroed() };
+        raw.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (dst, src) in raw.sun_path.iter_mut().zip(b"/run/krun-init.sock") {
+            *dst = *src as libc::c_char;
+        }
+        let addr = unsafe {
+            SockaddrStorage::from_raw(
+                &raw as *const libc::sockaddr_un as *const libc::sockaddr,
+                Some(mem::size_of::<libc::sockaddr_un>() as libc::socklen_t),
+            )
+        }
+        .unwrap();
+        assert_eq!(
+            tsi_unix_path(&addr),
+            Some(PathBuf::from("/run/krun-init.sock"))
+        );
+    }
+
+    #[test]
+    fn same_file_matches_identical_and_canonical_paths() {
+        let dir = std::env::temp_dir();
+        let a = dir.join("krun-same-file-test");
+        fs::write(&a, b"").unwrap();
+        let b = dir.join(".").join("krun-same-file-test");
+        assert!(same_file(&a, &b));
+        assert!(!same_file(&a, &dir.join("other")));
+        fs::remove_file(&a).unwrap();
     }
 }

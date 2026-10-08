@@ -2,6 +2,7 @@
 members = [
     "src/libkrun",
     "init/init-blob",
+    "init/common",
     "bindings/init-blob-via-cdylib",
     "src/input",
     "src/display",

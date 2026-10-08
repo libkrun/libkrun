@@ -9,17 +9,22 @@
 
 typedef void* KrunInitConfigError;
 typedef void* KrunInitApplyError;
+typedef void* KrunInitControlError;
 typedef void* KrunInitConfig;
 typedef void* KrunInitBuilder;
-typedef void* KrunInitError; /* KrunInitConfigError | KrunInitApplyError | KrunInitVtableError */
+typedef void* KrunInitController;
+typedef void* KrunInitExecRequest;
+typedef void* KrunInitProcess;
+typedef void* KrunInitError; /* KrunInitConfigError | KrunInitApplyError | KrunInitControlError | KrunInitVtableError */
 typedef void* KrunInitPushStr; /* KrunInitVtablePushStr */
 typedef void* KrunFsOverlay;
 typedef void* KrunPayload;
+typedef void* KrunVsockDevice;
 
 #ifndef KRUN_PRIMITIVES_DEFINED
 #define KRUN_PRIMITIVES_DEFINED
 
-typedef void* KrunObject; /* KrunInitConfigError | KrunInitApplyError | KrunInitConfig | KrunInitBuilder */
+typedef void* KrunObject; /* KrunInitConfigError | KrunInitApplyError | KrunInitControlError | KrunInitConfig | KrunInitBuilder | KrunInitController | KrunInitExecRequest | KrunInitProcess */
 
 typedef uint64_t KrunResult;
 #define KRUN_RESULT_SUCCESS 0
@@ -92,6 +97,18 @@ typedef void (*krun_init_free_object_array_fn)(KrunObjectArray a);
 
 #define KRUN_INIT_ERROR_APPLY_SYMBOL_NOT_FOUND ((uint64_t)33554438 << 32 | 1)
 #define KRUN_INIT_ERROR_APPLY_OVERLAY_ERROR ((uint64_t)33554438 << 32 | 2)
+#define KRUN_INIT_ERROR_APPLY_CONTROL_SOCKET_WITHOUT_VSOCK ((uint64_t)33554438 << 32 | 3)
+
+/* ControlError ------------------------------------------------------ */
+
+#define KRUN_INIT_ERROR_CONTROL_IO ((uint64_t)33554439 << 32 | 1)
+#define KRUN_INIT_ERROR_CONTROL_TIMEOUT ((uint64_t)33554439 << 32 | 2)
+#define KRUN_INIT_ERROR_CONTROL_PROTOCOL ((uint64_t)33554439 << 32 | 3)
+#define KRUN_INIT_ERROR_CONTROL_EXECUTABLE_NOT_FOUND ((uint64_t)33554439 << 32 | 4)
+#define KRUN_INIT_ERROR_CONTROL_SPAWN_FAILED ((uint64_t)33554439 << 32 | 5)
+#define KRUN_INIT_ERROR_CONTROL_REJECTED ((uint64_t)33554439 << 32 | 6)
+#define KRUN_INIT_ERROR_CONTROL_DISCONNECTED ((uint64_t)33554439 << 32 | 7)
+#define KRUN_INIT_ERROR_CONTROL_ALREADY_WAITED ((uint64_t)33554439 << 32 | 8)
 
 /* Config ------------------------------------------------------------ */
 
@@ -103,6 +120,8 @@ typedef KrunInitBuilder (*krun_init_config_builder_fn)();
  *
  * Adds the init binary and associated configuration file(s) as overlay
  * files, and appends the init kernel command line argument to the payload.
+ * Fails when a control socket is configured: that needs a vsock device,
+ * use [`apply_with_vsock`](Self::apply_with_vsock).
  *
  * The caller must keep this `Config` (or `KrunInitConfig`) alive for the
  * entire lifetime of the VM; `apply` borrows data pointers that remain
@@ -112,6 +131,12 @@ typedef KrunInitBuilder (*krun_init_config_builder_fn)();
  */
 KrunResult krun_init_config_apply(KrunInitConfig handle, KrunFsOverlay overlay, KrunPayload payload, KrunInitError* err_out);
 typedef KrunResult (*krun_init_config_apply_fn)(KrunInitConfig handle, KrunFsOverlay overlay, KrunPayload payload, KrunInitError* err_out);
+/**
+ * Like [`apply`](Self::apply), and also map the control server's vsock
+ * port to the configured control socket on `vsock`.
+ */
+KrunResult krun_init_config_apply_with_vsock(KrunInitConfig handle, KrunFsOverlay overlay, KrunPayload payload, KrunVsockDevice vsock, KrunInitError* err_out);
+typedef KrunResult (*krun_init_config_apply_with_vsock_fn)(KrunInitConfig handle, KrunFsOverlay overlay, KrunPayload payload, KrunVsockDevice vsock, KrunInitError* err_out);
 /**
  * Like [`apply`](Self::apply), but loads symbols from a specific library
  * handle (e.g. from `dlopen`). Pass null for `RTLD_DEFAULT`.
@@ -124,6 +149,12 @@ typedef KrunResult (*krun_init_config_apply_fn)(KrunInitConfig handle, KrunFsOve
  */
 KrunResult krun_init_config_apply_in(KrunInitConfig handle, void* lib_handle, KrunFsOverlay overlay, KrunPayload payload, KrunInitError* err_out);
 typedef KrunResult (*krun_init_config_apply_in_fn)(KrunInitConfig handle, void* lib_handle, KrunFsOverlay overlay, KrunPayload payload, KrunInitError* err_out);
+/**
+ * Like [`apply_with_vsock`](Self::apply_with_vsock), loading symbols
+ * from `lib_handle` as [`apply_in`](Self::apply_in) does.
+ */
+KrunResult krun_init_config_apply_with_vsock_in(KrunInitConfig handle, void* lib_handle, KrunFsOverlay overlay, KrunPayload payload, KrunVsockDevice vsock, KrunInitError* err_out);
+typedef KrunResult (*krun_init_config_apply_with_vsock_in_fn)(KrunInitConfig handle, void* lib_handle, KrunFsOverlay overlay, KrunPayload payload, KrunVsockDevice vsock, KrunInitError* err_out);
 void krun_init_config_destroy(KrunInitConfig handle);
 typedef void (*krun_init_config_destroy_fn)(KrunInitConfig handle);
 
@@ -165,6 +196,22 @@ typedef void (*krun_init_builder_rlimits_fn)(KrunInitBuilder* handle, const Krun
 /** Enable DHCP client in the guest. */
 void krun_init_builder_dhcp(KrunInitBuilder* handle, bool enable);
 typedef void (*krun_init_builder_dhcp_fn)(KrunInitBuilder* handle, bool enable);
+/**
+ * Run a control server in the guest and expose it to the host as the
+ * Unix socket `path`.
+ *
+ * The server lets the host start additional processes in the running
+ * VM ([`Controller::exec_pipes`](crate::Controller::exec_pipes),
+ * [`exec_tty`](crate::Controller::exec_tty)) and deliver signals to
+ * the workload ([`signal_entrypoint`](crate::Controller::signal_entrypoint)).
+ * [`Config::apply`] maps the server's vsock port to `path` on the vsock
+ * device it is given. Not available when the workload runs as PID 1.
+ */
+void krun_init_builder_control_socket(KrunInitBuilder* handle, KrunStr path);
+typedef void (*krun_init_builder_control_socket_fn)(KrunInitBuilder* handle, KrunStr path);
+/** Override the guest vsock port of the control server. */
+void krun_init_builder_control_vsock_port(KrunInitBuilder* handle, uint32_t port);
+typedef void (*krun_init_builder_control_vsock_port_fn)(KrunInitBuilder* handle, uint32_t port);
 /** Set the root disk to remount on boot. */
 void krun_init_builder_set_root_disk_remount(KrunInitBuilder* handle, KrunStr device, KrunStr fstype, KrunStr options);
 typedef void (*krun_init_builder_set_root_disk_remount_fn)(KrunInitBuilder* handle, KrunStr device, KrunStr fstype, KrunStr options);
@@ -176,6 +223,95 @@ KrunInitConfig krun_init_builder_build(KrunInitBuilder* handle);
 typedef KrunInitConfig (*krun_init_builder_build_fn)(KrunInitBuilder* handle);
 void krun_init_builder_destroy(KrunInitBuilder handle);
 typedef void (*krun_init_builder_destroy_fn)(KrunInitBuilder handle);
+
+/* Controller -------------------------------------------------------- */
+
+/**
+ * Reach the control server behind `socket_path`, the path given to
+ * [`Builder::control_socket`](crate::Builder::control_socket). Waits up
+ * to `timeout_ms` for the guest to start listening, and every later
+ * operation waits the same way.
+ */
+KrunInitController krun_init_controller_open(KrunStr socket_path, uint32_t timeout_ms, KrunInitError* err_out);
+typedef KrunInitController (*krun_init_controller_open_fn)(KrunStr socket_path, uint32_t timeout_ms, KrunInitError* err_out);
+/** Deliver `signal` to the guest's main workload. */
+KrunResult krun_init_controller_signal_entrypoint(KrunInitController handle, int32_t signal, KrunInitError* err_out);
+typedef KrunResult (*krun_init_controller_signal_entrypoint_fn)(KrunInitController handle, int32_t signal, KrunInitError* err_out);
+/**
+ * Start `request` with its stdio connected to the given descriptors,
+ * which are duplicated. Pass no `stdin` to give the process an empty one.
+ */
+KrunInitProcess krun_init_controller_exec_pipes(KrunInitController handle, KrunInitExecRequest request, int stdin, int stdout, int stderr, KrunInitError* err_out);
+typedef KrunInitProcess (*krun_init_controller_exec_pipes_fn)(KrunInitController handle, KrunInitExecRequest request, int stdin, int stdout, int stderr, KrunInitError* err_out);
+/**
+ * Start `request` on a pseudo-terminal mirroring `tty`: the guest pty
+ * gets the size of `tty`, which is switched to raw mode and relays the
+ * bytes both ways.
+ */
+KrunInitProcess krun_init_controller_exec_tty(KrunInitController handle, KrunInitExecRequest request, int tty, KrunInitError* err_out);
+typedef KrunInitProcess (*krun_init_controller_exec_tty_fn)(KrunInitController handle, KrunInitExecRequest request, int tty, KrunInitError* err_out);
+void krun_init_controller_destroy(KrunInitController handle);
+typedef void (*krun_init_controller_destroy_fn)(KrunInitController handle);
+
+/* ExecRequest ------------------------------------------------------- */
+
+/**
+ * Start describing a process; `program` is the path of the executable
+ * inside the guest.
+ */
+KrunInitExecRequest krun_init_exec_request_new(KrunStr program);
+typedef KrunInitExecRequest (*krun_init_exec_request_new_fn)(KrunStr program);
+/**
+ * Append an argument. The first one is `argv[0]`; without any, the
+ * program path is used.
+ */
+void krun_init_exec_request_arg(KrunInitExecRequest* handle, KrunStr arg);
+typedef void (*krun_init_exec_request_arg_fn)(KrunInitExecRequest* handle, KrunStr arg);
+/**
+ * Append an environment variable (`"KEY=value"`). The process gets
+ * exactly the variables given here.
+ */
+void krun_init_exec_request_env_var(KrunInitExecRequest* handle, KrunStr var);
+typedef void (*krun_init_exec_request_env_var_fn)(KrunInitExecRequest* handle, KrunStr var);
+/** Set the working directory. */
+void krun_init_exec_request_cwd(KrunInitExecRequest* handle, KrunStr dir);
+typedef void (*krun_init_exec_request_cwd_fn)(KrunInitExecRequest* handle, KrunStr dir);
+void krun_init_exec_request_uid(KrunInitExecRequest* handle, uint32_t uid);
+typedef void (*krun_init_exec_request_uid_fn)(KrunInitExecRequest* handle, uint32_t uid);
+void krun_init_exec_request_gid(KrunInitExecRequest* handle, uint32_t gid);
+typedef void (*krun_init_exec_request_gid_fn)(KrunInitExecRequest* handle, uint32_t gid);
+/** Append a supplementary group. */
+void krun_init_exec_request_additional_gid(KrunInitExecRequest* handle, uint32_t gid);
+typedef void (*krun_init_exec_request_additional_gid_fn)(KrunInitExecRequest* handle, uint32_t gid);
+void krun_init_exec_request_umask(KrunInitExecRequest* handle, uint32_t umask);
+typedef void (*krun_init_exec_request_umask_fn)(KrunInitExecRequest* handle, uint32_t umask);
+/**
+ * Give the process a pseudo-terminal of this size instead of pipes.
+ * [`Controller::exec_tty`] sets this from the terminal it is given.
+ */
+void krun_init_exec_request_window_size(KrunInitExecRequest* handle, uint16_t rows, uint16_t cols);
+typedef void (*krun_init_exec_request_window_size_fn)(KrunInitExecRequest* handle, uint16_t rows, uint16_t cols);
+void krun_init_exec_request_destroy(KrunInitExecRequest handle);
+typedef void (*krun_init_exec_request_destroy_fn)(KrunInitExecRequest handle);
+
+/* Process ----------------------------------------------------------- */
+
+/** Pid of the process inside the guest. */
+int32_t krun_init_process_pid(KrunInitProcess handle);
+typedef int32_t (*krun_init_process_pid_fn)(KrunInitProcess handle);
+/**
+ * Relay stdio until the process exits and return its exit code as a
+ * shell reports it (128 plus the signal number when it was killed).
+ *
+ * `signals`, if given, delivers signal numbers as single bytes, for
+ * example from a self-pipe written by the caller's signal handlers:
+ * `SIGWINCH` resizes the guest terminal, everything else is forwarded
+ * to the process.
+ */
+KrunResult krun_init_process_wait(KrunInitProcess handle, int signals, int32_t* result, KrunInitError* err_out);
+typedef KrunResult (*krun_init_process_wait_fn)(KrunInitProcess handle, int signals, int32_t* result, KrunInitError* err_out);
+void krun_init_process_destroy(KrunInitProcess handle);
+typedef void (*krun_init_process_destroy_fn)(KrunInitProcess handle);
 
 /* KrunInitPushStrVtable --------------------------------------------- */
 
@@ -222,6 +358,10 @@ uint32_t krun_init_apply_error_code(KrunInitApplyError handle);
 typedef uint32_t (*krun_init_apply_error_code_fn)(KrunInitApplyError handle);
 void krun_init_apply_error_message(KrunInitApplyError handle, KrunInitPushStr writer);
 typedef void (*krun_init_apply_error_message_fn)(KrunInitApplyError handle, KrunInitPushStr writer);
+uint32_t krun_init_control_error_code(KrunInitControlError handle);
+typedef uint32_t (*krun_init_control_error_code_fn)(KrunInitControlError handle);
+void krun_init_control_error_message(KrunInitControlError handle, KrunInitPushStr writer);
+typedef void (*krun_init_control_error_message_fn)(KrunInitControlError handle, KrunInitPushStr writer);
 KrunStr krun_init_result_name(KrunResult r);
 typedef KrunStr (*krun_init_result_name_fn)(KrunResult r);
 const char* krun_init_result_name_cstr(KrunResult r);

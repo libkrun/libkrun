@@ -191,6 +191,31 @@ pub fn setup_standard_devices_from<'a>(
     stdout: &'a std::io::Stdout,
     stderr: &'a std::io::Stderr,
 ) -> anyhow::Result<(krun::MmioDeviceManager<'a>, krun::Payload)> {
+    setup_standard_devices_inner(test_setup, init_config, stdin, stdout, stderr, None)
+}
+
+/// Like `setup_standard_devices`, for an init config with a control socket:
+/// the config is applied together with `vsock`, which gets the port mapping.
+/// The caller still adds `vsock` to the returned device manager.
+pub fn setup_standard_devices_with_vsock<'a>(
+    test_setup: &'a TestSetup,
+    init_config: &'a krun_init::Config,
+    stdin: &'a std::io::Stdin,
+    stdout: &'a std::io::Stdout,
+    stderr: &'a std::io::Stderr,
+    vsock: &mut krun::VsockDevice,
+) -> anyhow::Result<(krun::MmioDeviceManager<'a>, krun::Payload)> {
+    setup_standard_devices_inner(test_setup, init_config, stdin, stdout, stderr, Some(vsock))
+}
+
+fn setup_standard_devices_inner<'a>(
+    test_setup: &'a TestSetup,
+    init_config: &'a krun_init::Config,
+    stdin: &'a std::io::Stdin,
+    stdout: &'a std::io::Stdout,
+    stderr: &'a std::io::Stderr,
+    vsock: Option<&mut krun::VsockDevice>,
+) -> anyhow::Result<(krun::MmioDeviceManager<'a>, krun::Payload)> {
     let root_dir = setup_rootfs(test_setup)?;
 
     let mut rootfs = krun::FsDevice::new("/dev/root", root_dir.to_str().unwrap())
@@ -198,9 +223,14 @@ pub fn setup_standard_devices_from<'a>(
     let mut payload =
         krun::Payload::load_krunfw().map_err(|e| anyhow::anyhow!("load_krunfw: {e:?}"))?;
     let mut overlay = krun::FsOverlay::new();
-    init_config
-        .apply(&mut overlay, &mut payload)
-        .map_err(|e| anyhow::anyhow!("Config::apply: {e}"))?;
+    match vsock {
+        Some(vsock) => init_config
+            .apply_with_vsock(&mut overlay, &mut payload, vsock)
+            .map_err(|e| anyhow::anyhow!("Config::apply_with_vsock: {e}"))?,
+        None => init_config
+            .apply(&mut overlay, &mut payload)
+            .map_err(|e| anyhow::anyhow!("Config::apply: {e}"))?,
+    }
     rootfs.set_overlay(overlay);
 
     let mut console_builder = krun::ConsoleDevice::builder();

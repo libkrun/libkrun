@@ -17,6 +17,17 @@
       },
       "type_tag": 33554438
     },
+    "BorrowedFd": {
+      "kind": {
+        "alias": {
+          "alias_of": "RawFd"
+        }
+      },
+      "bless": "borrowed_fd",
+      "lifetime_params": [
+        "fd"
+      ]
+    },
     "Builder": {
       "kind": {
         "handle": {
@@ -41,6 +52,22 @@
       },
       "type_tag": 33554435
     },
+    "ControlError": {
+      "kind": {
+        "error": {
+          "c_name": "KrunInitControlError"
+        }
+      },
+      "type_tag": 33554439
+    },
+    "Controller": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunInitController"
+        }
+      },
+      "type_tag": 33554440
+    },
     "Error": {
       "kind": {
         "trait": {
@@ -49,6 +76,14 @@
       },
       "type_tag": 33554434,
       "bless": "error_trait"
+    },
+    "ExecRequest": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunInitExecRequest"
+        }
+      },
+      "type_tag": 33554441
     },
     "FfierObject": {
       "kind": {
@@ -101,6 +136,14 @@
         }
       }
     },
+    "Process": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunInitProcess"
+        }
+      },
+      "type_tag": 33554442
+    },
     "PushStr": {
       "kind": {
         "trait": {
@@ -110,6 +153,14 @@
       "type_tag": 33554433,
       "bless": "push_str"
     },
+    "RawFd": {
+      "kind": {
+        "primitive": {
+          "c_type": "int"
+        }
+      },
+      "bless": "raw_fd"
+    },
     "Self": {
       "kind": {
         "primitive": {
@@ -118,10 +169,25 @@
       },
       "bless": "replaces_self"
     },
+    "VsockDevice": {
+      "kind": {
+        "foreign_handle": {
+          "foreign_crate": "krun_via_cdylib_weak",
+          "c_name": "KrunVsockDevice"
+        }
+      }
+    },
     "bool": {
       "kind": {
         "primitive": {
           "c_type": "bool"
+        }
+      }
+    },
+    "i32": {
+      "kind": {
+        "primitive": {
+          "c_type": "int32_t"
         }
       }
     },
@@ -132,6 +198,13 @@
         }
       },
       "bless": "str"
+    },
+    "u16": {
+      "kind": {
+        "primitive": {
+          "c_type": "uint16_t"
+        }
+      }
     },
     "u32": {
       "kind": {
@@ -174,6 +247,8 @@
             "",
             " Adds the init binary and associated configuration file(s) as overlay",
             " files, and appends the init kernel command line argument to the payload.",
+            " Fails when a control socket is configured: that needs a vsock device,",
+            " use [`apply_with_vsock`](Self::apply_with_vsock).",
             "",
             " The caller must keep this `Config` (or `KrunInitConfig`) alive for the",
             " entire lifetime of the VM; `apply` borrows data pointers that remain",
@@ -209,6 +284,48 @@
             "c_convention": "out_param"
           },
           "ffi_name": "krun_init_config_apply",
+          "cfg": "feature = \"ffi-client\""
+        },
+        {
+          "name": "apply_with_vsock",
+          "doc": [
+            " Like [`apply`](Self::apply), and also map the control server's vsock",
+            " port to the configured control socket on `vsock`."
+          ],
+          "receiver": "ref",
+          "method_lifetimes": [
+            "a"
+          ],
+          "params": [
+            {
+              "name": "overlay",
+              "param_kind": "regular",
+              "type": "FsOverlay",
+              "ref_kind": "mut",
+              "type_args": [
+                "a"
+              ]
+            },
+            {
+              "name": "payload",
+              "param_kind": "regular",
+              "type": "Payload",
+              "ref_kind": "mut"
+            },
+            {
+              "name": "vsock",
+              "param_kind": "regular",
+              "type": "VsockDevice",
+              "ref_kind": "mut"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "ApplyError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_init_config_apply_with_vsock",
           "cfg": "feature = \"ffi-client\""
         },
         {
@@ -256,6 +373,53 @@
             "c_convention": "out_param"
           },
           "ffi_name": "krun_init_config_apply_in",
+          "cfg": "feature = \"ffi-client\""
+        },
+        {
+          "name": "apply_with_vsock_in",
+          "doc": [
+            " Like [`apply_with_vsock`](Self::apply_with_vsock), loading symbols",
+            " from `lib_handle` as [`apply_in`](Self::apply_in) does."
+          ],
+          "receiver": "ref",
+          "method_lifetimes": [
+            "a"
+          ],
+          "params": [
+            {
+              "name": "lib_handle",
+              "param_kind": "regular",
+              "type": "*mut core::ffi::c_void"
+            },
+            {
+              "name": "overlay",
+              "param_kind": "regular",
+              "type": "FsOverlay",
+              "ref_kind": "mut",
+              "type_args": [
+                "a"
+              ]
+            },
+            {
+              "name": "payload",
+              "param_kind": "regular",
+              "type": "Payload",
+              "ref_kind": "mut"
+            },
+            {
+              "name": "vsock",
+              "param_kind": "regular",
+              "type": "VsockDevice",
+              "ref_kind": "mut"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "ApplyError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_init_config_apply_with_vsock_in",
           "cfg": "feature = \"ffi-client\""
         }
       ]
@@ -521,6 +685,53 @@
           "ffi_name": "krun_init_builder_dhcp"
         },
         {
+          "name": "control_socket",
+          "doc": [
+            " Run a control server in the guest and expose it to the host as the",
+            " Unix socket `path`.",
+            "",
+            " The server lets the host start additional processes in the running",
+            " VM ([`Controller::exec_pipes`](crate::Controller::exec_pipes),",
+            " [`exec_tty`](crate::Controller::exec_tty)) and deliver signals to",
+            " the workload ([`signal_entrypoint`](crate::Controller::signal_entrypoint)).",
+            " [`Config::apply`] maps the server's vsock port to `path` on the vsock",
+            " device it is given. Not available when the workload runs as PID 1."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_builder_control_socket"
+        },
+        {
+          "name": "control_vsock_port",
+          "doc": [
+            " Override the guest vsock port of the control server."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "port",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_builder_control_vsock_port"
+        },
+        {
           "name": "set_root_disk_remount",
           "doc": [
             " Set the root disk to remount on boot."
@@ -569,6 +780,385 @@
           "ffi_name": "krun_init_builder_build"
         }
       ]
+    },
+    {
+      "name": "Controller",
+      "destroy_ffi_name": "krun_init_controller_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "open",
+          "doc": [
+            " Reach the control server behind `socket_path`, the path given to",
+            " [`Builder::control_socket`](crate::Builder::control_socket). Waits up",
+            " to `timeout_ms` for the guest to start listening, and every later",
+            " operation waits the same way."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "socket_path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "timeout_ms",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Controller"
+            },
+            "err_type": "ControlError",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_init_controller_open"
+        },
+        {
+          "name": "signal_entrypoint",
+          "doc": [
+            " Deliver `signal` to the guest's main workload."
+          ],
+          "receiver": "ref",
+          "params": [
+            {
+              "name": "signal",
+              "param_kind": "regular",
+              "type": "i32"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "ControlError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_init_controller_signal_entrypoint"
+        },
+        {
+          "name": "exec_pipes",
+          "doc": [
+            " Start `request` with its stdio connected to the given descriptors,",
+            " which are duplicated. Pass no `stdin` to give the process an empty one."
+          ],
+          "receiver": "ref",
+          "params": [
+            {
+              "name": "request",
+              "param_kind": "regular",
+              "type": "ExecRequest",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "stdin",
+              "param_kind": "regular",
+              "type": "BorrowedFd",
+              "type_args": [
+                "_"
+              ],
+              "optional": true
+            },
+            {
+              "name": "stdout",
+              "param_kind": "regular",
+              "type": "BorrowedFd",
+              "type_args": [
+                "_"
+              ]
+            },
+            {
+              "name": "stderr",
+              "param_kind": "regular",
+              "type": "BorrowedFd",
+              "type_args": [
+                "_"
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Process"
+            },
+            "err_type": "ControlError",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_init_controller_exec_pipes"
+        },
+        {
+          "name": "exec_tty",
+          "doc": [
+            " Start `request` on a pseudo-terminal mirroring `tty`: the guest pty",
+            " gets the size of `tty`, which is switched to raw mode and relays the",
+            " bytes both ways."
+          ],
+          "receiver": "ref",
+          "params": [
+            {
+              "name": "request",
+              "param_kind": "regular",
+              "type": "ExecRequest",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "tty",
+              "param_kind": "regular",
+              "type": "BorrowedFd",
+              "type_args": [
+                "_"
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Process"
+            },
+            "err_type": "ControlError",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_init_controller_exec_tty"
+        }
+      ]
+    },
+    {
+      "name": "ExecRequest",
+      "destroy_ffi_name": "krun_init_exec_request_destroy",
+      "is_builder_type": true,
+      "methods": [
+        {
+          "name": "new",
+          "doc": [
+            " Start describing a process; `program` is the path of the executable",
+            " inside the guest."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "program",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "ExecRequest"
+          },
+          "ffi_name": "krun_init_exec_request_new"
+        },
+        {
+          "name": "arg",
+          "doc": [
+            " Append an argument. The first one is `argv[0]`; without any, the",
+            " program path is used."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "arg",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_exec_request_arg"
+        },
+        {
+          "name": "env_var",
+          "doc": [
+            " Append an environment variable (`\"KEY=value\"`). The process gets",
+            " exactly the variables given here."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "var",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_exec_request_env_var"
+        },
+        {
+          "name": "cwd",
+          "doc": [
+            " Set the working directory."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "dir",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_exec_request_cwd"
+        },
+        {
+          "name": "uid",
+          "receiver": "value",
+          "params": [
+            {
+              "name": "uid",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_exec_request_uid"
+        },
+        {
+          "name": "gid",
+          "receiver": "value",
+          "params": [
+            {
+              "name": "gid",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_exec_request_gid"
+        },
+        {
+          "name": "additional_gid",
+          "doc": [
+            " Append a supplementary group."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "gid",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_exec_request_additional_gid"
+        },
+        {
+          "name": "umask",
+          "receiver": "value",
+          "params": [
+            {
+              "name": "umask",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_exec_request_umask"
+        },
+        {
+          "name": "window_size",
+          "doc": [
+            " Give the process a pseudo-terminal of this size instead of pipes.",
+            " [`Controller::exec_tty`] sets this from the terminal it is given."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "rows",
+              "param_kind": "regular",
+              "type": "u16"
+            },
+            {
+              "name": "cols",
+              "param_kind": "regular",
+              "type": "u16"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_exec_request_window_size"
+        }
+      ]
+    },
+    {
+      "name": "Process",
+      "destroy_ffi_name": "krun_init_process_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "pid",
+          "doc": [
+            " Pid of the process inside the guest."
+          ],
+          "receiver": "ref",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "i32"
+          },
+          "ffi_name": "krun_init_process_pid"
+        },
+        {
+          "name": "wait",
+          "doc": [
+            " Relay stdio until the process exits and return its exit code as a",
+            " shell reports it (128 plus the signal number when it was killed).",
+            "",
+            " `signals`, if given, delivers signal numbers as single bytes, for",
+            " example from a self-pipe written by the caller's signal handlers:",
+            " `SIGWINCH` resizes the guest terminal, everything else is forwarded",
+            " to the process."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "signals",
+              "param_kind": "regular",
+              "type": "BorrowedFd",
+              "type_args": [
+                "_"
+              ],
+              "optional": true
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "i32"
+            },
+            "err_type": "ControlError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_init_process_wait"
+        }
+      ]
     }
   ],
   "errors": [
@@ -609,6 +1199,95 @@
           "c_name": "KRUN_INIT_ERROR_APPLY_OVERLAY_ERROR",
           "code": 2,
           "message": "OverlayError(...)"
+        },
+        {
+          "name": "ControlSocketWithoutVsock",
+          "c_name": "KRUN_INIT_ERROR_APPLY_CONTROL_SOCKET_WITHOUT_VSOCK",
+          "code": 3,
+          "message": "ControlSocketWithoutVsock"
+        }
+      ]
+    },
+    {
+      "name": "ControlError",
+      "variants": [
+        {
+          "name": "Io",
+          "c_name": "KRUN_INIT_ERROR_CONTROL_IO",
+          "code": 1,
+          "message": "Io(...)",
+          "fields": [
+            {
+              "type": "str",
+              "owned": true
+            }
+          ]
+        },
+        {
+          "name": "Timeout",
+          "c_name": "KRUN_INIT_ERROR_CONTROL_TIMEOUT",
+          "code": 2,
+          "message": "Timeout"
+        },
+        {
+          "name": "Protocol",
+          "c_name": "KRUN_INIT_ERROR_CONTROL_PROTOCOL",
+          "code": 3,
+          "message": "Protocol(...)",
+          "fields": [
+            {
+              "type": "str",
+              "owned": true
+            }
+          ]
+        },
+        {
+          "name": "ExecutableNotFound",
+          "c_name": "KRUN_INIT_ERROR_CONTROL_EXECUTABLE_NOT_FOUND",
+          "code": 4,
+          "message": "ExecutableNotFound(...)",
+          "fields": [
+            {
+              "type": "str",
+              "owned": true
+            }
+          ]
+        },
+        {
+          "name": "SpawnFailed",
+          "c_name": "KRUN_INIT_ERROR_CONTROL_SPAWN_FAILED",
+          "code": 5,
+          "message": "SpawnFailed(...)",
+          "fields": [
+            {
+              "type": "str",
+              "owned": true
+            }
+          ]
+        },
+        {
+          "name": "Rejected",
+          "c_name": "KRUN_INIT_ERROR_CONTROL_REJECTED",
+          "code": 6,
+          "message": "Rejected(...)",
+          "fields": [
+            {
+              "type": "str",
+              "owned": true
+            }
+          ]
+        },
+        {
+          "name": "Disconnected",
+          "c_name": "KRUN_INIT_ERROR_CONTROL_DISCONNECTED",
+          "code": 7,
+          "message": "Disconnected"
+        },
+        {
+          "name": "AlreadyWaited",
+          "c_name": "KRUN_INIT_ERROR_CONTROL_ALREADY_WAITED",
+          "code": 8,
+          "message": "AlreadyWaited"
         }
       ]
     }
@@ -769,6 +1448,37 @@
             "return_kind": "void"
           },
           "ffi_name": "krun_init_apply_error_message"
+        }
+      ]
+    },
+    {
+      "trait_name": "Error",
+      "struct_name": "ControlError",
+      "methods": [
+        {
+          "name": "code",
+          "receiver": "ref",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "u32"
+          },
+          "ffi_name": "krun_init_control_error_code"
+        },
+        {
+          "name": "message",
+          "receiver": "ref",
+          "params": [
+            {
+              "name": "writer",
+              "param_kind": "impl_trait",
+              "trait_name": "PushStr"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_init_control_error_message"
         }
       ]
     }

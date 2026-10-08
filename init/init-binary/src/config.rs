@@ -30,6 +30,12 @@ struct Mount {
     source: Option<String>,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Deserialize, Default)]
+struct ControlServerConfig {
+    vsock_port: u32,
+}
+
 #[derive(Deserialize, Default)]
 struct RawConfig {
     process: Option<ProcessConfig>,
@@ -47,6 +53,8 @@ struct RawConfig {
     entrypoint: Option<Vec<String>>,
     #[cfg(target_os = "linux")]
     mounts: Option<Vec<Mount>>,
+    #[cfg(target_os = "linux")]
+    control_server: Option<ControlServerConfig>,
 }
 
 #[derive(Default)]
@@ -55,6 +63,8 @@ pub struct Config {
     pub workdir: Option<String>,
     #[cfg(target_os = "linux")]
     pub tmpfs: Option<String>,
+    #[cfg(target_os = "linux")]
+    pub control_vsock_port: Option<u32>,
 }
 
 pub fn load(#[cfg(target_os = "linux")] is_mount_point: impl Fn(&str) -> bool) -> Config {
@@ -122,6 +132,8 @@ pub fn load(#[cfg(target_os = "linux")] is_mount_point: impl Fn(&str) -> bool) -
         workdir,
         #[cfg(target_os = "linux")]
         tmpfs,
+        #[cfg(target_os = "linux")]
+        control_vsock_port: raw.control_server.map(|s| s.vsock_port),
     }
 }
 
@@ -202,6 +214,14 @@ mod tests {
             None => base,
         };
         assert_eq!(argv, Some(vec!["/ep.sh".into()]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn control_server_port_is_parsed() {
+        let r = raw(r#"{"control_server": {"vsock_port": 1234}}"#);
+        assert_eq!(r.control_server.map(|s| s.vsock_port), Some(1234));
+        assert!(raw("{}").control_server.is_none());
     }
 
     #[test]
