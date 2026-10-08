@@ -54,6 +54,11 @@ mod test_vsock_guest_connect_emfile;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_vsock_guest_connect_emfile::TestVsockGuestConnectEmfile;
 
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_init_control;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_init_control::TestInitControl;
+
 mod test_tsi_tcp_guest_connect;
 use test_tsi_tcp_guest_connect::TestTsiTcpGuestConnect;
 
@@ -196,6 +201,8 @@ pub fn test_cases() -> Vec<TestCase> {
             "vsock-guest-connect-emfile",
             Box::new(TestVsockGuestConnectEmfile),
         ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("init-control", Box::new(TestInitControl)),
         TestCase::new(
             "tsi-tcp-guest-connect",
             Box::new(TestTsiTcpGuestConnect::new()),
