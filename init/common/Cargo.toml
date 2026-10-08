@@ -1,0 +1,19 @@
+[package]
+name = "krun-init-common"
+version = "0.1.0-2.0.0-dev"
+edition = "2024"
+description = "Types shared between libkrun_init on the host and krun-init in the guest"
+license = "Apache-2.0"
+repository = "https://github.com/containers/libkrun"
+
+[features]
+default = ["client"]
+# Host side: connect to the control server of a running guest init.
+client = []
+# Guest side: serve exec and signal requests (Linux only).
+server = []
+
+[dependencies]
+bincode = { version = "2", default-features = false, features = ["std", "serde"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
