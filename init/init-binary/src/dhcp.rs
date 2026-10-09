@@ -5,6 +5,7 @@ use std::mem;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::slice;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use nix::errno::Errno;
@@ -13,15 +14,25 @@ use nix::sys::socket::{
     self, AddressFamily, MsgFlags, SockFlag, SockProtocol, SockType, SockaddrIn, sockopt,
 };
 use nix::sys::time::{TimeVal, TimeValLike};
-use nix::unistd;
+use nix::unistd::{self, ForkResult};
 
 const DHCP_BUFFER_SIZE: usize = 576;
+/// How long to keep retransmitting a request before giving up. A TAP attached
+/// to a bridge with STP can take several seconds to start forwarding, so a
+/// single-shot request is easily lost.
+const DHCP_RETRY_WINDOW: Duration = Duration::from_secs(8);
+/// Receive timeout, and therefore retransmit interval, for each attempt.
+const DHCP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+/// How long to wait for a reply to a renewal request.
+const DHCP_RENEW_TIMEOUT: Duration = Duration::from_secs(3);
 /// BOOTP vendor-specific area size (64) - magic cookie (4)
 const DHCP_OPTIONS_SIZE: usize = 60;
 const DHCP_OPTIONS_OFFSET: usize = 240;
 const DHCP_OPTIONS_END: u8 = 0xff;
 const DHCP_MSG_OFFER: u8 = 2;
+const DHCP_MSG_REQUEST: u8 = 3;
 const DHCP_MSG_ACK: u8 = 5;
+const DHCP_MSG_NAK: u8 = 6;
 /// RFC 2131: BOOTP/DHCP server
 const DHCP_SERVER_PORT: u16 = 67;
 /// RFC 2131: BOOTP/DHCP client
@@ -181,6 +192,16 @@ impl<'a> Iterator for DhcpOptions<'a> {
 
 fn struct_as_bytes<T: Sized>(v: &T) -> &[u8] {
     unsafe { slice::from_raw_parts(v as *const T as *const u8, mem::size_of::<T>()) }
+}
+
+/// Add up to half of `d` based on the current time, so concurrently booting
+/// VMs do not retransmit in lockstep.
+fn jitter(d: Duration) -> Duration {
+    let spread = (d.as_millis() as u64 / 2).max(1);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |t| u64::from(t.subsec_nanos()));
+    d + Duration::from_millis(now % spread)
 }
 
 /// Helper function to send netlink message
@@ -392,26 +413,75 @@ fn mod_route4(
     nl_check_ack(&buf, recv_len, "mod_route4")
 }
 
+/// Return the raw data for the first occurrence of `code` in a response.
+fn dhcp_option(response: &[u8], code: u8) -> Option<&[u8]> {
+    DhcpOptions::new(response.get(DHCP_OPTIONS_OFFSET..).unwrap_or(&[]))
+        .find(|&(c, _)| c == code)
+        .map(|(_, data)| data)
+}
+
+/// Return the big-endian u32 value of a four-octet option, if present.
+fn dhcp_option_u32(response: &[u8], code: u8) -> Option<u32> {
+    dhcp_option(response, code)
+        .and_then(|data| data.get(..4))
+        .map(|data| u32::from_be_bytes(data.try_into().unwrap()))
+}
+
 /// Return the DHCP message type (option 53) from a response, or 0
 fn dhcp_msg_type(response: &[u8]) -> u8 {
-    DhcpOptions::new(response.get(DHCP_OPTIONS_OFFSET..).unwrap_or(&[]))
-        .find(|&(code, _)| code == 53)
-        .and_then(|(_, data)| data.first().copied())
+    dhcp_option(response, 53)
+        .and_then(|data| data.first().copied())
         .unwrap_or(0)
 }
 
-/// Parse a DHCP ACK and configure the interface
-fn handle_dhcp_ack(nl_sock: libc::c_int, iface_index: i32, response: &[u8]) -> anyhow::Result<()> {
-    // Need at least 240 bytes (DHCP header + magic cookie) + 1 for options
-    if response.len() < DHCP_OPTIONS_OFFSET + 1 {
-        bail!("DHCPACK too short ({} bytes)", response.len());
-    }
+/// The address and timers granted by a DHCPACK (RFC 2131 section 4.4.5).
+struct Lease {
+    addr: u32,
+    server_id: [u8; 4],
+    lease_secs: u32,
+    t1: u32,
+    t2: u32,
+}
 
-    // Parse DHCP response. yiaddr is at offset 16-19 in network byte order
-    let addr = u32::from_ne_bytes(response[16..20].try_into().unwrap());
-    if addr == libc::INADDR_ANY {
-        bail!("DHCPACK: yiaddr is 0.0.0.0");
+impl Lease {
+    fn parse(response: &[u8]) -> anyhow::Result<Self> {
+        // Need at least 240 bytes (DHCP header + magic cookie) + 1 for options
+        if response.len() < DHCP_OPTIONS_OFFSET + 1 {
+            bail!("DHCPACK too short ({} bytes)", response.len());
+        }
+
+        // yiaddr is at offset 16-19 in network byte order
+        let addr = u32::from_ne_bytes(response[16..20].try_into().unwrap());
+        if addr == libc::INADDR_ANY {
+            bail!("DHCPACK: yiaddr is 0.0.0.0");
+        }
+
+        let lease_secs = dhcp_option_u32(response, 51).unwrap_or(0);
+        let server_id = dhcp_option(response, 54)
+            .and_then(|data| data.get(..4))
+            .map(|data| <[u8; 4]>::try_from(data).unwrap())
+            .unwrap_or([0; 4]);
+        // RFC 2131 section 4.4.5 defaults when the server sends no T1/T2.
+        let t1 = dhcp_option_u32(response, 58).unwrap_or(lease_secs / 2);
+        let t2 = dhcp_option_u32(response, 59).unwrap_or(lease_secs - lease_secs / 8);
+
+        Ok(Self {
+            addr,
+            server_id,
+            lease_secs,
+            t1,
+            t2,
+        })
     }
+}
+
+/// Parse a DHCP ACK and configure the interface
+fn handle_dhcp_ack(
+    nl_sock: libc::c_int,
+    iface_index: i32,
+    response: &[u8],
+) -> anyhow::Result<Lease> {
+    let lease = Lease::parse(response)?;
 
     let mut netmask: u32 = 0;
     let mut router: u32 = 0;
@@ -455,13 +525,126 @@ fn handle_dhcp_ack(nl_sock: libc::c_int, iface_index: i32, response: &[u8]) -> a
     // Calculate the prefix length from netmask
     let prefix_len = u32::from_be(netmask).leading_ones() as u8;
 
-    mod_addr4(nl_sock, iface_index, libc::RTM_NEWADDR, addr, prefix_len)
-        .context("add address from DHCP")?;
+    mod_addr4(
+        nl_sock,
+        iface_index,
+        libc::RTM_NEWADDR,
+        lease.addr,
+        prefix_len,
+    )
+    .context("add address from DHCP")?;
     mod_route4(nl_sock, iface_index, libc::RTM_NEWROUTE, router)
         .context("add default route from DHCP")?;
     let _ = set_mtu(nl_sock, iface_index, mtu as u32);
 
-    Ok(())
+    Ok(lease)
+}
+
+fn ipv4(addr: u32) -> Ipv4Addr {
+    Ipv4Addr::from(addr.to_ne_bytes())
+}
+
+enum Reply {
+    Ack(Lease),
+    Nak,
+    None,
+}
+
+/// Send a DHCPREQUEST for the current lease and wait DHCP_RENEW_TIMEOUT for a
+/// reply. Per RFC 2131 section 4.4.5 the request carries the client's address
+/// in 'ciaddr' and, while RENEWING, is unicast to the issuing server.
+fn renew(sock: &OwnedFd, mac: [u8; 16], lease: &Lease, server: Ipv4Addr) -> Reply {
+    let mut pkt = DhcpPacket::zeroed();
+    pkt.op = BOOTREQUEST;
+    pkt.htype = HTYPE_ETHERNET;
+    pkt.hlen = HLEN_ETHERNET;
+    pkt.xid = (unistd::getpid().as_raw() as u32).to_be();
+    pkt.ciaddr = lease.addr;
+    pkt.magic = DHCP_MAGIC_COOKIE.to_be();
+    pkt.chaddr = mac;
+    let mut opts = DhcpOptionsWriter::new(&mut pkt.options);
+    opts.push(53, &[DHCP_MSG_REQUEST]);
+    opts.finish();
+
+    let dest = SockaddrIn::from(SocketAddrV4::new(server, DHCP_SERVER_PORT));
+    if socket::sendto(sock.as_raw_fd(), pkt.as_bytes(), &dest, MsgFlags::empty()).is_err() {
+        return Reply::None;
+    }
+
+    let mut response = [0u8; DHCP_BUFFER_SIZE];
+    let Ok((n, _)) = socket::recvfrom::<SockaddrIn>(sock.as_raw_fd(), &mut response) else {
+        return Reply::None;
+    };
+    match dhcp_msg_type(&response[..n]) {
+        DHCP_MSG_ACK => Lease::parse(&response[..n]).map_or(Reply::None, Reply::Ack),
+        DHCP_MSG_NAK => Reply::Nak,
+        _ => Reply::None,
+    }
+}
+
+/// Spawn a child that keeps the lease alive so the server keeps listing the VM
+/// as an active client.
+///
+/// Forks rather than spawning a thread so the loop survives when the parent
+/// execs the workload in PID1 mode (a thread would be destroyed by exec; a
+/// separate process is not). Safe to call here because do_dhcp() runs before
+/// any other threads exist.
+fn spawn_renewer(sock: &OwnedFd, mac: [u8; 16], lease: Lease) {
+    if let Ok(ForkResult::Child) = unsafe { unistd::fork() } {
+        renew_loop(sock, mac, lease);
+        unsafe { libc::_exit(0) };
+    }
+}
+
+/// Renew at T1 (unicast) and rebind at T2 (broadcast), per RFC 2131 section
+/// 4.4.5. Gives up on NAK; otherwise keeps rebinding until a server answers.
+fn renew_loop(sock: &OwnedFd, mac: [u8; 16], mut lease: Lease) {
+    let timeout = TimeVal::seconds(DHCP_RENEW_TIMEOUT.as_secs() as i64);
+    let _ = socket::setsockopt(sock, sockopt::ReceiveTimeout, &timeout);
+
+    'renew: loop {
+        std::thread::sleep(Duration::from_secs(lease.t1.max(1) as u64));
+
+        // RENEWING: unicast to the server that issued the lease.
+        match renew(sock, mac, &lease, Ipv4Addr::from(lease.server_id)) {
+            Reply::Ack(next) => {
+                lease = next;
+                eprintln!(
+                    "[krun-dhcp] renewed {} (next in {}s)",
+                    ipv4(lease.addr),
+                    lease.t1
+                );
+                continue 'renew;
+            }
+            Reply::Nak => break,
+            Reply::None => {}
+        }
+
+        std::thread::sleep(Duration::from_secs(lease.t2.saturating_sub(lease.t1) as u64));
+
+        // REBINDING: broadcast, so any server can extend the lease. Keep trying
+        // after expiry too: the workload is already running, so the client
+        // cannot stop using the address.
+        loop {
+            match renew(sock, mac, &lease, Ipv4Addr::BROADCAST) {
+                Reply::Ack(next) => {
+                    lease = next;
+                    eprintln!(
+                        "[krun-dhcp] renewed {} (next in {}s)",
+                        ipv4(lease.addr),
+                        lease.t1
+                    );
+                    continue 'renew;
+                }
+                Reply::Nak => break 'renew,
+                Reply::None => {}
+            }
+            std::thread::sleep(Duration::from_secs(
+                lease.lease_secs.saturating_sub(lease.t2).max(1) as u64,
+            ));
+        }
+    }
+    eprintln!("[krun-dhcp] lease for {} lost", ipv4(lease.addr));
 }
 
 /// Perform DHCP discover and configuration for a network interface
@@ -469,7 +652,7 @@ fn handle_dhcp_ack(nl_sock: libc::c_int, iface_index: i32, response: &[u8]) -> a
 /// This function:
 /// 1. Binds a UDP socket to the interface using SO_BINDTODEVICE
 /// 2. Sends a DHCP DISCOVER message with Rapid Commit option
-/// 3. Waits up to 100ms for a response:
+/// 3. Retransmits the DISCOVER for up to DHCP_RETRY_WINDOW:
 ///     - If DHCPACK (Rapic Commit): applies configuration directly
 ///     - If DHCPOFFER: sends DHCPREQUEST and waits for DHCPACK
 ///     - If no response: returns success (VM may be IPv6-only)
@@ -558,38 +741,41 @@ pub fn do_dhcp(iface: &str) -> anyhow::Result<()> {
 
     let dest = SockaddrIn::from(SocketAddrV4::new(Ipv4Addr::BROADCAST, DHCP_SERVER_PORT));
 
-    // Keep IPv6-only fast: set receive timeout to 100ms
+    let interval = jitter(DHCP_RETRY_INTERVAL);
     socket::setsockopt(
         &sock,
         sockopt::ReceiveTimeout,
-        &TimeVal::microseconds(100_000),
+        &TimeVal::microseconds(interval.as_micros() as i64),
     )
     .context("setsockopt(SO_RCVTIMEO)")?;
 
-    // Send DHCP DISCOVER
     let pkt_bytes = pkt.as_bytes();
-    socket::sendto(sock.as_raw_fd(), pkt_bytes, &dest, MsgFlags::empty())
-        .context("sendto(DISCOVER)")?;
-
-    // Get response: DHCPACK (Rapid Commit) or DHCPOFFER
     let mut response = [0u8; DHCP_BUFFER_SIZE];
-    let (recv_len, from) = match socket::recvfrom::<SockaddrIn>(sock.as_raw_fd(), &mut response) {
-        Ok(r) => r,
-        Err(Errno::EAGAIN) => return Ok(()), // timeout — no DHCP server
-        Err(e) => bail!("recvfrom: {e}"),
+    let deadline = Instant::now() + DHCP_RETRY_WINDOW;
+    let (recv_len, from) = loop {
+        socket::sendto(sock.as_raw_fd(), pkt_bytes, &dest, MsgFlags::empty())
+            .context("sendto(DISCOVER)")?;
+
+        match socket::recvfrom::<SockaddrIn>(sock.as_raw_fd(), &mut response) {
+            Ok(r) => break r,
+            Err(Errno::EAGAIN) => {
+                if Instant::now() >= deadline {
+                    return Ok(()); // no DHCP server answered within the window
+                }
+            }
+            Err(e) => bail!("recvfrom: {e}"),
+        }
     };
 
     let msg_type = dhcp_msg_type(&response[..recv_len]);
 
-    match msg_type {
+    let lease = match msg_type {
         // Rapid Commit - server sent ACK directly
-        DHCP_MSG_ACK => {
-            handle_dhcp_ack(
-                nl_sock.as_raw_fd(),
-                iface_index as i32,
-                &response[..recv_len],
-            )?;
-        }
+        DHCP_MSG_ACK => handle_dhcp_ack(
+            nl_sock.as_raw_fd(),
+            iface_index as i32,
+            &response[..recv_len],
+        )?,
         // DHCPOFFER - complete the 4-way handshake by sending DHCPREQUEST and waiting for DHCPACK.
         // Servers without Rapid Commit (e.g. gvproxy) require this.
         DHCP_MSG_OFFER => {
@@ -604,23 +790,119 @@ pub fn do_dhcp(iface: &str) -> anyhow::Result<()> {
             opts.finish();
 
             let pkt_bytes = pkt.as_bytes();
-            socket::sendto(sock.as_raw_fd(), pkt_bytes, &dest, MsgFlags::empty())
-                .context("sendto(REQUEST)")?;
+            let deadline = Instant::now() + DHCP_RETRY_WINDOW;
+            let (recv_len2, _) = loop {
+                socket::sendto(sock.as_raw_fd(), pkt_bytes, &dest, MsgFlags::empty())
+                    .context("sendto(REQUEST)")?;
 
-            let (recv_len2, _) = socket::recvfrom::<SockaddrIn>(sock.as_raw_fd(), &mut response)
-                .context("no DHCPACK received")?;
-            let ack_type = dhcp_msg_type(&response[..recv_len2]);
-            if ack_type != DHCP_MSG_ACK {
-                bail!("expected DHCPACK, got type {ack_type}");
-            }
+                match socket::recvfrom::<SockaddrIn>(sock.as_raw_fd(), &mut response) {
+                    Ok(r) => {
+                        // Retransmitted DISCOVERs can leave duplicate OFFERs in
+                        // the socket buffer; only an ACK completes the handshake.
+                        if dhcp_msg_type(&response[..r.0]) == DHCP_MSG_ACK {
+                            break r;
+                        }
+                    }
+                    Err(Errno::EAGAIN) => {
+                        if Instant::now() >= deadline {
+                            bail!("no DHCPACK received");
+                        }
+                    }
+                    Err(e) => bail!("recvfrom(DHCPACK): {e}"),
+                }
+            };
             handle_dhcp_ack(
                 nl_sock.as_raw_fd(),
                 iface_index as i32,
                 &response[..recv_len2],
-            )?;
+            )?
         }
         _ => bail!("unexpected DHCP message type {msg_type}"),
+    };
+
+    // A zero or infinite lease has nothing to renew.
+    if lease.lease_secs > 0 && lease.lease_secs != u32::MAX {
+        spawn_renewer(&sock, pkt.chaddr, lease);
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ack(addr: [u8; 4], opts: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut buf = vec![0u8; DHCP_OPTIONS_OFFSET - 4];
+        buf[16..20].copy_from_slice(&addr);
+        buf.extend_from_slice(&DHCP_MAGIC_COOKIE.to_be_bytes());
+        for (code, data) in opts {
+            buf.push(*code);
+            buf.push(data.len() as u8);
+            buf.extend_from_slice(data);
+        }
+        buf.push(DHCP_OPTIONS_END);
+        buf
+    }
+
+    #[test]
+    fn lease_defaults_to_rfc_timers() {
+        let r = ack(
+            [192, 168, 1, 5],
+            &[(51, &3600u32.to_be_bytes()), (54, &[192, 168, 1, 1])],
+        );
+        let lease = Lease::parse(&r).unwrap();
+        assert_eq!(lease.addr, u32::from_ne_bytes([192, 168, 1, 5]));
+        assert_eq!(lease.lease_secs, 3600);
+        assert_eq!(lease.server_id, [192, 168, 1, 1]);
+        assert_eq!((lease.t1, lease.t2), (1800, 3150));
+    }
+
+    #[test]
+    fn lease_honours_server_timers() {
+        let r = ack(
+            [10, 0, 0, 5],
+            &[
+                (51, &300u32.to_be_bytes()),
+                (58, &150u32.to_be_bytes()),
+                (59, &262u32.to_be_bytes()),
+            ],
+        );
+        let lease = Lease::parse(&r).unwrap();
+        assert_eq!((lease.t1, lease.t2), (150, 262));
+    }
+
+    #[test]
+    fn infinite_lease_does_not_overflow() {
+        let r = ack([10, 0, 0, 5], &[(51, &u32::MAX.to_be_bytes())]);
+        let lease = Lease::parse(&r).unwrap();
+        assert_eq!(lease.lease_secs, u32::MAX);
+        assert!(lease.t2 >= lease.t1);
+    }
+
+    #[test]
+    fn rejects_unset_yiaddr() {
+        let r = ack([0, 0, 0, 0], &[(51, &3600u32.to_be_bytes())]);
+        assert!(Lease::parse(&r).is_err());
+    }
+
+    #[test]
+    fn reads_options_and_message_type() {
+        let r = ack(
+            [10, 0, 0, 5],
+            &[(53, &[DHCP_MSG_ACK]), (51, &3600u32.to_be_bytes())],
+        );
+        assert_eq!(dhcp_msg_type(&r), DHCP_MSG_ACK);
+        assert_eq!(dhcp_option_u32(&r, 51), Some(3600));
+        assert_eq!(dhcp_option_u32(&r, 58), None);
+    }
+
+    #[test]
+    fn jitter_stays_within_half_interval() {
+        let d = Duration::from_millis(250);
+        for _ in 0..100 {
+            let j = jitter(d);
+            assert!(j >= d && j <= d + d / 2, "{j:?}");
+        }
+    }
 }

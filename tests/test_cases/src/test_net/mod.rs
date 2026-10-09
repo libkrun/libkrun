@@ -103,6 +103,10 @@ impl TestNet {
     }
 }
 
+/// Boots a VM on a TAP with a short DHCP lease and checks that the guest renews
+/// its lease before the test ends (Linux only; see `tap.rs`).
+pub struct TestTapRenew;
+
 #[host]
 mod host {
     use super::*;
@@ -181,6 +185,64 @@ mod host {
             unreachable!()
         }
     }
+
+    impl Test for TestTapRenew {
+        fn should_run(&self) -> ShouldRun {
+            #[cfg(feature = "dynamic-linking")]
+            if require_symbols().is_err() {
+                return ShouldRun::No("feature not enabled in this libkrun build");
+            }
+            tap::should_run()
+        }
+
+        fn timeout_secs(&self) -> u64 {
+            100
+        }
+
+        fn check(self: Box<Self>, _stdout: Vec<u8>, test_setup: TestSetup) -> TestOutcome {
+            tap::cleanup();
+            let log =
+                std::fs::read_to_string(test_setup.tmp_dir.join("dnsmasq.log")).unwrap_or_default();
+            // The initial lease is granted via Rapid Commit (one DHCPACK); a
+            // renewal adds another, so two ACKs prove the lease was extended.
+            let acks = log.matches("DHCPACK").count();
+            if acks >= 2 {
+                TestOutcome::Pass
+            } else {
+                TestOutcome::Fail(format!(
+                    "expected a lease renewal (>=2 DHCPACK), saw {acks}:\n{log}"
+                ))
+            }
+        }
+
+        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            init_krun()?;
+            #[cfg(feature = "dynamic-linking")]
+            require_symbols().unwrap();
+
+            let init_config = init_config_builder(&test_setup, &[]).dhcp(true).build();
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let (mut devices, payload) =
+                setup_standard_devices_from(&test_setup, &init_config, &stdin, &stdout, &stderr)?;
+
+            devices.add(tap::setup_renew_backend(&test_setup)?);
+
+            let vmm = krun::VmmBuilder::new()
+                .vcpus(1)
+                .map_err(|e| anyhow::anyhow!("vcpus: {e:?}"))?
+                .ram_mib(512)
+                .map_err(|e| anyhow::anyhow!("ram_mib: {e:?}"))?
+                .payload(payload)
+                .devices(devices)
+                .build()
+                .map_err(|e| anyhow::anyhow!("build: {e:?}"))?;
+
+            vmm.run();
+            unreachable!()
+        }
+    }
 }
 
 #[guest]
@@ -192,6 +254,14 @@ mod guest {
         fn in_guest(self: Box<Self>) {
             self.tcp_tester.run_client();
 
+            println!("OK");
+        }
+    }
+
+    impl Test for TestTapRenew {
+        fn in_guest(self: Box<Self>) {
+            // Outlast T1 (half of the 120s lease) so at least one renewal occurs.
+            std::thread::sleep(std::time::Duration::from_secs(70));
             println!("OK");
         }
     }
