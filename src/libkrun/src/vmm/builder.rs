@@ -62,6 +62,8 @@ use crate::vmm::device_manager;
 #[cfg(feature = "tdx")]
 use crate::vmm::linux::tee::tdshim::{self, TdShim};
 use crate::vmm::terminal::{term_restore_mode, term_set_raw_mode};
+#[cfg(windows)]
+use crate::vmm::terminal::{term_restore_output_code_page, term_set_utf8_output};
 #[cfg(feature = "tdx")]
 use crate::vmm::vmm_config::firmware::TeeFirmwareType;
 use crate::vmm::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
@@ -959,6 +961,8 @@ pub fn build_microvm(
     // so let's keep track of FDs connected to legacy serial devices here
     // and set raw mode on them later.
     let mut serial_ttys = Vec::new();
+    #[cfg(windows)]
+    let mut has_terminal_serial_output = false;
 
     #[cfg(unix)]
     for s in &vm_resources.serial_consoles {
@@ -1010,6 +1014,8 @@ pub fn build_microvm(
         } else {
             None
         };
+
+        has_terminal_serial_output |= output_file.as_ref().is_some_and(File::is_terminal);
 
         let is_interactive_console = terminal.is_some() && output_file.is_some();
         let is_output_only_console =
@@ -1296,6 +1302,11 @@ pub fn build_microvm(
             false,
             serial_tty.1,
         );
+    }
+
+    #[cfg(windows)]
+    if has_terminal_serial_output {
+        setup_terminal_utf8_output(&mut vmm);
     }
 
     device_manager
@@ -2505,6 +2516,19 @@ pub fn setup_terminal_raw_mode(
                 log::error!("Failed to set terminal to raw mode: {e}")
             }
         };
+    }
+}
+
+#[cfg(windows)]
+fn setup_terminal_utf8_output(vmm: &mut Vmm) {
+    match term_set_utf8_output() {
+        Ok(Some(old_code_page)) => vmm.exit_observers.push(Arc::new(Mutex::new(move || {
+            if let Err(e) = term_restore_output_code_page(&old_code_page) {
+                log::error!("Failed to restore terminal output code page: {e}");
+            }
+        }))),
+        Ok(None) => {}
+        Err(e) => log::error!("Failed to set terminal output code page to UTF-8: {e}"),
     }
 }
 

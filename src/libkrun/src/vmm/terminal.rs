@@ -11,7 +11,8 @@ use std::{
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{
     CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-    ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode, SetConsoleMode,
+    ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode, GetConsoleOutputCP, SetConsoleMode,
+    SetConsoleOutputCP,
 };
 #[must_use]
 #[cfg(unix)]
@@ -20,6 +21,13 @@ pub struct TerminalMode(Termios);
 #[must_use]
 #[cfg(windows)]
 pub struct TerminalMode(CONSOLE_MODE);
+
+#[must_use]
+#[cfg(windows)]
+pub struct ConsoleOutputCodePage(u32);
+
+#[cfg(windows)]
+const UTF8_CODE_PAGE: u32 = 65001;
 
 #[cfg(unix)]
 pub fn term_set_raw_mode(
@@ -96,6 +104,29 @@ pub fn term_restore_mode(
 ) -> Result<(), io::Error> {
     let ret = unsafe { SetConsoleMode(term.as_raw_handle(), restore.0) };
     if ret == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn term_set_utf8_output() -> Result<Option<ConsoleOutputCodePage>, io::Error> {
+    let old_code_page = unsafe { GetConsoleOutputCP() };
+    if old_code_page == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if old_code_page == UTF8_CODE_PAGE {
+        return Ok(None);
+    }
+    if unsafe { SetConsoleOutputCP(UTF8_CODE_PAGE) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Some(ConsoleOutputCodePage(old_code_page)))
+}
+
+#[cfg(windows)]
+pub fn term_restore_output_code_page(restore: &ConsoleOutputCodePage) -> Result<(), io::Error> {
+    if unsafe { SetConsoleOutputCP(restore.0) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
