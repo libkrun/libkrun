@@ -10,7 +10,7 @@
 use macros::{guest, host};
 
 #[host]
-use crate::{ShouldRun, TestSetup};
+use crate::ShouldRun;
 
 /// Virtio-net performance test with configurable backend and direction
 pub struct TestNetPerf {
@@ -20,11 +20,7 @@ pub struct TestNetPerf {
     /// If true, run iperf3 with -R (reverse: server sends, client receives = RX)
     reverse: bool,
     #[cfg(feature = "host")]
-    should_run: fn() -> ShouldRun,
-    #[cfg(feature = "host")]
-    setup_backend: fn(&TestSetup) -> anyhow::Result<krun::NetDevice>,
-    #[cfg(feature = "host")]
-    cleanup: Option<fn()>,
+    backend: Box<dyn crate::test_net::NetBackend>,
 }
 
 impl TestNetPerf {
@@ -35,11 +31,7 @@ impl TestNetPerf {
             port: 15100,
             reverse: false,
             #[cfg(feature = "host")]
-            should_run: crate::test_net::passt::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: crate::test_net::passt::setup_backend,
-            #[cfg(feature = "host")]
-            cleanup: None,
+            backend: Box::new(crate::test_net::passt::Passt),
         }
     }
 
@@ -50,11 +42,7 @@ impl TestNetPerf {
             port: 15110,
             reverse: true,
             #[cfg(feature = "host")]
-            should_run: crate::test_net::passt::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: crate::test_net::passt::setup_backend,
-            #[cfg(feature = "host")]
-            cleanup: None,
+            backend: Box::new(crate::test_net::passt::Passt),
         }
     }
 
@@ -65,11 +53,7 @@ impl TestNetPerf {
             port: 15101,
             reverse: false,
             #[cfg(feature = "host")]
-            should_run: crate::test_net::tap::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: crate::test_net::tap::setup_backend,
-            #[cfg(feature = "host")]
-            cleanup: Some(crate::test_net::tap::cleanup),
+            backend: Box::new(crate::test_net::tap::Tap),
         }
     }
 
@@ -80,11 +64,7 @@ impl TestNetPerf {
             port: 15111,
             reverse: true,
             #[cfg(feature = "host")]
-            should_run: crate::test_net::tap::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: crate::test_net::tap::setup_backend,
-            #[cfg(feature = "host")]
-            cleanup: Some(crate::test_net::tap::cleanup),
+            backend: Box::new(crate::test_net::tap::Tap),
         }
     }
 
@@ -95,11 +75,7 @@ impl TestNetPerf {
             port: 15102,
             reverse: false,
             #[cfg(feature = "host")]
-            should_run: crate::test_net::gvproxy::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: crate::test_net::gvproxy::setup_backend,
-            #[cfg(feature = "host")]
-            cleanup: None,
+            backend: Box::new(crate::test_net::gvproxy::GvproxyBackend { long_path: false }),
         }
     }
 
@@ -110,11 +86,31 @@ impl TestNetPerf {
             port: 15112,
             reverse: true,
             #[cfg(feature = "host")]
-            should_run: crate::test_net::gvproxy::should_run,
+            backend: Box::new(crate::test_net::gvproxy::GvproxyBackend { long_path: false }),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn new_vhost_user_passt_tx() -> Self {
+        Self {
+            #[cfg(feature = "guest")]
+            host_ip: [169, 254, 2, 2],
+            port: 15104,
+            reverse: false,
             #[cfg(feature = "host")]
-            setup_backend: crate::test_net::gvproxy::setup_backend,
+            backend: Box::new(crate::test_net::vhost_user_passt::VhostUserPasst),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn new_vhost_user_passt_rx() -> Self {
+        Self {
+            #[cfg(feature = "guest")]
+            host_ip: [169, 254, 2, 2],
+            port: 15114,
+            reverse: true,
             #[cfg(feature = "host")]
-            cleanup: None,
+            backend: Box::new(crate::test_net::vhost_user_passt::VhostUserPasst),
         }
     }
 
@@ -125,11 +121,7 @@ impl TestNetPerf {
             port: 15103,
             reverse: false,
             #[cfg(feature = "host")]
-            should_run: crate::test_net::vmnet_helper::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: crate::test_net::vmnet_helper::setup_backend,
-            #[cfg(feature = "host")]
-            cleanup: None,
+            backend: Box::new(crate::test_net::vmnet_helper::VmnetHelper),
         }
     }
 
@@ -140,11 +132,7 @@ impl TestNetPerf {
             port: 15113,
             reverse: true,
             #[cfg(feature = "host")]
-            should_run: crate::test_net::vmnet_helper::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: crate::test_net::vmnet_helper::setup_backend,
-            #[cfg(feature = "host")]
-            cleanup: None,
+            backend: Box::new(crate::test_net::vmnet_helper::VmnetHelper),
         }
     }
 }
@@ -153,21 +141,6 @@ impl TestNetPerf {
 mod host {
     use super::*;
     use crate::common::{init_config_builder, init_krun, setup_standard_devices_from};
-
-    #[cfg(feature = "dynamic-linking")]
-    fn require_symbols() -> Result<(), libloading::Error> {
-        crate::common::require_vm_symbols()?;
-        krun::require(
-            None,
-            &[
-                krun::Symbol::KrunNetDeviceNewUnixgramPath,
-                krun::Symbol::KrunNetDeviceNewUnixgramFd,
-                krun::Symbol::KrunNetDeviceNewUnixstreamFd,
-                krun::Symbol::KrunNetDeviceNewTap,
-                krun::Symbol::KrunNetDeviceDestroy,
-            ],
-        )
-    }
     use crate::{Test, TestOutcome, TestSetup};
 
     use std::process::{Child, Command, Stdio};
@@ -329,10 +302,10 @@ RUN dnf install -y iperf3 && dnf clean all
                 return ShouldRun::No("IPERF_DURATION not set");
             }
             #[cfg(feature = "dynamic-linking")]
-            if require_symbols().is_err() {
+            if self.backend.require_symbols().is_err() {
                 return ShouldRun::No("feature not enabled in this libkrun build");
             }
-            let backend_result = (self.should_run)();
+            let backend_result = self.backend.should_run();
             if let ShouldRun::No(_) = backend_result {
                 return backend_result;
             }
@@ -367,17 +340,18 @@ RUN dnf install -y iperf3 && dnf clean all
 
             init_krun()?;
             #[cfg(feature = "dynamic-linking")]
-            require_symbols().unwrap();
+            self.backend.require_symbols().unwrap();
 
-            let init_config = init_config_builder(&test_setup, &[]).dhcp(true).build();
+            let init_config = init_config_builder(&test_setup, &[])
+                .dhcp(self.backend.guest_dhcp())
+                .build();
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
             let (mut devices, payload) =
                 setup_standard_devices_from(&test_setup, &init_config, &stdin, &stdout, &stderr)?;
 
-            let net_device = (self.setup_backend)(&test_setup)?;
-            devices.add(net_device);
+            self.backend.setup_backend(&mut devices, &test_setup)?;
 
             let vmm = krun::VmmBuilder::new()
                 .vcpus(1)
@@ -394,9 +368,7 @@ RUN dnf install -y iperf3 && dnf clean all
         }
 
         fn check(self: Box<Self>, stdout: Vec<u8>, _test_setup: TestSetup) -> TestOutcome {
-            if let Some(cleanup) = self.cleanup {
-                cleanup();
-            }
+            self.backend.cleanup();
             let stdout = String::from_utf8_lossy(&stdout).to_string();
 
             match serde_json::from_str::<Iperf3Output>(&stdout) {

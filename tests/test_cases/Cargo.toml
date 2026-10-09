@@ -4,7 +4,7 @@ edition = "2024"
 
 [features]
 host = ["libloading", "serde", "serde_json"]
-static-linking = ["host", "krun", "krun/blk", "krun/net", "krun-init-blob"]
+static-linking = ["host", "krun", "krun/blk", "krun/net", "krun/vhost-user", "krun-init-blob"]
 dynamic-linking = ["host", "krun-cdylib", "krun-init-cdylib"]
 guest = []
 
