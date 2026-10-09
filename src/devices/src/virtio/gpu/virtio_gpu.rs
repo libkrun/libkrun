@@ -945,6 +945,7 @@ impl VirtioGpu {
 
         let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
         let map_ptr = self.rutabaga.map(resource_id).map_err(|_| ErrUnspec)?.ptr;
+        resource.rutabaga_external_mapping = true;
 
         if let Ok(export) = self.rutabaga.export_blob(resource_id)
             && let Some(mesa_handle) = export.as_mesa_handle()
