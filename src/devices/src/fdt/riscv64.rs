@@ -74,7 +74,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     // Look for "Required nodes and properties".
 
     // Header or the root node as per above mentioned documentation.
-    let root_node = fdt.begin_node("root")?;
+    let root_node = fdt.begin_node("")?;
     fdt.property_string("compatible", "libkrun,riscv64")?;
     fdt.property_string("model", "libkrun riscv64")?;
     // For info on #address-cells and size-cells resort to Table 3.1 Root Node
@@ -144,7 +144,10 @@ fn create_memory_node(
     // for an explanation of this.
     let mem_reg_prop = [arch::riscv64::layout::DRAM_MEM_START, mem_size];
 
-    let mem_node = fdt.begin_node("memory")?;
+    let mem_node = fdt.begin_node(&format!(
+        "memory@{:x}",
+        arch::riscv64::layout::DRAM_MEM_START
+    ))?;
     fdt.property_string("device_type", "memory")?;
     fdt.property_array_u64("reg", &mem_reg_prop)?;
     fdt.end_node(mem_node)?;

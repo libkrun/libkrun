@@ -215,7 +215,7 @@ int main(int argc, char *const argv[])
     krun_nitro_config_exec_path(&nc, KRUN_STR(default_argv[0]));
     krun_nitro_config_args(&nc, KRUN_STR("cat /etc/os-release"));
     krun_nitro_config_env(&nc, KRUN_STR(DEFAULT_PATH_ENV));
-    krun_nitro_config_console_output(&nc, KRUN_STR("/dev/null"));
+    krun_nitro_config_console_output(&nc, KRUN_STR("/dev/stdout"));
     krun_nitro_config_debug(&nc, cmdline.debug);
 
     if (cmdline.net) {

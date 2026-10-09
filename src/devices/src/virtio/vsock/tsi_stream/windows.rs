@@ -435,6 +435,8 @@ pub(crate) fn do_shutdown(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) 
 pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
 
+    // A hung-up stream can still hold unread data. Only recv() can establish
+    // EOF, so stay in the draining states.
     if evset.contains(EventSet::HANG_UP)
         && !matches!(
             proxy.status,

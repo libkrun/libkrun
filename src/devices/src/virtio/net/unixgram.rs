@@ -147,11 +147,11 @@ impl NetBackend for Unixgram {
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
         let ret = match send(self.fd.as_raw_fd(), &buf[hdr_len..], MsgFlags::empty()) {
             Ok(ret) => ret,
-            // macOS returns ENOBUFS when the kernel socket buffer is full,
-            // rather than blocking or returning EAGAIN on non-blocking sockets.
-            Err(nix::Error::ENOBUFS) => {
+            // macOS returns ENOBUFS; Linux returns EAGAIN when the socket buffer is full.
+            #[allow(unreachable_patterns)]
+            Err(nix::Error::EAGAIN | nix::Error::EWOULDBLOCK | nix::Error::ENOBUFS) => {
                 if self.retries == 0 {
-                    info!("write_frame: ENOBUFS");
+                    info!("write_frame: socket buffer full");
                 }
                 self.retries += 1;
                 return Err(WriteError::NothingWritten);
@@ -160,7 +160,7 @@ impl NetBackend for Unixgram {
         };
         if self.retries > 0 {
             info!(
-                "write_frame: ENOBUFS resolved after {} retries",
+                "write_frame: socket buffer available after {} retries",
                 self.retries
             );
             self.retries = 0;

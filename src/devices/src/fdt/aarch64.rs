@@ -86,7 +86,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     // Look for "Required nodes and properties".
 
     // Header or the root node as per above mentioned documentation.
-    let root_node = fdt.begin_node("root")?;
+    let root_node = fdt.begin_node("")?;
     fdt.property_string("compatible", "libkrun,aarch64")?;
     fdt.property_string("model", "libkrun aarch64")?;
     // For info on #address-cells and size-cells read "Note about cells and address representation"
@@ -182,7 +182,7 @@ fn create_memory_node(
     // for an explanation of this.
     let mem_reg_prop = generate_prop64(&[arch_memory_info.ram_start_addr, mem_size]);
 
-    let mem_node = fdt.begin_node("memory")?;
+    let mem_node = fdt.begin_node(&format!("memory@{:x}", arch_memory_info.ram_start_addr))?;
     fdt.property_string("device_type", "memory")?;
     fdt.property("reg", &mem_reg_prop)?;
     fdt.end_node(mem_node)?;

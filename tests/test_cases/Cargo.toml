@@ -18,7 +18,7 @@ krun-init-blob = { path = "../../init/init-blob", package = "krun-init-blob", fe
 krun-init-cdylib = { path = "../../bindings/init-blob-via-cdylib", package = "krun-init-blob-via-cdylib", optional = true }
 libloading = { version = "0.8", optional = true }
 macros = { path = "../macros" }
-nix = { version = "0.29.0", features = ["fs", "socket", "ioctl", "user"] }
+nix = { version = "0.29.0", features = ["fs", "socket", "ioctl", "user", "signal", "process"] }
 anyhow = "1.0.95"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }

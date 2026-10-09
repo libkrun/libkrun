@@ -652,12 +652,16 @@ impl VsockMuxer {
     fn process_op_credit_update(&self, pkt: &VsockPacket) {
         debug!("OP_CREDIT_UPDATE");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        let update = self
-            .proxy_map
-            .read()
-            .unwrap()
-            .get(&id)
-            .map(|proxy| proxy.lock().unwrap().update_peer_credit(pkt));
+        let update = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+            let mut proxy = proxy.lock().unwrap();
+            let mut update = proxy.update_peer_credit(pkt);
+            // Apply the polling change under the proxy lock so a later event on
+            // the same connection cannot rearm it after we stopped polling.
+            if let Some((id, fd, events)) = update.polling.take() {
+                self.update_polling(id, fd, events);
+            }
+            update
+        });
         if let Some(update) = update {
             self.process_proxy_update(id, update);
         }
