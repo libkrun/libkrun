@@ -28,6 +28,11 @@ use crate::virtio::{InterruptTransport, PortDescription, VmmExitObserver};
 pub(crate) const CONTROL_RXQ_INDEX: usize = 2;
 pub(crate) const CONTROL_TXQ_INDEX: usize = 3;
 
+enum PortAction {
+    Open(usize),
+    Close(usize),
+}
+
 pub(crate) const AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_CONSOLE_F_SIZE as u64)
     | (1 << uapi::VIRTIO_CONSOLE_F_MULTIPORT as u64)
     | (1 << uapi::VIRTIO_F_VERSION_1 as u64);
@@ -172,7 +177,7 @@ impl Console {
             .expect("control tx queue should exist");
         let mut raise_irq = false;
 
-        let mut ports_to_start = Vec::new();
+        let mut port_actions = Vec::new();
 
         while let Some(head) = control_tx.queue.pop(mem) {
             raise_irq = true;
@@ -246,37 +251,62 @@ impl Console {
 
                     if !opened {
                         log::debug!("Guest closed port {}", cmd.id);
+                        port_actions.push(PortAction::Close(cmd.id as usize));
                         continue;
                     }
 
-                    ports_to_start.push(cmd.id as usize);
+                    port_actions.push(PortAction::Open(cmd.id as usize));
                 }
                 _ => log::warn!("Unknown console control event {:x}", cmd.event),
             }
         }
 
-        for port_id in ports_to_start {
-            log::trace!("Starting port io for port {port_id}");
-            let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
-            let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+        // Actions are deferred because `control_tx` mutably borrows one queue,
+        // but must still be applied in the order sent by the guest.
+        for action in port_actions {
+            match action {
+                PortAction::Close(port_id) => {
+                    if let Some((rx_queue, tx_queue)) = self.ports[port_id].shutdown() {
+                        let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+                        let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+                        self.queues[rx_idx] = Some(DeviceQueue::new(
+                            rx_queue,
+                            self.queue_events[rx_idx].clone(),
+                        ));
+                        self.queues[tx_idx] = Some(DeviceQueue::new(
+                            tx_queue,
+                            self.queue_events[tx_idx].clone(),
+                        ));
+                    }
+                }
+                PortAction::Open(port_id) => {
+                    log::trace!("Starting port io for port {port_id}");
+                    let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+                    let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
 
-            // Take ownership of port queues - they are moved to the port.
-            let rx_queue = self.queues[rx_idx]
-                .take()
-                .expect("port rx queue should exist")
-                .queue;
-            let tx_queue = self.queues[tx_idx]
-                .take()
-                .expect("port tx queue should exist")
-                .queue;
+                    // Take ownership of port queues - they are moved to the port. The queues
+                    // may legitimately be absent here if the guest sends PORT_OPEN(1) twice in a
+                    // row without an intervening close (e.g. a spurious duplicate notification):
+                    // in that case the port is already running against the queues from the
+                    // first open, so just skip re-starting it instead of panicking.
+                    let (Some(rx_queue), Some(tx_queue)) =
+                        (self.queues[rx_idx].take(), self.queues[tx_idx].take())
+                    else {
+                        log::warn!(
+                            "Ignoring duplicate PORT_OPEN for port {port_id}: queues already in use"
+                        );
+                        continue;
+                    };
 
-            self.ports[port_id].start(
-                mem.clone(),
-                rx_queue,
-                tx_queue,
-                interrupt.clone(),
-                self.control.clone(),
-            );
+                    self.ports[port_id].start(
+                        mem.clone(),
+                        rx_queue.queue,
+                        tx_queue.queue,
+                        interrupt.clone(),
+                        self.control.clone(),
+                    );
+                }
+            }
         }
 
         raise_irq
@@ -355,7 +385,7 @@ impl VirtioDevice for Console {
     fn reset(&mut self) -> bool {
         // Shutdown ports and clear queues.
         for port in &mut self.ports {
-            port.shutdown();
+            let _ = port.shutdown();
         }
         self.queues.clear();
         self.queue_events.clear();
