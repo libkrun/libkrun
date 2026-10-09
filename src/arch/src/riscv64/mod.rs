@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn test_regions_lt_1024gb() {
-        let (_mem_info, regions) = arch_memory_regions(1usize << 29, 0);
+        let (_mem_info, regions) = arch_memory_regions(1usize << 29, 0, None);
         assert_eq!(1, regions.len());
         assert_eq!(GuestAddress(super::layout::DRAM_MEM_START), regions[0].0);
         assert_eq!(1usize << 29, regions[0].1);
@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn test_regions_gt_1024gb() {
-        let (_mem_info, regions) = arch_memory_regions(1usize << 41, 0);
+        let (_mem_info, regions) = arch_memory_regions(1usize << 41, 0, None);
         assert_eq!(1, regions.len());
         assert_eq!(GuestAddress(super::layout::DRAM_MEM_START), regions[0].0);
         assert_eq!(super::layout::DRAM_MEM_MAX_SIZE, regions[0].1 as u64);
@@ -109,15 +109,15 @@ mod tests {
 
     #[test]
     fn test_get_fdt_addr() {
-        let (_mem_info, regions) = arch_memory_regions(layout::FDT_MAX_SIZE - 0x1000, 0);
+        let (_mem_info, regions) = arch_memory_regions(layout::FDT_MAX_SIZE - 0x1000, 0, None);
         let mem = GuestMemoryMmap::from_ranges(&regions).expect("Cannot initialize memory");
         assert_eq!(get_fdt_addr(&mem), layout::DRAM_MEM_START);
 
-        let (_mem_info, regions) = arch_memory_regions(layout::FDT_MAX_SIZE, 0);
+        let (_mem_info, regions) = arch_memory_regions(layout::FDT_MAX_SIZE, 0, None);
         let mem = GuestMemoryMmap::from_ranges(&regions).expect("Cannot initialize memory");
         assert_eq!(get_fdt_addr(&mem), layout::DRAM_MEM_START);
 
-        let (_mem_info, regions) = arch_memory_regions(layout::FDT_MAX_SIZE + 0x1000, 0);
+        let (_mem_info, regions) = arch_memory_regions(layout::FDT_MAX_SIZE + 0x1000, 0, None);
         let mem = GuestMemoryMmap::from_ranges(&regions).expect("Cannot initialize memory");
         assert_eq!(get_fdt_addr(&mem), 0x1000 + layout::DRAM_MEM_START);
     }

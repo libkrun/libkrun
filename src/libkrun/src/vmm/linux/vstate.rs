@@ -1303,6 +1303,12 @@ impl Vcpu {
         Ok(())
     }
 
+    /// Reads the actual `time` CSR frequency KVM runs this vCPU at
+    #[cfg(target_arch = "riscv64")]
+    pub fn get_timer_frequency(&self) -> Result<u64> {
+        arch::riscv64::regs::read_timer_frequency(&self.fd).map_err(Error::REGSConfiguration)
+    }
+
     /// Moves the vcpu to its own thread and constructs a VcpuHandle.
     /// The handle can be used to control the remote vcpu.
     pub fn start_threaded(mut self) -> Result<VcpuHandle> {
