@@ -398,7 +398,7 @@ fn run_tests(
         .count();
     let num_fail = results
         .iter()
-        .filter(|r| matches!(r.outcome, TestOutcome::Fail(_)))
+        .filter(|r| matches!(r.outcome, TestOutcome::Fail(_) | TestOutcome::Timeout))
         .count();
     let num_skip = results
         .iter()
