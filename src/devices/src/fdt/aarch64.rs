@@ -181,7 +181,7 @@ fn create_memory_node(
     // for an explanation of this.
     let mem_reg_prop = generate_prop64(&[arch_memory_info.ram_start_addr, mem_size]);
 
-    let mem_node = fdt.begin_node("memory")?;
+    let mem_node = fdt.begin_node(&format!("memory@{:x}", arch_memory_info.ram_start_addr))?;
     fdt.property_string("device_type", "memory")?;
     fdt.property("reg", &mem_reg_prop)?;
     fdt.end_node(mem_node)?;
