@@ -57,14 +57,17 @@ impl From<FdtError> for Error {
 }
 
 /// Creates the flattened device tree for this riscv64 VM.
+#[allow(clippy::too_many_arguments)]
 pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     guest_mem: &GuestMemoryMmap,
     arch_memory_info: &ArchMemoryInfo,
     num_vcpu: u32,
+    timebase_frequency: u32,
     cmdline: &str,
     device_info: &HashMap<(DeviceType, String), T>,
     aia_device: &IrqChip,
     initrd: &Option<InitrdConfig>,
+    riscv_isa_info: &Option<arch::riscv64::linux::kvm::RiscvIsaInfo>,
 ) -> Result<Vec<u8>> {
     // Allocate stuff necessary for the holding the blob.
     let mut fdt = FdtWriter::new()?;
@@ -80,7 +83,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     // Properties
     fdt.property_u32("#address-cells", ADDRESS_CELLS)?;
     fdt.property_u32("#size-cells", SIZE_CELLS)?;
-    create_cpu_nodes(&mut fdt, num_vcpu)?;
+    create_cpu_nodes(&mut fdt, num_vcpu, timebase_frequency, riscv_isa_info)?;
     create_memory_node(&mut fdt, guest_mem, arch_memory_info)?;
     create_chosen_node(&mut fdt, cmdline, initrd)?;
     create_aia_node(&mut fdt, aia_device)?;
@@ -101,20 +104,77 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
 }
 
 // Following are the auxiliary function for creating the different nodes that we append to our FDT.
-fn create_cpu_nodes(fdt: &mut FdtWriter, num_cpus: u32) -> Result<()> {
+fn create_cpu_nodes(
+    fdt: &mut FdtWriter,
+    num_cpus: u32,
+    timebase_frequency: u32,
+    riscv_isa_info: &Option<arch::riscv64::linux::kvm::RiscvIsaInfo>,
+) -> Result<()> {
     // See https://elixir.bootlin.com/linux/v6.10/source/Documentation/devicetree/bindings/riscv/cpus.yaml
     let cpus = fdt.begin_node("cpus")?;
     // As per documentation, on RISC-V 64-bit systems value should be set to 1.
     fdt.property_u32("#address-cells", 0x01)?;
     fdt.property_u32("#size-cells", 0x0)?;
-    fdt.property_u32("timebase-frequency", 0x989680)?;
+    fdt.property_u32("timebase-frequency", timebase_frequency)?;
 
     for cpu_index in 0..num_cpus {
         let cpu = fdt.begin_node(&format!("cpu@{cpu_index:x}"))?;
         fdt.property_string("device_type", "cpu")?;
         fdt.property_string("compatible", "riscv")?;
         fdt.property_string("mmu-type", "sv48")?;
-        fdt.property_string("riscv,isa", "rv64imafdc_smaia_ssaia")?;
+
+        // "riscv,isa" is deprecated by the kernel in favor of the
+        // "riscv,isa-base" + "riscv,isa-extensions" pair; we only emit the
+        // modern properties.
+        //
+        // "riscv,isa-base" identifies the base ISA and is always "rv64i" on
+        // riscv64 (see Documentation/devicetree/bindings/riscv/extensions.yaml).
+        fdt.property_string("riscv,isa-base", "rv64i")?;
+
+        // "riscv,isa-extensions" is a devicetree stringlist: each extension
+        // name must be its own NUL-terminated string. property_string_list()
+        // concatenates each entry with its own trailing NUL. Use the
+        // detected extensions if available, otherwise fall back to
+        // `arch::riscv64::linux::kvm::DEFAULT_ISA_EXTENSIONS` so the CPU
+        // node remains valid and matches the same fallback used by the
+        // detection code itself when it cannot probe anything.
+        let ext_list: Vec<String> = match riscv_isa_info {
+            Some(isa_info) if !isa_info.extensions.is_empty() => {
+                isa_info.extensions.iter().cloned().collect()
+            }
+            _ => arch::riscv64::linux::kvm::DEFAULT_ISA_EXTENSIONS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
+
+        // Only emit a cache block size property alongside the extension it
+        // belongs to: the devicetree bindings document these as dependent
+        // on the matching Z extension being listed in
+        // "riscv,isa-extensions", and the guest kernel sizes real `cbo.*`
+        // cache-maintenance instructions off these values, so they must
+        // not be advertised for an extension we did not detect.
+        let has_ext = |name: &str| ext_list.iter().any(|e| e == name);
+        if let Some(isa_info) = riscv_isa_info {
+            if has_ext("zicbom") {
+                if let Some(size) = isa_info.zicbom_block_size {
+                    fdt.property_u32("riscv,cbom-block-size", size)?;
+                }
+            }
+            if has_ext("zicboz") {
+                if let Some(size) = isa_info.zicboz_block_size {
+                    fdt.property_u32("riscv,cboz-block-size", size)?;
+                }
+            }
+            if has_ext("zicbop") {
+                if let Some(size) = isa_info.zicbop_block_size {
+                    fdt.property_u32("riscv,cbop-block-size", size)?;
+                }
+            }
+        }
+
+        fdt.property_string_list("riscv,isa-extensions", ext_list)?;
+
         fdt.property_string("status", "okay")?;
         fdt.property_u32("reg", cpu_index)?;
         fdt.property_u32("phandle", CPU_BASE_PHANDLE + cpu_index)?;
@@ -260,6 +320,23 @@ fn create_serial_node<T: DeviceInfoForFDT + Clone + Debug>(
     Ok(())
 }
 
+fn create_rtc_node<T: DeviceInfoForFDT + Clone + Debug>(
+    fdt: &mut FdtWriter,
+    dev_info: &T,
+) -> Result<()> {
+    let rtc_reg_prop = [dev_info.addr(), dev_info.length()];
+    let irq = [dev_info.irq(), IRQ_TYPE_LEVEL_HI];
+
+    let rtc_node = fdt.begin_node(&format!("rtc@{:x}", dev_info.addr()))?;
+    fdt.property_string("compatible", "google,goldfish-rtc")?;
+    fdt.property_array_u64("reg", &rtc_reg_prop)?;
+    fdt.property_u32("interrupt-parent", AIA_APLIC_PHANDLE)?;
+    fdt.property_array_u32("interrupts", &irq)?;
+    fdt.end_node(rtc_node)?;
+
+    Ok(())
+}
+
 fn create_devices_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt: &mut FdtWriter,
     dev_info: &HashMap<(DeviceType, String), T>,
@@ -270,6 +347,7 @@ fn create_devices_node<T: DeviceInfoForFDT + Clone + Debug>(
     for ((device_type, _device_id), info) in dev_info {
         match device_type {
             DeviceType::Serial => create_serial_node(fdt, info)?,
+            DeviceType::RTC => create_rtc_node(fdt, info)?,
             DeviceType::Virtio(_) => {
                 ordered_virtio_device.push(info);
             }
