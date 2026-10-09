@@ -7,9 +7,14 @@
 //! adapting it to work with libkrun's VirtioDevice trait.
 
 use std::io::{self, ErrorKind, IoSlice, Read, Result as IoResult, Write};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "net")]
+use std::time::Duration;
+#[cfg(feature = "net")]
+use virtio_bindings::{virtio_config::VIRTIO_F_VERSION_1, virtio_net::*, virtio_ring::*};
 
 use krun_display::{
     DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, ResourceFormat,
@@ -32,7 +37,6 @@ use vhost::vhost_user::{
 };
 use vhost::{VhostBackend, VhostUserMemoryRegionInfo, VringConfigData};
 use vm_memory::{Address, ByteValued, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
-use vmm_sys_util::eventfd::EventFd as VhostEventFd;
 
 use crate::display::DisplayInfo;
 use crate::virtio::{
@@ -223,6 +227,8 @@ pub struct VhostUserDevice {
 
     /// Available features from the backend
     avail_features: u64,
+    backend_features: u64,
+    net_config: Option<[u8; 12]>,
 
     /// Whether the backend supports protocol features
     has_protocol_features: bool,
@@ -294,7 +300,7 @@ impl VhostUserDevice {
     ///
     /// A new VhostUserDevice or an error if connection fails.
     pub fn new(
-        socket_path: impl AsRef<std::path::Path>,
+        socket_path: impl AsRef<Path>,
         device_type: u32,
         device_name: String,
         num_queues: u16,
@@ -309,6 +315,28 @@ impl VhostUserDevice {
 
         // Connect to the vhost-user backend
         let stream = UnixStream::connect(socket_path)?;
+        let mut device = Self::from_stream(
+            stream,
+            device_type,
+            device_name,
+            num_queues,
+            queue_sizes,
+            gpu_display,
+        )?;
+        if device_type == VIRTIO_ID_GPU {
+            device.display_backend = display_backend;
+        }
+        Ok(device)
+    }
+
+    fn from_stream(
+        stream: UnixStream,
+        device_type: u32,
+        device_name: String,
+        num_queues: u16,
+        queue_sizes: &[u16],
+        gpu_display: Option<DisplayInfo>,
+    ) -> IoResult<Self> {
         // NOTE: `num_queues` could be 0 here, but this is actually fine
         // because if `VhostUserProtocolFeatures::MQ` is supported the negotiated
         // value will be used automatically by Frontend
@@ -348,7 +376,7 @@ impl VhostUserDevice {
 
         // Determine actual queue count - may require protocol feature negotiation
         let actual_num_queues = if num_queues == 0 {
-            if has_protocol_features {
+            if negotiated_protocol_features.contains(VhostUserProtocolFeatures::MQ) {
                 let backend_queue_num = frontend.get_queue_num().map_err(io::Error::other)?;
 
                 debug!(
@@ -360,7 +388,7 @@ impl VhostUserDevice {
             } else {
                 return Err(io::Error::new(
                     ErrorKind::InvalidInput,
-                    "Backend doesn't support protocol features, must specify queue count",
+                    "Backend doesn't support MQ, must specify queue count",
                 ));
             }
         } else {
@@ -387,6 +415,8 @@ impl VhostUserDevice {
             device_name,
             queue_configs,
             avail_features,
+            backend_features: avail_features,
+            net_config: None,
             has_protocol_features,
             negotiated_protocol_features,
             acked_features: 0,
@@ -397,13 +427,42 @@ impl VhostUserDevice {
             gpu_display_info,
             shm_region: None,
             backend_req_handler: None,
-            display_backend: if device_type == VIRTIO_ID_GPU {
-                display_backend
-            } else {
-                None
-            },
+            display_backend: None,
             display_instance: None,
         })
+    }
+
+    #[cfg(feature = "net")]
+    pub fn new_net(stream: UnixStream, name: String, mac: [u8; 6]) -> IoResult<Self> {
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let mut device = Self::from_stream(stream, 1, name, 2, &[256, 256], None)?;
+        let supported = (1 << VIRTIO_F_VERSION_1)
+            | (1 << VIRTIO_RING_F_INDIRECT_DESC)
+            | (1 << VIRTIO_RING_F_EVENT_IDX)
+            | (1 << VIRTIO_NET_F_CSUM)
+            | (1 << VIRTIO_NET_F_GUEST_CSUM)
+            | (1 << VIRTIO_NET_F_GUEST_TSO4)
+            | (1 << VIRTIO_NET_F_GUEST_TSO6)
+            | (1 << VIRTIO_NET_F_GUEST_ECN)
+            | (1 << VIRTIO_NET_F_GUEST_UFO)
+            | (1 << VIRTIO_NET_F_HOST_TSO4)
+            | (1 << VIRTIO_NET_F_HOST_TSO6)
+            | (1 << VIRTIO_NET_F_HOST_ECN)
+            | (1 << VIRTIO_NET_F_HOST_UFO)
+            | (1 << VIRTIO_NET_F_MRG_RXBUF);
+        if device.backend_features & (1 << VIRTIO_F_VERSION_1) == 0 {
+            return Err(io::Error::new(
+                ErrorKind::Unsupported,
+                "vhost-user net requires virtio 1.0",
+            ));
+        }
+        device.backend_features &= supported;
+        device.avail_features = device.backend_features | (1 << VIRTIO_NET_F_MAC);
+        let mut config = [0; 12];
+        config[..6].copy_from_slice(&mac);
+        device.net_config = Some(config);
+        Ok(device)
     }
 
     pub fn set_shm_region(&mut self, region: VirtioShmRegion) {
@@ -422,9 +481,9 @@ impl VhostUserDevice {
 
         // Combine guest-acked features with backend-only features (QEMU approach)
         let backend_feature_bits = if self.has_protocol_features {
-            self.acked_features | VHOST_USER_F_PROTOCOL_FEATURES
+            (self.acked_features & self.backend_features) | VHOST_USER_F_PROTOCOL_FEATURES
         } else {
-            self.acked_features
+            self.acked_features & self.backend_features
         };
 
         frontend.set_owner().map_err(io::Error::other)?;
@@ -564,25 +623,12 @@ impl VhostUserDevice {
                     io::Error::other(e)
                 })?;
 
-            // Create vhost-compatible EventFd from the raw fd
-            // (bridges krun_utils::EventFd with vmm_sys_util::EventFd type mismatch)
-            let kick_fd = unsafe { VhostEventFd::from_raw_fd(device_queue.event.as_raw_fd()) };
             frontend
-                .set_vring_kick(queue_index, &kick_fd)
-                .map_err(|e| {
-                    error!("{}: set_vring_kick failed: {:?}", self.device_name, e);
-                    io::Error::other(e)
-                })?;
-            std::mem::forget(kick_fd); // Don't close the fd twice
-
-            let call_fd = unsafe { VhostEventFd::from_raw_fd(vring_call_event.as_raw_fd()) };
+                .set_vring_kick(queue_index, &device_queue.event)
+                .map_err(io::Error::other)?;
             frontend
-                .set_vring_call(queue_index, &call_fd)
-                .map_err(|e| {
-                    error!("{}: set_vring_call failed: {:?}", self.device_name, e);
-                    io::Error::other(e)
-                })?;
-            std::mem::forget(call_fd); // Don't close the fd twice
+                .set_vring_call(queue_index, &vring_call_event)
+                .map_err(io::Error::other)?;
 
             // Per QEMU vhost.c: when VHOST_USER_F_PROTOCOL_FEATURES is not negotiated,
             // the rings start directly in the enabled state, and set_vring_enable will fail.
@@ -635,9 +681,21 @@ impl VirtioDevice for VhostUserDevice {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
+        if let Some(config) = &self.net_config {
+            data.fill(0);
+            if let Ok(offset) = usize::try_from(offset)
+                && let Some(bytes) = config.get(offset..)
+            {
+                let len = bytes.len().min(data.len());
+                data[..len].copy_from_slice(&bytes[..len]);
+            }
+            return;
+        }
         // Fetch config from backend on every read (same as QEMU/crosvm)
         // No caching to avoid invalidation issues
-        if self.has_protocol_features
+        if self
+            .negotiated_protocol_features
+            .contains(VhostUserProtocolFeatures::CONFIG)
             && let Ok(mut frontend) = self.frontend.lock()
         {
             match frontend.get_config(
@@ -675,7 +733,11 @@ impl VirtioDevice for VhostUserDevice {
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
-        if !self.has_protocol_features {
+        if self.net_config.is_some()
+            || !self
+                .negotiated_protocol_features
+                .contains(VhostUserProtocolFeatures::CONFIG)
+        {
             debug!(
                 "{}: config write at offset {} skipped (no protocol features)",
                 self.device_name, offset
@@ -1271,5 +1333,94 @@ impl Subscriber for VhostUserDevice {
             EventSet::IN,
             self.activate_evt.as_raw_fd() as u64,
         )]
+    }
+}
+
+#[cfg(all(test, feature = "net"))]
+mod net_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::thread;
+
+    fn backend(features: u64, protocol: Option<u64>) -> (UnixStream, thread::JoinHandle<()>) {
+        let (frontend, mut backend) = UnixStream::pair().unwrap();
+        backend
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let handle = thread::spawn(move || {
+            let mut reply = |request: u32, value: u64| {
+                let mut header = [0; 12];
+                backend.read_exact(&mut header).unwrap();
+                assert_eq!(u32::from_le_bytes(header[..4].try_into().unwrap()), request);
+                assert_eq!(u32::from_le_bytes(header[8..].try_into().unwrap()), 0);
+                let mut response = Vec::new();
+                response.extend_from_slice(&request.to_le_bytes());
+                response.extend_from_slice(&5u32.to_le_bytes());
+                response.extend_from_slice(&8u32.to_le_bytes());
+                response.extend_from_slice(&value.to_le_bytes());
+                backend.write_all(&response).unwrap();
+            };
+            reply(1, features);
+            if let Some(protocol) = protocol {
+                reply(15, protocol);
+                let mut request = [0; 20];
+                backend.read_exact(&mut request).unwrap();
+                assert_eq!(u32::from_le_bytes(request[..4].try_into().unwrap()), 16);
+            }
+        });
+        (frontend, handle)
+    }
+
+    #[test]
+    fn passt_without_config_or_mq_uses_local_mac_and_two_queues() {
+        let (stream, backend) = backend(0x144008002, Some(0x8000e));
+        let mac = [2, 3, 4, 5, 6, 7];
+        let mut device = VhostUserDevice::new_net(stream, "eth0".into(), mac).unwrap();
+        backend.join().unwrap();
+        assert_eq!(device.queue_config().len(), 2);
+        assert_eq!(device.avail_features(), 0x100008022);
+        assert_eq!(device.backend_features, 0x100008002);
+        let mut config = [0xff; 16];
+        device.read_config(0, &mut config);
+        assert_eq!(&config[..6], &mac);
+        assert_eq!(&config[6..], &[0; 10]);
+        device.write_config(0, &[0xff; 6]);
+        device.read_config(4, &mut config);
+        assert_eq!(&config[..2], &mac[4..]);
+        assert_eq!(&config[2..], &[0; 14]);
+        device.read_config(u64::MAX, &mut config);
+        assert_eq!(config, [0; 16]);
+    }
+
+    #[test]
+    fn net_does_not_advertise_control_queue_or_multiqueue() {
+        let unsupported = (1 << VIRTIO_NET_F_CTRL_VQ)
+            | (1 << VIRTIO_NET_F_MQ)
+            | (1 << VIRTIO_NET_F_STATUS)
+            | (1 << VIRTIO_NET_F_MTU);
+        let (stream, backend) = backend((1 << VIRTIO_F_VERSION_1) | unsupported, None);
+        let device = VhostUserDevice::new_net(stream, "eth0".into(), [2; 6]).unwrap();
+        backend.join().unwrap();
+        assert_eq!(device.avail_features() & unsupported, 0);
+    }
+
+    #[test]
+    fn net_requires_modern_virtio() {
+        let (stream, backend) = backend(0, None);
+        let error = VhostUserDevice::new_net(stream, "eth0".into(), [2; 6])
+            .err()
+            .unwrap();
+        backend.join().unwrap();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn automatic_queue_count_requires_mq() {
+        let (stream, backend) = backend(0x144008002, Some(0x8000e));
+        let error = VhostUserDevice::from_stream(stream, 1, "eth0".into(), 0, &[], None)
+            .err()
+            .unwrap();
+        backend.join().unwrap();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
 }

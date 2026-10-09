@@ -128,6 +128,7 @@ pub fn require_vm_symbols() -> Result<(), libloading::Error> {
             KrunRngDeviceNew,
             KrunRngDeviceDestroy,
             KrunErrorPayload,
+            KrunErrorResult,
             KrunErrorDestroy,
         ],
     )
