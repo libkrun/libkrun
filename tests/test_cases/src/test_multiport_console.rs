@@ -134,12 +134,11 @@ mod guest {
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
 
-    fn test_port(port_map: &std::collections::HashMap<String, String>, name: &str, message: &str) {
-        let device_path = format!("/dev/{}", port_map.get(name).unwrap());
+    fn ping_pong(device_path: &str, message: &str) -> String {
         let mut port = fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&device_path)
+            .open(device_path)
             .unwrap();
 
         port.write_all(message.as_bytes()).unwrap();
@@ -148,9 +147,25 @@ mod guest {
         let mut reader = BufReader::new(port);
         let mut response = String::new();
         reader.read_line(&mut response).unwrap();
+        response
+    }
 
+    fn test_port(port_map: &std::collections::HashMap<String, String>, name: &str, message: &str) {
+        let device_path = format!("/dev/{}", port_map.get(name).unwrap());
         let expected = message.replace("PING", "PONG").to_string();
-        assert_eq!(response, expected, "{}: wrong response", name);
+
+        // First open: exercises the normal open path.
+        let response = ping_pong(&device_path, message);
+        assert_eq!(response, expected, "{}: wrong response (1st open)", name);
+
+        // `ping_pong` already dropped (closed) the port's file handle above,
+        // which makes the guest driver send VIRTIO_CONSOLE_PORT_OPEN(id, 0)
+        // to the host. Reopening the very same port here sends
+        // VIRTIO_CONSOLE_PORT_OPEN(id, 1) again, exercising the host-side
+        // close/reopen (queue reclaim) path on libkrun's virtio-console
+        // device. See `Console::process_control_tx` / `Port::shutdown`.
+        let response = ping_pong(&device_path, message);
+        assert_eq!(response, expected, "{}: wrong response (reopened)", name);
     }
 
     impl Test for TestMultiportConsole {
