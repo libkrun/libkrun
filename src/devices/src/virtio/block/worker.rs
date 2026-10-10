@@ -3,7 +3,7 @@ use crate::virtio::descriptor_utils::{Reader, Writer};
 use super::super::DeviceQueue;
 use super::device::{CacheType, DiskProperties};
 
-use crate::virtio::InterruptTransport;
+use crate::virtio::{DescriptorChain, InterruptTransport};
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -47,6 +47,81 @@ pub struct RequestHeader {
 }
 // Safe because RequestHeader only contains plain data.
 unsafe impl ByteValued for RequestHeader {}
+
+#[cfg(target_os = "macos")]
+const READ_BATCH_MAX_REQUESTS: usize = 128;
+#[cfg(target_os = "macos")]
+const READ_BATCH_THREADS: usize = 8;
+#[cfg(target_os = "macos")]
+const READ_BATCH_MIN_REQUESTS: usize = 8;
+#[cfg(target_os = "macos")]
+const READ_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+fn read_range<'a>(
+    mem: &'a GuestMemoryMmap,
+    candidate: &DescriptorChain<'a>,
+) -> Option<(u64, usize)> {
+    let mut reader = Reader::new(mem, candidate.clone()).ok()?;
+    let writer = Writer::new(mem, candidate.clone()).ok()?;
+    let header: RequestHeader = reader.read_obj().ok()?;
+    if header.request_type != VIRTIO_BLK_T_IN {
+        return None;
+    }
+
+    let data_len = writer.available_bytes().checked_sub(1)?;
+    if data_len == 0 || !data_len.is_multiple_of(512) {
+        return None;
+    }
+
+    Some((header.sector.checked_mul(512)?, data_len))
+}
+
+#[cfg(target_os = "macos")]
+struct ParallelReadBatch {
+    buffers: Vec<Vec<u8>>,
+    successes: Vec<bool>,
+}
+
+#[cfg(target_os = "macos")]
+fn read_ranges_parallel<F>(
+    ranges: &[(u64, usize)],
+    requested_threads: usize,
+    read: &F,
+) -> ParallelReadBatch
+where
+    F: Fn(&mut [u8], u64) -> bool + Sync,
+{
+    let mut buffers: Vec<Vec<u8>> = ranges.iter().map(|(_, len)| vec![0u8; *len]).collect();
+    let mut successes = vec![false; ranges.len()];
+
+    if ranges.is_empty() {
+        return ParallelReadBatch { buffers, successes };
+    }
+
+    let threads = requested_threads.max(1).min(ranges.len());
+    let chunk = ranges.len().div_ceil(threads);
+
+    thread::scope(|scope| {
+        for ((range_chunk, buffer_chunk), success_chunk) in ranges
+            .chunks(chunk)
+            .zip(buffers.chunks_mut(chunk))
+            .zip(successes.chunks_mut(chunk))
+        {
+            scope.spawn(move || {
+                for ((&(offset, _len), buffer), success) in range_chunk
+                    .iter()
+                    .zip(buffer_chunk.iter_mut())
+                    .zip(success_chunk.iter_mut())
+                {
+                    *success = read(buffer, offset);
+                }
+            });
+        }
+    });
+
+    ParallelReadBatch { buffers, successes }
+}
 
 #[derive(Copy, Clone, Default)]
 #[repr(C)]
@@ -162,55 +237,177 @@ impl BlockWorker {
     }
 
     fn process_queue(&mut self, mem: &GuestMemoryMmap) {
+        #[cfg(target_os = "macos")]
+        if self.disk.parallel_reads() {
+            self.process_queue_with_parallel_reads(mem);
+            return;
+        }
+
         while let Some(head) = self.device_queue.queue.pop(mem) {
-            let mut reader = match Reader::new(mem, head.clone()) {
-                Ok(r) => r,
+            self.process_head(mem, head);
+        }
+    }
+
+    fn process_head(&mut self, mem: &GuestMemoryMmap, head: DescriptorChain<'_>) {
+        let mut reader = match Reader::new(mem, head.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("invalid descriptor chain: {e:?}");
+                return;
+            }
+        };
+        let mut writer = match Writer::new(mem, head.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("invalid descriptor chain: {e:?}");
+                return;
+            }
+        };
+        let request_header: RequestHeader = match reader.read_obj() {
+            Ok(h) => h,
+            Err(e) => {
+                error!("invalid request header: {e:?}");
+                return;
+            }
+        };
+
+        let (status, len): (u8, usize) =
+            match self.process_request(request_header, &mut reader, &mut writer) {
+                Ok(l) => (VIRTIO_BLK_S_OK.try_into().unwrap(), l),
                 Err(e) => {
-                    error!("invalid descriptor chain: {e:?}");
-                    continue;
-                }
-            };
-            let mut writer = match Writer::new(mem, head.clone()) {
-                Ok(r) => r,
-                Err(e) => {
-                    error!("invalid descriptor chain: {e:?}");
-                    continue;
-                }
-            };
-            let request_header: RequestHeader = match reader.read_obj() {
-                Ok(h) => h,
-                Err(e) => {
-                    error!("invalid request header: {e:?}");
-                    continue;
+                    error!("error processing request: {e:?}");
+                    (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0)
                 }
             };
 
-            let (status, len): (u8, usize) =
-                match self.process_request(request_header, &mut reader, &mut writer) {
-                    Ok(l) => (VIRTIO_BLK_S_OK.try_into().unwrap(), l),
-                    Err(e) => {
-                        error!("error processing request: {e:?}");
-                        (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0)
+        self.complete_request(mem, head, writer, status, len);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_queue_with_parallel_reads(&mut self, mem: &GuestMemoryMmap) {
+        let mut pending: Option<(DescriptorChain<'_>, bool)> = None;
+
+        loop {
+            let (head, should_batch) = if let Some(pending) = pending.take() {
+                pending
+            } else if let Some(head) = self.device_queue.queue.pop(mem) {
+                (head, true)
+            } else {
+                break;
+            };
+
+            if should_batch && let Some(first_range) = read_range(mem, &head) {
+                let mut heads = Vec::with_capacity(READ_BATCH_MAX_REQUESTS);
+                let mut ranges = Vec::with_capacity(READ_BATCH_MAX_REQUESTS);
+                let mut total_bytes = first_range.1;
+                heads.push(head);
+                ranges.push(first_range);
+
+                // Only batch consecutive reads. The first write, flush, or other request is
+                // held back and processed after the batch, preserving the queue barrier.
+                while heads.len() < READ_BATCH_MAX_REQUESTS {
+                    let Some(candidate) = self.device_queue.queue.pop(mem) else {
+                        break;
+                    };
+                    let Some(range) = read_range(mem, &candidate) else {
+                        pending = Some((candidate, false));
+                        break;
+                    };
+                    if total_bytes.saturating_add(range.1) > READ_BATCH_MAX_BYTES {
+                        pending = Some((candidate, true));
+                        break;
                     }
-                };
 
-            if let Err(e) = writer.write_obj(status) {
-                error!("Failed to write virtio block status: {e:?}")
+                    total_bytes += range.1;
+                    heads.push(candidate);
+                    ranges.push(range);
+                }
+
+                if heads.len() >= READ_BATCH_MIN_REQUESTS {
+                    self.process_parallel_read_batch(mem, heads, &ranges);
+                } else {
+                    for head in heads {
+                        self.process_head(mem, head);
+                    }
+                }
+                continue;
             }
 
-            if let Err(e) = self
-                .device_queue
-                .queue
-                .add_used(mem, head.index, len as u32)
-            {
-                error!("failed to add used elements to the queue: {e:?}");
-            }
+            self.process_head(mem, head);
+        }
+    }
 
-            if self.device_queue.queue.needs_notification(mem).unwrap()
-                && let Err(e) = self.interrupt.try_signal_used_queue()
-            {
-                error!("error signalling queue: {e:?}");
+    #[cfg(target_os = "macos")]
+    fn process_parallel_read_batch(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        heads: Vec<DescriptorChain<'_>>,
+        ranges: &[(u64, usize)],
+    ) {
+        let disk = &self.disk;
+        let batch = read_ranges_parallel(ranges, READ_BATCH_THREADS, &|buffer, offset| {
+            disk.file.read().unwrap().read(buffer, offset).is_ok()
+        });
+
+        for (((head, &(offset, data_len)), buffer), host_success) in heads
+            .into_iter()
+            .zip(ranges.iter())
+            .zip(batch.buffers.into_iter())
+            .zip(batch.successes.into_iter())
+        {
+            let mut writer = match Writer::new(mem, head.clone()) {
+                Ok(writer) => writer,
+                Err(e) => {
+                    error!("invalid descriptor chain: {e:?}");
+                    continue;
+                }
+            };
+
+            if !host_success {
+                error!("error reading block range in parallel: offset={offset} len={data_len}");
             }
+            let guest_success = match writer.write_all(&buffer) {
+                Ok(()) => host_success,
+                Err(e) => {
+                    error!("error writing parallel block read to guest: {e:?}");
+                    false
+                }
+            };
+
+            let (status, len): (u8, usize) = if guest_success {
+                (VIRTIO_BLK_S_OK.try_into().unwrap(), data_len)
+            } else {
+                (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0)
+            };
+
+            self.complete_request(mem, head, writer, status, len);
+        }
+    }
+
+    fn complete_request(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        head: DescriptorChain<'_>,
+        mut writer: Writer,
+        status: u8,
+        len: usize,
+    ) {
+        if let Err(e) = writer.write_obj(status) {
+            error!("Failed to write virtio block status: {e:?}");
+        }
+
+        if let Err(e) = self
+            .device_queue
+            .queue
+            .add_used(mem, head.index, len as u32)
+        {
+            error!("failed to add used elements to the queue: {e:?}");
+        }
+
+        if self.device_queue.queue.needs_notification(mem).unwrap()
+            && let Err(e) = self.interrupt.try_signal_used_queue()
+        {
+            error!("error signalling queue: {e:?}");
         }
     }
 
@@ -243,7 +440,7 @@ impl BlockWorker {
             }
             VIRTIO_BLK_T_FLUSH => match self.disk.cache_type() {
                 CacheType::Writeback => {
-                    let diskfile = self.disk.file.lock().unwrap();
+                    let diskfile = self.disk.file.write().unwrap();
                     diskfile.flush().map_err(RequestError::FlushingToDisk)?;
                     diskfile.sync().map_err(RequestError::FlushingToDisk)?;
                     Ok(0)
@@ -268,7 +465,7 @@ impl BlockWorker {
                     .map_err(RequestError::ReadingFromDescriptor)?;
                 self.disk
                     .file
-                    .lock()
+                    .write()
                     .unwrap()
                     .discard_to_any(
                         discard_write_data.sector * 512,
@@ -285,7 +482,7 @@ impl BlockWorker {
                 if unmap {
                     self.disk
                         .file
-                        .lock()
+                        .write()
                         .unwrap()
                         .discard_to_zero(
                             discard_write_data.sector * 512,
@@ -295,7 +492,7 @@ impl BlockWorker {
                 } else {
                     self.disk
                         .file
-                        .lock()
+                        .write()
                         .unwrap()
                         .write_zeroes(
                             discard_write_data.sector * 512,
@@ -307,5 +504,107 @@ impl BlockWorker {
             }
             _ => Err(RequestError::UnknownRequest),
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use crate::virtio::descriptor_utils::{DescriptorType, create_descriptor_chain};
+    use vm_memory::{Bytes, GuestAddress};
+
+    fn request_chain<'a>(
+        mem: &'a GuestMemoryMmap,
+        request_type: u32,
+        sector: u64,
+        data_len: u32,
+    ) -> DescriptorChain<'a> {
+        let header_addr = GuestAddress(0x100);
+        let chain = create_descriptor_chain(
+            mem,
+            GuestAddress(0),
+            header_addr,
+            vec![
+                (
+                    DescriptorType::Readable,
+                    std::mem::size_of::<RequestHeader>() as u32,
+                ),
+                (DescriptorType::Writable, data_len),
+                (DescriptorType::Writable, 1),
+            ],
+            0,
+        )
+        .unwrap();
+        mem.write_obj(
+            RequestHeader {
+                request_type,
+                _reserved: 0,
+                sector,
+            },
+            header_addr,
+        )
+        .unwrap();
+        chain
+    }
+
+    #[test]
+    fn read_range_accepts_only_valid_reads() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+
+        let read = request_chain(&mem, VIRTIO_BLK_T_IN, 7, 512);
+        assert_eq!(read_range(&mem, &read), Some((7 * 512, 512)));
+
+        let write = request_chain(&mem, VIRTIO_BLK_T_OUT, 7, 512);
+        assert_eq!(read_range(&mem, &write), None);
+
+        let flush = request_chain(&mem, VIRTIO_BLK_T_FLUSH, 0, 0);
+        assert_eq!(read_range(&mem, &flush), None);
+
+        let misaligned = request_chain(&mem, VIRTIO_BLK_T_IN, 0, 513);
+        assert_eq!(read_range(&mem, &misaligned), None);
+    }
+
+    #[test]
+    fn parallel_reads_preserve_request_order() {
+        let data = [vec![0x11; 512], vec![0x22; 512], vec![0x33; 512]].concat();
+        let ranges = [(1024, 512), (0, 512), (512, 512)];
+
+        let batch = read_ranges_parallel(&ranges, 3, &|buffer, offset| {
+            let start = offset as usize;
+            let Some(end) = start.checked_add(buffer.len()) else {
+                return false;
+            };
+            let Some(source) = data.get(start..end) else {
+                return false;
+            };
+            buffer.copy_from_slice(source);
+            true
+        });
+
+        assert_eq!(batch.successes, vec![true, true, true]);
+        assert_eq!(batch.buffers[0].as_slice(), &data[1024..1536]);
+        assert_eq!(batch.buffers[1].as_slice(), &data[0..512]);
+        assert_eq!(batch.buffers[2].as_slice(), &data[512..1024]);
+    }
+
+    #[test]
+    fn parallel_reads_report_failures() {
+        let data = vec![0x5a; 512];
+        let ranges = [(0, 512), (512, 512)];
+
+        let batch = read_ranges_parallel(&ranges, 2, &|buffer, offset| {
+            let start = offset as usize;
+            let Some(end) = start.checked_add(buffer.len()) else {
+                return false;
+            };
+            let Some(source) = data.get(start..end) else {
+                return false;
+            };
+            buffer.copy_from_slice(source);
+            true
+        });
+
+        assert_eq!(batch.successes, vec![true, false]);
+        assert_eq!(batch.buffers[0], vec![0x5a; 512]);
     }
 }
