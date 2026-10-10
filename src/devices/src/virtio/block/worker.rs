@@ -96,21 +96,31 @@ impl BlockWorker {
 
         let mut epoll = Epoll::new().unwrap();
 
-        let _ = epoll.ctl(
+        if let Err(e) = epoll.ctl(
             ControlOperation::Add,
             virtq_ev_fd,
             &EpollEvent::new(EventSet::IN, virtq_ev_fd as u64),
-        );
+        ) {
+            log::error!("block worker: failed to add virtq event fd to epoll: {e}");
+        }
 
-        let _ = epoll.ctl(
+        if let Err(e) = epoll.ctl(
             ControlOperation::Add,
             stop_ev_fd,
             &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
-        );
+        ) {
+            log::error!("block worker: failed to add stop event fd to epoll: {e}");
+        }
 
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
-            match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
+            match epoll.wait(epoll_events.len(), 100, epoll_events.as_mut_slice()) {
+                Ok(0) => {
+                    // Fallback: poll queue and re-signal interrupt in case
+                    // eventfd or irqfd notifications were lost.
+                    self.process_virtio_queues();
+                    let _ = self.interrupt.try_signal_used_queue();
+                }
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
                         let source = event.fd();
