@@ -1006,7 +1006,7 @@ impl FileSystem for PassthroughFs {
             inode
         };
 
-        debug!("lookup: {}, inode: {:?}", name.to_str().unwrap(), inode);
+        debug!("lookup: {}, inode: {:?}", name.to_string_lossy(), inode);
 
         Ok(Entry {
             inode,
@@ -2289,5 +2289,48 @@ mod tests {
              the server uid (the scoped_cred Drop regressed to restoring euid 0)"
         );
         Ok(())
+    }
+
+    /// Regression test for the `lookup` debug log on non-UTF-8 names.
+    ///
+    /// File names are arbitrary bytes on Linux, but the log line formatted
+    /// the name with `name.to_str().unwrap()`. The arguments of `debug!`
+    /// are evaluated whenever `log::max_level()` allows debug, before any
+    /// logger filter runs, so with such a level in effect the first lookup
+    /// of a name that is not valid UTF-8 panicked the fs worker thread and
+    /// the device never answered another request. Raising the max level
+    /// here is enough to exercise that path; no logger needs to be set.
+    #[test]
+    fn lookup_handles_non_utf8_names_with_debug_logging() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = std::env::temp_dir().join(format!("libkrun-fs-non-utf8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let name: &[u8] = b"cache-\xff";
+        std::fs::write(dir.join(std::ffi::OsStr::from_bytes(name)), b"").unwrap();
+
+        let fs = PassthroughFs::new(
+            Config {
+                root_dir: dir.to_str().unwrap().to_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        log::set_max_level(log::LevelFilter::Debug);
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let entry = fs
+            .lookup(ctx, fuse::ROOT_ID, &CString::new(name).unwrap())
+            .unwrap();
+        assert_ne!(entry.inode, fuse::ROOT_ID);
+
+        drop(fs);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
