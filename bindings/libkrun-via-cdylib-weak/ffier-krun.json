@@ -490,7 +490,7 @@
           "ffi_name": "krun_pci_device_manager_new"
         }
       ],
-      "cfg": "all(target_arch = \"x86_64\", target_os = \"linux\")"
+      "cfg": "all(target_arch = \"x86_64\", any(target_os = \"linux\", target_os = \"windows\"))"
     },
     {
       "name": "FsDevice",
@@ -3001,7 +3001,7 @@
           "ffi_name": "krun_pci_device_manager_add"
         }
       ],
-      "cfg": "all(target_arch = \"x86_64\", target_os = \"linux\")"
+      "cfg": "all(target_arch = \"x86_64\", any(target_os = \"linux\", target_os = \"windows\"))"
     },
     {
       "trait_name": "AttachDevice",

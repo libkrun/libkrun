@@ -221,13 +221,22 @@ pub enum StartMicrovmError {
     /// Cannot initialize a MMIO Vsock Device or add a device to the MMIO Bus.
     RegisterVsockDevice(device_manager::mmio::Error),
     /// Cannot register the PCI root or a virtio PCI function.
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))]
     RegisterPciDevice(device_manager::pci::Error),
     /// PCI devices require ACPI discovery.
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))]
     PciRequiresAcpi,
     /// PCI shared-memory capabilities are not implemented yet.
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))]
     PciSharedMemoryNotSupported,
     /// Cannot attest the VM in the Secure Virtualization context.
     SecureVirtAttest(VstateError),
@@ -501,11 +510,20 @@ impl Display for StartMicrovmError {
                     "Cannot initialize a MMIO Vsock Device or add a device to the MMIO Bus. {err_msg}"
                 )
             }
-            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            #[cfg(all(
+                target_arch = "x86_64",
+                any(target_os = "linux", target_os = "windows")
+            ))]
             RegisterPciDevice(ref err) => write!(f, "Cannot register PCI device: {err}"),
-            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            #[cfg(all(
+                target_arch = "x86_64",
+                any(target_os = "linux", target_os = "windows")
+            ))]
             PciRequiresAcpi => write!(f, "PCI devices require ACPI to be enabled"),
-            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            #[cfg(all(
+                target_arch = "x86_64",
+                any(target_os = "linux", target_os = "windows")
+            ))]
             PciSharedMemoryNotSupported => {
                 write!(f, "PCI shared-memory regions are not supported yet")
             }
@@ -734,7 +752,10 @@ pub fn build_microvm(
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     let payload = choose_payload(vm_resources)?;
 
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))]
     let pci_enabled = {
         let enabled = device_manager.uses_pci();
         if enabled && !vm_resources.acpi_enabled {
@@ -744,7 +765,10 @@ pub fn build_microvm(
     };
 
     let requirements = device_manager.requirements();
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))]
     if pci_enabled
         && requirements
             .iter()
@@ -752,7 +776,11 @@ pub fn build_microvm(
     {
         return Err(StartMicrovmError::PciSharedMemoryNotSupported);
     }
-    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "gpu"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows"),
+        feature = "gpu"
+    ))]
     if pci_enabled
         && requirements
             .iter()
@@ -1077,14 +1105,20 @@ pub fn build_microvm(
     .map_err(Error::CreateLegacyDevice)
     .map_err(StartMicrovmError::Internal)?;
 
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))]
     let pci_device_manager = if pci_enabled {
         Some(device_manager::pci::PciHostManager::new())
     } else {
         None
     };
 
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))]
     if let Some(pci) = &pci_device_manager {
         pci.register_config_io(&mut pio_device_manager.io_bus)
             .map_err(StartMicrovmError::RegisterPciDevice)?;
@@ -1099,7 +1133,10 @@ pub fn build_microvm(
         (arch::IRQ_BASE, arch::IRQ_MAX),
     );
 
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))]
     if let Some(pci) = &pci_device_manager {
         pci.register_mmio(&mut mmio_device_manager.bus)
             .map_err(StartMicrovmError::RegisterPciDevice)?;
@@ -1309,7 +1346,10 @@ pub fn build_microvm(
         #[cfg(not(target_os = "windows"))]
         vm,
         mmio_device_manager,
-        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "linux", target_os = "windows")
+        ))]
         pci_device_manager,
         #[cfg(target_os = "macos")]
         vm_ctl_tx,
@@ -2490,7 +2530,10 @@ pub(crate) fn attach_mmio_device(
     Ok(())
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
 pub(crate) fn attach_pci_device(
     vmm: &mut Vmm,
     _id: String,
@@ -2498,11 +2541,14 @@ pub(crate) fn attach_pci_device(
     device: Arc<Mutex<dyn VirtioDevice>>,
 ) -> std::result::Result<(), device_manager::pci::Error> {
     let guest_memory = vmm.guest_memory.clone();
-    let vm = vmm.vm.fd_shared();
-    vmm.pci_device_manager
+    let pci = vmm
+        .pci_device_manager
         .as_mut()
-        .expect("PCI device manager must exist when attaching PCI devices")
-        .register_virtio_device(vm, guest_memory, device)?;
+        .expect("PCI device manager must exist when attaching PCI devices");
+    #[cfg(target_os = "linux")]
+    pci.register_virtio_device(vmm.vm.fd_shared(), guest_memory, device)?;
+    #[cfg(target_os = "windows")]
+    pci.register_virtio_device(_intc, guest_memory, device)?;
     Ok(())
 }
 

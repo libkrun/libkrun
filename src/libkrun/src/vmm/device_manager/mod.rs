@@ -26,3 +26,5 @@ pub use self::hvf::mmio;
 pub mod whp;
 #[cfg(target_os = "windows")]
 pub use self::whp::mmio;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use self::whp::pci;

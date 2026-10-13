@@ -50,7 +50,10 @@ use std::time::Duration;
 use utils::windows::AsRawFd;
 
 use crate::vmm::device_manager::mmio::MMIODeviceManager;
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
 use crate::vmm::device_manager::pci::PciHostManager;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::vmm::vstate::VcpuEvent;
@@ -161,7 +164,10 @@ pub struct Vmm {
 
     // Guest VM devices.
     pub(crate) mmio_device_manager: MMIODeviceManager,
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))]
     pub(crate) pci_device_manager: Option<PciHostManager>,
 
     // Out-of-band live pause/resume requests: the C API sends `VmCtl` from
@@ -332,12 +338,12 @@ impl Vmm {
                 self.kernel_cmdline.len() + 1
             };
 
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             let pci_host_info = self
                 .pci_device_manager
                 .as_ref()
                 .map(PciHostManager::acpi_info);
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
             let pci_host_info = None;
 
             arch::x86_64::configure_system(

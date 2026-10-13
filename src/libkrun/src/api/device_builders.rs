@@ -18,7 +18,10 @@ use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 
 use crate::vmm::Vmm;
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
 use crate::vmm::builder::attach_pci_device;
 use crate::vmm::builder::{attach_mmio_device, setup_terminal_raw_mode};
 use crate::vmm::device_manager::shm::ShmManager;
@@ -106,7 +109,10 @@ impl<'a> AttachContext<'a> {
         }
     }
 
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))]
     pub(crate) fn new_pci(
         vmm: &'a mut Vmm,
         event_manager: &'a mut EventManager,
@@ -344,9 +350,12 @@ pub struct MmioDeviceManager<'a> {
 
 /// Device manager using the modern virtio-pci transport.
 ///
-/// Available on x86_64 Linux hosts. The VM must enable ACPI with
+/// Available on x86_64 Linux and Windows hosts. The VM must enable ACPI with
 /// [`VmmBuilder::acpi`](crate::api::vmm_builder::VmmBuilder::acpi).
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
 #[derive(Default)]
 pub struct PciDeviceManager<'a> {
     devices: Vec<Box<dyn AttachDevice<'a> + 'a>>,
@@ -412,11 +421,16 @@ impl sealed::Sealed for MmioDeviceManager<'_> {
 
 #[cfg_attr(
     feature = "ffi",
-    ffier::export(cfg = "all(target_arch = \"x86_64\", target_os = \"linux\")")
+    ffier::export(
+        cfg = "all(target_arch = \"x86_64\", any(target_os = \"linux\", target_os = \"windows\"))"
+    )
 )]
 #[cfg_attr(
     not(feature = "ffi"),
-    cfg(all(target_arch = "x86_64", target_os = "linux"))
+    cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))
 )]
 impl<'a> PciDeviceManager<'a> {
     pub fn new() -> Self {
@@ -424,7 +438,10 @@ impl<'a> PciDeviceManager<'a> {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
 impl<'a> PciDeviceManager<'a> {
     pub fn add(&mut self, device: impl AttachDevice<'a>) -> &mut Self {
         self.devices.push(Box::new(device));
@@ -434,11 +451,16 @@ impl<'a> PciDeviceManager<'a> {
 
 #[cfg_attr(
     feature = "ffi",
-    ffier::export(cfg = "all(target_arch = \"x86_64\", target_os = \"linux\")")
+    ffier::export(
+        cfg = "all(target_arch = \"x86_64\", any(target_os = \"linux\", target_os = \"windows\"))"
+    )
 )]
 #[cfg_attr(
     not(feature = "ffi"),
-    cfg(all(target_arch = "x86_64", target_os = "linux"))
+    cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))
 )]
 impl<'a> DeviceManager<'a> for PciDeviceManager<'a> {
     fn add(&mut self, device: impl AttachDevice<'a>) {
@@ -446,7 +468,10 @@ impl<'a> DeviceManager<'a> for PciDeviceManager<'a> {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
 impl sealed::Sealed for PciDeviceManager<'_> {
     fn requirements(&self) -> Vec<DeviceRequirements> {
         self.devices
