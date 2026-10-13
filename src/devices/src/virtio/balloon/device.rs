@@ -205,4 +205,10 @@ impl VirtioDevice for Balloon {
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
     }
+
+    fn reset(&mut self) -> bool {
+        self.queues = None;
+        self.device_state = DeviceState::Inactive;
+        true
+    }
 }
