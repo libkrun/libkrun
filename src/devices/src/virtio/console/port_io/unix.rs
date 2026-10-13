@@ -97,12 +97,12 @@ impl PortInput for PortInputFd {
         }
     }
 
-    fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
+    fn wait_until_readable(&self, cancel_fds: &[&EventFd]) {
         let mut poll_fds = Vec::new();
         poll_fds.push(PollFd::new(self.0.as_fd(), PollFlags::POLLIN));
-        if let Some(stopfd) = stopfd {
-            // SAFETY: we trust stopfd won't go away to avoid a dup call here.
-            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(stopfd.as_raw_fd()) };
+        for cancel_fd in cancel_fds {
+            // SAFETY: we trust cancel_fd won't go away to avoid a dup call here.
+            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(cancel_fd.as_raw_fd()) };
             poll_fds.push(PollFd::new(borrowed_fd, PollFlags::POLLIN));
         }
         poll(&mut poll_fds, PollTimeout::NONE).expect("Failed to poll");
@@ -114,14 +114,17 @@ impl PortInput for PortInputEmpty {
         Ok(0)
     }
 
-    fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
-        if let Some(stopfd) = stopfd {
-            // SAFETY: we trust stopfd won't go away to avoid a dup call here.
-            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(stopfd.as_raw_fd()) };
-            let mut poll_fds = [PollFd::new(borrowed_fd, PollFlags::POLLIN)];
-            poll(&mut poll_fds, PollTimeout::NONE).expect("Failed to poll");
-        } else {
+    fn wait_until_readable(&self, cancel_fds: &[&EventFd]) {
+        if cancel_fds.is_empty() {
             std::thread::sleep(std::time::Duration::MAX);
+        } else {
+            let mut poll_fds = Vec::with_capacity(cancel_fds.len());
+            for cancel_fd in cancel_fds {
+                // SAFETY: we trust cancel_fd won't go away to avoid a dup call here.
+                let borrowed_fd = unsafe { BorrowedFd::borrow_raw(cancel_fd.as_raw_fd()) };
+                poll_fds.push(PollFd::new(borrowed_fd, PollFlags::POLLIN));
+            }
+            poll(&mut poll_fds, PollTimeout::NONE).expect("Failed to poll");
         }
     }
 }
@@ -135,7 +138,11 @@ impl AsRawFd for PortOutputFd {
 }
 
 impl PortOutput for PortOutputFd {
-    fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error> {
+    fn write_volatile(
+        &mut self,
+        buf: &VolatileSlice,
+        _pausefd: Option<&EventFd>,
+    ) -> Result<usize, io::Error> {
         self.0.write_volatile(buf).map_err(|e| match e {
             VolatileMemoryError::IOError(e) => e,
             e => {
@@ -145,8 +152,14 @@ impl PortOutput for PortOutputFd {
         })
     }
 
-    fn wait_until_writable(&self) {
-        let mut poll_fds = [PollFd::new(self.0.as_fd(), PollFlags::POLLOUT)];
+    fn wait_until_writable(&self, pausefd: Option<&EventFd>) {
+        let mut poll_fds = Vec::new();
+        poll_fds.push(PollFd::new(self.0.as_fd(), PollFlags::POLLOUT));
+        if let Some(pausefd) = pausefd {
+            // SAFETY: we trust pausefd won't go away to avoid a dup call here.
+            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(pausefd.as_raw_fd()) };
+            poll_fds.push(PollFd::new(borrowed_fd, PollFlags::POLLIN));
+        }
         poll(&mut poll_fds, PollTimeout::NONE).expect("Failed to poll");
     }
 }
@@ -218,15 +231,15 @@ impl PortInput for PortInputSigInt {
         Ok(1)
     }
 
-    fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
-        let mut poll_fds = Vec::with_capacity(2);
+    fn wait_until_readable(&self, cancel_fds: &[&EventFd]) {
+        let mut poll_fds = Vec::with_capacity(1 + cancel_fds.len());
         // SAFETY: we trust sigint_evt won't go away to avoid a dup call here.
         let sigint_bfd = unsafe { BorrowedFd::borrow_raw(self.sigint_evt.as_raw_fd()) };
         poll_fds.push(PollFd::new(sigint_bfd, PollFlags::POLLIN));
-        if let Some(stopfd) = stopfd {
-            // SAFETY: we trust stopfd won't go away to avoid a dup call here.
-            let stop_bfd = unsafe { BorrowedFd::borrow_raw(stopfd.as_raw_fd()) };
-            poll_fds.push(PollFd::new(stop_bfd, PollFlags::POLLIN));
+        for cancel_fd in cancel_fds {
+            // SAFETY: we trust cancel_fd won't go away to avoid a dup call here.
+            let cancel_bfd = unsafe { BorrowedFd::borrow_raw(cancel_fd.as_raw_fd()) };
+            poll_fds.push(PollFd::new(cancel_bfd, PollFlags::POLLIN));
         }
 
         poll(&mut poll_fds, PollTimeout::NONE).expect("Failed to poll");

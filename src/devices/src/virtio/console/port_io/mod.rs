@@ -20,13 +20,39 @@ pub trait PortInput {
     #[cfg(windows)]
     fn read_bytes(&mut self, buf: &mut [u8]) -> Result<usize, io::Error>;
 
-    fn wait_until_readable(&self, stopfd: Option<&EventFd>);
+    /// Blocks until input becomes readable, or any fd in `cancel_fds`
+    /// becomes readable/signaled, whichever happens first. Used both for
+    /// real VM shutdown (`stopfd`) and for a guest-initiated port pause
+    /// (`pausefd`) -- either should interrupt an idle wait promptly, since
+    /// there's nothing to drain on the input side.
+    fn wait_until_readable(&self, cancel_fds: &[&EventFd]);
 }
 
 pub trait PortOutput {
-    fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error>;
+    /// Writes `buf` to the output. `pausefd` is a cancellation signal used
+    /// only for a guest-initiated port pause: once it becomes
+    /// readable/signaled, implementations whose underlying write call may
+    /// itself block indefinitely (e.g. a native blocking write on Windows)
+    /// must abort the write and return promptly instead of waiting on a
+    /// backpressured/non-responsive sink forever. Implementations using a
+    /// non-blocking write (e.g. on Unix) can ignore `pausefd` here and rely
+    /// on `wait_until_writable` instead. This must NOT be triggered by real
+    /// VM shutdown: shutdown is expected to block until all buffered output
+    /// is drained.
+    fn write_volatile(
+        &mut self,
+        buf: &VolatileSlice,
+        pausefd: Option<&EventFd>,
+    ) -> Result<usize, io::Error>;
 
-    fn wait_until_writable(&self);
+    /// Blocks until the output becomes writable, or `pausefd` becomes
+    /// readable, whichever happens first. Implementations must return
+    /// promptly once `pausefd` is signaled, so that callers can bound a
+    /// pause operation and avoid blocking indefinitely on a
+    /// backpressured/non-responsive sink. Must NOT be interrupted by real
+    /// VM shutdown -- shutdown blocks here until the sink is writable, so
+    /// buffered output is never silently dropped on exit.
+    fn wait_until_writable(&self, pausefd: Option<&EventFd>);
 }
 
 /// Terminal properties associated with this port
@@ -70,7 +96,11 @@ impl PortOutputLog {
 }
 
 impl PortOutput for PortOutputLog {
-    fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error> {
+    fn write_volatile(
+        &mut self,
+        buf: &VolatileSlice,
+        _pausefd: Option<&EventFd>,
+    ) -> Result<usize, io::Error> {
         self.buf.write_volatile(buf).map_err(io::Error::other)?;
 
         let mut start = 0;
@@ -88,7 +118,7 @@ impl PortOutput for PortOutputLog {
         Ok(buf.len())
     }
 
-    fn wait_until_writable(&self) {}
+    fn wait_until_writable(&self, _pausefd: Option<&EventFd>) {}
 }
 
 pub struct PortInputEmpty {}

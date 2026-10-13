@@ -266,20 +266,27 @@ impl Console {
         for action in port_actions {
             match action {
                 PortAction::Close(port_id) => {
-                    if let Some((rx_queue, tx_queue)) = self.ports[port_id].shutdown() {
-                        let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
-                        let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
-                        self.queues[rx_idx] = Some(DeviceQueue::new(
-                            rx_queue,
-                            self.queue_events[rx_idx].clone(),
-                        ));
-                        self.queues[tx_idx] = Some(DeviceQueue::new(
-                            tx_queue,
-                            self.queue_events[tx_idx].clone(),
-                        ));
-                    }
+                    // Pause rather than shutdown: this is a guest-initiated
+                    // close while the VM keeps running, so we must not
+                    // block the VMM event loop waiting to drain output to
+                    // a possibly backpressured/non-responsive host sink.
+                    // The rx/tx queues stay held inside the port (not
+                    // handed back to self.queues) until the guest reopens
+                    // it (resume()) or the VM actually shuts down
+                    // (shutdown(), still fully draining in that case).
+                    self.ports[port_id].pause();
                 }
                 PortAction::Open(port_id) => {
+                    if self.ports[port_id].is_paused() {
+                        log::trace!("Resuming port io for port {port_id}");
+                        self.ports[port_id].resume(
+                            mem.clone(),
+                            interrupt.clone(),
+                            self.control.clone(),
+                        );
+                        continue;
+                    }
+
                     log::trace!("Starting port io for port {port_id}");
                     let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
                     let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
