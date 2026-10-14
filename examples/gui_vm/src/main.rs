@@ -122,6 +122,10 @@ struct Args {
     #[arg(long)]
     kernel_cmdline: Option<String>,
 
+    /// Describe virtio-mmio devices in ACPI instead of the kernel command line
+    #[arg(long)]
+    acpi: bool,
+
     // Display specifications in the format WIDTHxHEIGHT[@FPS][:DPIdpi|:PHYSICAL_WIDTHxPHYSICAL_HEIGHTmm]
     #[clap(long, value_parser = parse_display)]
     display: Vec<DisplayArg>,
@@ -359,13 +363,19 @@ fn krun_thread(
         devices.add(input_device);
     }
 
-    let vmm = krun::VmmBuilder::new()
+    let mut builder = krun::VmmBuilder::new()
         .vcpus(4)
         .map_err(|e| anyhow::anyhow!("vcpus: {e}"))?
         .ram_mib(4096)
         .map_err(|e| anyhow::anyhow!("ram_mib: {e}"))?
         .payload(payload)
-        .devices(devices)
+        .devices(devices);
+    if args.acpi {
+        builder = builder
+            .acpi(true)
+            .map_err(|e| anyhow::anyhow!("acpi: {e}"))?;
+    }
+    let vmm = builder
         .build()
         .map_err(|e| anyhow::anyhow!("VmmBuilder::build: {e}"))?;
 
