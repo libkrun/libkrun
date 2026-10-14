@@ -68,6 +68,17 @@
         "a"
       ]
     },
+    "DeviceManager": {
+      "kind": {
+        "trait": {
+          "c_name": "KrunDeviceManager"
+        }
+      },
+      "type_tag": 16777242,
+      "lifetime_params": [
+        "a"
+      ]
+    },
     "DiskFormat": {
       "kind": {
         "enum": {
@@ -250,6 +261,17 @@
         }
       },
       "type_tag": 16777224
+    },
+    "PciDeviceManager": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunPciDeviceManager"
+        }
+      },
+      "type_tag": 16777241,
+      "lifetime_params": [
+        "a"
+      ]
     },
     "PushStr": {
       "kind": {
@@ -446,34 +468,29 @@
             ]
           },
           "ffi_name": "krun_mmio_device_manager_new"
-        },
-        {
-          "name": "add",
-          "doc": [
-            " Add a device to this manager.",
-            "",
-            " Devices are attached in the order they are added. The device must",
-            " implement [`AttachDevice`] — all built-in device types",
-            " (`FsDevice`, `ConsoleDevice`, etc.) implement this trait."
-          ],
-          "receiver": "mut",
-          "params": [
-            {
-              "name": "device",
-              "param_kind": "impl_trait",
-              "trait_name": "AttachDevice",
-              "type_args": [
-                "a"
-              ]
-            }
-          ],
-          "ret": {
-            "return_kind": "value",
-            "type": "Self"
-          },
-          "ffi_name": "krun_mmio_device_manager_add"
         }
       ]
+    },
+    {
+      "name": "PciDeviceManager",
+      "destroy_ffi_name": "krun_pci_device_manager_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "new",
+          "receiver": "none",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "PciDeviceManager",
+            "type_args": [
+              "a"
+            ]
+          },
+          "ffi_name": "krun_pci_device_manager_new"
+        }
+      ],
+      "cfg": "all(target_arch = \"x86_64\", target_os = \"linux\")"
     },
     {
       "name": "FsDevice",
@@ -1330,12 +1347,17 @@
         },
         {
           "name": "devices",
+          "doc": [
+            " Add devices using their manager's transport.",
+            "",
+            " PCI devices require ACPI to be enabled with [`VmmBuilder::acpi`]."
+          ],
           "receiver": "value",
           "params": [
             {
               "name": "devices",
-              "param_kind": "regular",
-              "type": "MmioDeviceManager",
+              "param_kind": "impl_trait",
+              "trait_name": "DeviceManager",
               "type_args": [
                 "a"
               ]
@@ -1450,8 +1472,8 @@
             " Enable ACPI table generation for x86_64 guests.",
             "",
             " When disabled (the default), virtio-mmio devices are passed on the kernel",
-            " command line and SMP uses the MP table. When enabled, devices are described",
-            " in the ACPI DSDT and the RSDP is published in boot parameters."
+            " command line and SMP uses the MP table. When enabled, devices and the PCI",
+            " host bridge are described in ACPI and the RSDP is published in boot parameters."
           ],
           "receiver": "value",
           "params": [
@@ -2780,6 +2802,45 @@
   ],
   "traits": [
     {
+      "name": "DeviceManager",
+      "destroy_ffi_name": "krun_device_manager_destroy",
+      "type_tag_constant": "KRUN_DEVICE_MANAGER_TYPE_TAG",
+      "vtable_struct_c_name": "KrunDeviceManagerVtable",
+      "wrapper_c_name": "KrunVtableDeviceManager",
+      "vtable_struct_name": "DeviceManagerVtable",
+      "wrapper_name": "VtableDeviceManager",
+      "methods": [
+        {
+          "name": "add",
+          "doc": [
+            " Add a device to this manager, preserving the order devices are added."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "device",
+              "param_kind": "impl_trait",
+              "trait_name": "AttachDevice",
+              "type_args": [
+                "a"
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_device_manager_add",
+          "trait_definition": {
+            "index": 0,
+            "has_default": false
+          }
+        }
+      ],
+      "own_method_count": 1,
+      "max_vtable_slot": 0,
+      "no_vtable": true
+    },
+    {
       "name": "PushStr",
       "destroy_ffi_name": "krun_push_str_destroy",
       "type_tag_constant": "KRUN_PUSH_STR_TYPE_TAG",
@@ -2875,6 +2936,73 @@
     }
   ],
   "trait_impls": [
+    {
+      "trait_name": "DeviceManager",
+      "struct_name": "MmioDeviceManager",
+      "lifetimes": [
+        "a"
+      ],
+      "trait_lifetime_args": [
+        "a"
+      ],
+      "struct_lifetime_args": [
+        "a"
+      ],
+      "methods": [
+        {
+          "name": "add",
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "device",
+              "param_kind": "impl_trait",
+              "trait_name": "AttachDevice",
+              "type_args": [
+                "a"
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_mmio_device_manager_add"
+        }
+      ]
+    },
+    {
+      "trait_name": "DeviceManager",
+      "struct_name": "PciDeviceManager",
+      "lifetimes": [
+        "a"
+      ],
+      "trait_lifetime_args": [
+        "a"
+      ],
+      "struct_lifetime_args": [
+        "a"
+      ],
+      "methods": [
+        {
+          "name": "add",
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "device",
+              "param_kind": "impl_trait",
+              "trait_name": "AttachDevice",
+              "type_args": [
+                "a"
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_pci_device_manager_add"
+        }
+      ],
+      "cfg": "all(target_arch = \"x86_64\", target_os = \"linux\")"
+    },
     {
       "trait_name": "AttachDevice",
       "struct_name": "FsDevice",

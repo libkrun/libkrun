@@ -39,6 +39,8 @@ const WORKLOAD_INTERVAL_MS: u64 = 100;
 #[host]
 mod host {
     use super::*;
+    #[cfg(feature = "dynamic-linking")]
+    use krun::DeviceManager;
 
     const NUM_CPUS: u8 = 2;
     const WORKLOAD_MS: u64 = WORKLOAD_ITERS as u64 * WORKLOAD_INTERVAL_MS;

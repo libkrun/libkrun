@@ -21,6 +21,8 @@ fn stream_set_timeouts(stream: &mut UnixStream) {
 #[host]
 mod host {
     use super::*;
+    #[cfg(feature = "dynamic-linking")]
+    use krun::DeviceManager;
 
     use std::os::unix::net::UnixListener;
     use std::thread;

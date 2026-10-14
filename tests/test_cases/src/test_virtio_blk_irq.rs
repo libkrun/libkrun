@@ -7,6 +7,8 @@ pub struct TestVirtioBlkIrq {
 #[host]
 mod host {
     use super::*;
+    #[cfg(feature = "dynamic-linking")]
+    use krun::DeviceManager;
 
     use std::fs::File;
 

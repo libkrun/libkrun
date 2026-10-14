@@ -1,6 +1,8 @@
 //! Host-side utilities for FreeBSD guest tests.
 
 use anyhow::Context;
+#[cfg(feature = "dynamic-linking")]
+use krun::DeviceManager;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
