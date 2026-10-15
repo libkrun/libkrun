@@ -2407,7 +2407,6 @@ fn create_vcpus_riscv64(
 #[allow(unused)]
 pub(crate) fn attach_mmio_device(
     vmm: &mut Vmm,
-    id: String,
     intc: IrqChip,
     device: Arc<Mutex<dyn VirtioDevice>>,
 ) -> std::result::Result<(), device_manager::mmio::Error> {
@@ -2418,11 +2417,11 @@ pub(crate) fn attach_mmio_device(
     #[cfg(target_os = "linux")]
     let (_mmio_base, _irq) =
         vmm.mmio_device_manager
-            .register_mmio_device(vmm.vm.fd(), mmio_device, type_id, id)?;
+            .register_mmio_device(vmm.vm.fd(), mmio_device, type_id)?;
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    let (_mmio_base, _irq) =
-        vmm.mmio_device_manager
-            .register_mmio_device(mmio_device, type_id, id)?;
+    let (_mmio_base, _irq) = vmm
+        .mmio_device_manager
+        .register_mmio_device(mmio_device, type_id)?;
 
     Ok(())
 }

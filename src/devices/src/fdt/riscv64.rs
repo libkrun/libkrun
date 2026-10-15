@@ -1,7 +1,6 @@
 // Copyright 2025 The libkrun Authors. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::{io, result};
 
@@ -61,7 +60,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     arch_memory_info: &ArchMemoryInfo,
     num_vcpu: u32,
     cmdline: &str,
-    device_info: &HashMap<(DeviceType, String), T>,
+    device_info: &[(DeviceType, T)],
     aia_device: &IrqChip,
     initrd: &Option<InitrdConfig>,
 ) -> Result<Vec<u8>> {
@@ -264,12 +263,12 @@ fn create_serial_node<T: DeviceInfoForFDT + Clone + Debug>(
 
 fn create_devices_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt: &mut FdtWriter,
-    dev_info: &HashMap<(DeviceType, String), T>,
+    dev_info: &[(DeviceType, T)],
 ) -> Result<()> {
     // Create one temp Vec to store all virtio devices
     let mut ordered_virtio_device: Vec<&T> = Vec::new();
 
-    for ((device_type, _device_id), info) in dev_info {
+    for (device_type, info) in dev_info {
         match device_type {
             DeviceType::Serial => create_serial_node(fdt, info)?,
             DeviceType::Virtio(_) => {

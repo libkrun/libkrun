@@ -5,7 +5,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::{io, result};
 
@@ -74,7 +73,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     arch_memory_info: &ArchMemoryInfo,
     vcpu_mpidr: Vec<u64>,
     cmdline: &str,
-    device_info: &HashMap<(DeviceType, String), T>,
+    device_info: &[(DeviceType, T)],
     gic_device: &IrqChip,
     initrd: &Option<InitrdConfig>,
 ) -> Result<Vec<u8>> {
@@ -192,7 +191,7 @@ fn create_chosen_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt: &mut FdtWriter,
     cmdline: &str,
     initrd: &Option<InitrdConfig>,
-    dev_info: &HashMap<(DeviceType, String), T>,
+    dev_info: &[(DeviceType, T)],
 ) -> Result<()> {
     let chosen_node = fdt.begin_node("chosen")?;
     fdt.property_string("bootargs", cmdline)?;
@@ -200,7 +199,7 @@ fn create_chosen_node<T: DeviceInfoForFDT + Clone + Debug>(
     // If we have a legacy serial device, tell the guest this is the default console.
     // Clever guests will still switch to a better console (like virtio-console) if
     // it becomes available later, and this gives us a good fallback.
-    for ((device_type, _device_id), info) in dev_info {
+    for (device_type, info) in dev_info {
         if device_type == &DeviceType::Serial {
             fdt.property_string("stdout-path", &format!("/uart@{:x}", info.addr()))?;
         }
@@ -418,12 +417,12 @@ fn create_gpio_node<T: DeviceInfoForFDT + Clone + Debug>(
 
 fn create_devices_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt: &mut FdtWriter,
-    dev_info: &HashMap<(DeviceType, String), T>,
+    dev_info: &[(DeviceType, T)],
 ) -> Result<()> {
     // Create one temp Vec to store all virtio devices
     let mut ordered_virtio_device: Vec<&T> = Vec::new();
 
-    for ((device_type, _device_id), info) in dev_info {
+    for (device_type, info) in dev_info {
         match device_type {
             DeviceType::Gpio => create_gpio_node(fdt, info)?,
             DeviceType::RTC => create_rtc_node(fdt, info)?,
