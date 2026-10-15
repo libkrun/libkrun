@@ -159,6 +159,59 @@ impl Vm {
             reply_sender.send(true).unwrap();
         }
     }
+
+    /// Replaces the host pages backing a range of guest RAM with fresh anonymous memory, which
+    /// gives them back to the system and leaves the range reading as zeroes. madvise() can't do
+    /// this: it doesn't release the pages that the guest has written to.
+    ///
+    /// Returns whether the pages were replaced. If they weren't, the range is mapped as before.
+    /// An error means that it couldn't be mapped into the guest again.
+    pub fn reclaim_memory(
+        &self,
+        guest_mem: &GuestMemoryMmap,
+        guest_addr: u64,
+        len: u64,
+    ) -> Result<bool> {
+        // A range that isn't within a single region of guest memory would make mmap() replace
+        // whatever else the VMM has mapped after the region.
+        let Ok(slice) = guest_mem.get_slice(GuestAddress(guest_addr), len as usize) else {
+            warn!(
+                "Not reclaiming memory outside of a single guest memory region: guest_addr={guest_addr:x}, len={len}"
+            );
+            return Ok(false);
+        };
+        let host_addr = slice.ptr_guard_mut().as_ptr();
+        if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
+            error!("Error removing memory map: {e:?}");
+            return Ok(false);
+        }
+
+        // SAFETY: the range is within one region of guest memory, so only guest memory is
+        // replaced, and it stays mapped for the VMM's accesses.
+        let ret = unsafe {
+            libc::mmap(
+                host_addr.cast(),
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        let reclaimed = ret != libc::MAP_FAILED;
+        if !reclaimed {
+            // XNU puts the old pages back when a MAP_FIXED mmap() fails.
+            error!(
+                "Error replacing guest memory: {}",
+                io::Error::last_os_error()
+            );
+        }
+
+        self.hvf_vm
+            .map_memory(host_addr as u64, guest_addr, len)
+            .map_err(Error::SetUserMemoryRegion)?;
+        Ok(reclaimed)
+    }
 }
 
 /// Encapsulates configuration parameters for the guest vCPUS.
