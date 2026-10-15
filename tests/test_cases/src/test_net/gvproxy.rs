@@ -7,6 +7,9 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+use super::NetBackend;
+#[cfg(feature = "dynamic-linking")]
+use super::require_net_symbols;
 use crate::{ShouldRun, TestSetup};
 
 /// Read gvproxy binary path from `KRUN_TEST_GVPROXY_PATH` (set by `tests/run.sh`).
@@ -126,11 +129,11 @@ pub(crate) fn setup_gvproxy_port_forward(
     Ok(())
 }
 
-pub(crate) fn should_run() -> ShouldRun {
-    match gvproxy_path() {
-        Some(_) => ShouldRun::Yes,
-        None => ShouldRun::No("gvproxy not installed"),
-    }
+pub(crate) struct GvproxyBackend {
+    /// Use a peer socket path long enough to have previously triggered
+    /// ENAMETOOLONG on macOS when the local bind address was derived from the
+    /// peer path by appending a suffix.
+    pub long_path: bool,
 }
 
 fn setup_backend_with_socket(
@@ -168,32 +171,50 @@ fn setup_backend_with_socket(
     .map_err(|e| anyhow::anyhow!("NetDevice: {e:?}"))
 }
 
-pub(crate) fn setup_backend(test_setup: &TestSetup) -> anyhow::Result<krun::NetDevice> {
-    setup_backend_with_socket(test_setup, "gvproxy.sock", "gvproxy.log")
-}
+impl NetBackend for GvproxyBackend {
+    #[cfg(feature = "dynamic-linking")]
+    fn require_symbols(&self) -> Result<(), libloading::Error> {
+        require_net_symbols()
+    }
 
-/// Backend setup with a peer socket path long enough to have previously
-/// triggered ENAMETOOLONG on macOS when the local bind address was derived
-/// from the peer path by appending a suffix.
-pub(crate) fn setup_backend_long_path(test_setup: &TestSetup) -> anyhow::Result<krun::NetDevice> {
-    // Build a peer socket filename so that the full path approaches the
-    // 104-byte macOS unix socket limit. Use base_len measured at runtime so
-    // the padding is correct regardless of the exact tmp_dir length.
-    // tmp_dir is typically "/tmp/libkrun-tests.XXXXXXXX" (~27 chars), or
-    // "/private/tmp/libkrun-tests.XXXXXXXX" (~35 chars) after canonicalize on macOS.
-    let tmp_dir = test_setup
-        .tmp_dir
-        .canonicalize()
-        .unwrap_or_else(|_| test_setup.tmp_dir.clone());
-    let base_len = tmp_dir.to_str().map(|s| s.len()).unwrap_or(0);
-    const TARGET_PATH_LEN: usize = 96;
-    let prefix = "gvp-";
-    let suffix = ".sock";
-    let name_needed = TARGET_PATH_LEN.saturating_sub(base_len + 1);
-    let pad_len = name_needed
-        .saturating_sub(prefix.len() + suffix.len())
-        .max(1);
-    let socket_name = format!("{}{}{}", prefix, "x".repeat(pad_len), suffix);
+    fn should_run(&self) -> ShouldRun {
+        match gvproxy_path() {
+            Some(_) => ShouldRun::Yes,
+            None => ShouldRun::No("gvproxy not installed"),
+        }
+    }
 
-    setup_backend_with_socket(test_setup, &socket_name, "gvproxy-long-path.log")
+    fn setup_backend(
+        &self,
+        devices: &mut krun::MmioDeviceManager<'_>,
+        test_setup: &TestSetup,
+    ) -> anyhow::Result<()> {
+        let (socket_name, log_name) = if self.long_path {
+            // Build a peer socket filename so that the full path approaches the
+            // 104-byte macOS unix socket limit. Use base_len measured at runtime
+            // so the padding is correct regardless of the exact tmp_dir length.
+            let tmp_dir = test_setup
+                .tmp_dir
+                .canonicalize()
+                .unwrap_or_else(|_| test_setup.tmp_dir.clone());
+            let base_len = tmp_dir.to_str().map(|s| s.len()).unwrap_or(0);
+            const TARGET_PATH_LEN: usize = 96;
+            let prefix = "gvp-";
+            let suffix = ".sock";
+            let name_needed = TARGET_PATH_LEN.saturating_sub(base_len + 1);
+            let pad_len = name_needed
+                .saturating_sub(prefix.len() + suffix.len())
+                .max(1);
+            (
+                format!("{}{}{}", prefix, "x".repeat(pad_len), suffix),
+                "gvproxy-long-path.log".to_string(),
+            )
+        } else {
+            ("gvproxy.sock".to_string(), "gvproxy.log".to_string())
+        };
+
+        let net_device = setup_backend_with_socket(test_setup, &socket_name, &log_name)?;
+        devices.add(net_device);
+        Ok(())
+    }
 }

@@ -25,18 +25,72 @@ pub(crate) mod gvproxy;
 pub(crate) mod passt;
 #[cfg(feature = "host")]
 pub(crate) mod tap;
+#[cfg(all(feature = "host", target_os = "linux"))]
+pub(crate) mod vhost_user_passt;
 #[cfg(feature = "host")]
 pub(crate) mod vmnet_helper;
+
+/// Symbols needed by the in-process (non-vhost-user) net backends.
+#[cfg(feature = "dynamic-linking")]
+pub(crate) fn require_net_symbols() -> Result<(), libloading::Error> {
+    crate::common::require_vm_symbols()?;
+    krun::require(
+        None,
+        &[
+            krun::Symbol::KrunNetDeviceNewUnixgramPath,
+            krun::Symbol::KrunNetDeviceNewUnixgramFd,
+            krun::Symbol::KrunNetDeviceNewUnixstreamPath,
+            krun::Symbol::KrunNetDeviceNewUnixstreamFd,
+            krun::Symbol::KrunNetDeviceNewTap,
+            krun::Symbol::KrunNetDeviceDestroy,
+        ],
+    )
+}
+
+/// Backend-specific behavior for a virtio-net test.
+///
+/// Each backend (passt, tap, gvproxy, vhost-user, ...) implements this trait.
+/// The generic `TestNet` and `TestNetPerf` structs hold a `Box<dyn NetBackend>`
+/// and delegate backend-specific work to it.
+#[host]
+pub(crate) trait NetBackend {
+    /// Check if this backend can run on the current system.
+    fn should_run(&self) -> ShouldRun;
+
+    /// Create this backend's network device and add it to the device manager.
+    ///
+    /// Takes the manager directly because backends produce different device
+    /// types (e.g. `NetDevice` vs `VhostUserDevice`).
+    fn setup_backend(
+        &self,
+        devices: &mut krun::MmioDeviceManager<'_>,
+        test_setup: &TestSetup,
+    ) -> anyhow::Result<()>;
+
+    /// Optional cleanup after the test (e.g. removing persistent TAP devices).
+    fn cleanup(&self) {}
+
+    /// Whether the guest must run DHCP to get an address. In-process net
+    /// backends do this automatically; vhost-user backends do not.
+    fn guest_dhcp(&self) -> bool {
+        true
+    }
+
+    /// Ensure the libkrun symbols this backend needs are available.
+    ///
+    /// With static linking a missing feature is a compile error, so this is a
+    /// no-op. With dynamic linking it loads the symbols via dlsym.
+    #[cfg(feature = "dynamic-linking")]
+    fn require_symbols(&self) -> Result<(), libloading::Error> {
+        Ok(())
+    }
+}
 
 /// Virtio-net test with configurable backend
 pub struct TestNet {
     tcp_tester: TcpTester,
     #[cfg(feature = "host")]
-    should_run: fn() -> ShouldRun,
-    #[cfg(feature = "host")]
-    setup_backend: fn(&TestSetup) -> anyhow::Result<krun::NetDevice>,
-    #[cfg(feature = "host")]
-    cleanup: Option<fn()>,
+    backend: Box<dyn NetBackend>,
 }
 
 impl TestNet {
@@ -44,11 +98,7 @@ impl TestNet {
         Self {
             tcp_tester: TcpTester::new([169, 254, 2, 2].into(), 9000),
             #[cfg(feature = "host")]
-            should_run: passt::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: passt::setup_backend,
-            #[cfg(feature = "host")]
-            cleanup: None,
+            backend: Box::new(passt::Passt),
         }
     }
 
@@ -56,11 +106,7 @@ impl TestNet {
         Self {
             tcp_tester: TcpTester::new([10, 0, 0, 1].into(), 9001),
             #[cfg(feature = "host")]
-            should_run: tap::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: tap::setup_backend,
-            #[cfg(feature = "host")]
-            cleanup: Some(tap::cleanup),
+            backend: Box::new(tap::Tap),
         }
     }
 
@@ -68,11 +114,7 @@ impl TestNet {
         Self {
             tcp_tester: TcpTester::new([192, 168, 127, 254].into(), 9002),
             #[cfg(feature = "host")]
-            should_run: gvproxy::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: gvproxy::setup_backend,
-            #[cfg(feature = "host")]
-            cleanup: None,
+            backend: Box::new(gvproxy::GvproxyBackend { long_path: false }),
         }
     }
 
@@ -80,11 +122,16 @@ impl TestNet {
         Self {
             tcp_tester: TcpTester::new([192, 168, 105, 1].into(), 9003),
             #[cfg(feature = "host")]
-            should_run: vmnet_helper::should_run,
+            backend: Box::new(vmnet_helper::VmnetHelper),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn new_vhost_user_passt() -> Self {
+        Self {
+            tcp_tester: TcpTester::new([169, 254, 2, 2].into(), 9005),
             #[cfg(feature = "host")]
-            setup_backend: vmnet_helper::setup_backend,
-            #[cfg(feature = "host")]
-            cleanup: None,
+            backend: Box::new(vhost_user_passt::VhostUserPasst),
         }
     }
 
@@ -94,11 +141,7 @@ impl TestNet {
         Self {
             tcp_tester: TcpTester::new([192, 168, 127, 254].into(), 9004),
             #[cfg(feature = "host")]
-            should_run: gvproxy::should_run,
-            #[cfg(feature = "host")]
-            setup_backend: gvproxy::setup_backend_long_path,
-            #[cfg(feature = "host")]
-            cleanup: None,
+            backend: Box::new(gvproxy::GvproxyBackend { long_path: true }),
         }
     }
 }
@@ -111,35 +154,17 @@ mod host {
 
     use std::thread;
 
-    #[cfg(feature = "dynamic-linking")]
-    fn require_symbols() -> Result<(), libloading::Error> {
-        crate::common::require_vm_symbols()?;
-        krun::require(
-            None,
-            &[
-                krun::Symbol::KrunNetDeviceNewUnixgramPath,
-                krun::Symbol::KrunNetDeviceNewUnixgramFd,
-                krun::Symbol::KrunNetDeviceNewUnixstreamPath,
-                krun::Symbol::KrunNetDeviceNewUnixstreamFd,
-                krun::Symbol::KrunNetDeviceNewTap,
-                krun::Symbol::KrunNetDeviceDestroy,
-            ],
-        )
-    }
-
     impl Test for TestNet {
         fn should_run(&self) -> ShouldRun {
             #[cfg(feature = "dynamic-linking")]
-            if require_symbols().is_err() {
+            if self.backend.require_symbols().is_err() {
                 return ShouldRun::No("feature not enabled in this libkrun build");
             }
-            (self.should_run)()
+            self.backend.should_run()
         }
 
         fn check(self: Box<Self>, stdout: Vec<u8>, _test_setup: TestSetup) -> TestOutcome {
-            if let Some(cleanup) = self.cleanup {
-                cleanup();
-            }
+            self.backend.cleanup();
             let output = String::from_utf8(stdout).unwrap();
             if output == "OK\n" {
                 TestOutcome::Pass
@@ -149,23 +174,25 @@ mod host {
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            // Start TCP server
             let tcp_tester = self.tcp_tester;
             let listener = tcp_tester.create_server_socket();
             thread::spawn(move || tcp_tester.run_server(listener));
 
             init_krun()?;
             #[cfg(feature = "dynamic-linking")]
-            require_symbols().unwrap();
+            self.backend.require_symbols().unwrap();
 
-            let init_config = init_config_builder(&test_setup, &[]).dhcp(true).build();
+            let init_config = init_config_builder(&test_setup, &[])
+                .dhcp(self.backend.guest_dhcp())
+                .build();
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
             let (mut devices, payload) =
                 setup_standard_devices_from(&test_setup, &init_config, &stdin, &stdout, &stderr)?;
 
-            let net_device = (self.setup_backend)(&test_setup)?;
-            devices.add(net_device);
+            self.backend.setup_backend(&mut devices, &test_setup)?;
 
             let vmm = krun::VmmBuilder::new()
                 .vcpus(1)

@@ -5,6 +5,9 @@ use std::io::{BufRead, BufReader, Read};
 use std::os::fd::FromRawFd;
 use std::process::{Command, Stdio};
 
+use super::NetBackend;
+#[cfg(feature = "dynamic-linking")]
+use super::require_net_symbols;
 use crate::{ShouldRun, TestSetup};
 
 const VMNET_HELPER_PATH: &str = match option_env!("VMNET_HELPER_PATH") {
@@ -127,40 +130,55 @@ fn start_vmnet_helper(log_path: &std::path::Path) -> std::io::Result<VmnetConfig
     })
 }
 
-pub(crate) fn should_run() -> ShouldRun {
-    #[cfg(not(target_os = "macos"))]
-    return ShouldRun::No("vmnet-helper only supported on macOS");
-
-    #[cfg(target_os = "macos")]
-    {
-        if vmnet_helper_path().is_none() {
-            return ShouldRun::No("vmnet-helper not installed");
-        }
-        ShouldRun::Yes
-    }
-}
+pub(crate) struct VmnetHelper;
 
 const VMNET_NET_FEATURES: u32 = (1 << 0)   // CSUM
     | (1 << 1)   // GUEST_CSUM
     | (1 << 7)   // GUEST_TSO4
     | (1 << 11); // HOST_TSO4
 
-pub(crate) fn setup_backend(test_setup: &TestSetup) -> anyhow::Result<krun::NetDevice> {
-    let tmp_dir = test_setup
-        .tmp_dir
-        .canonicalize()
-        .unwrap_or_else(|_| test_setup.tmp_dir.clone());
-    let vmnet_log = tmp_dir.join("vmnet-helper.log");
+impl NetBackend for VmnetHelper {
+    #[cfg(feature = "dynamic-linking")]
+    fn require_symbols(&self) -> Result<(), libloading::Error> {
+        require_net_symbols()
+    }
 
-    let config = start_vmnet_helper(&vmnet_log)?;
-    test_setup.register_cleanup_pid(config.pid);
+    fn should_run(&self) -> ShouldRun {
+        #[cfg(not(target_os = "macos"))]
+        return ShouldRun::No("vmnet-helper only supported on macOS");
 
-    krun::NetDevice::new_unixgram_fd(
-        "net0",
-        config.fd,
-        &config.mac,
-        VMNET_NET_FEATURES,
-        krun::NetFlags::empty(),
-    )
-    .map_err(|e| anyhow::anyhow!("NetDevice: {e:?}"))
+        #[cfg(target_os = "macos")]
+        {
+            if vmnet_helper_path().is_none() {
+                return ShouldRun::No("vmnet-helper not installed");
+            }
+            ShouldRun::Yes
+        }
+    }
+
+    fn setup_backend(
+        &self,
+        devices: &mut krun::MmioDeviceManager<'_>,
+        test_setup: &TestSetup,
+    ) -> anyhow::Result<()> {
+        let tmp_dir = test_setup
+            .tmp_dir
+            .canonicalize()
+            .unwrap_or_else(|_| test_setup.tmp_dir.clone());
+        let vmnet_log = tmp_dir.join("vmnet-helper.log");
+
+        let config = start_vmnet_helper(&vmnet_log)?;
+        test_setup.register_cleanup_pid(config.pid);
+
+        let net_device = krun::NetDevice::new_unixgram_fd(
+            "net0",
+            config.fd,
+            &config.mac,
+            VMNET_NET_FEATURES,
+            krun::NetFlags::empty(),
+        )
+        .map_err(|e| anyhow::anyhow!("NetDevice: {e:?}"))?;
+        devices.add(net_device);
+        Ok(())
+    }
 }
