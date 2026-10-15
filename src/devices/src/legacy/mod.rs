@@ -9,6 +9,8 @@ pub mod aia;
 pub mod gic;
 #[cfg(target_os = "macos")]
 mod gicv3;
+#[cfg(target_arch = "riscv64")]
+mod goldfish_rtc;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod hvfgicv3;
 #[cfg(target_arch = "x86_64")]
@@ -53,6 +55,8 @@ use riscv64::serial;
 pub use self::cmos::Cmos;
 #[cfg(target_os = "macos")]
 pub use self::gicv3::GicV3;
+#[cfg(target_arch = "riscv64")]
+pub use self::goldfish_rtc::GoldfishRtc;
 #[cfg(target_arch = "aarch64")]
 pub use self::gpio::Gpio;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

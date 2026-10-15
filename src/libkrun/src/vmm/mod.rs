@@ -369,10 +369,13 @@ impl Vmm {
 
         #[cfg(target_arch = "riscv64")]
         {
+            let timebase_frequency = vcpus[0].get_timer_frequency().map_err(Error::Vcpu)? as u32;
+
             fdt::create_fdt(
                 &self.guest_memory,
                 &self.arch_memory_info,
                 vcpus.len() as u32,
+                timebase_frequency,
                 self.kernel_cmdline.as_str(),
                 self.mmio_device_manager.get_device_info(),
                 _intc,

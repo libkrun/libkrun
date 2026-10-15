@@ -48,7 +48,7 @@ pub enum DeviceType {
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     Serial,
     /// Device Type: RTC.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     RTC,
 }
 
