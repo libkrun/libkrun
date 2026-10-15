@@ -1327,6 +1327,30 @@ pub fn build_microvm(
         any(target_os = "linux", target_os = "windows")
     )))]
     let virtio_mmio_devices: Vec<(u64, u32)> = vec![];
+
+    // Detect RISC-V ISA information from KVM before FDT generation. This
+    // queries vCPU 0's registers directly, so it must run against the
+    // already-created vCPU 0 (`vcpus[0]`) rather than creating a new one,
+    // since KVM only allows one vCPU per id (KVM_CREATE_VCPU on an
+    // existing id fails with -EEXIST).
+    #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+    let riscv_isa_info = {
+        if let Some(isa_info) = &vm_resources.riscv_isa_info {
+            Some(isa_info.clone())
+        } else {
+            match vcpus[0].detect_riscv_isa() {
+                Ok(isa_info) => Some(isa_info),
+                Err(e) => {
+                    log::warn!("Failed to detect RISC-V ISA information: {:?}", e);
+                    None
+                }
+            }
+        }
+    };
+
+    #[cfg(not(all(target_os = "linux", target_arch = "riscv64")))]
+    let _riscv_isa_info: Option<()> = None;
+
     vmm.configure_system(
         vcpus.as_slice(),
         &intc,
@@ -1335,6 +1359,8 @@ pub fn build_microvm(
         vm_resources.acpi_enabled,
         &virtio_mmio_devices,
         payload_config.pvh,
+        #[cfg(target_arch = "riscv64")]
+        &riscv_isa_info,
     )
     .map_err(StartMicrovmError::Internal)?;
 
@@ -2229,6 +2255,12 @@ fn attach_legacy_devices(
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     mmio_device_manager
         .register_mmio_rtc(vm.fd())
+        .map_err(Error::RegisterMMIODevice)
+        .map_err(StartMicrovmError::Internal)?;
+
+    #[cfg(all(target_arch = "riscv64", target_os = "linux"))]
+    mmio_device_manager
+        .register_mmio_rtc(intc)
         .map_err(Error::RegisterMMIODevice)
         .map_err(StartMicrovmError::Internal)?;
 

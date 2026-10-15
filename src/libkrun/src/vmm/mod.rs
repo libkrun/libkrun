@@ -319,6 +319,9 @@ impl Vmm {
         _acpi_enabled: bool,
         _virtio_mmio_devices: &[(u64, u32)],
         _pvh: bool,
+        #[cfg(target_arch = "riscv64")] riscv_isa_info: &Option<
+            arch::riscv64::linux::kvm::RiscvIsaInfo,
+        >,
     ) -> Result<()> {
         #[cfg(target_arch = "x86_64")]
         {
@@ -369,14 +372,18 @@ impl Vmm {
 
         #[cfg(target_arch = "riscv64")]
         {
+            let timebase_frequency = vcpus[0].get_timer_frequency().map_err(Error::Vcpu)? as u32;
+
             fdt::create_fdt(
                 &self.guest_memory,
                 &self.arch_memory_info,
                 vcpus.len() as u32,
+                timebase_frequency,
                 self.kernel_cmdline.as_str(),
                 self.mmio_device_manager.get_device_info(),
                 _intc,
                 initrd,
+                riscv_isa_info,
             )
             .map_err(Error::SetupFDT)?;
 
