@@ -1761,7 +1761,7 @@
             " Create a new block device.",
             "",
             " Defaults to read-write (`read_only = false`), cached I/O (`direct_io = false`),",
-            " and [`SyncMode::Relaxed`]."
+            " [`SyncMode::Relaxed`], and serialized reads (`parallel_reads = false`)."
           ],
           "receiver": "none",
           "params": [
@@ -1849,6 +1849,26 @@
             "return_kind": "void"
           },
           "ffi_name": "krun_block_device_set_sync_mode"
+        },
+        {
+          "name": "set_parallel_reads",
+          "doc": [
+            " Serve guest reads on a host thread pool with out-of-order completion.",
+            "",
+            " Disabled by default. Writes, flushes, and discards stay on the device thread."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "enabled",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_block_device_set_parallel_reads"
         }
       ],
       "cfg": "feature = \"blk\""
