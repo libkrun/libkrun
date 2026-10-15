@@ -19,7 +19,7 @@ use std::sync::{LazyLock, OnceLock};
 use std::thread;
 
 use anyhow::Context;
-use krun::VirglRendererFlags;
+use krun::{DiskFormat, KernelFormat, VirglRendererFlags};
 use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
 
 static LIBKRUN: OnceLock<Library> = OnceLock::new();
@@ -37,6 +37,20 @@ struct DisplayArg {
     refresh_rate: Option<u32>,
     physical_size: Option<PhysicalSize>,
     touch: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VirtiofsArg {
+    tag: String,
+    host_dir: String,
+}
+
+fn parse_virtiofs(value: &str) -> Result<VirtiofsArg, String> {
+    let (tag, host_dir) = value.split_once('=').ok_or("Expected TAG=HOST_DIR")?;
+    Ok(VirtiofsArg {
+        tag: tag.to_string(),
+        host_dir: host_dir.to_string(),
+    })
 }
 
 /// Parses a display settings string.
@@ -89,11 +103,66 @@ fn parse_display(display_string: &str) -> Result<DisplayArg, String> {
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(long)]
-    root_dir: CString,
+    #[arg(
+        long,
+        required_unless_present = "root_disk",
+        conflicts_with = "root_disk"
+    )]
+    root_dir: Option<CString>,
 
+    #[arg(requires = "root_dir")]
     executable: Option<CString>,
+    #[arg(requires = "executable")]
     argv: Vec<CString>,
+
+    /// Disk image containing the guest root filesystem
+    #[arg(long, conflicts_with_all = ["executable", "argv"])]
+    root_disk: Option<CString>,
+
+    /// Disk image format: raw, qcow2, or vmdk (default: raw)
+    #[arg(long, requires = "root_disk", value_parser = parse_disk_format)]
+    disk_format: Option<DiskFormat>,
+
+    /// External kernel image
+    #[arg(long, required_unless_present_any = ["root_dir", "libkrunfw_kernel"], conflicts_with = "libkrunfw_kernel")]
+    kernel: Option<CString>,
+
+    /// Use the embedded libkrunfw kernel with the root disk, without an initramfs
+    #[arg(long, requires = "root_disk", conflicts_with_all = ["kernel", "initrd", "kernel_format"])]
+    libkrunfw_kernel: bool,
+
+    /// Kernel format: elf, raw, pe-gz, image-bz2, image-gz, or image-zstd
+    #[arg(long, requires = "kernel", value_parser = parse_kernel_format)]
+    kernel_format: Option<KernelFormat>,
+
+    /// Initramfs for the external kernel
+    #[arg(long, requires = "kernel")]
+    initrd: Option<CString>,
+
+    /// Kernel command line, including the root device (default: console=hvc0)
+    #[arg(long)]
+    kernel_cmdline: Option<String>,
+
+    /// Describe virtio-mmio devices in ACPI instead of the kernel command line
+    #[arg(long)]
+    acpi: bool,
+
+    /// Connect virtio-net to a passt Unix stream socket
+    #[arg(long)]
+    passt_socket: Option<CString>,
+
+    /// Share a writable host directory over virtiofs; repeat for multiple shares
+    ///
+    /// Use TAG=HOST_DIR with a distinct tag for each share. Tags contain 1 to 36
+    /// bytes; /dev/root is reserved when using --root-dir. Quote the argument
+    /// when the host path contains spaces.
+    ///
+    /// Mount in the guest with: mount -t virtiofs TAG /mount/point
+    ///
+    /// The guest kernel needs virtiofs support. Guest writes modify host files
+    /// subject to host permissions; UID/GID values are not remapped.
+    #[arg(long, value_name = "TAG=HOST_DIR", value_parser = parse_virtiofs)]
+    virtiofs: Vec<VirtiofsArg>,
 
     // Display specifications in the format WIDTHxHEIGHT[@FPS][:DPIdpi|:PHYSICAL_WIDTHxPHYSICAL_HEIGHTmm]
     #[clap(long, value_parser = parse_display)]
@@ -116,8 +185,29 @@ struct Args {
     vhost_user_gpu: Option<PathBuf>,
 }
 
+fn parse_disk_format(value: &str) -> Result<DiskFormat, String> {
+    match value {
+        "raw" => Ok(DiskFormat::Raw),
+        "qcow2" => Ok(DiskFormat::Qcow2),
+        "vmdk" => Ok(DiskFormat::Vmdk),
+        _ => Err("Expected raw, qcow2, or vmdk".to_string()),
+    }
+}
+
+fn parse_kernel_format(value: &str) -> Result<KernelFormat, String> {
+    match value {
+        "elf" => Ok(KernelFormat::Elf),
+        "raw" => Ok(KernelFormat::Raw),
+        "pe-gz" => Ok(KernelFormat::PeGz),
+        "image-bz2" => Ok(KernelFormat::ImageBz2),
+        "image-gz" => Ok(KernelFormat::ImageGz),
+        "image-zstd" => Ok(KernelFormat::ImageZstd),
+        _ => Err("Expected elf, raw, pe-gz, image-bz2, image-gz, or image-zstd".to_string()),
+    }
+}
+
 /// Load libkrun and resolve the symbols this example needs from its namespace.
-fn load_krun() -> anyhow::Result<()> {
+fn load_krun(args: &Args) -> anyhow::Result<()> {
     LIBKRUN.get_or_init(|| {
         let name = if cfg!(target_os = "macos") {
             "libkrun.dylib"
@@ -137,18 +227,14 @@ fn load_krun() -> anyhow::Result<()> {
         KrunMmioDeviceManagerNew,
         KrunMmioDeviceManagerAdd,
         KrunMmioDeviceManagerDestroy,
-        KrunFsDeviceNew,
-        KrunFsDeviceSetOverlay,
-        KrunFsDeviceDestroy,
-        KrunFsOverlayNew,
-        KrunFsOverlayDestroy,
         KrunConsoleDeviceBuilder,
         KrunConsoleBuilderAddDefaultConsole,
         KrunConsoleBuilderBuild,
         KrunConsoleBuilderDestroy,
         KrunConsoleDeviceDestroy,
-        KrunPayloadLoadKrunfw,
         KrunPayloadDestroy,
+        KrunRngDeviceNew,
+        KrunRngDeviceDestroy,
         KrunDisplayBackendNew,
         KrunDisplayBackendAddDisplay,
         KrunDisplayBackendDestroy,
@@ -172,12 +258,41 @@ fn load_krun() -> anyhow::Result<()> {
         KrunVmmDestroy,
         KrunVmmRun,
     ];
+    if args.root_dir.is_some() || !args.virtiofs.is_empty() {
+        symbols.extend([KrunFsDeviceNew, KrunFsDeviceDestroy]);
+    }
+    if args.executable.is_some() {
+        symbols.extend([
+            KrunFsDeviceSetOverlay,
+            KrunFsOverlayNew,
+            KrunFsOverlayDestroy,
+        ]);
+    }
+    if args.root_disk.is_some() {
+        symbols.extend([KrunBlockDeviceNew, KrunBlockDeviceDestroy]);
+    }
+    if args.kernel.is_some() {
+        symbols.push(KrunPayloadLoadExternal);
+    } else {
+        symbols.push(KrunPayloadLoadKrunfw);
+        if args.kernel_cmdline.is_some() {
+            symbols.push(KrunPayloadAppendCmdline);
+        }
+    }
+    if args.passt_socket.is_some() {
+        symbols.extend([KrunNetDeviceNewUnixstreamPath, KrunNetDeviceDestroy]);
+    }
     #[cfg(target_os = "linux")]
-    symbols.extend([
-        KrunVhostUserDeviceNew,
-        KrunVhostUserDeviceSetDisplayBackend,
-        KrunVhostUserDeviceDestroy,
-    ]);
+    if args.vhost_user_gpu.is_some() {
+        symbols.extend([
+            KrunVhostUserDeviceNew,
+            KrunVhostUserDeviceSetDisplayBackend,
+            KrunVhostUserDeviceDestroy,
+        ]);
+    }
+    if args.acpi {
+        symbols.push(KrunVmmBuilderAcpi);
+    }
     krun::require(None, &symbols).context("failed to load libkrun symbols")?;
 
     Ok(())
@@ -188,7 +303,7 @@ fn krun_thread(
     display_backend_handle: DisplayBackendHandle,
     input_device_handles: Vec<InputBackendHandle>,
 ) -> anyhow::Result<()> {
-    load_krun()?;
+    load_krun(args)?;
 
     let (target, level, style) = if let Some(path) = &args.color_log {
         let file = std::fs::OpenOptions::new()
@@ -208,31 +323,95 @@ fn krun_thread(
     krun::init_log(target, level, style, krun::LogOptions::empty())
         .map_err(|e| anyhow::anyhow!("init_log: {e}"))?;
 
-    let root_dir = args
-        .root_dir
-        .to_str()
-        .context("root_dir must be valid UTF-8")?;
-    let mut rootfs = krun::FsDevice::new("/dev/root", root_dir)
-        .map_err(|e| anyhow::anyhow!("FsDevice::new: {e}"))?;
-
-    let mut payload =
-        krun::Payload::load_krunfw().map_err(|e| anyhow::anyhow!("load_krunfw: {e}"))?;
-
-    // Build init configuration.
-    let exec = args.executable.as_ref().unwrap().to_str().unwrap();
-    let argv_strs: Vec<&str> = args.argv.iter().map(|a| a.to_str().unwrap()).collect();
-    let mut full_argv: Vec<&str> = vec![exec];
-    full_argv.extend_from_slice(&argv_strs);
-    let init_config = krun_init::Config::builder().args(&full_argv).build();
-    let mut overlay = krun::FsOverlay::new();
-    init_config
-        .apply(&mut overlay, &mut payload)
-        .map_err(|e| anyhow::anyhow!("Config::apply: {e}"))?;
-    rootfs.set_overlay(overlay);
-
     let stdin = io::stdin();
     let stdout = io::stdout();
     let stderr = io::stderr();
+    let input_files = args
+        .input
+        .iter()
+        .map(|input| {
+            File::open(input).with_context(|| format!("Failed to open input device {input:?}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut devices = krun::MmioDeviceManager::new();
+    devices.add(krun::RngDevice::new().map_err(|e| anyhow::anyhow!("RngDevice::new: {e}"))?);
+    let mut payload = if let Some(kernel) = &args.kernel {
+        let default_format = if cfg!(target_arch = "x86_64") {
+            KernelFormat::Elf
+        } else {
+            KernelFormat::Raw
+        };
+        let default_cmdline = if args.root_dir.is_some() {
+            "rootfstype=virtiofs rw console=hvc0"
+        } else {
+            "console=hvc0"
+        };
+        krun::Payload::load_external(
+            kernel.to_str()?,
+            args.kernel_format.unwrap_or(default_format),
+            args.initrd.as_ref().map(|path| path.to_str()).transpose()?,
+            args.kernel_cmdline.as_deref().unwrap_or(default_cmdline),
+        )
+        .map_err(|e| anyhow::anyhow!("Payload::load_external: {e}"))?
+    } else {
+        let mut payload =
+            krun::Payload::load_krunfw().map_err(|e| anyhow::anyhow!("load_krunfw: {e}"))?;
+        if let Some(cmdline) = &args.kernel_cmdline {
+            payload.append_cmdline(cmdline);
+        }
+        payload
+    };
+    if let Some(root_dir) = &args.root_dir {
+        let root_dir = root_dir.to_str().context("root_dir must be valid UTF-8")?;
+        let mut rootfs = krun::FsDevice::new("/dev/root", root_dir)
+            .map_err(|e| anyhow::anyhow!("FsDevice::new: {e}"))?;
+
+        if let Some(exec) = &args.executable {
+            let exec = exec.to_str()?;
+            let argv_strs = args
+                .argv
+                .iter()
+                .map(|arg| arg.to_str())
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut full_argv = vec![exec];
+            full_argv.extend_from_slice(&argv_strs);
+            let init_config = krun_init::Config::builder().args(&full_argv).build();
+            let mut overlay = krun::FsOverlay::new();
+            init_config
+                .apply(&mut overlay, &mut payload)
+                .map_err(|e| anyhow::anyhow!("Config::apply: {e}"))?;
+            rootfs.set_overlay(overlay);
+        }
+        devices.add(rootfs);
+    } else {
+        let disk = args.root_disk.as_ref().unwrap().to_str()?;
+        let disk =
+            krun::BlockDevice::new("root", disk, args.disk_format.unwrap_or(DiskFormat::Raw))
+                .map_err(|e| anyhow::anyhow!("BlockDevice::new: {e}"))?;
+        devices.add(disk);
+    }
+
+    for share in &args.virtiofs {
+        let filesystem = krun::FsDevice::new(&share.tag, &share.host_dir).map_err(|e| {
+            anyhow::anyhow!("Failed to share {} as {}: {e}", share.host_dir, share.tag)
+        })?;
+        devices.add(filesystem);
+    }
+
+    if let Some(socket) = &args.passt_socket {
+        let mac = [0x52, 0x54, 0x00, 0x44, 0x00, 0x01];
+        let features = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 14);
+        let network = krun::NetDevice::new_unixstream_path(
+            "net0",
+            socket.to_str()?,
+            &mac,
+            features,
+            krun::NetFlags::empty(),
+        )
+        .map_err(|e| anyhow::anyhow!("NetDevice::new_unixstream_path: {e}"))?;
+        devices.add(network);
+    }
+
     let mut console_builder = krun::ConsoleDevice::builder();
     console_builder
         .add_default_console(
@@ -267,16 +446,6 @@ fn krun_thread(
         display_backend.add_display(display_builder);
     }
 
-    let input_files = args
-        .input
-        .iter()
-        .map(|input| {
-            File::open(input).with_context(|| format!("Failed to open input device {input:?}"))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    let mut devices = krun::MmioDeviceManager::new();
-    devices.add(rootfs);
     devices.add(console);
 
     #[cfg(target_os = "linux")]
@@ -343,13 +512,19 @@ fn krun_thread(
         devices.add(input_device);
     }
 
-    let vmm = krun::VmmBuilder::new()
+    let mut builder = krun::VmmBuilder::new()
         .vcpus(4)
         .map_err(|e| anyhow::anyhow!("vcpus: {e}"))?
         .ram_mib(4096)
         .map_err(|e| anyhow::anyhow!("ram_mib: {e}"))?
         .payload(payload)
-        .devices(devices)
+        .devices(devices);
+    if args.acpi {
+        builder = builder
+            .acpi(true)
+            .map_err(|e| anyhow::anyhow!("acpi: {e}"))?;
+    }
+    let vmm = builder
         .build()
         .map_err(|e| anyhow::anyhow!("VmmBuilder::build: {e}"))?;
 
