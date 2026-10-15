@@ -1,7 +1,8 @@
 use crate::virtio::descriptor_utils::{Reader, Writer};
 
-use super::super::DeviceQueue;
+use super::super::{DescriptorChain, DeviceQueue, Queue};
 use super::device::{CacheType, DiskProperties};
+use super::flush::FlushEngine;
 
 use crate::virtio::InterruptTransport;
 use std::io::{self, Write};
@@ -63,6 +64,9 @@ pub struct BlockWorker {
     interrupt: InterruptTransport,
     mem: GuestMemoryMmap,
     disk: DiskProperties,
+    /// Makes FLUSH requests stable off this thread. Only this thread touches
+    /// the queue, so the engine's completions come back here to be used.
+    flush_engine: Option<FlushEngine>,
     stop_fd: EventFd,
 }
 
@@ -72,6 +76,7 @@ impl BlockWorker {
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
         disk: DiskProperties,
+        flush_engine: Option<FlushEngine>,
         stop_fd: EventFd,
     ) -> Self {
         Self {
@@ -79,6 +84,7 @@ impl BlockWorker {
             interrupt,
             mem,
             disk,
+            flush_engine,
             stop_fd,
         }
     }
@@ -108,6 +114,18 @@ impl BlockWorker {
             &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
         );
 
+        let flush_ev_fd = self
+            .flush_engine
+            .as_ref()
+            .map(|engine| engine.completions().as_raw_fd());
+        if let Some(fd) = flush_ev_fd {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                fd,
+                &EpollEvent::new(EventSet::IN, fd as u64),
+            );
+        }
+
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
@@ -119,9 +137,17 @@ impl BlockWorker {
                             EventSet::IN if source == virtq_ev_fd => {
                                 self.process_queue_event();
                             }
+                            EventSet::IN if Some(source) == flush_ev_fd => {
+                                self.process_flush_completions();
+                            }
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
+                                // The device is being reset: FLUSH requests
+                                // still in flight are dropped, not completed.
+                                if let Some(engine) = self.flush_engine.take() {
+                                    engine.stop();
+                                }
                                 return;
                             }
                             _ => {
@@ -185,6 +211,23 @@ impl BlockWorker {
                 }
             };
 
+            if request_header.request_type == VIRTIO_BLK_T_FLUSH
+                && let Some(engine) = &self.flush_engine
+            {
+                let Err(index) = engine.submit(head.index) else {
+                    continue;
+                };
+                error!("block flush engine has exited; failing FLUSH request");
+                complete_deferred(
+                    &mut self.device_queue.queue,
+                    mem,
+                    index,
+                    VIRTIO_BLK_S_IOERR.try_into().unwrap(),
+                );
+                self.signal_used_queue(mem);
+                continue;
+            }
+
             let (status, len): (u8, usize) =
                 match self.process_request(request_header, &mut reader, &mut writer) {
                     Ok(l) => (VIRTIO_BLK_S_OK.try_into().unwrap(), l),
@@ -206,11 +249,38 @@ impl BlockWorker {
                 error!("failed to add used elements to the queue: {e:?}");
             }
 
-            if self.device_queue.queue.needs_notification(mem).unwrap()
-                && let Err(e) = self.interrupt.try_signal_used_queue()
-            {
-                error!("error signalling queue: {e:?}");
+            self.signal_used_queue(mem);
+        }
+    }
+
+    /// Uses every FLUSH request the flush engine has completed, then notifies
+    /// the driver once for all of them.
+    fn process_flush_completions(&mut self) {
+        let Some(engine) = &self.flush_engine else {
+            return;
+        };
+        let mem = self.mem.clone();
+        loop {
+            let completion = match engine.completions().try_recv() {
+                Ok(Some(completion)) => completion,
+                Ok(None) => break,
+                Err(e) => {
+                    error!("failed to receive FLUSH completions: {e:?}");
+                    break;
+                }
+            };
+            for head in completion.heads {
+                complete_deferred(&mut self.device_queue.queue, &mem, head, completion.status);
             }
+        }
+        self.signal_used_queue(&mem);
+    }
+
+    fn signal_used_queue(&mut self, mem: &GuestMemoryMmap) {
+        if self.device_queue.queue.needs_notification(mem).unwrap()
+            && let Err(e) = self.interrupt.try_signal_used_queue()
+        {
+            error!("error signalling queue: {e:?}");
         }
     }
 
@@ -307,5 +377,59 @@ impl BlockWorker {
             }
             _ => Err(RequestError::UnknownRequest),
         }
+    }
+}
+
+/// Writes the status of a request whose completion was deferred and puts it in
+/// the used ring. The descriptor chain is walked again from its head, which is
+/// sound because the driver does not touch a request's descriptors until the
+/// device has used it. The status lands where the worker writes it for a
+/// request completed in place: the first writable byte, after zero bytes of
+/// data.
+fn complete_deferred(queue: &mut Queue, mem: &GuestMemoryMmap, head: u16, status: u8) {
+    match DescriptorChain::checked_new(mem, queue.desc_table, queue.actual_size(), head)
+        .map(|chain| Writer::new(mem, chain))
+    {
+        Some(Ok(mut writer)) => {
+            if let Err(e) = writer.write_obj(status) {
+                error!("Failed to write virtio block status: {e:?}");
+            }
+        }
+        Some(Err(e)) => error!("invalid descriptor chain: {e:?}"),
+        None => error!("invalid descriptor chain head: {head}"),
+    }
+    if let Err(e) = queue.add_used(mem, head, 0) {
+        error!("failed to add used elements to the queue: {e:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtio::queue::tests::VirtQueue;
+    use vm_memory::{Bytes, GuestAddress};
+
+    const VIRTQ_DESC_F_NEXT: u16 = 0x1;
+    const VIRTQ_DESC_F_WRITE: u16 = 0x2;
+
+    #[test]
+    fn a_deferred_flush_gets_its_status_and_a_used_entry() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let mut queue = vq.create_queue();
+
+        // A FLUSH as the Linux driver lays it out: the header, then the status byte.
+        let header = GuestAddress(0x2000);
+        let status = GuestAddress(0x3000);
+        mem.write_obj(0xffu8, status).unwrap();
+        vq.dtable[3].set(header.0, 16, VIRTQ_DESC_F_NEXT, 5);
+        vq.dtable[5].set(status.0, 1, VIRTQ_DESC_F_WRITE, 0);
+
+        complete_deferred(&mut queue, &mem, 3, VIRTIO_BLK_S_OK.try_into().unwrap());
+
+        assert_eq!(mem.read_obj::<u8>(status).unwrap(), VIRTIO_BLK_S_OK as u8);
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(vq.used.ring[0].get().id, 3);
+        assert_eq!(vq.used.ring[0].get().len, 0);
     }
 }
