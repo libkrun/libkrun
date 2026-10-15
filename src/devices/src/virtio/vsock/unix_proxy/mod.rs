@@ -277,6 +277,7 @@ impl Proxy for UnixProxy {
         self.push_reset();
         let mut update = self.release();
         self.status = ProxyStatus::Closed;
+        update.polling = Some((self.id, self.as_raw_fd(), EventSet::empty()));
         update.signal_queue = true;
         update
     }
