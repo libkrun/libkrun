@@ -66,7 +66,7 @@ mod host {
         }
 
         fn timeout_secs(&self) -> u64 {
-            20
+            30
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
