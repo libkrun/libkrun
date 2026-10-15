@@ -91,7 +91,16 @@ impl Balloon {
         while let Some(head) = queues[FRQ_INDEX].queue.pop(mem) {
             let index = head.index;
             for desc in head.into_iter() {
-                let host_addr = mem.get_host_address(desc.addr).unwrap();
+                // The range comes from the guest. Releasing one that runs past the end of
+                // a guest memory region would discard whatever the VMM has mapped after it.
+                let Ok(slice) = mem.get_slice(desc.addr, desc.len as usize) else {
+                    warn!(
+                        "balloon: ignoring free page report outside guest memory: guest_addr={:?} len={}",
+                        desc.addr, desc.len
+                    );
+                    continue;
+                };
+                let host_addr = slice.ptr_guard_mut().as_ptr();
                 debug!(
                     "balloon: should release guest_addr={:?} host_addr={:p} len={}",
                     desc.addr, host_addr, desc.len
