@@ -186,6 +186,9 @@ pub enum StartMicrovmError {
     PeGzInvalid,
     /// Cannot open the file containing the kernel code.
     RawOpenKernel(io::Error),
+    /// Cannot create the balloon device.
+    #[cfg(not(feature = "tee"))]
+    CreateBalloonDevice(devices::virtio::BalloonError),
     /// Cannot initialize a MMIO Balloon device or add a device to the MMIO Bus.
     RegisterBalloonDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Block Device or add a device to the MMIO Bus.
@@ -375,6 +378,8 @@ impl Display for StartMicrovmError {
             RawOpenKernel(ref err) => {
                 write!(f, "Cannot open the file containing the kernel code: {err}")
             }
+            #[cfg(not(feature = "tee"))]
+            CreateBalloonDevice(ref err) => write!(f, "Cannot create the balloon device: {err:?}"),
             RegisterBalloonDevice(ref err) => {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");
@@ -978,7 +983,13 @@ pub fn build_microvm(
     }
 
     #[cfg(not(feature = "tee"))]
-    attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
+    attach_balloon_device(
+        &mut vmm,
+        event_manager,
+        intc.clone(),
+        #[cfg(target_os = "macos")]
+        _sender.clone(),
+    )?;
     #[cfg(not(feature = "tee"))]
     attach_rng_device(&mut vmm, event_manager, intc.clone())?;
     let mut console_id = 0;
@@ -2212,10 +2223,17 @@ fn attach_balloon_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
     intc: IrqChip,
+    #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
     let balloon = Arc::new(Mutex::new(devices::virtio::Balloon::new().unwrap()));
+    #[cfg(target_os = "macos")]
+    balloon
+        .lock()
+        .unwrap()
+        .set_map_sender(map_sender)
+        .map_err(CreateBalloonDevice)?;
 
     event_manager
         .add_subscriber(balloon.clone())

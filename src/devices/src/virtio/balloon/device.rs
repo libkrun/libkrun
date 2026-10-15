@@ -52,6 +52,8 @@ pub struct Balloon {
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
     config: VirtioBalloonConfig,
+    #[cfg(target_os = "macos")]
+    pub(super) reclaim: super::macos::FreePageReclaim,
 }
 
 impl Balloon {
@@ -64,6 +66,8 @@ impl Balloon {
                 .map_err(BalloonError::EventFd)?,
             device_state: DeviceState::Inactive,
             config: VirtioBalloonConfig::default(),
+            #[cfg(target_os = "macos")]
+            reclaim: Default::default(),
         })
     }
 
@@ -83,10 +87,18 @@ impl Balloon {
             .queues
             .as_mut()
             .expect("queues should exist when activated");
-        let mut have_used = false;
 
+        // Reports stay in the queue while too many are still being reclaimed.
+        #[cfg(target_os = "macos")]
+        if !self.reclaim.can_take_report() {
+            return false;
+        }
+
+        let mut have_used = false;
         while let Some(head) = queues[FRQ_INDEX].queue.pop(mem) {
             let index = head.index;
+            #[cfg(target_os = "macos")]
+            let mut reclaim_ranges = Vec::new();
             for desc in head.into_iter() {
                 // The range comes from the guest. Releasing one that runs past the end of
                 // a guest memory region would discard whatever the VMM has mapped after it.
@@ -102,6 +114,11 @@ impl Balloon {
                     "balloon: should release guest_addr={:?} host_addr={:p} len={}",
                     desc.addr, host_addr, desc.len
                 );
+                #[cfg(target_os = "macos")]
+                if self.reclaim.reclaims(desc.addr, desc.len) {
+                    reclaim_ranges.push(desc.addr.0..desc.addr.0 + u64::from(desc.len));
+                    continue;
+                }
                 #[cfg(target_os = "linux")]
                 let advice = libc::MADV_DONTNEED;
                 #[cfg(target_os = "macos")]
@@ -113,6 +130,14 @@ impl Balloon {
                         advice,
                     )
                 };
+            }
+
+            #[cfg(target_os = "macos")]
+            if self.reclaim.submit(index, reclaim_ranges) {
+                if !self.reclaim.can_take_report() {
+                    break;
+                }
+                continue;
             }
 
             have_used = true;
