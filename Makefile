@@ -217,7 +217,9 @@ ifeq ($(TDX),1)
 	mv target/release/libkrun.so target/release/$(KRUN_BASE_$(OS))
 endif
 ifeq ($(OS),Darwin)
+ifneq ($(KRUN_BASE_$(OS)),libkrun.dylib)
 	mv target/release/libkrun.dylib target/release/$(KRUN_BASE_$(OS))
+endif
 endif
 	cp target/release/$(KRUN_BASE_$(OS)) $(LIBRARY_RELEASE_$(OS))
 	cp target/release/$(KRUN_INIT_BASE_$(OS)) target/release/$(KRUN_INIT_BINARY_$(OS))
