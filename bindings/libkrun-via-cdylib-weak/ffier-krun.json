@@ -1636,6 +1636,30 @@
             "c_convention": "handle_or_null"
           },
           "ffi_name": "krun_balloon_device_new"
+        },
+        {
+          "name": "set_free_page_reclaim",
+          "doc": [
+            " Set whether memory that the guest reports as free is given back to the host on macOS.",
+            " Disabled by default.",
+            "",
+            " On macOS, madvise() doesn't release guest memory that the guest has written to, so the",
+            " device has the VMM replace the reported pages with fresh memory instead. This costs a few",
+            " system calls per report, and the guest's next access to each page faults it in again.",
+            " Other platforms always release reported pages and ignore this setting."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "enabled",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_balloon_device_set_free_page_reclaim"
         }
       ],
       "cfg": "not(feature = \"tee\")"

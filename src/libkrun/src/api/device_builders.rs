@@ -1118,6 +1118,20 @@ impl BalloonDevice {
             inner: Arc::new(Mutex::new(balloon)),
         })
     }
+
+    /// Set whether memory that the guest reports as free is given back to the host on macOS.
+    /// Disabled by default.
+    ///
+    /// On macOS, madvise() doesn't release guest memory that the guest has written to, so the
+    /// device has the VMM replace the reported pages with fresh memory instead. This costs a few
+    /// system calls per report, and the guest's next access to each page faults it in again.
+    /// Other platforms always release reported pages and ignore this setting.
+    pub fn set_free_page_reclaim(&mut self, enabled: bool) {
+        #[cfg(target_os = "macos")]
+        self.inner.lock().unwrap().set_free_page_reclaim(enabled);
+        #[cfg(not(target_os = "macos"))]
+        let _ = enabled;
+    }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
@@ -1125,6 +1139,12 @@ impl BalloonDevice {
 impl<'a> AttachDevice<'a> for BalloonDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        #[cfg(target_os = "macos")]
+        self.inner
+            .lock()
+            .unwrap()
+            .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
+            .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
         ctx.subscribe_events(self.inner.clone())?;
         ctx.register("balloon", self.inner)
     }

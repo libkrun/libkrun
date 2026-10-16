@@ -467,6 +467,17 @@ typedef void (*krun_vmm_handle_destroy_fn)(KrunVmmHandle handle);
 
 KrunBalloonDevice krun_balloon_device_new(KrunError* err_out);
 typedef KrunBalloonDevice (*krun_balloon_device_new_fn)(KrunError* err_out);
+/**
+ * Set whether memory that the guest reports as free is given back to the host on macOS.
+ * Disabled by default.
+ *
+ * On macOS, madvise() doesn't release guest memory that the guest has written to, so the
+ * device has the VMM replace the reported pages with fresh memory instead. This costs a few
+ * system calls per report, and the guest's next access to each page faults it in again.
+ * Other platforms always release reported pages and ignore this setting.
+ */
+void krun_balloon_device_set_free_page_reclaim(KrunBalloonDevice handle, bool enabled);
+typedef void (*krun_balloon_device_set_free_page_reclaim_fn)(KrunBalloonDevice handle, bool enabled);
 void krun_balloon_device_destroy(KrunBalloonDevice handle);
 typedef void (*krun_balloon_device_destroy_fn)(KrunBalloonDevice handle);
 

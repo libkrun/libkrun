@@ -148,6 +148,19 @@ impl Balloon {
                 error!("Failed to register balloon frq with event manager: {e:?}");
             });
 
+        #[cfg(target_os = "macos")]
+        if let Some(fd) = self.reclaim.done_fd() {
+            event_manager
+                .register(
+                    fd,
+                    EpollEvent::new(EventSet::IN, fd as u64),
+                    self_subscriber.clone(),
+                )
+                .unwrap_or_else(|e| {
+                    error!("Failed to register balloon reclaim with event manager: {e:?}");
+                });
+        }
+
         event_manager
             .unregister(self.activate_evt.as_raw_fd())
             .unwrap_or_else(|e| {
@@ -165,6 +178,8 @@ impl Subscriber for Balloon {
         let phq = self.queue_event(PHQ_INDEX).as_raw_fd();
         let frq = self.queue_event(FRQ_INDEX).as_raw_fd();
         let activate_evt = self.activate_evt.as_raw_fd();
+        #[cfg(target_os = "macos")]
+        let reclaim_done = self.reclaim.done_fd();
 
         if self.is_activated() {
             match source {
@@ -173,6 +188,8 @@ impl Subscriber for Balloon {
                 _ if source == stq => self.handle_stq_event(event),
                 _ if source == phq => self.handle_phq_event(event),
                 _ if source == frq => self.handle_frq_event(event),
+                #[cfg(target_os = "macos")]
+                _ if Some(source) == reclaim_done => self.handle_reclaim_done_event(event),
                 _ if source == activate_evt => {
                     self.handle_activate_event(event_manager);
                 }

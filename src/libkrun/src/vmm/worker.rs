@@ -27,15 +27,9 @@ pub fn start_worker_thread(
     std::thread::Builder::new()
         .name("vmm worker".into())
         .spawn(move || {
-            loop {
-                let received = receiver.recv();
-                match received {
-                    Err(e) => error!("error receiving message from vmm worker thread: {e:?}"),
-                    #[cfg(target_os = "macos")]
-                    Ok(message) => vmm.lock().unwrap().match_worker_message(message),
-                    #[cfg(target_os = "linux")]
-                    Ok(message) => vmm.lock().unwrap().match_worker_message(message),
-                }
+            // This ends once every sender is gone, as no message can arrive anymore.
+            for message in receiver {
+                vmm.lock().unwrap().match_worker_message(message);
             }
         })?;
     Ok(())
@@ -43,12 +37,14 @@ pub fn start_worker_thread(
 
 impl super::Vmm {
     #[allow(dead_code)]
-    fn match_worker_message(&self, msg: WorkerMessage) {
+    fn match_worker_message(&mut self, msg: WorkerMessage) {
         match msg {
             #[cfg(target_os = "macos")]
             WorkerMessage::GpuAddMapping(s, h, g, l) => self.add_mapping(s, h, g, l),
             #[cfg(target_os = "macos")]
             WorkerMessage::GpuRemoveMapping(s, g, l) => self.remove_mapping(s, g, l),
+            #[cfg(target_os = "macos")]
+            WorkerMessage::ReclaimMemory(s, g, l) => self.reclaim_memory(s, g, l),
             #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
             WorkerMessage::GsiRoute(sender, entries) => {
                 let mut routing = kvm_bindings::KvmIrqRouting::new(entries.len()).unwrap();

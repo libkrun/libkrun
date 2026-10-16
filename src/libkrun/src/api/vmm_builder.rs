@@ -456,9 +456,10 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
             {
                 builder_cfg.split_irqchip
             }
+            // On macOS, devices change the guest's memory map through the worker.
             #[cfg(not(target_arch = "x86_64"))]
             {
-                false
+                cfg!(target_os = "macos")
             }
         }
     };
