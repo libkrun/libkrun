@@ -1995,6 +1995,15 @@ pub fn create_guest_memory(
             .map_err(StartMicrovmError::FirmwareInvalidAddress)?;
     }
 
+    #[cfg(target_os = "windows")]
+    if matches!(payload, Payload::Firmware)
+        && let Some(firmware_data) = firmware_data.as_ref()
+    {
+        guest_mem
+            .write(firmware_data, GuestAddress(arch_mem_info.firmware_addr))
+            .map_err(StartMicrovmError::FirmwareInvalidAddress)?;
+    }
+
     let payload_config = PayloadConfig {
         entry_addr,
         initrd_config,
