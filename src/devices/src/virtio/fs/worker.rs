@@ -3,7 +3,6 @@ use crossbeam_channel::Sender;
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 
-use std::io;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -18,24 +17,21 @@ use vm_memory::GuestMemoryMmap;
 
 use super::super::{FsError, Queue};
 use super::augment_fs::AugmentFs;
-use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
-use super::inode_alloc::InodeAllocator;
 use super::null_fs::NullFs;
-use super::passthrough::{self, PassthroughFs};
+use super::passthrough::PassthroughFs;
 use super::read_only::PassthroughFsRo;
 use super::server::Server;
-use super::virtual_entry::VirtualDirEntry;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 
-enum FsServer {
+pub(super) enum FsServer {
     ReadWrite(Server<AugmentFs<PassthroughFs>>),
     ReadOnly(Server<AugmentFs<PassthroughFsRo>>),
     Null(Server<AugmentFs<NullFs>>),
 }
 
 impl FsServer {
-    fn handle_message(
+    pub(super) fn handle_message(
         &self,
         r: Reader,
         w: Writer,
@@ -83,7 +79,7 @@ pub struct FsWorker {
     mem: GuestMemoryMmap,
     allow_idmap: bool,
     shm_region: Option<VirtioShmRegion>,
-    server: FsServer,
+    server: Arc<FsServer>,
     stop_fd: EventFd,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
@@ -99,38 +95,12 @@ impl FsWorker {
         mem: GuestMemoryMmap,
         allow_idmap: bool,
         shm_region: Option<VirtioShmRegion>,
-        passthrough_cfg: Option<passthrough::Config>,
-        read_only: bool,
-        virtual_entries: Vec<VirtualDirEntry<'static>>,
+        server: Arc<FsServer>,
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
-    ) -> Result<Self, io::Error> {
-        let inode_alloc = Arc::new(InodeAllocator::new());
-        let server = match passthrough_cfg {
-            Some(cfg) if read_only => {
-                let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;
-                FsServer::ReadOnly(Server::new(AugmentFs::new(
-                    inner,
-                    &inode_alloc,
-                    virtual_entries,
-                )))
-            }
-            Some(cfg) => {
-                let inner = PassthroughFs::new(cfg, inode_alloc.clone())?;
-                FsServer::ReadWrite(Server::new(AugmentFs::new(
-                    inner,
-                    &inode_alloc,
-                    virtual_entries,
-                )))
-            }
-            None => FsServer::Null(Server::new(AugmentFs::new(
-                NullFs,
-                &inode_alloc,
-                virtual_entries,
-            ))),
-        };
-        Ok(Self {
+    ) -> Self {
+        Self {
             queues,
             queue_evts,
             interrupt,
@@ -142,7 +112,7 @@ impl FsWorker {
             exit_code,
             #[cfg(target_os = "macos")]
             map_sender,
-        })
+        }
     }
 
     pub fn run(self) -> thread::JoinHandle<()> {
@@ -153,26 +123,24 @@ impl FsWorker {
     }
 
     fn work(mut self) {
-        let virtq_hpq_ev_fd = self.queue_evts[HPQ_INDEX].as_raw_fd();
-        let virtq_req_ev_fd = self.queue_evts[REQ_INDEX].as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
+        let stop_token = self.queues.len() as u64;
 
         let mut epoll = Epoll::new().unwrap();
 
-        let _ = epoll.ctl(
-            ControlOperation::Add,
-            virtq_hpq_ev_fd,
-            &EpollEvent::new(EventSet::IN, virtq_hpq_ev_fd as u64),
-        );
-        let _ = epoll.ctl(
-            ControlOperation::Add,
-            virtq_req_ev_fd,
-            &EpollEvent::new(EventSet::IN, virtq_req_ev_fd as u64),
-        );
+        for (index, (queue, event)) in self.queues.iter().zip(&self.queue_evts).enumerate() {
+            if queue.ready {
+                let _ = epoll.ctl(
+                    ControlOperation::Add,
+                    event.as_raw_fd(),
+                    &EpollEvent::new(EventSet::IN, index as u64),
+                );
+            }
+        }
         let _ = epoll.ctl(
             ControlOperation::Add,
             stop_ev_fd,
-            &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
+            &EpollEvent::new(EventSet::IN, stop_token),
         );
 
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
@@ -180,23 +148,20 @@ impl FsWorker {
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
-                        let source = event.fd();
+                        let source = event.data();
                         let event_set = event.event_set();
                         match event_set {
-                            EventSet::IN if source == virtq_hpq_ev_fd => {
-                                self.handle_event(HPQ_INDEX);
+                            EventSet::IN if source < stop_token => {
+                                self.handle_event(source as usize);
                             }
-                            EventSet::IN if source == virtq_req_ev_fd => {
-                                self.handle_event(REQ_INDEX);
-                            }
-                            EventSet::IN if source == stop_ev_fd => {
+                            EventSet::IN if source == stop_token => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
                                 return;
                             }
                             _ => {
                                 log::warn!(
-                                    "Received unknown event: {event_set:?} from fd: {source:?}"
+                                    "Received unknown event: {event_set:?} from source: {source:?}"
                                 );
                             }
                         }

@@ -69,6 +69,7 @@ pub struct AttachContext<'a> {
     shm_manager: &'a ShmManager,
     intc: IrqChip,
     device_index: usize,
+    vcpu_count: u8,
     register_fn: Box<
         dyn Fn(&mut Vmm, String, IrqChip, Arc<Mutex<dyn VirtioDevice>>) -> Result<(), VmmError>
             + 'a,
@@ -84,6 +85,7 @@ impl<'a> AttachContext<'a> {
         shm_manager: &'a ShmManager,
         intc: IrqChip,
         device_index: usize,
+        vcpu_count: u8,
         #[cfg(target_os = "macos")] map_sender: Option<
             crossbeam_channel::Sender<utils::worker_message::WorkerMessage>,
         >,
@@ -94,6 +96,7 @@ impl<'a> AttachContext<'a> {
             shm_manager,
             intc,
             device_index,
+            vcpu_count,
             register_fn: Box::new(|vmm, id, intc, device| {
                 attach_mmio_device(vmm, id, intc, device)
                     .map_err(|e| VmmError::Internal(format!("{e:?}")))?;
@@ -135,6 +138,11 @@ impl<'a> AttachContext<'a> {
     /// to communicate an exit code to the host.
     pub fn exit_code(&self) -> &Arc<AtomicI32> {
         &self.vmm.exit_code
+    }
+
+    /// The number of vCPUs configured for this VM.
+    pub fn vcpu_count(&self) -> u8 {
+        self.vcpu_count
     }
 
     /// The VM's guest memory map.
@@ -289,6 +297,7 @@ pub trait DeviceManager<'a>: sealed::Sealed + Send + 'a {
         event_manager: &mut EventManager,
         shm_manager: &ShmManager,
         intc: IrqChip,
+        vcpu_count: u8,
         #[cfg(target_os = "macos")] map_sender: Option<
             crossbeam_channel::Sender<utils::worker_message::WorkerMessage>,
         >,
@@ -335,6 +344,7 @@ impl<'a> DeviceManager<'a> for MmioDeviceManager<'a> {
         event_manager: &mut EventManager,
         shm_manager: &ShmManager,
         intc: IrqChip,
+        vcpu_count: u8,
         #[cfg(target_os = "macos")] map_sender: Option<
             crossbeam_channel::Sender<utils::worker_message::WorkerMessage>,
         >,
@@ -346,6 +356,7 @@ impl<'a> DeviceManager<'a> for MmioDeviceManager<'a> {
                 shm_manager,
                 intc.clone(),
                 i,
+                vcpu_count,
                 #[cfg(target_os = "macos")]
                 map_sender.clone(),
             );
@@ -448,9 +459,9 @@ impl<'a> FsOverlay<'a> {
 /// (e.g. `mount -t virtiofs /dev/root /mnt`).
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub struct FsDevice<'a> {
-    pub(crate) inner: Arc<Mutex<devices::virtio::Fs>>,
-    #[allow(dead_code)]
-    pub(crate) tag: String,
+    tag: String,
+    host_path: Option<String>,
+    read_only: bool,
     pub(crate) shm_size: Option<usize>,
     pub(crate) overlay: Option<FsOverlay<'a>>,
     _lifetime: PhantomData<&'a ()>,
@@ -510,20 +521,10 @@ impl<'a> FsDevice<'a> {
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 impl<'a> FsDevice<'a> {
     fn new_inner(tag: &str, host_path: Option<String>, read_only: bool) -> Result<Self, VmmError> {
-        let exit_code = Arc::new(AtomicI32::new(i32::MAX));
-        let fs = devices::virtio::Fs::new(
-            tag.to_string(),
-            PermissionSemantics::LinuxComplete,
-            host_path,
-            exit_code.clone(),
-            read_only,
-            Vec::new(),
-        )
-        .map_err(|e| VmmError::Internal(format!("fs device: {e:?}")))?;
-
         Ok(Self {
-            inner: Arc::new(Mutex::new(fs)),
             tag: tag.to_string(),
+            host_path,
+            read_only,
             shm_size: None,
             overlay: None,
             _lifetime: PhantomData,
@@ -550,28 +551,33 @@ impl<'a> AttachDevice<'a> for FsDevice<'a> {
 
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
-        {
-            let mut fs = self.inner.lock().unwrap();
-            // Wire exit code from VMM into the fs device
-            fs.set_exit_code(ctx.exit_code().clone());
-            // Resolve overlay entries
-            if let Some(overlay) = self.overlay {
-                // FIXME: The VMM terminates the process on VM exit, so the
-                // borrowed overlay data remains valid for the worker lifetime.
-                let entries: Vec<VirtualDirEntry<'static>> =
-                    unsafe { std::mem::transmute(overlay.into_entries()) };
-                for entry in entries {
-                    fs.add_virtual_entry(entry);
-                }
-            }
-            // Set up SHM region if allocated
-            #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-            if let Some(region) = ctx.resolved_shm_region() {
-                fs.set_shm_region(region.into());
-            }
+        let mut virtual_entries = Vec::new();
+        if let Some(overlay) = self.overlay {
+            // FIXME: The VMM terminates the process on VM exit, so the
+            // borrowed overlay data remains valid for the worker lifetime.
+            let entries: Vec<VirtualDirEntry<'static>> =
+                unsafe { std::mem::transmute(overlay.into_entries()) };
+            virtual_entries = entries;
         }
 
-        ctx.register(&format!("virtiofs{}", ctx.device_index()), self.inner)
+        let mut fs = devices::virtio::Fs::new(
+            self.tag.clone(),
+            PermissionSemantics::LinuxComplete,
+            self.host_path,
+            ctx.exit_code().clone(),
+            self.read_only,
+            virtual_entries,
+            ctx.vcpu_count() as u32,
+        )
+        .map_err(|e| VmmError::Internal(format!("fs device: {e:?}")))?;
+
+        #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+        if let Some(region) = ctx.resolved_shm_region() {
+            fs.set_shm_region(region.into());
+        }
+
+        let inner = Arc::new(Mutex::new(fs));
+        ctx.register(&format!("virtiofs{}", ctx.device_index()), inner)
     }
 }
 

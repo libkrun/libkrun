@@ -1153,7 +1153,8 @@ pub struct InHeader {
     pub uid: u32,
     pub gid: u32,
     pub pid: u32,
-    pub padding: u32,
+    pub total_extlen: u16,
+    pub padding: u16,
 }
 unsafe impl ByteValued for InHeader {}
 

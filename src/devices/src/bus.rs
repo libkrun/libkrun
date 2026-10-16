@@ -16,6 +16,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::virtio::AsAny;
 
+/// An owned write operation executed inline after releasing the bus device lock.
+/// Implementations must synchronize with device reset without reacquiring that lock.
+pub trait BusWriteAction: Send + Sync {
+    fn execute(&self);
+}
+
 /// Trait for devices that respond to reads or writes in an arbitrary address space.
 ///
 /// The device does not care where it exists in address space as each method is only given an offset
@@ -26,6 +32,16 @@ pub trait BusDevice: AsAny + Send {
     fn read(&mut self, vcpuid: u64, offset: u64, data: &mut [u8]) {}
     /// Writes at `offset` into this device
     fn write(&mut self, vcpuid: u64, offset: u64, data: &[u8]) {}
+    /// Handles a write or returns work to complete before the caller resumes the guest.
+    fn prepare_write(
+        &mut self,
+        vcpuid: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Option<Arc<dyn BusWriteAction>> {
+        self.write(vcpuid, offset, data);
+        None
+    }
     /// Triggers the `irq_mask` interrupt on this device
     fn interrupt(&self, irq_mask: u32) -> io::Result<()> {
         Ok(())
@@ -161,9 +177,13 @@ impl Bus {
     pub fn write(&self, vcpuid: u64, addr: u64, data: &[u8]) -> bool {
         if let Some((offset, dev)) = self.get_device(addr) {
             // OK to unwrap as lock() failing is a serious error condition and should panic.
-            dev.lock()
-                .expect("Failed to acquire device lock")
-                .write(vcpuid, offset, data);
+            let action = {
+                let mut device = dev.lock().expect("Failed to acquire device lock");
+                device.prepare_write(vcpuid, offset, data)
+            };
+            if let Some(action) = action {
+                action.execute();
+            }
             true
         } else {
             false
@@ -174,6 +194,56 @@ impl Bus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::{self, Receiver, SyncSender};
+    use std::thread::{self, ThreadId};
+    use std::time::Duration;
+
+    struct BlockingWrite {
+        entered: SyncSender<ThreadId>,
+        resume: Mutex<Receiver<()>>,
+    }
+
+    impl BusWriteAction for BlockingWrite {
+        fn execute(&self) {
+            self.entered.send(thread::current().id()).unwrap();
+            self.resume.lock().unwrap().recv().unwrap();
+        }
+    }
+
+    struct DeferredDevice(Arc<BlockingWrite>);
+
+    impl BusDevice for DeferredDevice {
+        fn prepare_write(
+            &mut self,
+            _vcpuid: u64,
+            _offset: u64,
+            _data: &[u8],
+        ) -> Option<Arc<dyn BusWriteAction>> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn write_action_runs_inline_without_device_lock() {
+        let (entered, running) = mpsc::sync_channel(1);
+        let (resume, waiting) = mpsc::channel();
+        let device = Arc::new(Mutex::new(DeferredDevice(Arc::new(BlockingWrite {
+            entered,
+            resume: Mutex::new(waiting),
+        }))));
+        let mut bus = Bus::new();
+        bus.insert(device.clone(), 0x10, 0x10).unwrap();
+        let writer = thread::spawn(move || bus.write(7, 0x10, &[1]));
+        let executing_thread = running.recv_timeout(Duration::from_secs(5));
+        let unlocked = device.try_lock().is_ok();
+        let pending = !writer.is_finished();
+        resume.send(()).unwrap();
+        let caller_thread = writer.thread().id();
+        assert!(writer.join().unwrap());
+        assert_eq!(executing_thread.unwrap(), caller_thread);
+        assert!(unlocked);
+        assert!(pending);
+    }
 
     struct DummyDevice;
     impl BusDevice for DummyDevice {}

@@ -131,6 +131,9 @@ impl MMIODeviceManager {
         }
 
         for (i, queue_evt) in mmio_device.queue_evts().iter().enumerate() {
+            if mmio_device.queue_is_sync(i) {
+                continue;
+            }
             let io_addr = IoEventAddress::Mmio(
                 self.mmio_base + u64::from(devices::virtio::NOTIFY_REG_OFFSET),
             );

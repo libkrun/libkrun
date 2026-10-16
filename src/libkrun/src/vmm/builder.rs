@@ -1272,6 +1272,7 @@ pub fn build_microvm(
             event_manager,
             &_shm_manager,
             intc.clone(),
+            vcpu_config.vcpu_count,
             #[cfg(target_os = "macos")]
             Some(_sender.clone()),
         )

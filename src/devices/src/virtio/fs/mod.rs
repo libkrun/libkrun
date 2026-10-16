@@ -1,3 +1,9 @@
+//! The experimental VIRTIO_FS_F_SYNC feature (bit 1) appends per-CPU queues
+//! after the hiprio and normal request queues. Its little-endian queue count
+//! follows num_request_queues in device configuration. Synchronous queue i has
+//! index 1 + num_request_queues + i and completes in the notifying vCPU thread.
+//! Hiprio and normal requests use a worker and retain interrupt completions.
+
 mod augment_fs;
 mod device;
 #[allow(dead_code)]
@@ -39,19 +45,17 @@ pub use self::device::Fs;
 pub use self::filesystem::ExportTable;
 
 mod defs {
-    use super::super::QueueConfig;
-
     pub const FS_DEV_ID: &str = "virtio_fs";
-    pub const NUM_QUEUES: usize = 2;
     pub const QUEUE_SIZE: u16 = 1024;
-    pub static QUEUE_CONFIG: [QueueConfig; NUM_QUEUES] = [QueueConfig::new(QUEUE_SIZE); NUM_QUEUES];
     // High priority queue.
+    #[allow(dead_code)]
     pub const HPQ_INDEX: usize = 0;
     // Request queue.
     pub const REQ_INDEX: usize = 1;
 
     pub mod uapi {
         pub const VIRTIO_ID_FS: u32 = 26;
+        pub const VIRTIO_FS_F_SYNC: u32 = 1;
     }
 }
 

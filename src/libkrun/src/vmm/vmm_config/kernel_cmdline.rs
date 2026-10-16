@@ -6,7 +6,7 @@ pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodu
                                           rootfstype=virtiofs rw quiet no-kvmapf";
 #[cfg(target_os = "macos")]
 pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
-                                          rootfstype=virtiofs rw quiet no-kvmapf";
+                                          rootfstype=virtiofs rw no-kvmapf";
 // WHP (Windows Hypervisor Platform) differs from KVM in that it provides
 // no in-kernel PIT, PIC, or IOAPIC emulation. All three are emulated in
 // userspace. This makes interrupt delivery inherently less precise than KVM,

@@ -20,7 +20,7 @@ pub mod fdt;
 pub mod legacy;
 pub mod virtio;
 
-pub use self::bus::{Bus, BusDevice, Error as BusError};
+pub use self::bus::{Bus, BusDevice, BusWriteAction, Error as BusError};
 
 #[derive(Debug)]
 pub enum Error {

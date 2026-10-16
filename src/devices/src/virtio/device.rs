@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use super::{ActivateResult, InterruptTransport, Queue};
+use crate::BusWriteAction;
 use crate::virtio::AsAny;
 use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
@@ -19,11 +20,23 @@ use vm_memory::GuestMemoryMmap;
 pub struct QueueConfig {
     /// Maximum size of the queue.
     pub size: u16,
+    /// Notifications must exit to the VMM instead of using ioeventfd.
+    pub synchronous: bool,
 }
 
 impl QueueConfig {
     pub const fn new(size: u16) -> Self {
-        Self { size }
+        Self {
+            size,
+            synchronous: false,
+        }
+    }
+
+    pub const fn new_sync(size: u16) -> Self {
+        Self {
+            size,
+            synchronous: true,
+        }
     }
 }
 
@@ -162,6 +175,12 @@ pub trait VirtioDevice: AsAny + Send {
 
     /// Get base and size of the SHM region
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
+        None
+    }
+
+    /// Select a synchronous queue handler without executing it under the device lock.
+    /// Reset must invalidate outstanding handlers and wait for active executions.
+    fn sync_queue(&self, _queue_idx: u32) -> Option<Arc<dyn BusWriteAction>> {
         None
     }
 }

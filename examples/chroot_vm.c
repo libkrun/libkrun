@@ -383,6 +383,7 @@ int main(int argc, char *const argv[])
         krun_mmio_device_manager_add(devices, console);
     }
 
+/*
     // Configure vhost-user RNG if requested
     if (cmdline.vhost_user_rng_socket != NULL) {
         // Auto-detect queue count; use custom queue size of 512
@@ -460,6 +461,7 @@ int main(int argc, char *const argv[])
         krun_mmio_device_manager_add(devices, media);
         printf("Using vhost-user media backend at %s\n", cmdline.vhost_user_media_socket);
     }
+*/
 
     // Raise RLIMIT_NOFILE to the maximum allowed to create some room for virtio-fs
     getrlimit(RLIMIT_NOFILE, &rlim);
@@ -518,7 +520,7 @@ int main(int argc, char *const argv[])
 
     // Build the VM.
     KrunVmmBuilder builder = krun_vmm_builder_new();
-    CHECK(krun_vmm_builder_vcpus(&builder, 4, &krun_err));
+    CHECK(krun_vmm_builder_vcpus(&builder, 1, &krun_err));
     CHECK(krun_vmm_builder_ram_mib(&builder, 4096, &krun_err));
     krun_vmm_builder_payload(&builder, payload);
     krun_vmm_builder_devices(&builder, devices);
