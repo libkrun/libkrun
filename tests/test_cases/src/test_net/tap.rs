@@ -143,12 +143,22 @@ pub(crate) fn cleanup() {
     }
 }
 
-fn start_dhcp_server(tap_name: &str, test_setup: &TestSetup) -> anyhow::Result<()> {
+fn start_dhcp_server(
+    tap_name: &str,
+    test_setup: &TestSetup,
+    lease_secs: Option<u32>,
+    log_dhcp: bool,
+) -> anyhow::Result<()> {
     let lease_file = test_setup.tmp_dir.join("dnsmasq.leases");
-    let child = Command::new("dnsmasq")
-        .arg("--no-daemon")
+    let range = match lease_secs {
+        Some(secs) => format!("--dhcp-range=10.0.0.2,10.0.0.10,255.255.255.0,{secs}s"),
+        None => "--dhcp-range=10.0.0.2,10.0.0.10,255.255.255.0".to_string(),
+    };
+
+    let mut cmd = Command::new("dnsmasq");
+    cmd.arg("--no-daemon")
         .arg(format!("--interface={tap_name}"))
-        .arg("--dhcp-range=10.0.0.2,10.0.0.10,255.255.255.0")
+        .arg(range)
         .arg("--dhcp-option=3,10.0.0.1") // gateway
         .arg("--dhcp-rapid-commit") // init's DHCP client uses Rapid Commit
         .arg("--no-ping") // skip ARP probe delay before assigning
@@ -157,7 +167,15 @@ fn start_dhcp_server(tap_name: &str, test_setup: &TestSetup) -> anyhow::Result<(
         .arg("--except-interface=lo")
         .arg("--port=0") // disable DNS, we only need DHCP
         .arg("--no-resolv")
-        .arg("--no-hosts")
+        .arg("--no-hosts");
+    if log_dhcp {
+        cmd.arg("--log-dhcp").arg(format!(
+            "--log-facility={}",
+            test_setup.tmp_dir.join("dnsmasq.log").display()
+        ));
+    }
+
+    let child = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -174,6 +192,34 @@ fn start_dhcp_server(tap_name: &str, test_setup: &TestSetup) -> anyhow::Result<(
     anyhow::bail!("dnsmasq did not start in time");
 }
 
+/// Lease time for the renewal test. dnsmasq enforces a two-minute minimum, so
+/// T1 (half of it) lands at 60s and the guest must run a little past that.
+const RENEW_LEASE_SECS: u32 = 120;
+
+/// Like `setup_backend`, but with a short lease and DHCP logging so a renewal
+/// can be observed from the host.
+pub(crate) fn setup_renew_backend(test_setup: &TestSetup) -> anyhow::Result<krun::NetDevice> {
+    let tap_name = if let Ok(name) = std::env::var("LIBKRUN_TAP_NAME") {
+        name
+    } else {
+        create_tap(DEFAULT_TAP_NAME)?;
+        configure_host_interface(DEFAULT_TAP_NAME, HOST_IP, NETMASK)
+            .map_err(|e| anyhow::anyhow!("Failed to configure TAP: {}", e))?;
+        start_dhcp_server(DEFAULT_TAP_NAME, test_setup, Some(RENEW_LEASE_SECS), true)?;
+        DEFAULT_TAP_NAME.to_string()
+    };
+
+    let mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
+
+    krun::NetDevice::new_tap(
+        "net0",
+        &tap_name,
+        &mac,
+        crate::test_net::COMPAT_NET_FEATURES,
+    )
+    .map_err(|e| anyhow::anyhow!("NetDevice: {e:?}"))
+}
+
 pub(crate) fn setup_backend(test_setup: &TestSetup) -> anyhow::Result<krun::NetDevice> {
     let tap_name = if let Ok(name) = std::env::var("LIBKRUN_TAP_NAME") {
         name
@@ -181,7 +227,7 @@ pub(crate) fn setup_backend(test_setup: &TestSetup) -> anyhow::Result<krun::NetD
         create_tap(DEFAULT_TAP_NAME)?;
         configure_host_interface(DEFAULT_TAP_NAME, HOST_IP, NETMASK)
             .map_err(|e| anyhow::anyhow!("Failed to configure TAP: {}", e))?;
-        start_dhcp_server(DEFAULT_TAP_NAME, test_setup)?;
+        start_dhcp_server(DEFAULT_TAP_NAME, test_setup, None, false)?;
         DEFAULT_TAP_NAME.to_string()
     };
 

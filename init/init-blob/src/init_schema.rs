@@ -40,4 +40,12 @@ pub(crate) struct ConfigSchema {
     pub process: ProcessConfig,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<Mount>,
+    /// Configure the guest network interface with DHCP.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dhcp: Option<bool>,
+    /// Keep the guest's DHCP lease renewed, retrying lost requests, instead of
+    /// configuring the interface once. Intended for guests on a physical
+    /// network.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dhcp_renew: Option<bool>,
 }

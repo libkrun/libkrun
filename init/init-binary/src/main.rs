@@ -91,6 +91,10 @@ fn main() -> anyhow::Result<()> {
     env::setup_network(
         #[cfg(target_os = "linux")]
         "eth0",
+        #[cfg(target_os = "linux")]
+        cfg.dhcp,
+        #[cfg(target_os = "linux")]
+        cfg.dhcp_renew,
     );
 
     #[cfg(target_os = "linux")]

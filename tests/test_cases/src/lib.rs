@@ -59,7 +59,7 @@ mod test_tsi_unix_host_close;
 use test_tsi_unix_host_close::TestTsiUnixHostClose;
 
 pub(crate) mod test_net;
-use test_net::TestNet;
+use test_net::{TestNet, TestTapRenew};
 
 mod test_net_perf;
 use test_net_perf::TestNetPerf;
@@ -174,6 +174,7 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("tsi-unix-host-close", Box::new(TestTsiUnixHostClose)),
         TestCase::new("net-passt", Box::new(TestNet::new_passt())),
         TestCase::new("net-tap", Box::new(TestNet::new_tap())),
+        TestCase::new("net-tap-renew", Box::new(TestTapRenew)),
         TestCase::new("net-gvproxy", Box::new(TestNet::new_gvproxy())),
         TestCase::new(
             "net-gvproxy-long-path",

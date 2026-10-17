@@ -47,6 +47,10 @@ struct RawConfig {
     entrypoint: Option<Vec<String>>,
     #[cfg(target_os = "linux")]
     mounts: Option<Vec<Mount>>,
+    #[cfg(target_os = "linux")]
+    dhcp: Option<bool>,
+    #[cfg(target_os = "linux")]
+    dhcp_renew: Option<bool>,
 }
 
 #[derive(Default)]
@@ -55,6 +59,10 @@ pub struct Config {
     pub workdir: Option<String>,
     #[cfg(target_os = "linux")]
     pub tmpfs: Option<String>,
+    #[cfg(target_os = "linux")]
+    pub dhcp: bool,
+    #[cfg(target_os = "linux")]
+    pub dhcp_renew: bool,
 }
 
 pub fn load(#[cfg(target_os = "linux")] is_mount_point: impl Fn(&str) -> bool) -> Config {
@@ -69,6 +77,11 @@ pub fn load(#[cfg(target_os = "linux")] is_mount_point: impl Fn(&str) -> bool) -
     let Ok(raw) = parse_file(&path) else {
         return Config::default();
     };
+
+    #[cfg(target_os = "linux")]
+    let dhcp = raw.dhcp.unwrap_or(false);
+    #[cfg(target_os = "linux")]
+    let dhcp_renew = raw.dhcp_renew.unwrap_or(false);
 
     // Extract Entrypoint before partially moving raw into process below.
     let entrypoint = raw.entrypoint.filter(|v| !v.is_empty());
@@ -122,6 +135,10 @@ pub fn load(#[cfg(target_os = "linux")] is_mount_point: impl Fn(&str) -> bool) -
         workdir,
         #[cfg(target_os = "linux")]
         tmpfs,
+        #[cfg(target_os = "linux")]
+        dhcp,
+        #[cfg(target_os = "linux")]
+        dhcp_renew,
     }
 }
 
@@ -218,5 +235,14 @@ mod tests {
             None => base,
         };
         assert_eq!(argv, Some(vec!["myapp".into()]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dhcp_flags_are_parsed() {
+        let r = raw(r#"{"dhcp": true, "dhcp_renew": true}"#);
+        assert_eq!(r.dhcp, Some(true));
+        assert_eq!(r.dhcp_renew, Some(true));
+        assert_eq!(raw(r#"{}"#).dhcp_renew, None);
     }
 }
