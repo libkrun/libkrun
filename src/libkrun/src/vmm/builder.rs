@@ -564,6 +564,19 @@ pub enum Payload {
     Tee,
 }
 
+impl Payload {
+    fn is_external_kernel(&self) -> bool {
+        #[cfg(not(target_os = "windows"))]
+        {
+            matches!(self, Self::ExternalKernel(_))
+        }
+        #[cfg(target_os = "windows")]
+        {
+            false
+        }
+    }
+}
+
 pub fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmError> {
     if let Some(_kernel_bundle) = &vm_resources.kernel_bundle {
         #[cfg(feature = "tee")]
@@ -1984,10 +1997,7 @@ pub fn create_guest_memory(
         payload,
     )?;
 
-    // Only write firmware if data exists AND this isn't an ExternalKernel payload
-    // (ExternalKernel does direct kernel boot and doesn't use EFI firmware)
-    #[cfg(not(target_os = "windows"))]
-    if !matches!(payload, Payload::ExternalKernel(_))
+    if !payload.is_external_kernel()
         && let Some(firmware_data) = firmware_data.as_ref()
     {
         guest_mem

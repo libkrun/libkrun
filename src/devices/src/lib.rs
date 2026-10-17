@@ -19,6 +19,8 @@ pub mod display;
 pub mod fdt;
 pub mod legacy;
 pub mod virtio;
+#[cfg(windows)]
+pub mod windows_console;
 
 pub use self::bus::{Bus, BusDevice, Error as BusError};
 
