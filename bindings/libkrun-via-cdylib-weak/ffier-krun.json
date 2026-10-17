@@ -1409,6 +1409,32 @@
           "cfg": "not(target_os = \"windows\")"
         },
         {
+          "name": "add_serial_console",
+          "receiver": "value",
+          "params": [
+            {
+              "name": "input_handle",
+              "param_kind": "regular",
+              "type": "u64"
+            },
+            {
+              "name": "output_handle",
+              "param_kind": "regular",
+              "type": "u64"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vmm_builder_add_serial_console",
+          "cfg": "target_os = \"windows\""
+        },
+        {
           "name": "nested_virt",
           "receiver": "value",
           "params": [

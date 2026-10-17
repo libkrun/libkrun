@@ -1,12 +1,14 @@
 use std::marker::PhantomData;
-#[cfg(not(target_os = "windows"))]
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd};
+#[cfg(target_os = "windows")]
+use std::os::windows::io::RawHandle;
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
 use crate::vmm::VmCtl;
 use crate::vmm::Vmm as InnerVmm;
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 use crate::vmm::resources::SerialConsoleConfig;
 use crate::vmm::resources::VmResources;
 use crate::vmm::vmm_config::machine_config::VmConfig;
@@ -27,7 +29,7 @@ pub struct VmmBuilder<'a> {
     ram_mib: Option<u32>,
     payload: Option<Payload>,
     device_manager: Option<Box<dyn DeviceManager<'a> + 'a>>,
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "windows"))]
     serial_consoles: Vec<SerialConsoleConfig>,
     kernel_console: Option<String>,
     nested_virt: bool,
@@ -93,6 +95,19 @@ impl<'a> VmmBuilder<'a> {
         self.serial_consoles.push(SerialConsoleConfig {
             input_fd: in_fd,
             output_fd: out_fd,
+        });
+        Ok(self)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn add_serial_console(
+        mut self,
+        input_handle: u64,
+        output_handle: u64,
+    ) -> Result<Self, VmmError> {
+        self.serial_consoles.push(SerialConsoleConfig {
+            input_handle: input_handle as RawHandle,
+            output_handle: output_handle as RawHandle,
         });
         Ok(self)
     }
@@ -412,7 +427,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         vm_resources.kernel_console = Some(console);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "windows"))]
     {
         vm_resources.serial_consoles = builder_cfg.serial_consoles;
     }
