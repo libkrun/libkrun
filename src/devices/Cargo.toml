@@ -58,6 +58,7 @@ rutabaga_gfx = { version = "0.1.85", features = ["virgl_renderer"], optional = t
 caps = "0.5.5"
 kvm-bindings = { version = "0.14.1", features = ["fam-wrappers"] }
 kvm-ioctls = "0.25"
+vmm-sys-util = "0.15"
 
 [target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
 vm-fdt = ">= 0.2.0"

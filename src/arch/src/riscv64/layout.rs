@@ -15,10 +15,10 @@ pub const CMDLINE_MAX_SIZE: usize = 1024;
 pub const FDT_MAX_SIZE: usize = 0x1_0000;
 
 /// First usable interrupt on riscv64.
-pub const IRQ_BASE: u32 = 0;
+pub const IRQ_BASE: u32 = 1;
 
 /// Last usable interrupt on riscv64.
-pub const IRQ_MAX: u32 = 1023;
+pub const IRQ_MAX: u32 = 63;
 
 /// AIA related devices
 /// 0x0 ~ 0x0400_0000 (64 MiB) resides APLICs

@@ -33,8 +33,8 @@ fn connect(server_ip: Ipv4Addr, port: u16) -> TcpStream {
         match TcpStream::connect(addr) {
             Ok(stream) => return stream,
             Err(err) => {
-                if tries == 5 {
-                    panic!("Couldn't connect to server after 5 attempts: {err}");
+                if tries == 12 {
+                    panic!("Couldn't connect to server after {tries} retries: {err}");
                 }
                 tries += 1;
                 thread::sleep(Duration::from_secs(1));
