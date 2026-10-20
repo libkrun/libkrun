@@ -23,11 +23,15 @@ pub fn start_worker_thread(
     vmm: Arc<Mutex<super::Vmm>>,
     receiver: Receiver<WorkerMessage>,
 ) -> io::Result<()> {
+    let vmm = Arc::downgrade(&vmm);
     std::thread::Builder::new()
         .name("vmm worker".into())
         .spawn(move || {
             // This ends once every sender is gone, as no message can arrive anymore.
             for message in receiver {
+                let Some(vmm) = vmm.upgrade() else {
+                    break;
+                };
                 vmm.lock().unwrap().match_worker_message(message);
             }
         })?;

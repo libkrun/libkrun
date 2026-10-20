@@ -112,15 +112,20 @@ fn reclaim(
     for report in reports {
         for range in report.ranges {
             let (reply_sender, reply) = unbounded();
-            map_sender
+            if map_sender
                 .send(WorkerMessage::ReclaimMemory(
                     reply_sender,
                     range.start,
                     range.end - range.start,
                 ))
-                .unwrap();
+                .is_err()
+            {
+                return;
+            }
             // Pages that the VMM couldn't replace are left as they were, which only costs memory.
-            reply.recv().unwrap();
+            if reply.recv().is_err() {
+                return;
+            }
         }
         done.send(report.head).unwrap();
     }
@@ -325,6 +330,50 @@ mod tests {
             sleep(Duration::from_millis(1));
         };
         assert_eq!(head, 7);
+    }
+
+    #[test]
+    fn test_reclaim_stops_when_vmm_channel_is_closed() {
+        let (reports, report_receiver) = unbounded();
+        reports
+            .send(Report {
+                head: 7,
+                ranges: vec![0x8000_0000..0x8020_0000, 0x8040_0000..0x8080_0000],
+            })
+            .unwrap();
+        drop(reports);
+
+        let (map_sender, map_receiver) = unbounded();
+        drop(map_receiver);
+        let (done_sender, done) = pollable_channel().unwrap();
+
+        reclaim(report_receiver, map_sender, done_sender);
+
+        assert_eq!(done.try_recv().unwrap(), None);
+    }
+
+    #[test]
+    fn test_reclaim_stops_when_vmm_drops_reply() {
+        let (reports, report_receiver) = unbounded();
+        reports
+            .send(Report {
+                head: 7,
+                ranges: vec![0x8000_0000..0x8020_0000, 0x8040_0000..0x8080_0000],
+            })
+            .unwrap();
+        drop(reports);
+
+        let (map_sender, map_receiver) = unbounded();
+        let (done_sender, done) = pollable_channel().unwrap();
+        let worker = thread::spawn(move || {
+            let message = map_receiver.recv_timeout(TIMEOUT).unwrap();
+            assert!(matches!(message, WorkerMessage::ReclaimMemory(..)));
+        });
+
+        reclaim(report_receiver, map_sender, done_sender);
+        worker.join().unwrap();
+
+        assert_eq!(done.try_recv().unwrap(), None);
     }
 
     #[test]
