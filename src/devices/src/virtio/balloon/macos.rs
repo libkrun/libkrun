@@ -9,7 +9,7 @@ use utils::worker_message::WorkerMessage;
 use vm_memory::GuestAddress;
 
 use super::defs::QUEUE_SIZE;
-use super::device::{Balloon, FRQ_INDEX};
+use super::device::{Balloon, FreeRange, FRQ_INDEX};
 use super::{BalloonError, FreePageReportingMode, Result};
 use crate::virtio::DeviceState;
 
@@ -51,8 +51,8 @@ struct Report {
 
 impl FreePageReclaim {
     /// Whether a range of a report is to be reclaimed rather than madvise()d.
-    pub(super) fn reclaims(&self, addr: GuestAddress, len: u32) -> bool {
-        self.reclaimer.is_some() && reclaimable(addr, len)
+    fn reclaims(&self, range: &FreeRange) -> bool {
+        self.reclaimer.is_some() && reclaimable(range.guest_addr, range.len)
     }
 
     /// Whether another report can be taken from the queue.
@@ -62,9 +62,25 @@ impl FreePageReclaim {
             .is_none_or(|reclaimer| reclaimer.in_flight < MAX_IN_FLIGHT)
     }
 
+    /// Gives the pages of the report `head` back to the host. Returns true if some of them are
+    /// still being reclaimed, in which case the report mustn't be used until
+    /// [`FreePageReclaim::take_done`] returns it.
+    pub(super) fn release(&mut self, head: u16, ranges: Vec<FreeRange>) -> bool {
+        let mut reclaim_ranges = Vec::new();
+        for range in ranges {
+            if self.reclaims(&range) {
+                reclaim_ranges.push(range.guest_addr.0..range.guest_addr.0 + range.len as u64);
+                continue;
+            }
+            // SAFETY: the range is guest memory, whose contents the guest has given up.
+            unsafe { libc::madvise(range.host_addr.cast(), range.len, libc::MADV_FREE) };
+        }
+        self.submit(head, reclaim_ranges)
+    }
+
     /// Has the VMM reclaim the ranges of the report `head`. Returns false if there are none, in
     /// which case the report can be completed right away.
-    pub(super) fn submit(&mut self, head: u16, ranges: Vec<Range<u64>>) -> bool {
+    fn submit(&mut self, head: u16, ranges: Vec<Range<u64>>) -> bool {
         match &mut self.reclaimer {
             Some(reclaimer) if !ranges.is_empty() => {
                 reclaimer.reports.send(Report { head, ranges }).unwrap();
@@ -131,8 +147,8 @@ fn reclaim(
     }
 }
 
-fn reclaimable(addr: GuestAddress, len: u32) -> bool {
-    let len = u64::from(len);
+fn reclaimable(addr: GuestAddress, len: usize) -> bool {
+    let len = len as u64;
     len != 0 && addr.0.is_multiple_of(RECLAIM_ALIGN) && len.is_multiple_of(RECLAIM_ALIGN)
 }
 
@@ -185,96 +201,51 @@ impl Balloon {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-    use std::sync::Arc;
+    use std::ops::{Deref, DerefMut};
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
-    use utils::eventfd::{EventFd, EFD_NONBLOCK};
-    use vm_memory::GuestMemoryMmap;
+    use vm_memory::{Bytes, GuestMemoryMmap};
 
+    use super::super::test_util;
     use super::*;
-    use crate::legacy::DummyIrqChip;
-    use crate::virtio::queue::tests::VirtQueue;
-    use crate::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
-    use crate::virtio::{
-        DeviceQueue, InterruptTransport, Queue, VirtioDevice, VIRTIO_MMIO_INT_VRING,
-    };
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
     struct TestDevice<'a> {
-        balloon: Balloon,
-        frq: VirtQueue<'a>,
-        interrupt: InterruptTransport,
+        dev: test_util::TestDevice<'a>,
         worker: Receiver<WorkerMessage>,
+    }
+
+    impl<'a> Deref for TestDevice<'a> {
+        type Target = test_util::TestDevice<'a>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.dev
+        }
+    }
+
+    impl DerefMut for TestDevice<'_> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.dev
+        }
     }
 
     impl<'a> TestDevice<'a> {
         /// Attaches and activates a balloon, calling set_free_page_reporting_mode() unless `mode`
         /// is None.
         fn new(mem: &'a GuestMemoryMmap, mode: Option<FreePageReportingMode>) -> Self {
-            let mut balloon = Balloon::new().unwrap();
+            let mut dev = test_util::TestDevice::new(mem);
             if let Some(mode) = mode {
-                balloon.set_free_page_reporting_mode(mode);
+                dev.balloon.set_free_page_reporting_mode(mode);
             }
             let (map_sender, worker) = unbounded();
-            balloon.set_map_sender(map_sender).unwrap();
-
-            let frq = VirtQueue::new(GuestAddress(0), mem, 16);
-            let queues = (0..super::super::defs::NUM_QUEUES)
-                .map(|i| {
-                    let queue = if i == FRQ_INDEX {
-                        frq.create_queue()
-                    } else {
-                        Queue::new(16)
-                    };
-                    DeviceQueue::new(queue, Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()))
-                })
-                .collect();
-            let interrupt =
-                InterruptTransport::new(DummyIrqChip::new().into(), "balloon".into()).unwrap();
-            balloon
-                .activate(mem.clone(), interrupt.clone(), queues)
-                .unwrap();
-
-            Self {
-                balloon,
-                frq,
-                interrupt,
-                worker,
-            }
-        }
-
-        /// Puts a report of free pages in the queue, as the guest does.
-        fn report(&self, ranges: &[(u64, u32)]) {
-            for (i, &(addr, len)) in ranges.iter().enumerate() {
-                let next = i + 1 < ranges.len();
-                let flags = VIRTQ_DESC_F_WRITE | if next { VIRTQ_DESC_F_NEXT } else { 0 };
-                self.frq.dtable[i].set(addr, len, flags, i as u16 + 1);
-            }
-            let idx = self.frq.avail.idx.get();
-            self.frq.avail.ring[usize::from(idx) % self.frq.dtable.len()].set(0);
-            self.frq.avail.idx.set(idx + 1);
-        }
-
-        fn used(&self) -> u16 {
-            self.frq.used.idx.get()
-        }
-
-        /// The number of reports that the guest made available and the device didn't take yet.
-        fn pending(&self, mem: &GuestMemoryMmap) -> u16 {
-            self.balloon.queues.as_ref().unwrap()[FRQ_INDEX]
-                .queue
-                .len(mem)
+            dev.balloon.set_map_sender(map_sender).unwrap();
+            Self { dev, worker }
         }
 
         fn in_flight(&self) -> usize {
             self.balloon.reclaim.reclaimer.as_ref().unwrap().in_flight
-        }
-
-        fn signaled(&self) -> bool {
-            self.interrupt.status().load(Ordering::SeqCst) & VIRTIO_MMIO_INT_VRING as usize != 0
         }
 
         fn handle_reclaim_done(&mut self) {
@@ -476,5 +447,115 @@ mod tests {
         assert_eq!(dev.in_flight(), 0);
         assert!(dev.worker.try_recv().is_err());
         assert!(dev.signaled());
+    }
+
+    /// What the kernel says about the pages of a range that is mapped into this process.
+    mod page_query {
+        use std::os::raw::c_int;
+
+        const VM_PAGE_QUERY_PAGE_DIRTY: c_int = 0x8;
+        const VM_PAGE_QUERY_PAGE_REUSABLE: c_int = 0x800;
+
+        unsafe extern "C" {
+            fn mach_task_self() -> libc::mach_port_t;
+            fn mach_vm_page_range_query(
+                target: libc::mach_port_t,
+                address: u64,
+                size: u64,
+                dispositions: *mut c_int,
+                dispositions_count: *mut u64,
+            ) -> c_int;
+        }
+
+        /// Whether each page of the range is still marked as modified, and whether it's marked
+        /// as reusable.
+        pub fn pages(addr: *const u8, len: usize) -> Vec<(bool, bool)> {
+            // SAFETY: sysconf() has no preconditions.
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            let mut dispositions = vec![0; len / page_size];
+            let mut count = dispositions.len() as u64;
+            // SAFETY: the buffer has room for the `count` dispositions of the range.
+            let ret = unsafe {
+                mach_vm_page_range_query(
+                    mach_task_self(),
+                    addr as u64,
+                    len as u64,
+                    dispositions.as_mut_ptr(),
+                    &mut count,
+                )
+            };
+            assert_eq!(ret, 0);
+            assert_eq!(count as usize, dispositions.len());
+            dispositions
+                .iter()
+                .map(|d| {
+                    (
+                        d & VM_PAGE_QUERY_PAGE_DIRTY != 0,
+                        d & VM_PAGE_QUERY_PAGE_REUSABLE != 0,
+                    )
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn test_default_mode_marks_reported_pages_as_free() {
+        // A multiple of the page size of every host.
+        const PAGE: usize = 64 << 10;
+        const FIRST: usize = 1 << 20;
+        const PAGES: usize = 32;
+        let mem = guest_memory();
+        mem.write_slice(&vec![0xff; PAGES * PAGE], GuestAddress(FIRST as u64))
+            .unwrap();
+        let host_addr = FreeRange::new(&mem, GuestAddress(FIRST as u64), PAGES * PAGE)
+            .unwrap()
+            .host_addr;
+
+        let mut dev = TestDevice::new(&mem, None);
+        // (first page, pages)
+        let released = [(1, 1), (4, 3), (20, 1)];
+        let report: Vec<_> = released
+            .iter()
+            .map(|&(page, pages)| ((FIRST + page * PAGE) as u64, (pages * PAGE) as u32))
+            .collect();
+        dev.report(&report);
+        assert!(dev.balloon.process_frq());
+
+        // MADV_FREE clears the modified state of the pages without marking them as reusable,
+        // which MADV_FREE_REUSABLE does. MADV_DONTNEED doesn't touch it.
+        let pages = page_query::pages(host_addr, PAGES * PAGE);
+        for (block, pages) in pages.chunks(pages.len() / PAGES).enumerate() {
+            let is_released = released
+                .iter()
+                .any(|&(first, blocks)| (first..first + blocks).contains(&block));
+            for &(modified, reusable) in pages {
+                assert_eq!((modified, reusable), (!is_released, false), "page {block}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_ranges_outside_guest_memory_are_not_reclaimed() {
+        let mem = guest_memory();
+        let mut dev = TestDevice::new(&mem, Some(FreePageReportingMode::Replace));
+        // The second range is aligned, and runs past the end of the guest memory.
+        dev.report(&[(0x40_0000, 2 << 20), (14 << 20, 4 << 20)]);
+        assert!(!dev.balloon.process_frq());
+
+        let WorkerMessage::ReclaimMemory(reply_sender, guest_addr, len) =
+            dev.worker.recv_timeout(TIMEOUT).unwrap()
+        else {
+            panic!("unexpected worker message");
+        };
+        assert_eq!((guest_addr, len), (0x40_0000, 2 << 20));
+        reply_sender.send(true).unwrap();
+
+        let deadline = Instant::now() + TIMEOUT;
+        while dev.used() == 0 {
+            assert!(Instant::now() < deadline, "report not used");
+            sleep(Duration::from_millis(1));
+            dev.handle_reclaim_done();
+        }
+        assert!(dev.worker.try_recv().is_err());
     }
 }
