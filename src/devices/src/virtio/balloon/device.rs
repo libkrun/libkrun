@@ -64,6 +64,30 @@ impl FreeRange {
             len,
         })
     }
+
+    pub(super) fn guest_end(&self) -> GuestAddress {
+        GuestAddress(self.guest_addr.0 + self.len as u64)
+    }
+}
+
+/// Merges the ranges of a report that are adjacent in the same region of guest memory, so that
+/// each run of them is released with a single system call.
+pub(super) fn coalesce(mem: &GuestMemoryMmap, mut ranges: Vec<FreeRange>) -> Vec<FreeRange> {
+    // Linux fills a report from the free lists of its page allocator, which aren't sorted by
+    // address.
+    ranges.sort_unstable_by_key(|range| range.guest_addr);
+    ranges.dedup_by(|next, prev| {
+        if prev.guest_end() != next.guest_addr {
+            return false;
+        }
+        // Two regions can be adjacent in guest memory without being adjacent in the VMM's.
+        let Some(merged) = FreeRange::new(mem, prev.guest_addr, prev.len + next.len) else {
+            return false;
+        };
+        *prev = merged;
+        true
+    });
+    ranges
 }
 
 pub struct Balloon {
@@ -133,7 +157,7 @@ impl Balloon {
                 ranges.push(range);
             }
 
-            if self.reclaim.release(index, ranges) {
+            if self.reclaim.release(mem, index, ranges) {
                 if !self.reclaim.can_take_report() {
                     break;
                 }
@@ -269,5 +293,127 @@ mod tests {
         assert_eq!(dev.used(), 1);
         assert!(dev.signaled());
         assert_eq!(dev.pending(&mem), 0);
+    }
+
+    fn ranges(mem: &GuestMemoryMmap, ranges: &[(u64, usize)]) -> Vec<FreeRange> {
+        ranges
+            .iter()
+            .map(|&(addr, len)| FreeRange::new(mem, GuestAddress(addr), len).unwrap())
+            .collect()
+    }
+
+    fn assert_coalesced(reported: &[(u64, usize)], expected: &[(u64, usize)]) {
+        // Two regions that are adjacent in guest memory.
+        let mem = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), MIB as usize),
+            (GuestAddress(MIB), MIB as usize),
+        ])
+        .unwrap();
+        assert_eq!(
+            coalesce(&mem, ranges(&mem, reported)),
+            ranges(&mem, expected)
+        );
+    }
+
+    #[test]
+    fn test_release_discards_each_run_of_adjacent_ranges_once() {
+        // Two regions that are adjacent in guest memory.
+        let mem = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), MIB as usize),
+            (GuestAddress(MIB), MIB as usize),
+        ])
+        .unwrap();
+        let reported = ranges(
+            &mem,
+            &[
+                (0x4000, 0x1000),
+                (MIB, 0x1000),
+                (0x1000, 0x1000),
+                (0x8000, 0x1000),
+                (0x2000, 0x2000),
+                (MIB - 0x1000, 0x1000),
+            ],
+        );
+
+        let mut balloon = Balloon::new().unwrap();
+        let mut discarded = Vec::new();
+        let in_flight = balloon
+            .reclaim
+            .release_with(&mem, 0, reported, |range| discarded.push(*range));
+
+        assert!(!in_flight);
+        assert_eq!(
+            discarded,
+            ranges(
+                &mem,
+                &[
+                    (0x1000, 0x4000),
+                    (0x8000, 0x1000),
+                    (MIB - 0x1000, 0x1000),
+                    (MIB, 0x1000)
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn test_coalesce_adjacent_ranges() {
+        assert_coalesced(
+            &[(0x1000, 0x1000), (0x2000, 0x2000), (0x4000, 0x1000)],
+            &[(0x1000, 0x4000)],
+        );
+    }
+
+    #[test]
+    fn test_coalesce_unsorted_ranges() {
+        assert_coalesced(
+            &[(0x4000, 0x1000), (0x1000, 0x1000), (0x2000, 0x2000)],
+            &[(0x1000, 0x4000)],
+        );
+    }
+
+    #[test]
+    fn test_coalesce_keeps_ranges_with_gaps_apart() {
+        assert_coalesced(
+            &[
+                (0x1000, 0x1000),
+                (0x3000, 0x1000),
+                (0x5000, 0x1000),
+                (0x6000, 0x1000),
+            ],
+            &[(0x1000, 0x1000), (0x3000, 0x1000), (0x5000, 0x2000)],
+        );
+    }
+
+    #[test]
+    fn test_coalesce_keeps_overlapping_ranges_apart() {
+        // Adding up their lengths would release memory that the guest didn't report.
+        assert_coalesced(
+            &[(0x1000, 0x2000), (0x2000, 0x2000), (0x2000, 0x2000)],
+            &[(0x1000, 0x2000), (0x2000, 0x2000), (0x2000, 0x2000)],
+        );
+    }
+
+    #[test]
+    fn test_coalesce_keeps_regions_apart() {
+        assert_coalesced(
+            &[
+                (MIB - 0x2000, 0x1000),
+                (MIB - 0x1000, 0x1000),
+                (MIB, 0x1000),
+                (MIB + 0x1000, 0x1000),
+            ],
+            &[(MIB - 0x2000, 0x2000), (MIB, 0x2000)],
+        );
+    }
+
+    #[test]
+    fn test_coalesce_empty_report() {
+        assert_coalesced(&[], &[]);
+    }
+
+    #[test]
+    fn test_coalesce_single_range() {
+        assert_coalesced(&[(0x1000, 0x1000)], &[(0x1000, 0x1000)]);
     }
 }

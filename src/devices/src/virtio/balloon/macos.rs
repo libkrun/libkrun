@@ -6,10 +6,10 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use utils::epoll::{EpollEvent, EventSet};
 use utils::pollable_channel::{pollable_channel, PollableChannelReciever, PollableChannelSender};
 use utils::worker_message::WorkerMessage;
-use vm_memory::GuestAddress;
+use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::defs::QUEUE_SIZE;
-use super::device::{Balloon, FreeRange, FRQ_INDEX};
+use super::device::{coalesce, Balloon, FreeRange, FRQ_INDEX};
 use super::{BalloonError, FreePageReportingMode, Result};
 use crate::virtio::DeviceState;
 
@@ -65,16 +65,38 @@ impl FreePageReclaim {
     /// Gives the pages of the report `head` back to the host. Returns true if some of them are
     /// still being reclaimed, in which case the report mustn't be used until
     /// [`FreePageReclaim::take_done`] returns it.
-    pub(super) fn release(&mut self, head: u16, ranges: Vec<FreeRange>) -> bool {
-        let mut reclaim_ranges = Vec::new();
-        for range in ranges {
-            if self.reclaims(&range) {
-                reclaim_ranges.push(range.guest_addr.0..range.guest_addr.0 + range.len as u64);
-                continue;
-            }
+    pub(super) fn release(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        head: u16,
+        ranges: Vec<FreeRange>,
+    ) -> bool {
+        self.release_with(mem, head, ranges, |range| {
             // SAFETY: the range is guest memory, whose contents the guest has given up.
             unsafe { libc::madvise(range.host_addr.cast(), range.len, libc::MADV_FREE) };
+        })
+    }
+
+    /// Like [`FreePageReclaim::release`], with `discard` giving back each run of adjacent ranges
+    /// that isn't reclaimed. The tests use it to count the calls.
+    pub(super) fn release_with(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        head: u16,
+        ranges: Vec<FreeRange>,
+        mut discard: impl FnMut(&FreeRange),
+    ) -> bool {
+        // Each range is given back as it would be on its own: merged with a range that is only
+        // madvise()d, one that is reclaimed would end up unaligned and only be madvise()d too.
+        let (reclaimed, madvised): (Vec<_>, Vec<_>) =
+            ranges.into_iter().partition(|range| self.reclaims(range));
+        for range in coalesce(mem, madvised) {
+            discard(&range);
         }
+        let reclaim_ranges = coalesce(mem, reclaimed)
+            .iter()
+            .map(|range| range.guest_addr.0..range.guest_end().0)
+            .collect();
         self.submit(head, reclaim_ranges)
     }
 
@@ -405,6 +427,35 @@ mod tests {
     }
 
     #[test]
+    fn test_adjacent_ranges_reclaimed_at_once() {
+        let mem = guest_memory();
+        let mut dev = TestDevice::new(&mem, Some(FreePageReportingMode::Replace));
+        // The last range is too small to be reclaimed, and is only madvise()d.
+        dev.report(&[
+            (0x60_0000, 2 << 20),
+            (0x40_0000, 2 << 20),
+            (0x80_0000, 0x1000),
+        ]);
+        assert!(!dev.balloon.process_frq());
+
+        let WorkerMessage::ReclaimMemory(reply_sender, guest_addr, len) =
+            dev.worker.recv_timeout(TIMEOUT).unwrap()
+        else {
+            panic!("unexpected worker message");
+        };
+        assert_eq!((guest_addr, len), (0x40_0000, 4 << 20));
+
+        reply_sender.send(true).unwrap();
+        let deadline = Instant::now() + TIMEOUT;
+        while dev.used() == 0 {
+            assert!(Instant::now() < deadline, "report not used");
+            sleep(Duration::from_millis(1));
+            dev.handle_reclaim_done();
+        }
+        assert!(dev.worker.try_recv().is_err());
+    }
+
+    #[test]
     fn test_reports_in_flight_are_limited() {
         let mem = guest_memory();
         let mut dev = TestDevice::new(&mem, Some(FreePageReportingMode::Replace));
@@ -447,6 +498,39 @@ mod tests {
         assert_eq!(dev.in_flight(), 0);
         assert!(dev.worker.try_recv().is_err());
         assert!(dev.signaled());
+    }
+
+    #[test]
+    fn test_small_ranges_are_merged_apart_from_reclaimed_ones() {
+        let mem = guest_memory();
+        let mut dev = TestDevice::new(&mem, Some(FreePageReportingMode::Replace));
+        let ranges = [
+            // The small ranges are adjacent to each other, and the first is adjacent to the
+            // range that is reclaimed too.
+            (0x60_0000, 0x1000),
+            (0x80_0000, 0x1000),
+            (0x40_0000, 2 << 20),
+            (0x80_1000, 0x1000),
+        ]
+        .map(|(addr, len)| FreeRange::new(&mem, GuestAddress(addr), len).unwrap())
+        .to_vec();
+
+        let mut discarded = Vec::new();
+        assert!(dev
+            .balloon
+            .reclaim
+            .release_with(&mem, 0, ranges, |range| discarded.push(*range)));
+
+        let expected = [(0x60_0000, 0x1000), (0x80_0000, 0x2000)]
+            .map(|(addr, len)| FreeRange::new(&mem, GuestAddress(addr), len).unwrap());
+        assert_eq!(discarded, expected);
+        let WorkerMessage::ReclaimMemory(reply_sender, guest_addr, len) =
+            dev.worker.recv_timeout(TIMEOUT).unwrap()
+        else {
+            panic!("unexpected worker message");
+        };
+        assert_eq!((guest_addr, len), (0x40_0000, 2 << 20));
+        reply_sender.send(true).unwrap();
     }
 
     /// What the kernel says about the pages of a range that is mapped into this process.

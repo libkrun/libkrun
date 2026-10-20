@@ -1,4 +1,6 @@
-use super::device::FreeRange;
+use vm_memory::GuestMemoryMmap;
+
+use super::device::{coalesce, FreeRange};
 
 /// Gives the pages of free page reports back to the host with madvise(MADV_DONTNEED).
 #[derive(Default)]
@@ -13,10 +15,29 @@ impl FreePageReclaim {
 
     /// Gives the pages of a report back to the host. That's done right away, so this returns
     /// false: the report can be used right away.
-    pub(super) fn release(&mut self, _head: u16, ranges: Vec<FreeRange>) -> bool {
-        for range in ranges {
+    pub(super) fn release(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        head: u16,
+        ranges: Vec<FreeRange>,
+    ) -> bool {
+        self.release_with(mem, head, ranges, |range| {
             // SAFETY: the range is guest memory, whose contents the guest has given up.
             unsafe { libc::madvise(range.host_addr.cast(), range.len, libc::MADV_DONTNEED) };
+        })
+    }
+
+    /// Like [`FreePageReclaim::release`], with `discard` giving back each run of adjacent ranges.
+    /// The tests use it to count the calls.
+    pub(super) fn release_with(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        _head: u16,
+        ranges: Vec<FreeRange>,
+        mut discard: impl FnMut(&FreeRange),
+    ) -> bool {
+        for range in coalesce(mem, ranges) {
+            discard(&range);
         }
         false
     }
@@ -24,7 +45,7 @@ impl FreePageReclaim {
 
 #[cfg(test)]
 mod tests {
-    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+    use vm_memory::{Bytes, GuestAddress};
 
     use super::super::test_util::TestDevice;
     use super::*;
@@ -47,7 +68,7 @@ mod tests {
                 FreeRange::new(&mem, GuestAddress((page * PAGE) as u64), pages * PAGE).unwrap()
             })
             .collect();
-        assert!(!FreePageReclaim.release(0, ranges));
+        assert!(!FreePageReclaim.release(&mem, 0, ranges));
 
         let mut contents = vec![0; PAGES * PAGE];
         mem.read_slice(&mut contents, GuestAddress(0)).unwrap();
