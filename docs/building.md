@@ -53,6 +53,46 @@ sudo make BLK=1 NET=1 install
 
 ---
 
+### Build the chroot_vm example
+
+```bash
+cd examples
+make chroot_vm
+```
+
+Optionally you may build outside of make assuming installed locally:
+
+```bash
+cd examples
+gcc -O2 -g -I"$HOME/.local/include" -L"$HOME/.local/lib64" \
+    -o chroot_vm chroot_vm.c -lkrun -lkrun_init
+```
+
+The `-I` and `-L` flags use headers and libraries installed in `$HOME/.local`, without a system-wide libkrun installation.
+
+### Prepare a rootfs
+
+Requires [podman](https://podman.io) installation.
+
+```bash
+make rootfs  # extracts a Fedora root filesystem
+```
+
+### Run the chroot_vm isolated process example
+
+Running the VM also requires [libkrunfw](https://github.com/containers/libkrunfw) to be installed and discoverable by the dynamic linker. If you have installed libkrun and libkrunfw to the default system-wide install use the following:
+
+```bash
+./chroot_vm ./rootfs_fedora /bin/sh
+```
+
+If libkrun and libkrunfw are installed to your local prefix, use its `lib64` directory for the `LD_LIBRARY_PATH`.
+
+```bash
+LD_LIBRARY_PATH="$HOME/.local/lib64" ./chroot_vm ./rootfs_fedora /bin/sh
+```
+
+
 ## Linux (AMD SEV & Intel TDX Variants)
 
 The confidential computing variants produce standalone libraries (`libkrun-sev.so` and `libkrun-tdx.so`) with distinct sonames.

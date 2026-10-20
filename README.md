@@ -63,38 +63,11 @@ In `libkrun`, guest networking can use two approaches:
 
 For full configuration details, port forwarding, and security models, see [Networking](docs/networking.md).
 
-## Linux Quickstart
+## Quickstart
 
-Build and install `libkrun`, then run a shell inside an isolated microVM using the `chroot_vm` example:
+Build and install `libkrun`, then run a shell inside an isolated microVM using the `chroot_vm` example.
 
-### 1. Build and install libkrun
-
-```bash
-# Build with common features, then install to a user-owned prefix
-make -j11 BLK=1 NET=1 VHOST_USER=1
-make -j11 BLK=1 NET=1 VHOST_USER=1 PREFIX="$HOME/.local" install
-```
-
-> For complete prerequisites, platform instructions (macOS / SEV / TDX), and feature flags, see [Building and Installing libkrun](docs/building.md).
-
-### 2. Build the example and prepare a rootfs
-
-```bash
-cd examples
-gcc -O2 -g -I"$HOME/.local/include" -L"$HOME/.local/lib64" \
-    -o chroot_vm chroot_vm.c -lkrun -lkrun_init
-make rootfs  # extracts a Fedora root filesystem (requires podman)
-```
-
-The `-I` and `-L` flags use headers and libraries installed in `$HOME/.local`, without a system-wide libkrun installation. Running the VM also requires [libkrunfw](https://github.com/containers/libkrunfw) to be installed and discoverable by the dynamic linker.
-
-### 3. Run an isolated process
-
-```bash
-LD_LIBRARY_PATH="$HOME/.local/lib64" ./chroot_vm ./rootfs_fedora /bin/sh
-```
-
-If you installed to another prefix, use its `include` directory for `-I` and its `lib64` directory for `-L` and `LD_LIBRARY_PATH`.
+> For complete prerequisites, platform instructions, and feature flags, see [Building and Installing libkrun](docs/building.md).
 
 ## Architecture & Development Guides
 
