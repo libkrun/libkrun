@@ -124,7 +124,8 @@ bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
 
 void *listen_shutdown_request(void *opaque)
 {
-    int server_sock, client_sock, len, ret;
+    int server_sock, client_sock, ret;
+    socklen_t len;
     KrunVmmHandle handle = (KrunVmmHandle) opaque;
     struct sockaddr_un server_sockaddr;
     struct sockaddr_un client_sockaddr;
