@@ -211,6 +211,7 @@ int start_passt()
             perror("execlp");
             return -1;
         }
+        return 0;
     }
     else
     { // parent
