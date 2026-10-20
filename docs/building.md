@@ -61,15 +61,14 @@ cd examples
 make chroot_vm
 ```
 
-Optionally you may build outside of make assuming installed locally:
+Optionally you may build against a local libkrun installation prefix:
 
 ```bash
 cd examples
-gcc -O2 -g -I"$HOME/.local/include" -L"$HOME/.local/lib64" \
-    -o chroot_vm chroot_vm.c -lkrun -lkrun_init
+make LIBKRUN_LOCAL_INSTALL="$HOME/.local" chroot_vm
 ```
 
-The `-I` and `-L` flags use headers and libraries installed in `$HOME/.local`, without a system-wide libkrun installation.
+`LIBKRUN_LOCAL_INSTALL` uses headers and libraries installed below `$HOME/.local`, without a system-wide libkrun installation.
 
 ### Prepare a rootfs
 
@@ -169,6 +168,15 @@ sudo make BLK=1 NET=1 install
 cd examples
 make chroot_vm
 ```
+
+Optionally you may build against a local libkrun installation prefix:
+
+```bash
+cd examples
+make LIBKRUN_LOCAL_INSTALL="$HOME/.local" chroot_vm
+```
+
+`LIBKRUN_LOCAL_INSTALL` uses headers and libraries installed below `$HOME/.local`, without a system-wide libkrun installation.
 
 ### Prepare a rootfs
 
