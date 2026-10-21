@@ -8,12 +8,13 @@ All builds go through the top-level `Makefile`, which handles feature flag confi
 
 ### Prerequisites
 
-- [libkrunfw](https://github.com/containers/libkrunfw)
+- Installation of [libkrunfw](https://github.com/libkrun/libkrunfw)
 - A working [Rust](https://www.rust-lang.org/) toolchain with the musl cross-target for the guest init binary:
   ```bash
   rustup target add x86_64-unknown-linux-musl   # on x86_64
   rustup target add aarch64-unknown-linux-musl  # on aarch64
   ```
+ - Beyond the rust toolchain install packages such as lld, llvm-config, clang-libs, clang-devel, virglrenderer-devel and glibc-static.
 
 ### Optional Build Features
 
@@ -75,7 +76,7 @@ The `-I` and `-L` flags use headers and libraries installed in `$HOME/.local`, w
 Requires [podman](https://podman.io) installation.
 
 ```bash
-make rootfs  # extracts a Fedora root filesystem
+make rootfs  # extracts a Fedora root filesystem to a local rootfs_fedora directory
 ```
 
 ### Run the chroot_vm isolated process example
