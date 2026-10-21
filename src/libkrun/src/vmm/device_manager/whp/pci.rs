@@ -17,6 +17,8 @@ use devices::virtio::{
 };
 use vm_memory::GuestMemoryMmap;
 
+use crate::vmm::device_manager::irq::IrqAllocator;
+
 const PCI_BUS0: u8 = 0;
 
 #[derive(Debug)]
@@ -43,7 +45,7 @@ type Result<T> = std::result::Result<T, Error>;
 pub struct PciHostManager {
     root: devices::pci::SharedPciRoot,
     next_device: u8,
-    irq: u32,
+    irqs: IrqAllocator,
     functions: Vec<arch::x86_64::PciFunctionInfo>,
 }
 
@@ -68,11 +70,11 @@ impl PciIntxLine for WhpPciIntxLine {
 }
 
 impl PciHostManager {
-    pub fn new() -> Self {
+    pub fn new(irqs: IrqAllocator) -> Self {
         Self {
             root: devices::pci::PciRoot::shared(),
             next_device: 1,
-            irq: arch::x86_64::layout::IRQ_BASE,
+            irqs,
             functions: Vec::new(),
         }
     }
@@ -110,17 +112,17 @@ impl PciHostManager {
         guest_memory: GuestMemoryMmap,
         device: Arc<Mutex<dyn VirtioDevice>>,
     ) -> Result<arch::x86_64::PciFunctionInfo> {
-        if self.irq > arch::x86_64::layout::IRQ_MAX || self.next_device > 31 {
+        if self.next_device > 31 {
             return Err(Error::IrqsExhausted);
         }
 
-        let irq = self.irq;
         let address = PciAddress::new(PCI_BUS0, self.next_device, 0);
         let bar_base = arch::x86_64::layout::PCI_BAR_START
             + u64::from(self.next_device - 1) * VIRTIO_PCI_BAR0_SIZE;
         if bar_base + VIRTIO_PCI_BAR0_SIZE > arch::x86_64::layout::PCI_BAR_END {
             return Err(Error::IrqsExhausted);
         }
+        let irq = self.irqs.alloc().map_err(|_| Error::IrqsExhausted)?;
         let intx_line = Arc::new(WhpPciIntxLine { intc, gsi: irq });
         let transport =
             VirtioPciTransport::new(guest_memory, device, irq as u8, intx_line, bar_base as u32)
@@ -140,7 +142,6 @@ impl PciHostManager {
         };
         self.functions.push(info);
         self.next_device += 1;
-        self.irq += 1;
         Ok(info)
     }
 

@@ -29,6 +29,7 @@ use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 
 use super::{Error, Vmm};
 
+use crate::vmm::device_manager::irq::IrqAllocator;
 #[cfg(target_arch = "x86_64")]
 use crate::vmm::device_manager::legacy::PortIODeviceManager;
 use crate::vmm::device_manager::mmio::MMIODeviceManager;
@@ -1118,12 +1119,18 @@ pub fn build_microvm(
     .map_err(Error::CreateLegacyDevice)
     .map_err(StartMicrovmError::Internal)?;
 
+    // Every device manager draws its interrupt lines from this one allocator,
+    // so that devices on different transports never share a line.
+    let irq_allocator = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX);
+
     #[cfg(all(
         target_arch = "x86_64",
         any(target_os = "linux", target_os = "windows")
     ))]
     let pci_device_manager = if pci_enabled {
-        Some(device_manager::pci::PciHostManager::new())
+        Some(device_manager::pci::PciHostManager::new(
+            irq_allocator.clone(),
+        ))
     } else {
         None
     };
@@ -1141,10 +1148,8 @@ pub fn build_microvm(
     // 'mmio_base' address has to be an address which is protected by the kernel
     // and is architectural specific.
     #[allow(unused_mut)]
-    let mut mmio_device_manager = MMIODeviceManager::new(
-        &mut (arch::MMIO_MEM_START.clone()),
-        (arch::IRQ_BASE, arch::IRQ_MAX),
-    );
+    let mut mmio_device_manager =
+        MMIODeviceManager::new(&mut (arch::MMIO_MEM_START.clone()), irq_allocator);
 
     #[cfg(all(
         target_arch = "x86_64",

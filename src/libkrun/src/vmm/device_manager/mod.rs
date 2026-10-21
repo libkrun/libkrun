@@ -5,6 +5,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+/// Interrupt line allocation shared by the device managers.
+pub mod irq;
+
 /// Legacy Device Manager.
 pub mod legacy;
 
