@@ -4,18 +4,7 @@ All builds go through the top-level `Makefile`, which handles feature flag confi
 
 ---
 
-## Linux
-
-### Prerequisites
-
-- [libkrunfw](https://github.com/containers/libkrunfw)
-- A working [Rust](https://www.rust-lang.org/) toolchain with the musl cross-target for the guest init binary:
-  ```bash
-  rustup target add x86_64-unknown-linux-musl   # on x86_64
-  rustup target add aarch64-unknown-linux-musl  # on aarch64
-  ```
-
-### Optional Build Features
+## Optional Build Features
 
 - `BLK=1`: Enables virtio-block support (`BlockDevice`).
 - `NET=1`: Enables virtio-net support (`NetDevice`).
@@ -23,6 +12,18 @@ All builds go through the top-level `Makefile`, which handles feature flag confi
 - `INPUT=1`: Enables virtio-input support (`InputDevice`).
 - `VHOST_USER=1`: Enables vhost-user device bridge support (`VhostUserDevice`).
 - `TIMESYNC=1`: Enables PTP time synchronization device support.
+
+## Linux
+
+### Prerequisites
+
+- Installation of [libkrunfw](https://github.com/libkrun/libkrunfw)
+- A working [Rust](https://www.rust-lang.org/) toolchain with the musl cross-target for the guest init binary:
+  ```bash
+  rustup target add x86_64-unknown-linux-musl   # on x86_64
+  rustup target add aarch64-unknown-linux-musl  # on aarch64
+  ```
+ - Beyond the rust toolchain install packages such as lld, llvm-config, clang-libs, clang-devel, virglrenderer-devel and glibc-static.
 
 ### Compiling
 
@@ -75,7 +76,7 @@ The `-I` and `-L` flags use headers and libraries installed in `$HOME/.local`, w
 Requires [podman](https://podman.io) installation.
 
 ```bash
-make rootfs  # extracts a Fedora root filesystem
+make rootfs  # extracts a Fedora root filesystem to a local rootfs_fedora directory
 ```
 
 ### Run the chroot_vm isolated process example
