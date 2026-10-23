@@ -171,6 +171,7 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 #define KRUN_CACHE_POLICY_NEVER 0
 #define KRUN_CACHE_POLICY_AUTO 1
 #define KRUN_CACHE_POLICY_ALWAYS 2
+#define KRUN_CACHE_POLICY_KEEP_UNCHANGED 3
 
 /* LogOptions -------------------------------------------------------- */
 
