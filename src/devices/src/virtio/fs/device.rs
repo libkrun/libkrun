@@ -433,7 +433,12 @@ mod tests {
         let attr_timeout = Duration::from_millis(123);
         fs.passthrough_cfg.as_mut().unwrap().attr_timeout = attr_timeout;
 
-        for policy in [CachePolicy::Never, CachePolicy::Always, CachePolicy::Auto] {
+        for policy in [
+            CachePolicy::Never,
+            CachePolicy::Always,
+            CachePolicy::KeepUnchanged,
+            CachePolicy::Auto,
+        ] {
             assert!(fs.set_cache_policy(policy));
             let cfg = fs.passthrough_cfg.as_ref().unwrap();
             assert_eq!(cfg.cache_policy, policy);

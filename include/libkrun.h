@@ -211,6 +211,7 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 #define KRUN_CACHE_POLICY_NEVER 0
 #define KRUN_CACHE_POLICY_AUTO 1
 #define KRUN_CACHE_POLICY_ALWAYS 2
+#define KRUN_CACHE_POLICY_KEEP_UNCHANGED 3
 #endif
 
 /* LogOptions -------------------------------------------------------- */
@@ -341,8 +342,10 @@ typedef KrunResult (*krun_fs_device_set_fixed_owner_fn)(KrunFsDevice handle, uin
  * Defaults to `Auto`, which uses close-to-open consistency. `Never` forwards file-data
  * I/O to the server without caching it in the guest. `Always` keeps cached file data
  * across opens and should only be used when the filesystem has exclusive access to
- * the shared directory. Attribute caching is controlled by the permission semantics.
- * A NullFs device has no host-backed file data and returns `InvalidParam`.
+ * the shared directory. `KeepUnchanged` is `Auto` that keeps cached data while the host
+ * file's mtime, ctime and size stay the same, which misses writes through a host shared
+ * mapping until they are flushed. Attribute caching is controlled by the permission
+ * semantics. A NullFs device has no host-backed file data and returns `InvalidParam`.
  */
 KrunResult krun_fs_device_set_cache_policy(KrunFsDevice handle, uint32_t policy, KrunError* err_out);
 typedef KrunResult (*krun_fs_device_set_cache_policy_fn)(KrunFsDevice handle, uint32_t policy, KrunError* err_out);
