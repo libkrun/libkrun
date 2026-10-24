@@ -1279,6 +1279,20 @@ fn clear_suid_sgid(mode: u32) -> u32 {
     new_mode
 }
 
+/// A `readdirplus` entry with inode 0, which tells the kernel the attributes are not included,
+/// so it takes no lookup reference.
+fn entry_without_attributes() -> Entry {
+    Entry {
+        inode: 0,
+        generation: 0,
+        // Safe because stat64 is plain data, for which all-zero bytes are a valid value.
+        attr: unsafe { std::mem::zeroed() },
+        attr_flags: 0,
+        attr_timeout: Duration::ZERO,
+        entry_timeout: Duration::ZERO,
+    }
+}
+
 fn forget_one(
     inodes: &mut MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>,
     inode: Inode,
@@ -1591,16 +1605,30 @@ impl FileSystem for PassthroughFs {
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
         self.do_readdir(inode, handle, size, offset, |dir_entry| {
-            // Safe because the kernel guarantees that the buffer is nul-terminated. Additionally,
-            // the kernel will pad the name with '\0' bytes up to 8-byte alignment and there's no
-            // way for us to know exactly how many padding bytes there are. This would cause
-            // `CStr::from_bytes_with_nul` to return an error because it would think there are
-            // interior '\0' bytes. We trust the kernel to provide us with properly formatted data
-            // so we'll just skip the checks here.
-            let name = unsafe { CStr::from_bytes_with_nul_unchecked(dir_entry.name) };
-            let entry = self.lookup(ctx, inode, name)?;
-
-            add_entry(dir_entry, entry)
+            // The directory stream keeps each name without a NUL, and without "." and "..".
+            let name = CString::new(dir_entry.name).map_err(|_| einval())?;
+            let entry = match self.lookup(ctx, inode, &name) {
+                Ok(entry) => entry,
+                // A name removed since the directory was read still lists, without attributes,
+                // instead of ending the reply early.
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                    return add_entry(dir_entry, entry_without_attributes());
+                }
+                Err(e) => return Err(e),
+            };
+            let looked_up = entry.inode;
+            match add_entry(dir_entry, entry) {
+                // The entry did not fit, so the kernel never saw the reference this lookup took.
+                Ok(0) => {
+                    forget_one(&mut self.inodes.write().unwrap(), looked_up, 1);
+                    Ok(0)
+                }
+                Err(e) => {
+                    forget_one(&mut self.inodes.write().unwrap(), looked_up, 1);
+                    Err(e)
+                }
+                added => added,
+            }
         })
     }
 
