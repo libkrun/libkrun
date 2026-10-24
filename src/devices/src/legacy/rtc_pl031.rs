@@ -9,7 +9,6 @@
 //!
 
 use std::fmt;
-use std::time::Instant;
 use std::{io, result};
 
 use crate::BusDevice;
@@ -54,9 +53,35 @@ impl fmt::Display for Error {
 }
 type Result<T> = result::Result<T, Error>;
 
+/// Nanoseconds on a host clock that keeps counting while the host sleeps, so
+/// the guest's wall clock does not fall behind across a host suspend.
+fn host_clock_ns() -> i128 {
+    #[cfg(target_os = "macos")]
+    let clock = libc::CLOCK_MONOTONIC;
+    #[cfg(not(target_os = "macos"))]
+    let clock = libc::CLOCK_BOOTTIME;
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a live, exclusively borrowed timespec, so the kernel
+    // writes only into memory we own and nothing else aliases it.
+    let ret = unsafe { libc::clock_gettime(clock, &mut ts) };
+    // The call fails only for a clock id the host does not support. Both ids
+    // exist on every host this code builds for, so a failure means a broken
+    // host. Stop rather than let the guest clock freeze without a trace.
+    assert_eq!(
+        ret,
+        0,
+        "clock_gettime({clock}) failed: {}",
+        io::Error::last_os_error()
+    );
+    (ts.tv_sec as i128) * (utils::time::NANOS_PER_SECOND as i128) + (ts.tv_nsec as i128)
+}
+
 /// A RTC device following the PL031 specification..
 pub struct RTC {
-    previous_now: Instant,
+    previous_now: i128,
     tick_offset: i64,
     // This is used for implementing the RTC alarm. However, in Firecracker we do not need it.
     match_value: u32,
@@ -72,7 +97,7 @@ impl RTC {
     pub fn new(interrupt_evt: EventFd) -> RTC {
         RTC {
             // This is used only for duration measuring purposes.
-            previous_now: Instant::now(),
+            previous_now: host_clock_ns(),
             tick_offset: utils::time::get_time(utils::time::ClockType::Real) as i64,
             match_value: 0,
             load: 0,
@@ -87,8 +112,7 @@ impl RTC {
     }
 
     fn get_time(&self) -> u32 {
-        let ts = (self.tick_offset as i128)
-            + (Instant::now().duration_since(self.previous_now).as_nanos() as i128);
+        let ts = (self.tick_offset as i128) + (host_clock_ns() - self.previous_now);
         (ts / utils::time::NANOS_PER_SECOND as i128) as u32
     }
 
@@ -104,7 +128,7 @@ impl RTC {
             }
             RTCLR => {
                 self.load = val;
-                self.previous_now = Instant::now();
+                self.previous_now = host_clock_ns();
                 // If the unwrap fails, then the internal value of the clock has been corrupted and
                 // we want to terminate the execution of the process.
                 self.tick_offset = utils::time::seconds_to_nanoseconds(i64::from(val)).unwrap();
