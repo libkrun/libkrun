@@ -1404,6 +1404,14 @@ impl FileSystem for PassthroughFs {
             self.announce_submounts.store(true, Ordering::Relaxed);
         }
 
+        // Every lookup costs a round trip through the VMM, so let the kernel fetch a directory's
+        // attributes along with its entries, and look up names in one directory concurrently.
+        // Neither `readdirplus` nor `lookup` takes a lock on the directory.
+        opts |= capable
+            & (FsOptions::DO_READDIRPLUS
+                | FsOptions::READDIRPLUS_AUTO
+                | FsOptions::PARALLEL_DIROPS);
+
         Ok(opts)
     }
 
