@@ -3058,10 +3058,9 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     };
 
+    // On macOS, devices change the guest's memory map through the worker.
     #[cfg(target_os = "macos")]
-    if ctx_cfg.gpu_virgl_flags.is_some() {
-        vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
-    }
+    vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
 
     #[cfg(target_arch = "x86_64")]
     if ctx_cfg.vmr.split_irqchip {
