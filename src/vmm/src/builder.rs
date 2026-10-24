@@ -46,6 +46,8 @@ use devices::legacy::{IoApic, IrqChipT};
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
+#[cfg(not(feature = "tee"))]
+use devices::virtio::balloon::FreePageReportingMode;
 use devices::virtio::{port_io, MmioTransport, PortDescription, VirtioDevice, Vsock};
 
 #[cfg(feature = "tee")]
@@ -987,6 +989,7 @@ pub fn build_microvm(
         &mut vmm,
         event_manager,
         intc.clone(),
+        vm_resources.balloon_free_page_reporting_mode,
         #[cfg(target_os = "macos")]
         _sender.clone(),
     )?;
@@ -2223,17 +2226,23 @@ fn attach_balloon_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
     intc: IrqChip,
+    free_page_reporting_mode: FreePageReportingMode,
     #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
     let balloon = Arc::new(Mutex::new(devices::virtio::Balloon::new().unwrap()));
     #[cfg(target_os = "macos")]
-    balloon
-        .lock()
-        .unwrap()
-        .set_map_sender(map_sender)
-        .map_err(CreateBalloonDevice)?;
+    {
+        let mut balloon = balloon.lock().unwrap();
+        balloon.set_free_page_reporting_mode(free_page_reporting_mode);
+        balloon
+            .set_map_sender(map_sender)
+            .map_err(CreateBalloonDevice)?;
+    }
+    // Only macOS implements a mode other than the default.
+    #[cfg(not(target_os = "macos"))]
+    let _ = free_page_reporting_mode;
 
     event_manager
         .add_subscriber(balloon.clone())

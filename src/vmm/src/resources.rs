@@ -28,6 +28,8 @@ use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
 use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig, NetworkInterfaceError};
 use crate::vmm_config::vsock::*;
 use crate::vstate::VcpuConfig;
+#[cfg(not(feature = "tee"))]
+use devices::virtio::balloon::FreePageReportingMode;
 #[cfg(feature = "gpu")]
 use devices::virtio::display::DisplayInfo;
 #[cfg(feature = "tee")]
@@ -192,6 +194,9 @@ pub struct VmResources {
     pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
     /// Enable the embedded dhcp client in init.c
     pub dhcp_client: bool,
+    /// How the balloon gives the memory of free page reports back to the host.
+    #[cfg(not(feature = "tee"))]
+    pub balloon_free_page_reporting_mode: FreePageReportingMode,
 }
 
 impl VmResources {
@@ -401,6 +406,8 @@ mod tests {
     use crate::vmm_config::machine_config::{CpuFeaturesTemplate, VmConfig, VmConfigError};
     use crate::vmm_config::vsock::tests::{default_config, TempSockFile};
     use crate::vstate::VcpuConfig;
+    #[cfg(not(feature = "tee"))]
+    use devices::virtio::balloon::FreePageReportingMode;
     use utils::tempfile::TempFile;
 
     fn default_kernel_cmdline() -> KernelCmdlineConfig {
@@ -444,6 +451,8 @@ mod tests {
             virtio_consoles: Vec::new(),
             kernel_console: None,
             dhcp_client: false,
+            #[cfg(not(feature = "tee"))]
+            balloon_free_page_reporting_mode: FreePageReportingMode::Default,
         }
     }
 
