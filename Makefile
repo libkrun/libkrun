@@ -17,6 +17,9 @@ KRUN_INIT_BINARY_Darwin = libkrun_init.$(KRUN_INIT_FULL_VERSION).dylib
 KRUN_INIT_SONAME_Darwin = libkrun_init.$(KRUN_INIT_ABI_VERSION).dylib
 KRUN_INIT_BASE_Darwin = libkrun_init.dylib
 
+INSTALL_NAME_KRUN_Darwin = @rpath/$(KRUN_SONAME_Darwin)
+INSTALL_NAME_KRUN_INIT_Darwin = @rpath/$(KRUN_INIT_SONAME_Darwin)
+
 # Install prefix for `make test` and, going forward, the examples. Defined
 # early so goal names (e.g. `test-prefix`) and their recipes reference one
 # symbol; renaming the directory is a single-line change.
@@ -229,9 +232,12 @@ ifeq ($(OS),Darwin)
 ifneq ($(KRUN_BASE_$(OS)),libkrun.dylib)
 	mv target/release/libkrun.dylib target/release/$(KRUN_BASE_$(OS))
 endif
+	install_name_tool -id $(INSTALL_NAME_KRUN_Darwin) target/release/$(KRUN_BASE_$(OS))
+	install_name_tool -id $(INSTALL_NAME_KRUN_INIT_Darwin) target/release/$(KRUN_INIT_BASE_$(OS))
 endif
 	cp target/release/$(KRUN_BASE_$(OS)) $(LIBRARY_RELEASE_$(OS))
 	cp target/release/$(KRUN_INIT_BASE_$(OS)) target/release/$(KRUN_INIT_BINARY_$(OS))
+	cd target/release ; ln -sf $(KRUN_BINARY_$(OS)) $(KRUN_SONAME_$(OS)) ; ln -sf $(KRUN_INIT_BINARY_$(OS)) $(KRUN_INIT_SONAME_$(OS))
 
 $(LIBRARY_DEBUG_$(OS)): $(INIT_BINARY_BSD)
 	cargo build $(FEATURE_FLAGS)
@@ -242,8 +248,13 @@ endif
 ifeq ($(TDX),1)
 	mv target/debug/libkrun.so target/debug/$(KRUN_BASE_$(OS))
 endif
+ifeq ($(OS),Darwin)
+	install_name_tool -id $(INSTALL_NAME_KRUN_Darwin) target/debug/$(KRUN_BASE_$(OS))
+	install_name_tool -id $(INSTALL_NAME_KRUN_INIT_Darwin) target/debug/$(KRUN_INIT_BASE_$(OS))
+endif
 	cp target/debug/$(KRUN_BASE_$(OS)) $(LIBRARY_DEBUG_$(OS))
 	cp target/debug/$(KRUN_INIT_BASE_$(OS)) target/debug/$(KRUN_INIT_BINARY_$(OS))
+	cd target/debug ; ln -sf $(KRUN_BINARY_$(OS)) $(KRUN_SONAME_$(OS)) ; ln -sf $(KRUN_INIT_BINARY_$(OS)) $(KRUN_INIT_SONAME_$(OS))
 
 libkrun.pc: libkrun.pc.in Makefile
 	rm -f $@ $@-t
