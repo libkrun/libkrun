@@ -1,15 +1,14 @@
 use std::cmp;
-use std::convert::TryInto;
 use std::io::Write;
 
 use utils::eventfd::EventFd;
-use vm_memory::{ByteValued, GuestMemory, GuestMemoryMmap};
+use vm_memory::{ByteValued, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, BalloonError, DeviceQueue, DeviceState, QueueConfig,
     VirtioDevice,
 };
-use super::{defs, defs::uapi};
+use super::{defs, defs::uapi, FreePageReclaim};
 use crate::virtio::InterruptTransport;
 
 // Inflate queue.
@@ -45,6 +44,52 @@ pub struct VirtioBalloonConfig {
 // Safe because it only has data and has no implicit padding.
 unsafe impl ByteValued for VirtioBalloonConfig {}
 
+/// A range of a free page report that is within a single region of guest memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FreeRange {
+    pub(super) guest_addr: GuestAddress,
+    /// Where the VMM maps the range.
+    pub(super) host_addr: *mut u8,
+    pub(super) len: usize,
+}
+
+impl FreeRange {
+    /// Returns the range of `len` bytes at `guest_addr`, if it's within a single region of
+    /// `mem`.
+    pub(super) fn new(mem: &GuestMemoryMmap, guest_addr: GuestAddress, len: usize) -> Option<Self> {
+        let slice = mem.get_slice(guest_addr, len).ok()?;
+        Some(Self {
+            guest_addr,
+            host_addr: slice.ptr_guard_mut().as_ptr(),
+            len,
+        })
+    }
+
+    pub(super) fn guest_end(&self) -> GuestAddress {
+        GuestAddress(self.guest_addr.0 + self.len as u64)
+    }
+}
+
+/// Merges the ranges of a report that are adjacent in the same region of guest memory, so that
+/// each run of them is released with a single system call.
+pub(super) fn coalesce(mem: &GuestMemoryMmap, mut ranges: Vec<FreeRange>) -> Vec<FreeRange> {
+    // Linux fills a report from the free lists of its page allocator, which aren't sorted by
+    // address.
+    ranges.sort_unstable_by_key(|range| range.guest_addr);
+    ranges.dedup_by(|next, prev| {
+        if prev.guest_end() != next.guest_addr {
+            return false;
+        }
+        // Two regions can be adjacent in guest memory without being adjacent in the VMM's.
+        let Some(merged) = FreeRange::new(mem, prev.guest_addr, prev.len + next.len) else {
+            return false;
+        };
+        *prev = merged;
+        true
+    });
+    ranges
+}
+
 pub struct Balloon {
     pub(crate) queues: Option<Vec<DeviceQueue>>,
     pub(crate) avail_features: u64,
@@ -52,6 +97,7 @@ pub struct Balloon {
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
     config: VirtioBalloonConfig,
+    pub(super) reclaim: FreePageReclaim,
 }
 
 impl Balloon {
@@ -64,6 +110,7 @@ impl Balloon {
                 .map_err(BalloonError::EventFd)?,
             device_state: DeviceState::Inactive,
             config: VirtioBalloonConfig::default(),
+            reclaim: Default::default(),
         })
     }
 
@@ -83,36 +130,38 @@ impl Balloon {
             .queues
             .as_mut()
             .expect("queues should exist when activated");
-        let mut have_used = false;
 
+        // Reports stay in the queue while too many are still being reclaimed.
+        if !self.reclaim.can_take_report() {
+            return false;
+        }
+
+        let mut have_used = false;
         while let Some(head) = queues[FRQ_INDEX].queue.pop(mem) {
             let index = head.index;
+            let mut ranges = Vec::new();
             for desc in head.into_iter() {
                 // The range comes from the guest. Releasing one that runs past the end of
                 // a guest memory region would discard whatever the VMM has mapped after it.
-                let Ok(slice) = mem.get_slice(desc.addr, desc.len as usize) else {
+                let Some(range) = FreeRange::new(mem, desc.addr, desc.len as usize) else {
                     warn!(
                         "balloon: ignoring free page report outside guest memory: guest_addr={:?} len={}",
                         desc.addr, desc.len
                     );
                     continue;
                 };
-                let host_addr = slice.ptr_guard_mut().as_ptr();
                 debug!(
                     "balloon: should release guest_addr={:?} host_addr={:p} len={}",
-                    desc.addr, host_addr, desc.len
+                    range.guest_addr, range.host_addr, range.len
                 );
-                #[cfg(target_os = "linux")]
-                let advice = libc::MADV_DONTNEED;
-                #[cfg(target_os = "macos")]
-                let advice = libc::MADV_FREE;
-                unsafe {
-                    libc::madvise(
-                        host_addr as *mut libc::c_void,
-                        desc.len.try_into().unwrap(),
-                        advice,
-                    )
-                };
+                ranges.push(range);
+            }
+
+            if self.reclaim.release(mem, index, ranges) {
+                if !self.reclaim.can_take_report() {
+                    break;
+                }
+                continue;
             }
 
             have_used = true;
@@ -200,5 +249,171 @@ impl VirtioDevice for Balloon {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_util::TestDevice;
+    use super::*;
+
+    const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn test_report_is_used_and_signaled() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (16 * MIB) as usize)]).unwrap();
+        let mut dev = TestDevice::new(&mem);
+        dev.report(&[(4 * MIB, 2 * MIB as u32)]);
+        dev.notify();
+
+        assert_eq!(dev.used(), 1);
+        assert_eq!(dev.frq.used.ring[0].get().id, 0);
+        assert!(dev.signaled());
+        assert_eq!(dev.pending(&mem), 0);
+    }
+
+    #[test]
+    fn test_report_outside_guest_memory_is_still_used() {
+        // A hole of 3 MiB between two regions.
+        let mem = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), MIB as usize),
+            (GuestAddress(4 * MIB), MIB as usize),
+        ])
+        .unwrap();
+        let mut dev = TestDevice::new(&mem);
+        dev.report(&[
+            // Past the end of a region, in the hole, from a hole into a region, and way out.
+            (MIB - 0x1000, 0x2000),
+            (2 * MIB, 0x1000),
+            (4 * MIB - 0x1000, 0x2000),
+            (u64::MAX - 0x1000, 0x2000),
+        ]);
+        dev.notify();
+
+        assert_eq!(dev.used(), 1);
+        assert!(dev.signaled());
+        assert_eq!(dev.pending(&mem), 0);
+    }
+
+    fn ranges(mem: &GuestMemoryMmap, ranges: &[(u64, usize)]) -> Vec<FreeRange> {
+        ranges
+            .iter()
+            .map(|&(addr, len)| FreeRange::new(mem, GuestAddress(addr), len).unwrap())
+            .collect()
+    }
+
+    fn assert_coalesced(reported: &[(u64, usize)], expected: &[(u64, usize)]) {
+        // Two regions that are adjacent in guest memory.
+        let mem = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), MIB as usize),
+            (GuestAddress(MIB), MIB as usize),
+        ])
+        .unwrap();
+        assert_eq!(
+            coalesce(&mem, ranges(&mem, reported)),
+            ranges(&mem, expected)
+        );
+    }
+
+    #[test]
+    fn test_release_discards_each_run_of_adjacent_ranges_once() {
+        // Two regions that are adjacent in guest memory.
+        let mem = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), MIB as usize),
+            (GuestAddress(MIB), MIB as usize),
+        ])
+        .unwrap();
+        let reported = ranges(
+            &mem,
+            &[
+                (0x4000, 0x1000),
+                (MIB, 0x1000),
+                (0x1000, 0x1000),
+                (0x8000, 0x1000),
+                (0x2000, 0x2000),
+                (MIB - 0x1000, 0x1000),
+            ],
+        );
+
+        let mut balloon = Balloon::new().unwrap();
+        let mut discarded = Vec::new();
+        let in_flight = balloon
+            .reclaim
+            .release_with(&mem, 0, reported, |range| discarded.push(*range));
+
+        assert!(!in_flight);
+        assert_eq!(
+            discarded,
+            ranges(
+                &mem,
+                &[
+                    (0x1000, 0x4000),
+                    (0x8000, 0x1000),
+                    (MIB - 0x1000, 0x1000),
+                    (MIB, 0x1000)
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn test_coalesce_adjacent_ranges() {
+        assert_coalesced(
+            &[(0x1000, 0x1000), (0x2000, 0x2000), (0x4000, 0x1000)],
+            &[(0x1000, 0x4000)],
+        );
+    }
+
+    #[test]
+    fn test_coalesce_unsorted_ranges() {
+        assert_coalesced(
+            &[(0x4000, 0x1000), (0x1000, 0x1000), (0x2000, 0x2000)],
+            &[(0x1000, 0x4000)],
+        );
+    }
+
+    #[test]
+    fn test_coalesce_keeps_ranges_with_gaps_apart() {
+        assert_coalesced(
+            &[
+                (0x1000, 0x1000),
+                (0x3000, 0x1000),
+                (0x5000, 0x1000),
+                (0x6000, 0x1000),
+            ],
+            &[(0x1000, 0x1000), (0x3000, 0x1000), (0x5000, 0x2000)],
+        );
+    }
+
+    #[test]
+    fn test_coalesce_keeps_overlapping_ranges_apart() {
+        // Adding up their lengths would release memory that the guest didn't report.
+        assert_coalesced(
+            &[(0x1000, 0x2000), (0x2000, 0x2000), (0x2000, 0x2000)],
+            &[(0x1000, 0x2000), (0x2000, 0x2000), (0x2000, 0x2000)],
+        );
+    }
+
+    #[test]
+    fn test_coalesce_keeps_regions_apart() {
+        assert_coalesced(
+            &[
+                (MIB - 0x2000, 0x1000),
+                (MIB - 0x1000, 0x1000),
+                (MIB, 0x1000),
+                (MIB + 0x1000, 0x1000),
+            ],
+            &[(MIB - 0x2000, 0x2000), (MIB, 0x2000)],
+        );
+    }
+
+    #[test]
+    fn test_coalesce_empty_report() {
+        assert_coalesced(&[], &[]);
+    }
+
+    #[test]
+    fn test_coalesce_single_range() {
+        assert_coalesced(&[(0x1000, 0x1000)], &[(0x1000, 0x1000)]);
     }
 }

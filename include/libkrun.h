@@ -1051,6 +1051,36 @@ int32_t krun_set_nested_virt(uint32_t ctx_id, bool enabled);
  */
 int32_t krun_check_nested_virt(void);
 
+/* Free page reporting modes for krun_set_balloon_free_page_reporting_mode() */
+#define KRUN_FREE_PAGE_REPORTING_MODE_DEFAULT 0
+#define KRUN_FREE_PAGE_REPORTING_MODE_REPLACE 1
+
+/**
+ * Sets how the memory that the guest reports as free through the virtio-balloon
+ * device is given back to the host.
+ *
+ * KRUN_FREE_PAGE_REPORTING_MODE_DEFAULT, the default, madvise()s it. On macOS, this
+ * doesn't release guest memory that the guest has written to.
+ *
+ * KRUN_FREE_PAGE_REPORTING_MODE_REPLACE has the VMM replace the reported pages with
+ * fresh memory on macOS instead, which does release them. This costs a few system
+ * calls per report, and the guest's next access to each page faults it in again.
+ * Other platforms don't implement it, and use KRUN_FREE_PAGE_REPORTING_MODE_DEFAULT
+ * instead.
+ *
+ * The guest only reports free pages if its kernel has CONFIG_PAGE_REPORTING and the
+ * virtio-balloon driver.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *  "mode"   - one of the KRUN_FREE_PAGE_REPORTING_MODE_* values.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure. Fails with -ENOTSUP if libkrun
+ *  was built for a TEE, whose VMs have no balloon device.
+ */
+int32_t krun_set_balloon_free_page_reporting_mode(uint32_t ctx_id, uint32_t mode);
+
 /* Feature constants for krun_has_feature() */
 #define KRUN_FEATURE_NET 0
 #define KRUN_FEATURE_BLK 1

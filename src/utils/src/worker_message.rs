@@ -18,5 +18,9 @@ pub enum WorkerMessage {
     GpuAddMapping(crossbeam_channel::Sender<bool>, u64, u64, u64),
     #[cfg(target_os = "macos")]
     GpuRemoveMapping(crossbeam_channel::Sender<bool>, u64, u64),
+    /// Gives the host pages backing a range of guest RAM back to the system; the range reads
+    /// as zeroes afterwards. Replies whether they were given back.
+    #[cfg(target_os = "macos")]
+    ReclaimMemory(crossbeam_channel::Sender<bool>, u64, u64),
     ConvertMemory(crossbeam_channel::Sender<bool>, MemoryProperties),
 }

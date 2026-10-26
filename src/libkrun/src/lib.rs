@@ -2,6 +2,8 @@
 extern crate log;
 
 use crossbeam_channel::unbounded;
+#[cfg(not(feature = "tee"))]
+use devices::virtio::balloon::FreePageReportingMode;
 #[cfg(feature = "blk")]
 use devices::virtio::block::{ImageType, SyncMode};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -1989,6 +1991,34 @@ pub unsafe extern "C" fn krun_check_nested_virt() -> i32 {
     -libc::EOPNOTSUPP
 }
 
+#[cfg(not(feature = "tee"))]
+const KRUN_FREE_PAGE_REPORTING_MODE_DEFAULT: u32 = 0;
+#[cfg(not(feature = "tee"))]
+const KRUN_FREE_PAGE_REPORTING_MODE_REPLACE: u32 = 1;
+
+#[cfg(not(feature = "tee"))]
+#[no_mangle]
+pub extern "C" fn krun_set_balloon_free_page_reporting_mode(ctx_id: u32, mode: u32) -> i32 {
+    let mode = match mode {
+        KRUN_FREE_PAGE_REPORTING_MODE_DEFAULT => FreePageReportingMode::Default,
+        KRUN_FREE_PAGE_REPORTING_MODE_REPLACE => FreePageReportingMode::Replace,
+        _ => return -libc::EINVAL,
+    };
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg.get_mut().vmr.balloon_free_page_reporting_mode = mode;
+            KRUN_SUCCESS
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
+}
+
+#[cfg(feature = "tee")]
+#[no_mangle]
+pub extern "C" fn krun_set_balloon_free_page_reporting_mode(_ctx_id: u32, _mode: u32) -> i32 {
+    -libc::ENOTSUP
+}
+
 const KRUN_FEATURE_NET: u64 = 0;
 const KRUN_FEATURE_BLK: u64 = 1;
 const KRUN_FEATURE_GPU: u64 = 2;
@@ -3058,10 +3088,9 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     };
 
+    // On macOS, devices change the guest's memory map through the worker.
     #[cfg(target_os = "macos")]
-    if ctx_cfg.gpu_virgl_flags.is_some() {
-        vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
-    }
+    vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
 
     #[cfg(target_arch = "x86_64")]
     if ctx_cfg.vmr.split_irqchip {
@@ -3125,6 +3154,51 @@ mod test_disable_implicit_init {
         );
         drop(ctx_map);
         assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
+    }
+}
+
+#[cfg(all(test, not(feature = "tee")))]
+mod test_balloon_free_page_reporting_mode {
+    use super::*;
+
+    fn mode(ctx: u32) -> FreePageReportingMode {
+        CTX_MAP
+            .lock()
+            .unwrap()
+            .get(&ctx)
+            .unwrap()
+            .vmr
+            .balloon_free_page_reporting_mode
+    }
+
+    #[test]
+    fn test_set_balloon_free_page_reporting_mode() {
+        let ctx = krun_create_ctx() as u32;
+        assert_eq!(mode(ctx), FreePageReportingMode::Default);
+
+        assert_eq!(
+            krun_set_balloon_free_page_reporting_mode(ctx, KRUN_FREE_PAGE_REPORTING_MODE_REPLACE),
+            KRUN_SUCCESS
+        );
+        assert_eq!(mode(ctx), FreePageReportingMode::Replace);
+
+        assert_eq!(
+            krun_set_balloon_free_page_reporting_mode(ctx, 2),
+            -libc::EINVAL
+        );
+        assert_eq!(mode(ctx), FreePageReportingMode::Replace);
+
+        assert_eq!(
+            krun_set_balloon_free_page_reporting_mode(ctx, KRUN_FREE_PAGE_REPORTING_MODE_DEFAULT),
+            KRUN_SUCCESS
+        );
+        assert_eq!(mode(ctx), FreePageReportingMode::Default);
+
+        assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
+        assert_eq!(
+            krun_set_balloon_free_page_reporting_mode(ctx, KRUN_FREE_PAGE_REPORTING_MODE_REPLACE),
+            -libc::ENOENT
+        );
     }
 }
 

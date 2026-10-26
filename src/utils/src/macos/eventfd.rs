@@ -38,7 +38,7 @@ impl EventFd {
     pub fn new(flag: i32) -> result::Result<EventFd, io::Error> {
         let (read_fd, write_fd) = pipe()?;
 
-        if flag == EFD_NONBLOCK {
+        if flag & EFD_NONBLOCK != 0 {
             set_nonblock(&read_fd)?;
             set_nonblock(&write_fd)?;
         }
