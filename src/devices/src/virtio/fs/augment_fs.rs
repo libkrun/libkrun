@@ -4,8 +4,10 @@
 // FUSE operations for virtual inodes — synthetic read-only files that exist
 // only in memory. All other operations are delegated to the inner filesystem.
 //
-// Virtual inodes are injected into the root directory (parent = ROOT_ID) and
-// are currently only accessible via lookup (they do not appear in readdir).
+// Virtual inodes are injected into the root directory (parent = ROOT_ID).
+// readdir only lists the entries of the inner filesystem: a virtual inode is
+// listed only when it shadows one of them, and then with the identity lookup
+// returns for it.
 //
 // One-shot files can only be looked up once — the name is removed from the
 // directory on first lookup so subsequent lookups return ENOENT.
@@ -143,6 +145,38 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> AugmentFs<T> {
         }
         (st, timeout)
     }
+
+    fn virtual_entry(ino: Inode, vnode: &VirtualEntry) -> Entry {
+        let (attr, timeout) = Self::virtual_stat(ino, vnode);
+        Entry {
+            inode: ino,
+            generation: 0,
+            attr,
+            attr_flags: 0,
+            attr_timeout: timeout,
+            entry_timeout: timeout,
+        }
+    }
+
+    /// Returns `dir_entry` and its `Entry` as `lookup` reports them when a
+    /// virtual inode shadows `dir_entry` in `parent`, without consuming a
+    /// one-shot name.
+    fn shadowing_entry<'a>(
+        &self,
+        parent: Inode,
+        dir_entry: &DirEntry<'a>,
+    ) -> Option<(DirEntry<'a>, Entry)> {
+        let key = (parent, CString::new(dir_entry.name).ok()?);
+        let inode = *self.name_to_inode.read().unwrap().get(&key)?;
+        let inodes = self.inodes.read().unwrap();
+        let vnode = inodes.get(&inode)?;
+        let shadowing = DirEntry {
+            ino: inode,
+            type_: vnode.dirent_type(),
+            ..*dir_entry
+        };
+        Some((shadowing, Self::virtual_entry(inode, vnode)))
+    }
 }
 
 impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> {
@@ -164,21 +198,14 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
             let inodes = self.inodes.read().unwrap();
             if let Some(vnode) = inodes.get(&inode) {
                 let one_shot = vnode.one_shot;
-                let (st, timeout) = Self::virtual_stat(inode, vnode);
+                let entry = Self::virtual_entry(inode, vnode);
 
                 if one_shot {
                     drop(inodes);
                     self.name_to_inode.write().unwrap().remove(&key);
                 }
 
-                return Ok(Entry {
-                    inode,
-                    generation: 0,
-                    attr: st,
-                    attr_flags: 0,
-                    attr_timeout: timeout,
-                    entry_timeout: timeout,
-                });
+                return Ok(entry);
             }
         }
         self.inner.lookup(ctx, parent, name)
@@ -522,13 +549,18 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
         handle: Handle,
         size: u32,
         offset: u64,
-        add_entry: F,
+        mut add_entry: F,
     ) -> io::Result<()>
     where
         F: FnMut(DirEntry) -> io::Result<usize>,
     {
         self.inner
-            .readdir(ctx, inode, handle, size, offset, add_entry)
+            .readdir(ctx, inode, handle, size, offset, |dir_entry| {
+                match self.shadowing_entry(inode, &dir_entry) {
+                    Some((shadowing, _)) => add_entry(shadowing),
+                    None => add_entry(dir_entry),
+                }
+            })
     }
 
     fn readdirplus<F>(
@@ -538,13 +570,25 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
         handle: Handle,
         size: u32,
         offset: u64,
-        add_entry: F,
+        mut add_entry: F,
     ) -> io::Result<()>
     where
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
-        self.inner
-            .readdirplus(ctx, inode, handle, size, offset, add_entry)
+        self.inner.readdirplus(
+            ctx,
+            inode,
+            handle,
+            size,
+            offset,
+            |dir_entry, entry| match self.shadowing_entry(inode, &dir_entry) {
+                Some((shadowing, virtual_entry)) => {
+                    self.inner.forget(ctx, entry.inode, 1);
+                    add_entry(shadowing, virtual_entry)
+                }
+                None => add_entry(dir_entry, entry),
+            },
+        )
     }
 
     fn fsyncdir(
@@ -759,5 +803,192 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
                 ctx, inode, handle, flags, cmd, arg, in_size, out_size, exit_code,
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    const SHADOWED: &CStr = c"shadowed";
+    const SHADOWED_REAL_INODE: Inode = 100;
+    const PLAIN: &CStr = c"plain";
+    const PLAIN_INODE: Inode = 101;
+    const DT_DIR: u32 = 4;
+    const DT_REG: u32 = 8;
+
+    const CTX: Context = Context {
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    };
+
+    #[derive(Default)]
+    struct InnerFs {
+        forgotten: Mutex<Vec<(Inode, u64)>>,
+    }
+
+    impl InnerFs {
+        fn dir_entries() -> [DirEntry<'static>; 2] {
+            [
+                DirEntry {
+                    ino: SHADOWED_REAL_INODE,
+                    offset: 1,
+                    type_: DT_REG,
+                    name: SHADOWED.to_bytes(),
+                },
+                DirEntry {
+                    ino: PLAIN_INODE,
+                    offset: 2,
+                    type_: DT_REG,
+                    name: PLAIN.to_bytes(),
+                },
+            ]
+        }
+
+        fn entry(ino: Inode) -> Entry {
+            let mut attr: bindings::stat64 = unsafe { mem::zeroed() };
+            attr.st_ino = ino;
+            Entry {
+                inode: ino,
+                generation: 0,
+                attr,
+                attr_flags: 0,
+                attr_timeout: Duration::ZERO,
+                entry_timeout: Duration::ZERO,
+            }
+        }
+    }
+
+    impl FileSystem for InnerFs {
+        type Inode = Inode;
+        type Handle = Handle;
+
+        fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
+            self.forgotten.lock().unwrap().push((inode, count));
+        }
+
+        fn readdir<F>(
+            &self,
+            _ctx: Context,
+            _inode: Inode,
+            _handle: Handle,
+            _size: u32,
+            _offset: u64,
+            mut add_entry: F,
+        ) -> io::Result<()>
+        where
+            F: FnMut(DirEntry) -> io::Result<usize>,
+        {
+            for dir_entry in Self::dir_entries() {
+                add_entry(dir_entry)?;
+            }
+            Ok(())
+        }
+
+        fn readdirplus<F>(
+            &self,
+            _ctx: Context,
+            _inode: Inode,
+            _handle: Handle,
+            _size: u32,
+            _offset: u64,
+            mut add_entry: F,
+        ) -> io::Result<()>
+        where
+            F: FnMut(DirEntry, Entry) -> io::Result<usize>,
+        {
+            for dir_entry in Self::dir_entries() {
+                let entry = Self::entry(dir_entry.ino);
+                add_entry(dir_entry, entry)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn augment_fs() -> AugmentFs<InnerFs> {
+        let shadowing_dir = VirtualDirEntry {
+            name: SHADOWED.into(),
+            entry: VirtualEntry {
+                mode: 0o755,
+                one_shot: false,
+                content: VirtualEntryContent::Dir {
+                    children: Vec::new(),
+                },
+            },
+        };
+        AugmentFs::new(
+            InnerFs::default(),
+            &InodeAllocator::new(),
+            vec![shadowing_dir],
+        )
+    }
+
+    #[test]
+    fn readdirplus_reports_the_identity_lookup_returns_for_a_shadowed_name() {
+        let fs = augment_fs();
+        let looked_up = fs.lookup(CTX, fuse::ROOT_ID, SHADOWED).unwrap();
+        assert_ne!(looked_up.inode, SHADOWED_REAL_INODE);
+
+        let mut listed = Vec::new();
+        fs.readdirplus(CTX, fuse::ROOT_ID, 0, 4096, 0, |dir_entry, entry| {
+            listed.push((
+                dir_entry.name.to_vec(),
+                dir_entry.ino,
+                dir_entry.type_,
+                entry,
+            ));
+            Ok(1)
+        })
+        .unwrap();
+
+        let (name, ino, type_, entry) = &listed[0];
+        assert_eq!(name.as_slice(), SHADOWED.to_bytes());
+        assert_eq!(*ino, looked_up.inode);
+        assert_eq!(*type_, DT_DIR);
+        assert_eq!(entry.inode, looked_up.inode);
+        assert_eq!(entry.attr.st_ino, looked_up.attr.st_ino);
+        assert_eq!(entry.attr.st_mode, looked_up.attr.st_mode);
+
+        let (name, ino, _, entry) = &listed[1];
+        assert_eq!(name.as_slice(), PLAIN.to_bytes());
+        assert_eq!(*ino, PLAIN_INODE);
+        assert_eq!(entry.inode, PLAIN_INODE);
+    }
+
+    #[test]
+    fn readdirplus_forgets_the_inner_lookup_of_a_shadowed_name() {
+        let fs = augment_fs();
+
+        fs.readdirplus(CTX, fuse::ROOT_ID, 0, 4096, 0, |_, _| Ok(1))
+            .unwrap();
+
+        assert_eq!(
+            *fs.inner.forgotten.lock().unwrap(),
+            [(SHADOWED_REAL_INODE, 1)]
+        );
+    }
+
+    #[test]
+    fn readdir_reports_the_inode_lookup_returns_for_a_shadowed_name() {
+        let fs = augment_fs();
+        let looked_up = fs.lookup(CTX, fuse::ROOT_ID, SHADOWED).unwrap();
+
+        let mut listed = Vec::new();
+        fs.readdir(CTX, fuse::ROOT_ID, 0, 4096, 0, |dir_entry| {
+            listed.push((dir_entry.name.to_vec(), dir_entry.ino, dir_entry.type_));
+            Ok(1)
+        })
+        .unwrap();
+
+        assert_eq!(
+            listed,
+            [
+                (SHADOWED.to_bytes().to_vec(), looked_up.inode, DT_DIR),
+                (PLAIN.to_bytes().to_vec(), PLAIN_INODE, DT_REG),
+            ]
+        );
     }
 }

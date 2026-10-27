@@ -40,6 +40,11 @@ impl<'a> VirtualEntry<'a> {
         file_type | (self.mode & !(libc::S_IFMT as u32))
     }
 
+    /// Returns the directory entry type (`DT_*`) that matches `st_mode()`.
+    pub fn dirent_type(&self) -> u32 {
+        self.st_mode() >> 12
+    }
+
     pub fn data(&self) -> Option<&'a [u8]> {
         match &self.content {
             VirtualEntryContent::File { data } => Some(data),
