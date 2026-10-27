@@ -75,6 +75,11 @@ use test_virtiofs_root_ro::TestVirtiofsRootRo;
 mod test_augmentfs;
 use test_augmentfs::TestAugmentFs;
 
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_augmentfs_shadowed_dir;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_augmentfs_shadowed_dir::TestAugmentFsShadowedDir;
+
 mod test_root_disk_remount;
 use test_root_disk_remount::TestRootDiskRemount;
 
@@ -190,6 +195,8 @@ pub fn test_cases() -> Vec<TestCase> {
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-root-ro", Box::new(TestVirtiofsRootRo)),
         TestCase::new("augmentfs", Box::new(TestAugmentFs)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("augmentfs-shadowed-dir", Box::new(TestAugmentFsShadowedDir)),
         TestCase::new("root-disk-remount", Box::new(TestRootDiskRemount)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-misc", Box::new(TestVirtioFsMisc)),
