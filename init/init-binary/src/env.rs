@@ -12,7 +12,7 @@ use nix::errno::Errno;
 use nix::sys::socket::{self, AddressFamily, SockFlag, SockType};
 
 #[cfg(target_os = "linux")]
-pub fn setup_network(iface: &str) {
+pub fn setup_network(iface: &str, dhcp: bool, dhcp_renew: bool) {
     let Ok(sock) = socket::socket(
         AddressFamily::Inet,
         SockType::Datagram,
@@ -33,7 +33,7 @@ pub fn setup_network(iface: &str) {
         libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS as _, &ifr);
     }
 
-    setup_dhcp(iface, sock.as_raw_fd());
+    setup_dhcp(iface, sock.as_raw_fd(), dhcp, dhcp_renew);
 }
 
 #[cfg(target_os = "freebsd")]
@@ -73,8 +73,8 @@ pub fn setup_network() {
 pub fn setup_network() {}
 
 #[cfg(target_os = "linux")]
-fn setup_dhcp(iface: &str, sock: i32) {
-    if std::env::var("KRUN_DHCP").as_deref() != Ok("1") {
+fn setup_dhcp(iface: &str, sock: i32, dhcp: bool, renew: bool) {
+    if !dhcp {
         return;
     }
 
@@ -93,7 +93,7 @@ fn setup_dhcp(iface: &str, sock: i32) {
             ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
             libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr);
         }
-        if let Err(e) = crate::dhcp::do_dhcp(iface) {
+        if let Err(e) = crate::dhcp::do_dhcp(iface, renew) {
             eprintln!("Warning: DHCP configuration for {iface} failed: {e}");
         }
     }

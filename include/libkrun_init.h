@@ -165,6 +165,13 @@ typedef void (*krun_init_builder_rlimits_fn)(KrunInitBuilder* handle, const Krun
 /** Enable DHCP client in the guest. */
 void krun_init_builder_dhcp(KrunInitBuilder* handle, bool enable);
 typedef void (*krun_init_builder_dhcp_fn)(KrunInitBuilder* handle, bool enable);
+/**
+ * Keep the guest's DHCP lease renewed, retrying lost requests, instead of
+ * configuring the interface once. Intended for guests on a physical
+ * network; requires the DHCP client to be enabled.
+ */
+void krun_init_builder_dhcp_renew(KrunInitBuilder* handle, bool enable);
+typedef void (*krun_init_builder_dhcp_renew_fn)(KrunInitBuilder* handle, bool enable);
 /** Set the root disk to remount on boot. */
 void krun_init_builder_set_root_disk_remount(KrunInitBuilder* handle, KrunStr device, KrunStr fstype, KrunStr options);
 typedef void (*krun_init_builder_set_root_disk_remount_fn)(KrunInitBuilder* handle, KrunStr device, KrunStr fstype, KrunStr options);

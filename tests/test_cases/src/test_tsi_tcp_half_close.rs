@@ -19,6 +19,9 @@ fn payload(seed: u8, len: usize) -> Vec<u8> {
 #[host]
 mod host {
     use super::*;
+    #[cfg(feature = "dynamic-linking")]
+    use krun::DeviceManager;
+
     use anyhow::{Context, ensure};
     use std::io::{Read, Write};
     use std::net::{Shutdown, SocketAddrV4, TcpStream};

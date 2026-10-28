@@ -58,6 +58,7 @@ rutabaga_gfx = { version = "0.1.85", features = ["virgl_renderer"], optional = t
 caps = "0.5.5"
 kvm-bindings = { version = "0.14.1", features = ["fam-wrappers"] }
 kvm-ioctls = "0.25"
+vmm-sys-util = "0.15"
 
 [target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
 vm-fdt = ">= 0.2.0"
@@ -72,7 +73,9 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_Memory",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
 ] }

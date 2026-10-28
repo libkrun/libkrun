@@ -15,6 +15,7 @@ mod host {
     use crate::common::setup_and_run_with_env;
     use crate::{ShouldRun, Test, TestOutcome, TestSetup};
     use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
 
     impl Test for TestVirtioFsMisc {
         fn should_run(&self) -> ShouldRun {
@@ -75,6 +76,18 @@ mod host {
                 contents[8192..].iter().all(|&b| b == 0xAA),
                 "host: data after hole should be 0xAA"
             );
+
+            // Verify non-UTF-8 names: the guest's bytes reach the host directory
+            // as they are on Linux; macOS rewrites the invalid byte to U+FFFD.
+            let expected: &[u8] = if cfg!(target_os = "macos") {
+                "non_utf8_\u{FFFD}".as_bytes()
+            } else {
+                b"non_utf8_\xff"
+            };
+            let path = root
+                .join("test_non_utf8_names")
+                .join(std::ffi::OsStr::from_bytes(expected));
+            assert!(path.is_file(), "host: {} missing", path.display());
 
             TestOutcome::Pass
         }
@@ -717,6 +730,42 @@ mod guest {
         }
     }
 
+    /// File names are arbitrary bytes on Linux; the server must serve them
+    /// without assuming UTF-8. The `lookup` debug log used to format the
+    /// name with `to_str().unwrap()`, which panicked the fs worker thread on
+    /// the first such name and left every later request hanging, so with
+    /// the harness's trace logging this subtest never returns on that bug.
+    fn test_non_utf8_file_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = "/test_non_utf8_names";
+        fs::create_dir(dir).expect("mkdir");
+        let name = OsStr::from_bytes(b"non_utf8_\xff");
+        let file = std::path::Path::new(dir).join(name);
+        fs::write(&file, b"data").expect("write non-UTF-8 name");
+
+        let meta = fs::metadata(&file).expect("stat non-UTF-8 name");
+        assert_eq!(meta.len(), 4, "size of the non-UTF-8 named file");
+        assert_eq!(fs::read(&file).expect("read"), b"data");
+
+        // readdir must hand the entry back (compared lossily: a macOS host
+        // rewrites the invalid byte to U+FFFD and serves that consistently).
+        let listed = fs::read_dir(dir)
+            .expect("readdir")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            listed.contains(&name.to_string_lossy().into_owned()),
+            "readdir should list the non-UTF-8 name, got {listed:?}"
+        );
+
+        let sub = std::path::Path::new(dir).join(OsStr::from_bytes(b"dir_\xff"));
+        fs::create_dir(&sub).expect("mkdir non-UTF-8 dir");
+        fs::write(sub.join("inner"), b"").expect("write inside non-UTF-8 dir");
+        fs::metadata(sub.join("inner")).expect("stat inside non-UTF-8 dir");
+    }
+
     impl Test for TestVirtioFsMisc {
         fn in_guest(self: Box<Self>) {
             run_subtests(&[
@@ -747,6 +796,7 @@ mod guest {
                     test_uid_gid_mapping_preexisting_files,
                 ),
                 ("uid_gid_mapping_chown", test_uid_gid_mapping_chown),
+                ("non_utf8_file_names", test_non_utf8_file_names),
             ]);
         }
     }

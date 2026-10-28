@@ -18,11 +18,18 @@ use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 
 use crate::vmm::Vmm;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
+use crate::vmm::builder::attach_pci_device;
 use crate::vmm::builder::{attach_mmio_device, setup_terminal_raw_mode};
 use crate::vmm::device_manager::shm::ShmManager;
 #[cfg(any(feature = "gpu", feature = "vhost-user"))]
 use devices::display::{DisplayInfo, DisplayInfoEdid, PhysicalSize};
 use devices::legacy::IrqChip;
+#[cfg(not(feature = "tee"))]
+use devices::virtio::balloon::FreePageReportingMode;
 #[cfg(feature = "blk")]
 use devices::virtio::block::{DiskFormat, SyncMode};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -104,9 +111,36 @@ impl<'a> AttachContext<'a> {
         }
     }
 
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    pub(crate) fn new_pci(
+        vmm: &'a mut Vmm,
+        event_manager: &'a mut EventManager,
+        shm_manager: &'a ShmManager,
+        intc: IrqChip,
+        device_index: usize,
+    ) -> Self {
+        Self {
+            vmm,
+            event_manager,
+            shm_manager,
+            intc,
+            device_index,
+            register_fn: Box::new(|vmm, id, intc, device| {
+                attach_pci_device(vmm, id, intc, device)
+                    .map_err(|e| VmmError::Internal(format!("{e:?}")))?;
+                Ok(())
+            }),
+            #[cfg(target_os = "macos")]
+            map_sender: None,
+        }
+    }
+
     /// Register a virtio device on the transport bus.
     ///
-    /// The actual transport (MMIO, future PCIe) is determined by which
+    /// The actual transport (MMIO or PCI) is determined by which
     /// [`DeviceManager`] the device was added to.
     pub fn register(
         &mut self,
@@ -268,31 +302,43 @@ pub trait AttachDevice<'a>: Send + 'a {
 }
 
 mod sealed {
-    pub trait Sealed {}
+    use super::{DeviceRequirements, EventManager, IrqChip, ShmManager, Vmm, VmmError};
+
+    pub trait Sealed {
+        /// Collect requirements from all devices (called before guest memory creation).
+        fn requirements(&self) -> Vec<DeviceRequirements>;
+
+        /// Whether this manager registers devices on the PCI bus.
+        fn uses_pci(&self) -> bool {
+            false
+        }
+
+        /// Attach all devices using the given VMM context.
+        fn attach_all(
+            self: Box<Self>,
+            vmm: &mut Vmm,
+            event_manager: &mut EventManager,
+            shm_manager: &ShmManager,
+            intc: IrqChip,
+            #[cfg(target_os = "macos")] map_sender: Option<
+                crossbeam_channel::Sender<utils::worker_message::WorkerMessage>,
+            >,
+        ) -> Result<(), VmmError>;
+    }
 }
 
 /// A device manager that owns a set of devices and knows how to attach them
-/// to a VM using a specific transport (e.g. MMIO, future PCIe).
+/// to a VM using a specific transport (MMIO or PCI).
 ///
 /// This trait is sealed — only libkrun-provided managers can implement it.
 /// The seal may be lifted in a future major version.
+#[cfg_attr(feature = "ffi", ffier::export(no_vtable))]
 pub trait DeviceManager<'a>: sealed::Sealed + Send + 'a {
-    /// Collect requirements from all devices (called before guest memory creation).
-    #[doc(hidden)]
-    fn requirements(&self) -> Vec<DeviceRequirements>;
-
-    /// Attach all devices using the given VMM context.
-    #[doc(hidden)]
-    fn attach_all(
-        self: Box<Self>,
-        vmm: &mut Vmm,
-        event_manager: &mut EventManager,
-        shm_manager: &ShmManager,
-        intc: IrqChip,
-        #[cfg(target_os = "macos")] map_sender: Option<
-            crossbeam_channel::Sender<utils::worker_message::WorkerMessage>,
-        >,
-    ) -> Result<(), VmmError>;
+    /// Add a device to this manager, preserving the order devices are added.
+    #[cfg_attr(feature = "ffi", ffier(index = 0))]
+    fn add(&mut self, device: impl AttachDevice<'a>)
+    where
+        Self: Sized;
 }
 
 /// Device manager using the virtio-mmio transport.
@@ -304,13 +350,28 @@ pub struct MmioDeviceManager<'a> {
     devices: Vec<Box<dyn AttachDevice<'a> + 'a>>,
 }
 
+/// Device manager using the modern virtio-pci transport.
+///
+/// Available on x86_64 Linux and Windows hosts. The VM must enable ACPI with
+/// [`VmmBuilder::acpi`](crate::api::vmm_builder::VmmBuilder::acpi).
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
+#[derive(Default)]
+pub struct PciDeviceManager<'a> {
+    devices: Vec<Box<dyn AttachDevice<'a> + 'a>>,
+}
+
 #[cfg_attr(feature = "ffi", ffier::export)]
 impl<'a> MmioDeviceManager<'a> {
     /// Create an empty device manager.
     pub fn new() -> Self {
         Self::default()
     }
+}
 
+impl<'a> MmioDeviceManager<'a> {
     /// Add a device to this manager.
     ///
     /// Devices are attached in the order they are added. The device must
@@ -322,9 +383,14 @@ impl<'a> MmioDeviceManager<'a> {
     }
 }
 
-impl sealed::Sealed for MmioDeviceManager<'_> {}
-
+#[cfg_attr(feature = "ffi", ffier::export)]
 impl<'a> DeviceManager<'a> for MmioDeviceManager<'a> {
+    fn add(&mut self, device: impl AttachDevice<'a>) {
+        self.add(device);
+    }
+}
+
+impl sealed::Sealed for MmioDeviceManager<'_> {
     fn requirements(&self) -> Vec<DeviceRequirements> {
         self.devices.iter().map(|d| d.requirements()).collect()
     }
@@ -349,6 +415,90 @@ impl<'a> DeviceManager<'a> for MmioDeviceManager<'a> {
                 #[cfg(target_os = "macos")]
                 map_sender.clone(),
             );
+            device.attach(&mut ctx)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(
+        cfg = "all(target_arch = \"x86_64\", any(target_os = \"linux\", target_os = \"windows\"))"
+    )
+)]
+#[cfg_attr(
+    not(feature = "ffi"),
+    cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))
+)]
+impl<'a> PciDeviceManager<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
+impl<'a> PciDeviceManager<'a> {
+    pub fn add(&mut self, device: impl AttachDevice<'a>) -> &mut Self {
+        self.devices.push(Box::new(device));
+        self
+    }
+}
+
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(
+        cfg = "all(target_arch = \"x86_64\", any(target_os = \"linux\", target_os = \"windows\"))"
+    )
+)]
+#[cfg_attr(
+    not(feature = "ffi"),
+    cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))
+)]
+impl<'a> DeviceManager<'a> for PciDeviceManager<'a> {
+    fn add(&mut self, device: impl AttachDevice<'a>) {
+        self.add(device);
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
+impl sealed::Sealed for PciDeviceManager<'_> {
+    fn requirements(&self) -> Vec<DeviceRequirements> {
+        self.devices
+            .iter()
+            .map(|device| device.requirements())
+            .collect()
+    }
+
+    fn uses_pci(&self) -> bool {
+        true
+    }
+
+    fn attach_all(
+        self: Box<Self>,
+        vmm: &mut Vmm,
+        event_manager: &mut EventManager,
+        shm_manager: &ShmManager,
+        intc: IrqChip,
+        #[cfg(target_os = "macos")] _map_sender: Option<
+            crossbeam_channel::Sender<utils::worker_message::WorkerMessage>,
+        >,
+    ) -> Result<(), VmmError> {
+        for (index, device) in self.devices.into_iter().enumerate() {
+            let mut ctx =
+                AttachContext::new_pci(vmm, event_manager, shm_manager, intc.clone(), index);
             device.attach(&mut ctx)?;
         }
         Ok(())
@@ -871,9 +1021,7 @@ impl<'a> ConsoleBuilder<'a> {
         let stdout_is_tty = stdout.as_ref().is_some_and(|fd| fd.is_terminal());
         let stderr_is_tty = stderr.as_ref().is_some_and(|fd| fd.is_terminal());
 
-        let term_handle = if stdin_is_tty {
-            stdin
-        } else if stdout_is_tty {
+        let term_handle = if stdout_is_tty {
             stdout
         } else if stderr_is_tty {
             stderr
@@ -913,14 +1061,6 @@ impl<'a> ConsoleBuilder<'a> {
 
         let terminal: Option<Box<dyn devices::virtio::port_io::PortTerminalProperties>> =
             if let Some(tfd) = term_handle {
-                // SAFETY: The caller guarantees via `'a` that the borrowed file descriptor outlasts
-                // the console device and VMM. Currently, the VMM runs until process termination via `_exit()`,
-                // so the host file descriptor is valid for the remainder of the process.
-                // TODO: remove this transmute once we get proper support for stopping the VMM instead of _exit().
-                let static_fd = unsafe {
-                    std::mem::transmute::<BorrowedHandle<'a>, BorrowedHandle<'static>>(tfd)
-                };
-                self.tty_fds.push(static_fd);
                 Some(port_io::term_handle(tfd.as_raw_handle()).map_err(|e| {
                     log::error!("term fd: {e}");
                     VmmError::BadFd()
@@ -928,6 +1068,18 @@ impl<'a> ConsoleBuilder<'a> {
             } else {
                 Some(port_io::term_fixed_size(0, 0))
             };
+
+        if stdin_is_tty && let Some(tfd) = stdin {
+            // Raw input mode applies to the console input buffer, not the
+            // screen-buffer handle used above to determine window size.
+            // SAFETY: The caller guarantees via `'a` that the borrowed handle outlasts
+            // the console device and VMM. Currently, the VMM runs until process termination via `_exit()`,
+            // so the host handle is valid for the remainder of the process.
+            // TODO: remove this transmute once we get proper support for stopping the VMM instead of _exit().
+            let static_fd =
+                unsafe { std::mem::transmute::<BorrowedHandle<'a>, BorrowedHandle<'static>>(tfd) };
+            self.tty_fds.push(static_fd);
+        }
 
         // Port 0: default console (hvc0)
         self.ports.push(PortDescription {
@@ -1118,6 +1270,25 @@ impl BalloonDevice {
             inner: Arc::new(Mutex::new(balloon)),
         })
     }
+
+    /// Set how memory that the guest reports as free is given back to the host. Defaults to
+    /// [`FreePageReportingMode::Default`], which madvise()s it on Linux and macOS, and
+    /// discards it with DiscardVirtualMemory() on Windows.
+    ///
+    /// On macOS, madvise() doesn't release guest memory that the guest has written to.
+    /// [`FreePageReportingMode::Replace`] has the VMM replace the reported pages with fresh
+    /// memory instead, which does release them. This costs a few system calls per report, and
+    /// the guest's next access to each page faults it in again. Other platforms don't implement
+    /// [`FreePageReportingMode::Replace`], and use [`FreePageReportingMode::Default`] instead.
+    pub fn set_free_page_reporting_mode(&mut self, mode: FreePageReportingMode) {
+        #[cfg(target_os = "macos")]
+        self.inner
+            .lock()
+            .unwrap()
+            .set_free_page_reporting_mode(mode);
+        #[cfg(not(target_os = "macos"))]
+        let _ = mode;
+    }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
@@ -1125,6 +1296,12 @@ impl BalloonDevice {
 impl<'a> AttachDevice<'a> for BalloonDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        #[cfg(target_os = "macos")]
+        self.inner
+            .lock()
+            .unwrap()
+            .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
+            .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
         ctx.subscribe_events(self.inner.clone())?;
         ctx.register("balloon", self.inner)
     }

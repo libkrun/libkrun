@@ -9,6 +9,7 @@
 
 typedef void* KrunVmmError;
 typedef void* KrunMmioDeviceManager;
+typedef void* KrunPciDeviceManager;
 typedef void* KrunFsDevice;
 typedef void* KrunConsoleDevice;
 typedef void* KrunConsoleBuilder;
@@ -29,13 +30,14 @@ typedef void* KrunDisplayBackend;
 typedef void* KrunGpuDevice;
 typedef void* KrunInputDevice;
 typedef void* KrunAttachDevice; /* KrunFsDevice | KrunConsoleDevice | KrunBlockDevice | KrunNetDevice | KrunGpuDevice | KrunInputDevice | KrunVhostUserDevice | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice */
+typedef void* KrunDeviceManager; /* KrunMmioDeviceManager | KrunPciDeviceManager */
 typedef void* KrunError; /* KrunVmmError | KrunVtableError */
 typedef void* KrunPushStr; /* KrunVtablePushStr */
 
 #ifndef KRUN_PRIMITIVES_DEFINED
 #define KRUN_PRIMITIVES_DEFINED
 
-typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice */
+typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice */
 
 typedef uint64_t KrunResult;
 #define KRUN_RESULT_SUCCESS 0
@@ -138,6 +140,11 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 #define KRUN_SYNC_MODE_RELAXED 1
 #define KRUN_SYNC_MODE_FULL 2
 
+/* FreePageReportingMode --------------------------------------------- */
+
+#define KRUN_FREE_PAGE_REPORTING_MODE_DEFAULT 0
+#define KRUN_FREE_PAGE_REPORTING_MODE_REPLACE 1
+
 /* LogLevel ---------------------------------------------------------- */
 
 #define KRUN_LOG_LEVEL_OFF 0
@@ -191,17 +198,15 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 /** Create an empty device manager. */
 KrunMmioDeviceManager krun_mmio_device_manager_new();
 typedef KrunMmioDeviceManager (*krun_mmio_device_manager_new_fn)();
-/**
- * Add a device to this manager.
- *
- * Devices are attached in the order they are added. The device must
- * implement [`AttachDevice`] — all built-in device types
- * (`FsDevice`, `ConsoleDevice`, etc.) implement this trait.
- */
-void krun_mmio_device_manager_add(KrunMmioDeviceManager handle, KrunAttachDevice device);
-typedef void (*krun_mmio_device_manager_add_fn)(KrunMmioDeviceManager handle, KrunAttachDevice device);
 void krun_mmio_device_manager_destroy(KrunMmioDeviceManager handle);
 typedef void (*krun_mmio_device_manager_destroy_fn)(KrunMmioDeviceManager handle);
+
+/* PciDeviceManager -------------------------------------------------- */
+
+KrunPciDeviceManager krun_pci_device_manager_new();
+typedef KrunPciDeviceManager (*krun_pci_device_manager_new_fn)();
+void krun_pci_device_manager_destroy(KrunPciDeviceManager handle);
+typedef void (*krun_pci_device_manager_destroy_fn)(KrunPciDeviceManager handle);
 
 /* FsDevice ---------------------------------------------------------- */
 
@@ -383,8 +388,13 @@ KrunResult krun_vmm_builder_ram_mib(KrunVmmBuilder* handle, uint32_t mib, KrunEr
 typedef KrunResult (*krun_vmm_builder_ram_mib_fn)(KrunVmmBuilder* handle, uint32_t mib, KrunError* err_out);
 void krun_vmm_builder_payload(KrunVmmBuilder* handle, KrunPayload payload);
 typedef void (*krun_vmm_builder_payload_fn)(KrunVmmBuilder* handle, KrunPayload payload);
-void krun_vmm_builder_devices(KrunVmmBuilder* handle, KrunMmioDeviceManager devices);
-typedef void (*krun_vmm_builder_devices_fn)(KrunVmmBuilder* handle, KrunMmioDeviceManager devices);
+/**
+ * Add devices using their manager's transport.
+ *
+ * PCI devices require ACPI to be enabled with [`VmmBuilder::acpi`].
+ */
+void krun_vmm_builder_devices(KrunVmmBuilder* handle, KrunDeviceManager devices);
+typedef void (*krun_vmm_builder_devices_fn)(KrunVmmBuilder* handle, KrunDeviceManager devices);
 void krun_vmm_builder_set_kernel_console(KrunVmmBuilder* handle, KrunStr console);
 typedef void (*krun_vmm_builder_set_kernel_console_fn)(KrunVmmBuilder* handle, KrunStr console);
 /**
@@ -407,8 +417,8 @@ typedef KrunResult (*krun_vmm_builder_split_irqchip_fn)(KrunVmmBuilder* handle, 
  * Enable ACPI table generation for x86_64 guests.
  *
  * When disabled (the default), virtio-mmio devices are passed on the kernel
- * command line and SMP uses the MP table. When enabled, devices are described
- * in the ACPI DSDT and the RSDP is published in boot parameters.
+ * command line and SMP uses the MP table. When enabled, devices and the PCI
+ * host bridge are described in ACPI and the RSDP is published in boot parameters.
  */
 KrunResult krun_vmm_builder_acpi(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 typedef KrunResult (*krun_vmm_builder_acpi_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
@@ -467,6 +477,19 @@ typedef void (*krun_vmm_handle_destroy_fn)(KrunVmmHandle handle);
 
 KrunBalloonDevice krun_balloon_device_new(KrunError* err_out);
 typedef KrunBalloonDevice (*krun_balloon_device_new_fn)(KrunError* err_out);
+/**
+ * Set how memory that the guest reports as free is given back to the host. Defaults to
+ * [`FreePageReportingMode::Default`], which madvise()s it on Linux and macOS, and
+ * discards it with DiscardVirtualMemory() on Windows.
+ *
+ * On macOS, madvise() doesn't release guest memory that the guest has written to.
+ * [`FreePageReportingMode::Replace`] has the VMM replace the reported pages with fresh
+ * memory instead, which does release them. This costs a few system calls per report, and
+ * the guest's next access to each page faults it in again. Other platforms don't implement
+ * [`FreePageReportingMode::Replace`], and use [`FreePageReportingMode::Default`] instead.
+ */
+void krun_balloon_device_set_free_page_reporting_mode(KrunBalloonDevice handle, uint32_t mode);
+typedef void (*krun_balloon_device_set_free_page_reporting_mode_fn)(KrunBalloonDevice handle, uint32_t mode);
 void krun_balloon_device_destroy(KrunBalloonDevice handle);
 typedef void (*krun_balloon_device_destroy_fn)(KrunBalloonDevice handle);
 
@@ -639,6 +662,14 @@ typedef KrunInputDevice (*krun_input_device_new_from_fd_fn)(int input_fd, KrunEr
 void krun_input_device_destroy(KrunInputDevice handle);
 typedef void (*krun_input_device_destroy_fn)(KrunInputDevice handle);
 
+/* DeviceManager (dispatch) ------------------------------------------ */
+
+/** Add a device to this manager, preserving the order devices are added. */
+void krun_device_manager_add(KrunDeviceManager handle, KrunAttachDevice device);
+typedef void (*krun_device_manager_add_fn)(KrunDeviceManager handle, KrunAttachDevice device);
+void krun_device_manager_destroy(KrunDeviceManager handle);
+typedef void (*krun_device_manager_destroy_fn)(KrunDeviceManager handle);
+
 /* KrunPushStrVtable ------------------------------------------------- */
 
 #define KRUN_PUSH_STR_TYPE_TAG 16777228
@@ -676,6 +707,10 @@ uint64_t krun_error_result(KrunError handle);
 typedef uint64_t (*krun_error_result_fn)(KrunError handle);
 void krun_error_destroy(KrunError handle);
 typedef void (*krun_error_destroy_fn)(KrunError handle);
+void krun_mmio_device_manager_add(KrunMmioDeviceManager handle, KrunAttachDevice device);
+typedef void (*krun_mmio_device_manager_add_fn)(KrunMmioDeviceManager handle, KrunAttachDevice device);
+void krun_pci_device_manager_add(KrunPciDeviceManager handle, KrunAttachDevice device);
+typedef void (*krun_pci_device_manager_add_fn)(KrunPciDeviceManager handle, KrunAttachDevice device);
 uint32_t krun_vmm_error_code(KrunVmmError handle);
 typedef uint32_t (*krun_vmm_error_code_fn)(KrunVmmError handle);
 void krun_vmm_error_message(KrunVmmError handle, KrunPushStr writer);

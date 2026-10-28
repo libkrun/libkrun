@@ -521,6 +521,27 @@
           "ffi_name": "krun_init_builder_dhcp"
         },
         {
+          "name": "dhcp_renew",
+          "doc": [
+            " Keep the guest's DHCP lease renewed, retrying lost requests, instead of",
+            " configuring the interface once. Intended for guests on a physical",
+            " network; requires the DHCP client to be enabled."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "enable",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_init_builder_dhcp_renew"
+        },
+        {
           "name": "set_root_disk_remount",
           "doc": [
             " Set the root disk to remount on boot."

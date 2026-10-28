@@ -34,6 +34,11 @@ pub use device_builders::InputDevice;
 pub use device_builders::NetDevice;
 #[cfg(feature = "net")]
 pub use device_builders::NetFlags;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub use device_builders::PciDeviceManager;
 #[cfg(not(feature = "tee"))]
 pub use device_builders::RngDevice;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
@@ -47,6 +52,8 @@ pub use device_builders::{ConsoleBuilder, ConsoleDevice};
 pub use device_builders::{DisplayBackend, DisplayInfoBuilder};
 #[cfg(feature = "gpu")]
 pub use device_builders::{GpuDevice, VirglRendererFlags};
+#[cfg(not(feature = "tee"))]
+pub use devices::virtio::balloon::FreePageReportingMode;
 #[cfg(feature = "blk")]
 pub use devices::virtio::block::{DiskFormat, SyncMode};
 pub use error::VmmError;
@@ -63,6 +70,14 @@ ffier::library_definition!("krun", library_tag = 1,
     primitives_prefix = "krun",
     crate::api::error::VmmError = 1,
     crate::api::device_builders::MmioDeviceManager<'_> = 2,
+    #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+    crate::api::device_builders::PciDeviceManager<'_> = 25,
+    trait crate::api::device_builders::DeviceManager = 26,
+    crate::api::device_builders::DeviceManager
+        for crate::api::device_builders::MmioDeviceManager,
+    #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "windows")))]
+    crate::api::device_builders::DeviceManager
+        for crate::api::device_builders::PciDeviceManager,
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     crate::api::device_builders::FsDevice<'_> = 3,
     crate::api::device_builders::ConsoleDevice<'_> = 4,
@@ -121,6 +136,8 @@ ffier::library_definition!("krun", library_tag = 1,
     enum devices::virtio::block::DiskFormat,
     #[cfg(feature = "blk")]
     enum devices::virtio::block::SyncMode,
+    #[cfg(not(feature = "tee"))]
+    enum devices::virtio::balloon::FreePageReportingMode,
     enum crate::api::logging::LogLevel,
     enum crate::api::logging::LogStyle,
     fn crate::api::logging::init_log,

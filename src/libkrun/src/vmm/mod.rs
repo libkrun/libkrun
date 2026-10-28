@@ -50,6 +50,11 @@ use std::time::Duration;
 use utils::windows::AsRawFd;
 
 use crate::vmm::device_manager::mmio::MMIODeviceManager;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
+use crate::vmm::device_manager::pci::PciHostManager;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::vmm::vstate::VcpuEvent;
 #[cfg(not(target_os = "windows"))]
@@ -159,6 +164,11 @@ pub struct Vmm {
 
     // Guest VM devices.
     pub(crate) mmio_device_manager: MMIODeviceManager,
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    pub(crate) pci_device_manager: Option<PciHostManager>,
 
     // Out-of-band live pause/resume requests: the C API sends `VmCtl` from
     // another thread; the event loop freezes or wakes the vCPUs. A single
@@ -328,6 +338,14 @@ impl Vmm {
                 self.kernel_cmdline.len() + 1
             };
 
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            let pci_host_info = self
+                .pci_device_manager
+                .as_ref()
+                .map(PciHostManager::acpi_info);
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            let pci_host_info = None;
+
             arch::x86_64::configure_system(
                 &self.guest_memory,
                 &self.arch_memory_info,
@@ -338,6 +356,7 @@ impl Vmm {
                 _pvh,
                 _acpi_enabled,
                 _virtio_mmio_devices,
+                pci_host_info.as_ref(),
             )
             .map_err(Error::ConfigureSystem)?;
         }
@@ -431,6 +450,28 @@ impl Vmm {
     #[cfg(target_os = "macos")]
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
         self.vm.remove_mapping(reply_sender, guest_addr, len);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn reclaim_memory(&mut self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
+        let info = &self.arch_memory_info;
+        // Replacing the pages of the firmware or SHM regions, which are guest memory too, would
+        // break them.
+        if guest_addr < info.ram_start_addr || guest_addr + len > info.ram_last_addr {
+            warn!(
+                "Not reclaiming guest memory outside of RAM: guest_addr={guest_addr:x}, len={len}"
+            );
+            reply_sender.send(false).unwrap();
+            return;
+        }
+        match self.vm.reclaim_memory(&self.guest_memory, guest_addr, len) {
+            Ok(reclaimed) => reply_sender.send(reclaimed).unwrap(),
+            Err(e) => {
+                // The guest's accesses to the hole would be emulated as MMIO and lose data.
+                error!("Cannot map reclaimed guest memory back, stopping the VM: {e}");
+                self.stop(i32::from(FC_EXIT_CODE_GENERIC_ERROR));
+            }
+        }
     }
 }
 

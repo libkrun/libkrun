@@ -14,7 +14,7 @@ use super::defs::uapi;
 use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::muxer_thread::MuxerThread;
 use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
-use super::proxy::{Proxy, ProxyRemoval, ProxyUpdate};
+use super::proxy::{Proxy, ProxyRemoval, ProxyStatus, ProxyUpdate};
 use super::reaper::ReaperThread;
 #[cfg(target_os = "macos")]
 use super::timesync::TimesyncThread;
@@ -588,7 +588,7 @@ impl VsockMuxer {
             }
             let rxq = self.rxq.clone();
 
-            let mut unix = UnixProxy::new(
+            let mut unix = match UnixProxy::new(
                 id,
                 self.cid,
                 pkt.dst_port(),
@@ -597,16 +597,52 @@ impl VsockMuxer {
                 queue.clone(),
                 rxq,
                 path.to_path_buf(),
-            )
-            .unwrap();
+            ) {
+                Ok(unix) => unix,
+                Err(e) => {
+                    error!(
+                        "error creating unix proxy for port {}, sending rst: {e}",
+                        pkt.dst_port()
+                    );
+                    self.push_packet(MuxerRx::Reset {
+                        local_port: pkt.dst_port(),
+                        peer_port: pkt.src_port(),
+                    });
+                    return;
+                }
+            };
             let tsi = TsiConnectReq {
                 peer_port: 0,
                 addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
             };
             let update = unix.connect(pkt, tsi);
+            if !matches!(
+                unix.status(),
+                ProxyStatus::Connected | ProxyStatus::Connecting
+            ) {
+                error!(
+                    "error connecting unix proxy for port {} to {}, sending rst",
+                    pkt.dst_port(),
+                    path.display()
+                );
+                self.push_packet(MuxerRx::Reset {
+                    local_port: pkt.dst_port(),
+                    peer_port: pkt.src_port(),
+                });
+                return;
+            }
             unix.confirm_connect(pkt);
             proxy_map.insert(id, Mutex::new(Box::new(unix)));
             self.process_proxy_update(id, update);
+        } else {
+            debug!(
+                "no unix socket mapped for port {}, sending rst",
+                pkt.dst_port()
+            );
+            self.push_packet(MuxerRx::Reset {
+                local_port: pkt.dst_port(),
+                peer_port: pkt.src_port(),
+            });
         }
     }
 
@@ -652,12 +688,16 @@ impl VsockMuxer {
     fn process_op_credit_update(&self, pkt: &VsockPacket) {
         debug!("OP_CREDIT_UPDATE");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        let update = self
-            .proxy_map
-            .read()
-            .unwrap()
-            .get(&id)
-            .map(|proxy| proxy.lock().unwrap().update_peer_credit(pkt));
+        let update = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+            let mut proxy = proxy.lock().unwrap();
+            let mut update = proxy.update_peer_credit(pkt);
+            // Apply the polling change under the proxy lock so a later event on
+            // the same connection cannot rearm it after we stopped polling.
+            if let Some((id, fd, events)) = update.polling.take() {
+                self.update_polling(id, fd, events);
+            }
+            update
+        });
         if let Some(update) = update {
             self.process_proxy_update(id, update);
         }

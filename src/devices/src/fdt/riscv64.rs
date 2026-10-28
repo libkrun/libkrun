@@ -9,7 +9,6 @@ use crate::DeviceType;
 use crate::legacy::IrqChip;
 use crate::legacy::aia::AIADevice;
 use arch::riscv64::get_fdt_addr;
-use arch::riscv64::layout::IRQ_BASE;
 use arch::{ArchMemoryInfo, InitrdConfig};
 use vm_fdt::{Error as FdtError, FdtWriter};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryError, GuestMemoryMmap};
@@ -74,7 +73,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     // Look for "Required nodes and properties".
 
     // Header or the root node as per above mentioned documentation.
-    let root_node = fdt.begin_node("root")?;
+    let root_node = fdt.begin_node("")?;
     fdt.property_string("compatible", "linux,dummy-virt")?;
     // For info on #address-cells and size-cells resort to Table 3.1 Root Node
     // Properties
@@ -143,7 +142,10 @@ fn create_memory_node(
     // for an explanation of this.
     let mem_reg_prop = [arch::riscv64::layout::DRAM_MEM_START, mem_size];
 
-    let mem_node = fdt.begin_node("memory")?;
+    let mem_node = fdt.begin_node(&format!(
+        "memory@{:x}",
+        arch::riscv64::layout::DRAM_MEM_START
+    ))?;
     fdt.property_string("device_type", "memory")?;
     fdt.property_array_u64("reg", &mem_reg_prop)?;
     fdt.end_node(mem_node)?;
@@ -215,7 +217,7 @@ fn create_aia_node(fdt: &mut FdtWriter, aia_device: &IrqChip) -> Result<()> {
     fdt.property_array_u32("reg", &reg_cells)?;
     fdt.property_u32("#interrupt-cells", 2u32)?;
     fdt.property_null("interrupt-controller")?;
-    fdt.property_u32("riscv,num-sources", 96u32)?;
+    fdt.property_u32("riscv,num-sources", arch::riscv64::layout::IRQ_MAX)?;
     fdt.property_u32("phandle", AIA_APLIC_PHANDLE)?;
     fdt.property_u32("msi-parent", AIA_IMSIC_PHANDLE)?;
 
@@ -230,7 +232,7 @@ fn create_virtio_node<T: DeviceInfoForFDT + Clone + Debug>(
 ) -> Result<()> {
     let device_reg_prop = [dev_info.addr(), dev_info.length()];
     #[cfg(target_os = "linux")]
-    let irq = [dev_info.irq() - IRQ_BASE, IRQ_TYPE_LEVEL_HI];
+    let irq = [dev_info.irq(), IRQ_TYPE_LEVEL_HI];
 
     let virtio_node = fdt.begin_node(&format!("virtio_mmio@{:x}", dev_info.addr()))?;
     fdt.property_string("compatible", "virtio,mmio")?;
@@ -247,7 +249,7 @@ fn create_serial_node<T: DeviceInfoForFDT + Clone + Debug>(
     dev_info: &T,
 ) -> Result<()> {
     let serial_reg_prop = [dev_info.addr(), dev_info.length()];
-    let irq = [dev_info.irq() - IRQ_BASE, IRQ_TYPE_LEVEL_HI];
+    let irq = [dev_info.irq(), IRQ_TYPE_LEVEL_HI];
 
     let serial_node = fdt.begin_node(&format!("serial@{:x}", dev_info.addr()))?;
     fdt.property_string("compatible", "ns16550a")?;

@@ -237,13 +237,15 @@ impl Builder {
 
     /// Enable DHCP client in the guest.
     pub fn dhcp(mut self, enable: bool) -> Self {
-        self.inner
-            .process
-            .env
-            .retain(|e| !e.starts_with("KRUN_DHCP="));
-        if enable {
-            self.inner.process.env.push("KRUN_DHCP=1".to_string());
-        }
+        self.inner.dhcp = enable.then_some(true);
+        self
+    }
+
+    /// Keep the guest's DHCP lease renewed, retrying lost requests, instead of
+    /// configuring the interface once. Intended for guests on a physical
+    /// network; requires the DHCP client to be enabled.
+    pub fn dhcp_renew(mut self, enable: bool) -> Self {
+        self.inner.dhcp_renew = enable.then_some(true);
         self
     }
 
@@ -361,5 +363,17 @@ mod tests {
         assert_eq!(cfg.files[0].path, INIT_PATH);
         assert!(!cfg.files[0].data.is_empty());
         assert_eq!(cfg.files[1].path, "/.krun_config.json");
+    }
+
+    #[test]
+    fn dhcp_flags_are_serialized() {
+        let json = parse_config_json(&Config::builder().dhcp(true).dhcp_renew(true).build());
+        assert_eq!(json["dhcp"], serde_json::json!(true));
+        assert_eq!(json["dhcp_renew"], serde_json::json!(true));
+
+        // Disabled flags are omitted entirely.
+        let json = parse_config_json(&Config::builder().dhcp(false).build());
+        assert!(json.get("dhcp").is_none());
+        assert!(json.get("dhcp_renew").is_none());
     }
 }

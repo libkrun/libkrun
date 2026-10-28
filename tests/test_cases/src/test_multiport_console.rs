@@ -5,6 +5,8 @@ pub struct TestMultiportConsole;
 #[host]
 mod host {
     use super::*;
+    #[cfg(feature = "dynamic-linking")]
+    use krun::DeviceManager;
 
     use std::io::{BufRead, BufReader, Write};
     use std::os::fd::AsFd;

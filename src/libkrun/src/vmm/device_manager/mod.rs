@@ -16,6 +16,8 @@ pub mod shm;
 pub mod kvm;
 #[cfg(target_os = "linux")]
 pub use self::kvm::mmio;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub use self::kvm::pci;
 #[cfg(target_os = "macos")]
 pub mod hvf;
 #[cfg(target_os = "macos")]
@@ -24,3 +26,5 @@ pub use self::hvf::mmio;
 pub mod whp;
 #[cfg(target_os = "windows")]
 pub use self::whp::mmio;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use self::whp::pci;

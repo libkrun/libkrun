@@ -1006,7 +1006,7 @@ impl FileSystem for PassthroughFs {
             inode
         };
 
-        debug!("lookup: {}, inode: {:?}", name.to_str().unwrap(), inode);
+        debug!("lookup: {name:?}, inode: {inode:?}");
 
         Ok(Entry {
             inode,

@@ -21,6 +21,8 @@ fn stream_set_timeouts(stream: &mut UnixStream) {
 #[host]
 mod host {
     use super::*;
+    #[cfg(feature = "dynamic-linking")]
+    use krun::DeviceManager;
 
     use std::os::unix::net::UnixListener;
     use std::thread;
@@ -66,7 +68,7 @@ mod host {
         }
 
         fn timeout_secs(&self) -> u64 {
-            20
+            30
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {

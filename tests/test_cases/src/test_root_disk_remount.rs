@@ -12,6 +12,8 @@ pub struct TestRootDiskRemount;
 #[host]
 mod host {
     use super::*;
+    #[cfg(feature = "dynamic-linking")]
+    use krun::DeviceManager;
 
     use std::os::fd::AsFd;
     use std::process::Command;

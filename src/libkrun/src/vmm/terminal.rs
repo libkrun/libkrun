@@ -66,7 +66,7 @@ pub fn term_set_raw_mode(
         mode &= !ENABLE_PROCESSED_INPUT;
     }
 
-    mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+    mode &= !ENABLE_VIRTUAL_TERMINAL_INPUT;
 
     let ret = unsafe { SetConsoleMode(term.as_raw_handle(), mode) };
     if ret == 0 {

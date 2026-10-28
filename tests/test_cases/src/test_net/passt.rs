@@ -24,9 +24,19 @@ fn start_passt() -> std::io::Result<OwnedFd> {
     let (parent_fd, child_fd) = (fds[0], fds[1]);
 
     let mut cmd = Command::new("passt");
-    cmd.args(["-f", "--fd", &child_fd.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null());
+    cmd.args([
+        "-f",
+        "--fd",
+        &child_fd.to_string(),
+        "--address",
+        "169.254.2.1",
+        "--netmask",
+        "255.255.0.0",
+        "--gateway",
+        "169.254.2.2",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null());
 
     // Safety: clear CLOEXEC on child_fd so passt inherits it, and close the
     // parent end we don't need in the child.

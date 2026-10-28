@@ -473,7 +473,10 @@ pub(crate) fn update_peer_credit(
     proxy.peer_buf_alloc = pkt.buf_alloc();
     proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
-    if proxy.host_read_closed || proxy.status == ProxyStatus::Closed {
+    if proxy.host_read_closed
+        || proxy.status != ProxyStatus::WaitingCreditUpdate
+        || proxy.peer_avail_credit() == 0
+    {
         return ProxyUpdate::default();
     }
 
@@ -533,6 +536,9 @@ pub(crate) fn do_shutdown(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) 
 pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
 
+    // A hung-up stream can still hold unread data: Linux reports EPOLLIN
+    // together with EPOLLHUP even while the peer keeps unread bytes buffered.
+    // Only recv() can establish EOF, so stay in the draining states.
     if evset.contains(EventSet::HANG_UP)
         && !matches!(
             proxy.status,
