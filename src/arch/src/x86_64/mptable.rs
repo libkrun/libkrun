@@ -12,6 +12,8 @@ use std::slice;
 use libc::c_char;
 
 use arch_gen::x86::mpspec;
+
+use super::layout::IRQ_MAX;
 use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 // This is a workaround to the Rust enforcement specifying that any implementation of a foreign
@@ -119,7 +121,7 @@ fn compute_mp_size(num_cpus: u8) -> usize {
         + mem::size_of::<MpcCpuWrapper>() * (num_cpus as usize)
         + mem::size_of::<MpcIoapicWrapper>()
         + mem::size_of::<MpcBusWrapper>()
-        + mem::size_of::<MpcIntsrcWrapper>() * 16
+        + mem::size_of::<MpcIntsrcWrapper>() * (IRQ_MAX as usize + 1)
         + mem::size_of::<MpcLintsrcWrapper>() * 2
 }
 
@@ -214,8 +216,10 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
         base_mp = base_mp.unchecked_add(size);
         checksum = checksum.wrapping_add(compute_checksum(&mpc_ioapic.0));
     }
-    // Per kvm_setup_default_irq_routing() in kernel
-    for i in 0..16 {
+    // Per kvm_setup_default_irq_routing() in kernel. Every IOAPIC pin up to
+    // IRQ_MAX gets an entry: without one the guest cannot route the
+    // virtio-mmio devices placed above IRQ 15.
+    for i in 0..=(IRQ_MAX as u8) {
         let size = mem::size_of::<MpcIntsrcWrapper>() as u64;
         let mut mpc_intsrc = MpcIntsrcWrapper(mpspec::mpc_intsrc::default());
         mpc_intsrc.0.type_ = mpspec::MP_INTSRC as u8;
@@ -414,6 +418,42 @@ mod tests {
             }
             assert_eq!(cpu_count, i);
         }
+    }
+
+    #[test]
+    fn intsrc_entry_per_irq() {
+        let num_cpus = 1;
+        let mem = GuestMemoryMmap::from_ranges(&[(
+            GuestAddress(MPTABLE_START),
+            compute_mp_size(num_cpus),
+        )])
+        .unwrap();
+
+        setup_mptable(&mem, num_cpus).unwrap();
+
+        let mpf_intel: MpfIntelWrapper = mem.read_obj(GuestAddress(MPTABLE_START)).unwrap();
+        let mpc_offset = GuestAddress(u64::from(mpf_intel.0.physptr));
+        let mpc_table: MpcTableWrapper = mem.read_obj(mpc_offset).unwrap();
+        let mpc_end = mpc_offset
+            .checked_add(u64::from(mpc_table.0.length))
+            .unwrap();
+
+        let mut entry_offset = mpc_offset
+            .checked_add(mem::size_of::<MpcTableWrapper>() as u64)
+            .unwrap();
+        let mut irqs = Vec::new();
+        while entry_offset < mpc_end {
+            let entry_type: u8 = mem.read_obj(entry_offset).unwrap();
+            if u32::from(entry_type) == mpspec::MP_INTSRC {
+                let intsrc: MpcIntsrcWrapper = mem.read_obj(entry_offset).unwrap();
+                assert_eq!(intsrc.0.srcbusirq, intsrc.0.dstirq);
+                irqs.push(intsrc.0.dstirq);
+            }
+            entry_offset = entry_offset
+                .checked_add(table_entry_size(entry_type) as u64)
+                .unwrap();
+        }
+        assert_eq!(irqs, (0..=IRQ_MAX as u8).collect::<Vec<_>>());
     }
 
     #[test]
