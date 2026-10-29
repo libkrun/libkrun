@@ -123,6 +123,10 @@ pub struct VmResources {
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
     pub serial_consoles: Vec<SerialConsoleConfig>,
+    /// MiB of guest memory, on top of the RAM of `vm_config`, that the VMM locks into host
+    /// memory and that the guest sees as a NUMA node without CPUs.
+    #[cfg(target_arch = "aarch64")]
+    pub locked_mem_mib: u32,
     /// RISC-V ISA information discovered from KVM
     #[cfg(target_arch = "riscv64")]
     pub riscv_isa_info: Option<arch::riscv64::linux::kvm::RiscvIsaInfo>,
@@ -271,6 +275,8 @@ mod tests {
             acpi_enabled: false,
             serial_consoles: Vec::new(),
             kernel_console: None,
+            #[cfg(target_arch = "aarch64")]
+            locked_mem_mib: 0,
             #[cfg(target_arch = "riscv64")]
             riscv_isa_info: None,
         }

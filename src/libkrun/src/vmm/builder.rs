@@ -846,6 +846,8 @@ pub fn build_microvm(
             .vm_config()
             .mem_size_mib
             .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
+        #[cfg(target_arch = "aarch64")]
+        vm_resources.locked_mem_mib,
         vm_resources.kernel_bundle.as_ref(),
         #[cfg(feature = "tee")]
         vm_resources.qboot_bundle.as_ref(),
@@ -2015,6 +2017,7 @@ fn map_ram_in_blocks(
 #[allow(clippy::too_many_arguments)]
 pub fn create_guest_memory(
     mem_size: usize,
+    #[cfg(target_arch = "aarch64")] locked_mem_mib: u32,
     kernel_bundle: Option<&crate::vmm::vmm_config::kernel_bundle::KernelBundle>,
     #[cfg(feature = "tee")] qboot_bundle: Option<
         &crate::vmm::vmm_config::kernel_bundle::QbootBundle,
@@ -2087,7 +2090,20 @@ pub fn create_guest_memory(
         #[cfg(feature = "tee")]
         Payload::Firmware => arch::arch_memory_regions(mem_size, None, 0, 0, None),
     };
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    #[cfg(target_arch = "aarch64")]
+    let (mut arch_mem_info, mut arch_mem_regions) = {
+        let locked_mem_size = (locked_mem_mib as usize) << 20;
+        match payload {
+            Payload::ExternalKernel(external_kernel) => arch::arch_memory_regions(
+                mem_size,
+                locked_mem_size,
+                external_kernel.initramfs_size,
+                None,
+            ),
+            _ => arch::arch_memory_regions(mem_size, locked_mem_size, 0, _firmware_size),
+        }
+    };
+    #[cfg(target_arch = "riscv64")]
     let (mut arch_mem_info, mut arch_mem_regions) = match payload {
         Payload::ExternalKernel(external_kernel) => {
             arch::arch_memory_regions(mem_size, external_kernel.initramfs_size, None)
@@ -2748,6 +2764,8 @@ pub mod tests {
 
         create_guest_memory(
             mem_size_mib,
+            #[cfg(target_arch = "aarch64")]
+            0,
             Some(&kernel_bundle),
             #[cfg(feature = "tee")]
             None,
@@ -2772,6 +2790,8 @@ pub mod tests {
         for (ram_in_blocks, entry_size) in [(true, RECLAIM_BLOCK_SIZE), (false, 64 * MIB)] {
             let (guest_memory, info, _shm_manager, payload_config) = create_guest_memory(
                 64,
+                #[cfg(target_arch = "aarch64")]
+                0,
                 None,
                 None,
                 &[],
@@ -2794,8 +2814,19 @@ pub mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn test_ram_that_cant_be_mapped_in_blocks_is_reported() {
-        let (guest_memory, info, _shm_manager, _payload_config) =
-            create_guest_memory(64, None, None, &[], None, false, &Payload::Empty, false).unwrap();
+        let (guest_memory, info, _shm_manager, _payload_config) = create_guest_memory(
+            64,
+            #[cfg(target_arch = "aarch64")]
+            0,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            &Payload::Empty,
+            false,
+        )
+        .unwrap();
 
         let mut asked = None;
         let in_blocks = map_ram_in_blocks(&guest_memory, &info, |_, ram| {
