@@ -6,6 +6,7 @@
  */
 
 #include <errno.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +51,24 @@ static KrunVtableHandle krun_stderr_writer = KRUN_VTABLE_HANDLE(
         krun_error_destroy(krun_err);                                          \
         return -1;                                                             \
     }
+
+static void *load_fn(const char *fname)
+{
+    const char *err;
+    void *fn;
+
+    fn = dlsym(RTLD_DEFAULT, fname);
+    err = dlerror();
+    if (err != NULL || fn == NULL) {
+        fprintf(stderr, "Could not resolve %s", fname);
+        if (err != NULL) {
+            fprintf(stderr, ": %s", err);
+        }
+        fputc('\n', stderr);
+        return NULL;
+    }
+    return fn;
+}
 
 static void print_help(char *const name)
 {
@@ -184,7 +203,25 @@ int main(int argc, char *const argv[])
 {
     KrunError krun_err;
     pthread_t thread;
+    krun_block_device_new_fn blkdev_new;
+    krun_net_device_new_unixstream_path_fn netpath_fn;
     struct cmdline cmdline;
+
+    if ((krun_build_capability_flags() & KRUN_BUILD_CAPABILITY_FLAGS_BLK) == 0) {
+        fprintf(stderr, "Requires: libkrun to be built with BLK=1\n");
+        return -1;
+    }
+
+    if ((krun_build_capability_flags() & KRUN_BUILD_CAPABILITY_FLAGS_NET) == 0) {
+        fprintf(stderr, "Requires: libkrun to be built with NET=1\n");
+        return -1;
+    }
+
+    if (!(blkdev_new = (krun_block_device_new_fn) load_fn("krun_block_device_new")) ||
+        !(netpath_fn = (krun_net_device_new_unixgram_path_fn) load_fn(("krun_net_device_new_unixgram_path")))) {
+        print_help(argv[0]);
+        return -1;
+    }
 
     if (!parse_cmdline(argc, argv, &cmdline)) {
         putchar('\n');
@@ -215,14 +252,14 @@ int main(int argc, char *const argv[])
     CHECK(KrunPayload payload = krun_payload_load_firmware(KRUN_STR(cmdline.efi_fw), KRUN_STR(""), &krun_err));
 
     {
-        CHECK(KrunBlockDevice blk = krun_block_device_new(KRUN_STR("root"),
+        CHECK(KrunBlockDevice blk = (blkdev_new)(KRUN_STR("root"),
             KRUN_STR(cmdline.disk_image), KRUN_DISK_FORMAT_RAW, &krun_err));
         krun_mmio_device_manager_add(devices, blk);
     }
 
     {
         uint8_t mac[] = {0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee};
-        CHECK(KrunNetDevice net = krun_net_device_new_unixgram_path(KRUN_STR("net0"),
+        CHECK(KrunNetDevice net = (netpath_fn)(KRUN_STR("net0"),
             KRUN_STR(cmdline.passt_socket_path), KRUN_BYTES(mac), COMPAT_NET_FEATURES,
             KRUN_NET_FLAGS_VFKIT, &krun_err));
         krun_mmio_device_manager_add(devices, net);
