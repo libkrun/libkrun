@@ -280,6 +280,13 @@
         "a"
       ]
     },
+    "PermissionSemantics": {
+      "kind": {
+        "enum": {
+          "alias_of": "u32"
+        }
+      }
+    },
     "PushStr": {
       "kind": {
         "trait": {
@@ -637,7 +644,10 @@
             "",
             " When set, the guest can memory-map files from the shared filesystem",
             " directly into its address space, avoiding data copies. If not set,",
-            " no DAX window is allocated."
+            " no DAX window is allocated.",
+            "",
+            " Returns `InvalidParam` without changing the configuration when",
+            " `Restricted` permission semantics are selected."
           ],
           "receiver": "mut",
           "params": [
@@ -648,9 +658,40 @@
             }
           ],
           "ret": {
-            "return_kind": "void"
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "VmmError",
+            "c_convention": "out_param"
           },
           "ffi_name": "krun_fs_device_set_dax_window_size"
+        },
+        {
+          "name": "set_permission_semantics",
+          "doc": [
+            " Select the permission semantics before attaching this device.",
+            "",
+            " Defaults to `LinuxComplete`. `LinuxSimplified` disables xattrs and idmaps",
+            " and disables attribute caching because ownership depends on the requester.",
+            " `Restricted` confines macOS operations to the export root and cannot be combined",
+            " with a DAX window. Concurrent host namespace changes require host OS isolation.",
+            " Other hosts return `FeatureDisabled` for `Restricted`.",
+            " A NullFs device has no host permission semantics and returns `InvalidParam`."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "semantics",
+              "param_kind": "regular",
+              "type": "PermissionSemantics"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_fs_device_set_permission_semantics"
         }
       ],
       "cfg": "not(any(feature = \"tee\", feature = \"aws-nitro\"))"
@@ -2730,6 +2771,27 @@
           "value": 2
         }
       ]
+    },
+    {
+      "name": "PermissionSemantics",
+      "variants": [
+        {
+          "name": "LinuxComplete",
+          "c_name": "KRUN_PERMISSION_SEMANTICS_LINUX_COMPLETE",
+          "value": 0
+        },
+        {
+          "name": "LinuxSimplified",
+          "c_name": "KRUN_PERMISSION_SEMANTICS_LINUX_SIMPLIFIED",
+          "value": 1
+        },
+        {
+          "name": "Restricted",
+          "c_name": "KRUN_PERMISSION_SEMANTICS_RESTRICTED",
+          "value": 2
+        }
+      ],
+      "cfg": "not(any(feature = \"tee\", feature = \"aws-nitro\"))"
     }
   ],
   "bitflags_constants": [

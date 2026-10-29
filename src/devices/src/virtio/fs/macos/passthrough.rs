@@ -22,6 +22,8 @@ use crossbeam_channel::{Sender, unbounded};
 use nix::errno::Errno;
 use utils::worker_message::WorkerMessage;
 
+use super::restricted::RestrictedFs;
+
 use crate::virtio::fs::filesystem::SecContext;
 
 use super::super::super::linux_errno::{LINUX_ERANGE, linux_error};
@@ -45,9 +47,9 @@ type Inode = u64;
 type Handle = u64;
 
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
-struct InodeAltKey {
-    ino: u64,
-    dev: i32,
+pub(super) struct InodeAltKey {
+    pub(super) ino: u64,
+    pub(super) dev: i32,
 }
 
 struct InodeData {
@@ -69,20 +71,20 @@ struct CachedDirEntry {
     type_: u8,
 }
 
-struct DirStream {
+pub(super) struct DirStream {
     entries: Vec<CachedDirEntry>,
     ready: bool,
 }
 
 impl DirStream {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             entries: Vec::new(),
             ready: false,
         }
     }
 
-    fn get_entry<'a>(&'a self, offset: u64) -> Option<DirEntry<'a>> {
+    pub(super) fn get_entry<'a>(&'a self, offset: u64) -> Option<DirEntry<'a>> {
         self.entries.get(offset as usize).map(|e| DirEntry {
             ino: e.ino,
             // offset points to the next entry, not the current one
@@ -92,7 +94,7 @@ impl DirStream {
         })
     }
 
-    fn fill_from_fd(&mut self, fd: RawFd) -> io::Result<()> {
+    pub(super) fn fill_from_fd(&mut self, fd: RawFd) -> io::Result<()> {
         // fdopendir() takes ownership of the fd, so we need to obtain a new one
         // to be donated.
         let newfd = unsafe { libc::dup(fd) };
@@ -386,7 +388,9 @@ fn set_stat(
 ) -> io::Result<()> {
     match semantics {
         PermissionSemantics::LinuxComplete => set_xattr_stat(ctx, file, st, owner, mode),
-        PermissionSemantics::LinuxSimplified => set_host_stat(file, owner, mode),
+        PermissionSemantics::LinuxSimplified | PermissionSemantics::Restricted => {
+            set_host_stat(file, owner, mode)
+        }
     }
 }
 
@@ -413,7 +417,7 @@ fn stat_xattr_common(
     Ok(*st)
 }
 
-fn fstat(
+pub(super) fn fstat(
     ctx: &Context,
     semantics: PermissionSemantics,
     fd: RawFd,
@@ -433,7 +437,7 @@ fn fstat(
                     let (uid, gid, mode) = get_xattr_fstat(fd, st)?;
                     stat_xattr_common(&mut st, uid, gid, mode)
                 }
-                PermissionSemantics::LinuxSimplified => {
+                PermissionSemantics::LinuxSimplified | PermissionSemantics::Restricted => {
                     st.st_uid = ctx.uid;
                     st.st_gid = ctx.gid;
                     Ok(st)
@@ -467,7 +471,7 @@ fn lstat(
                     let (uid, gid, mode) = get_xattr_lstat(c_path, st)?;
                     stat_xattr_common(&mut st, uid, gid, mode)
                 }
-                PermissionSemantics::LinuxSimplified => {
+                PermissionSemantics::LinuxSimplified | PermissionSemantics::Restricted => {
                     st.st_uid = ctx.uid;
                     st.st_gid = ctx.gid;
                     Ok(st)
@@ -542,6 +546,12 @@ pub enum PermissionSemantics {
     ///    requesting the operation within the guest (obtained from `Context`).
     ///  - Permissions bits are stored in the host, not as extended attributes.
     LinuxSimplified,
+
+    /// As `LinuxSimplified`, with descriptor-based containment inside the export root.
+    /// Hard links, special files, xattrs, idmaps, writeback caching and DAX are rejected.
+    /// Symlinks are resolved manually relative to the export root for target operations.
+    /// Moved-out and unlinked objects become inaccessible, including through open handles.
+    Restricted,
 }
 
 /// Options that configure the behavior of the file system.
@@ -632,7 +642,10 @@ impl Default for Config {
 /// that wish to serve only a specific directory should set up the environment so that that
 /// directory ends up as the root of the file system process. One way to accomplish this is via a
 /// combination of mount namespaces and the pivot_root system call.
+/// On macOS, `PermissionSemantics::Restricted` provides checked export-relative access;
+/// concurrent host namespace changes still require host OS isolation.
 pub struct PassthroughFs {
+    restricted: Option<RestrictedFs>,
     inodes: RwLock<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
     inode_alloc: Arc<InodeAllocator>,
 
@@ -650,23 +663,34 @@ pub struct PassthroughFs {
 
 impl PassthroughFs {
     pub fn new(cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<PassthroughFs> {
-        let root = CString::new(cfg.root_dir.as_str()).expect("CString::new failed");
-
-        // Safe because this doesn't modify any memory and we check the return value.
-        let fd = unsafe {
-            libc::openat(
-                libc::AT_FDCWD,
-                root.as_ptr(),
-                libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
+        let restricted = if matches!(cfg.semantics, PermissionSemantics::Restricted) {
+            Some(RestrictedFs::new(
+                Path::new(&cfg.root_dir),
+                inode_alloc.clone(),
+            )?)
+        } else {
+            None
         };
-        if fd < 0 {
-            return Err(linux_error(io::Error::last_os_error()));
+        if restricted.is_none() {
+            let root = CString::new(cfg.root_dir.as_str()).expect("CString::new failed");
+
+            // Safe because this doesn't modify any memory and we check the return value.
+            let fd = unsafe {
+                libc::openat(
+                    libc::AT_FDCWD,
+                    root.as_ptr(),
+                    libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+
+            unsafe { libc::close(fd) };
         }
 
-        unsafe { libc::close(fd) };
-
         Ok(PassthroughFs {
+            restricted,
             inodes: RwLock::new(MultikeyBTreeMap::new()),
             inode_alloc,
 
@@ -681,15 +705,28 @@ impl PassthroughFs {
         })
     }
 
-    fn inode_to_handle(&self, inode: Inode, supports_fd: bool) -> io::Result<InodeHandle> {
-        debug!("inode_to_handle: inode={inode}");
-        let data = self
-            .inodes
+    fn inode_data(&self, inode: Inode) -> io::Result<Arc<InodeData>> {
+        self.inodes
             .read()
             .unwrap()
             .get(&inode)
             .cloned()
-            .ok_or_else(ebadf)?;
+            .ok_or_else(ebadf)
+    }
+
+    fn handle_data(&self, inode: Inode, handle: Handle) -> io::Result<Arc<HandleData>> {
+        self.handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|data| data.inode == inode)
+            .cloned()
+            .ok_or_else(ebadf)
+    }
+
+    fn inode_to_handle(&self, inode: Inode, supports_fd: bool) -> io::Result<InodeHandle> {
+        debug!("inode_to_handle: inode={inode}");
+        let data = self.inode_data(inode)?;
 
         let cstr =
             CString::new(format!("/.vol/{}/{}", data.dev, data.ino)).map_err(|_| einval())?;
@@ -711,14 +748,7 @@ impl PassthroughFs {
             parent,
             name.to_string_lossy()
         );
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
+        let data = self.inode_data(parent)?;
         let cstr = CString::new(format!(
             "/.vol/{}/{}/{}",
             data.dev,
@@ -784,14 +814,7 @@ impl PassthroughFs {
             return Ok(());
         }
 
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.handle_data(inode, handle)?;
 
         let mut ds = data.dirstream.lock().unwrap();
 
@@ -850,7 +873,7 @@ impl PassthroughFs {
         kill_priv: bool,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        let flags = self.parse_open_flags(flags as i32);
+        let flags = parse_open_flags(flags as i32);
 
         let file = RwLock::new(self.open_inode(inode, flags)?);
 
@@ -1124,34 +1147,34 @@ impl PassthroughFs {
         };
         self.lookup(ctx, parent, name)
     }
+}
 
-    fn parse_open_flags(&self, flags: i32) -> i32 {
-        let mut mflags: i32 = flags & 0b11;
+pub(super) fn parse_open_flags(flags: i32) -> i32 {
+    let mut mflags: i32 = flags & 0b11;
 
-        if (flags & bindings::LINUX_O_NONBLOCK) != 0 {
-            mflags |= libc::O_NONBLOCK;
-        }
-        if (flags & bindings::LINUX_O_APPEND) != 0 {
-            mflags |= libc::O_APPEND;
-        }
-        if (flags & bindings::LINUX_O_CREAT) != 0 {
-            mflags |= libc::O_CREAT;
-        }
-        if (flags & bindings::LINUX_O_TRUNC) != 0 {
-            mflags |= libc::O_TRUNC;
-        }
-        if (flags & bindings::LINUX_O_EXCL) != 0 {
-            mflags |= libc::O_EXCL;
-        }
-        if (flags & bindings::LINUX_O_NOFOLLOW) != 0 {
-            mflags |= libc::O_NOFOLLOW;
-        }
-        if (flags & bindings::LINUX_O_CLOEXEC) != 0 {
-            mflags |= libc::O_CLOEXEC;
-        }
-
-        mflags
+    if (flags & bindings::LINUX_O_NONBLOCK) != 0 {
+        mflags |= libc::O_NONBLOCK;
     }
+    if (flags & bindings::LINUX_O_APPEND) != 0 {
+        mflags |= libc::O_APPEND;
+    }
+    if (flags & bindings::LINUX_O_CREAT) != 0 {
+        mflags |= libc::O_CREAT;
+    }
+    if (flags & bindings::LINUX_O_TRUNC) != 0 {
+        mflags |= libc::O_TRUNC;
+    }
+    if (flags & bindings::LINUX_O_EXCL) != 0 {
+        mflags |= libc::O_EXCL;
+    }
+    if (flags & bindings::LINUX_O_NOFOLLOW) != 0 {
+        mflags |= libc::O_NOFOLLOW;
+    }
+    if (flags & bindings::LINUX_O_CLOEXEC) != 0 {
+        mflags |= libc::O_CLOEXEC;
+    }
+
+    mflags
 }
 
 fn do_set_secctx(file: &InodeHandle, secctx: &SecContext, options: i32) -> io::Result<()> {
@@ -1322,6 +1345,10 @@ impl FileSystem for PassthroughFs {
     type Handle = Handle;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+        if let Some(fs) = &self.restricted {
+            return fs.init(capable);
+        }
+
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
 
         // Safe because this doesn't modify any memory and we check the return value.
@@ -1388,11 +1415,19 @@ impl FileSystem for PassthroughFs {
     }
 
     fn destroy(&self) {
+        if let Some(fs) = &self.restricted {
+            return fs.destroy();
+        }
+
         self.handles.write().unwrap().clear();
         self.inodes.write().unwrap().clear();
     }
 
     fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<bindings::statvfs64> {
+        if let Some(fs) = &self.restricted {
+            return fs.statfs(_ctx, inode);
+        }
+
         let mut out = MaybeUninit::<bindings::statvfs64>::zeroed();
 
         let res = match self.inode_to_handle(inode, true)? {
@@ -1410,13 +1445,11 @@ impl FileSystem for PassthroughFs {
     }
 
     fn lookup(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        let parent_data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        if let Some(fs) = &self.restricted {
+            return fs.lookup(ctx, parent, name);
+        }
+
+        let parent_data = self.inode_data(parent)?;
 
         let c_path = self.name_to_path(parent, name)?;
         let st = lstat(&ctx, self.cfg.semantics, &c_path, false)?;
@@ -1480,12 +1513,20 @@ impl FileSystem for PassthroughFs {
     }
 
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
+        if let Some(fs) = &self.restricted {
+            return fs.forget(_ctx, inode, count);
+        }
+
         let mut inodes = self.inodes.write().unwrap();
 
         forget_one(&mut inodes, inode, count)
     }
 
     fn batch_forget(&self, _ctx: Context, requests: Vec<(Inode, u64)>) {
+        if let Some(fs) = &self.restricted {
+            return fs.batch_forget(_ctx, requests);
+        }
+
         let mut inodes = self.inodes.write().unwrap();
 
         for (inode, count) in requests {
@@ -1499,6 +1540,10 @@ impl FileSystem for PassthroughFs {
         inode: Inode,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        if let Some(fs) = &self.restricted {
+            return fs.opendir(ctx, inode, flags);
+        }
+
         self.do_open(&ctx, inode, false, flags | libc::O_DIRECTORY as u32)
     }
 
@@ -1509,6 +1554,10 @@ impl FileSystem for PassthroughFs {
         _flags: u32,
         handle: Handle,
     ) -> io::Result<()> {
+        if let Some(fs) = &self.restricted {
+            return fs.releasedir(_ctx, inode, _flags, handle);
+        }
+
         self.do_release(inode, handle)
     }
 
@@ -1521,11 +1570,17 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        if let Some(fs) = &self.restricted {
+            return fs.mkdir(ctx, parent, name, mode, umask, extensions);
+        }
+
         let c_path = self.name_to_path(parent, name)?;
 
         let (host_mode, complete) = match self.cfg.semantics {
             PermissionSemantics::LinuxComplete => (0o700, true),
-            PermissionSemantics::LinuxSimplified => ((mode & !umask) as u16, false),
+            PermissionSemantics::LinuxSimplified | PermissionSemantics::Restricted => {
+                ((mode & !umask) as u16, false)
+            }
         };
 
         // Safe because this doesn't modify any memory and we check the return value.
@@ -1554,6 +1609,10 @@ impl FileSystem for PassthroughFs {
     }
 
     fn rmdir(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        if let Some(fs) = &self.restricted {
+            return fs.rmdir(ctx, parent, name);
+        }
+
         self.do_unlink(ctx, parent, name, libc::AT_REMOVEDIR)
     }
 
@@ -1569,6 +1628,10 @@ impl FileSystem for PassthroughFs {
     where
         F: FnMut(DirEntry) -> io::Result<usize>,
     {
+        if let Some(fs) = &self.restricted {
+            return fs.readdir(_ctx, inode, handle, size, offset, add_entry);
+        }
+
         self.do_readdir(inode, handle, size, offset, add_entry)
     }
 
@@ -1584,6 +1647,10 @@ impl FileSystem for PassthroughFs {
     where
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
+        if let Some(fs) = &self.restricted {
+            return fs.readdirplus(ctx, inode, handle, size, offset, add_entry);
+        }
+
         self.do_readdir(inode, handle, size, offset, |dir_entry| {
             // Safe because the kernel guarantees that the buffer is nul-terminated. Additionally,
             // the kernel will pad the name with '\0' bytes up to 8-byte alignment and there's no
@@ -1605,6 +1672,10 @@ impl FileSystem for PassthroughFs {
         kill_priv: bool,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        if let Some(fs) = &self.restricted {
+            return fs.open(ctx, inode, kill_priv, flags);
+        }
+
         self.do_open(&ctx, inode, kill_priv, flags)
     }
 
@@ -1618,6 +1689,18 @@ impl FileSystem for PassthroughFs {
         _flock_release: bool,
         _lock_owner: Option<u64>,
     ) -> io::Result<()> {
+        if let Some(fs) = &self.restricted {
+            return fs.release(
+                _ctx,
+                inode,
+                _flags,
+                handle,
+                _flush,
+                _flock_release,
+                _lock_owner,
+            );
+        }
+
         self.do_release(inode, handle)
     }
 
@@ -1632,9 +1715,13 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
+        if let Some(fs) = &self.restricted {
+            return fs.create(ctx, parent, name, mode, kill_priv, flags, umask, extensions);
+        }
+
         let c_path = self.name_to_path(parent, name)?;
 
-        let flags = self.parse_open_flags(flags as i32);
+        let flags = parse_open_flags(flags as i32);
         let (host_mode, complete) = match self.cfg.semantics {
             PermissionSemantics::LinuxComplete => {
                 let mode = if (flags & libc::O_DIRECTORY) != 0 {
@@ -1644,7 +1731,9 @@ impl FileSystem for PassthroughFs {
                 };
                 (mode, true)
             }
-            PermissionSemantics::LinuxSimplified => (mode & !(umask & 0o777), false),
+            PermissionSemantics::LinuxSimplified | PermissionSemantics::Restricted => {
+                (mode & !(umask & 0o777), false)
+            }
         };
 
         // Safe because this doesn't modify any memory and we check the return value. We don't
@@ -1713,6 +1802,10 @@ impl FileSystem for PassthroughFs {
     }
 
     fn unlink(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        if let Some(fs) = &self.restricted {
+            return fs.unlink(ctx, parent, name);
+        }
+
         self.do_unlink(ctx, parent, name, 0)
     }
 
@@ -1727,15 +1820,12 @@ impl FileSystem for PassthroughFs {
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> io::Result<usize> {
+        if let Some(fs) = &self.restricted {
+            return fs.read(_ctx, inode, handle, w, size, offset, _lock_owner, _flags);
+        }
+
         debug!("read: {inode:?}");
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.handle_data(inode, handle)?;
 
         // This is safe because write_from uses preadv64, so the underlying file descriptor
         // offset is not affected by this operation.
@@ -1756,14 +1846,22 @@ impl FileSystem for PassthroughFs {
         kill_priv: bool,
         _flags: u32,
     ) -> io::Result<usize> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        if let Some(fs) = &self.restricted {
+            return fs.write(
+                ctx,
+                inode,
+                handle,
+                r,
+                size,
+                offset,
+                _lock_owner,
+                _delayed_write,
+                kill_priv,
+                _flags,
+            );
+        }
+
+        let data = self.handle_data(inode, handle)?;
 
         // This is safe because read_to uses pwritev64, so the underlying file descriptor
         // offset is not affected by this operation.
@@ -1804,6 +1902,10 @@ impl FileSystem for PassthroughFs {
         inode: Inode,
         _handle: Option<Handle>,
     ) -> io::Result<(bindings::stat64, Duration)> {
+        if let Some(fs) = &self.restricted {
+            return fs.getattr(ctx, inode, _handle);
+        }
+
         self.do_getattr(&ctx, inode)
     }
 
@@ -1815,6 +1917,10 @@ impl FileSystem for PassthroughFs {
         handle: Option<Handle>,
         valid: SetattrValid,
     ) -> io::Result<(bindings::stat64, Duration)> {
+        if let Some(fs) = &self.restricted {
+            return fs.setattr(ctx, inode, attr, handle, valid);
+        }
+
         // If we have a handle then use it otherwise get a new fd from the inode.
         let ihandle = if let Some(handle) = handle {
             let hd = self
@@ -1984,6 +2090,10 @@ impl FileSystem for PassthroughFs {
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
+        if let Some(fs) = &self.restricted {
+            return fs.rename(ctx, olddir, oldname, newdir, newname, flags);
+        }
+
         let mut mflags: u32 = 0;
         if ((flags as i32) & bindings::LINUX_RENAME_NOREPLACE) != 0 {
             mflags |= libc::RENAME_EXCL;
@@ -2056,7 +2166,7 @@ impl FileSystem for PassthroughFs {
             if ((flags as i32) & bindings::LINUX_RENAME_WHITEOUT) != 0 {
                 let (host_mode, complete) = match self.cfg.semantics {
                     PermissionSemantics::LinuxComplete => (0o600, true),
-                    PermissionSemantics::LinuxSimplified => {
+                    PermissionSemantics::LinuxSimplified | PermissionSemantics::Restricted => {
                         (((libc::S_IFCHR | 0o600) as u32), false)
                     }
                 };
@@ -2109,11 +2219,15 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        if let Some(fs) = &self.restricted {
+            return fs.mknod(ctx, parent, name, mode, rdev, umask, extensions);
+        }
+
         match self.cfg.semantics {
             PermissionSemantics::LinuxComplete => {
                 self.mknod_complete(ctx, parent, name, mode, rdev, umask, extensions)
             }
-            PermissionSemantics::LinuxSimplified => {
+            PermissionSemantics::LinuxSimplified | PermissionSemantics::Restricted => {
                 self.mknod_simplified(ctx, parent, name, mode, rdev, umask, extensions)
             }
         }
@@ -2126,6 +2240,10 @@ impl FileSystem for PassthroughFs {
         newparent: Inode,
         newname: &CStr,
     ) -> io::Result<Entry> {
+        if let Some(fs) = &self.restricted {
+            return fs.link(ctx, inode, newparent, newname);
+        }
+
         let orig_c_path = match self.inode_to_handle(inode, false)? {
             InodeHandle::Path(c_path) => c_path,
             InodeHandle::Fd(_) => return Err(ebadf()),
@@ -2149,6 +2267,10 @@ impl FileSystem for PassthroughFs {
         name: &CStr,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        if let Some(fs) = &self.restricted {
+            return fs.symlink(ctx, linkname, parent, name, extensions);
+        }
+
         let c_path = self.name_to_path(parent, name)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
@@ -2183,6 +2305,10 @@ impl FileSystem for PassthroughFs {
     }
 
     fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
+        if let Some(fs) = &self.restricted {
+            return fs.readlink(_ctx, inode);
+        }
+
         let mut buf = vec![0; libc::PATH_MAX as usize];
 
         let res = match self.inode_to_handle(inode, true)? {
@@ -2212,14 +2338,11 @@ impl FileSystem for PassthroughFs {
         handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        if let Some(fs) = &self.restricted {
+            return fs.flush(_ctx, inode, handle, _lock_owner);
+        }
+
+        let data = self.handle_data(inode, handle)?;
 
         // Since this method is called whenever an fd is closed in the client, we can emulate that
         // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
@@ -2245,14 +2368,11 @@ impl FileSystem for PassthroughFs {
         _datasync: bool,
         handle: Handle,
     ) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        if let Some(fs) = &self.restricted {
+            return fs.fsync(_ctx, inode, _datasync, handle);
+        }
+
+        let data = self.handle_data(inode, handle)?;
 
         let fd = data.file.write().unwrap().as_raw_fd();
 
@@ -2273,10 +2393,18 @@ impl FileSystem for PassthroughFs {
         datasync: bool,
         handle: Handle,
     ) -> io::Result<()> {
+        if let Some(fs) = &self.restricted {
+            return fs.fsyncdir(ctx, inode, datasync, handle);
+        }
+
         self.fsync(ctx, inode, datasync, handle)
     }
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
+        if let Some(fs) = &self.restricted {
+            return fs.access(ctx, inode, mask);
+        }
+
         let st = match self.inode_to_handle(inode, true)? {
             InodeHandle::Path(c_path) => lstat(&ctx, self.cfg.semantics, &c_path, false)?,
             InodeHandle::Fd(fd) => fstat(&ctx, self.cfg.semantics, fd, false)?,
@@ -2336,6 +2464,10 @@ impl FileSystem for PassthroughFs {
         value: &[u8],
         flags: u32,
     ) -> io::Result<()> {
+        if let Some(fs) = &self.restricted {
+            return fs.setxattr(_ctx, inode, name, value, flags);
+        }
+
         debug!("setxattr: inode={inode} name={name:?} value={value:?}");
 
         if !self.cfg.xattr {
@@ -2396,6 +2528,10 @@ impl FileSystem for PassthroughFs {
         name: &CStr,
         size: u32,
     ) -> io::Result<GetxattrReply> {
+        if let Some(fs) = &self.restricted {
+            return fs.getxattr(_ctx, inode, name, size);
+        }
+
         debug!("getxattr: inode={inode} name={name:?}, size={size}");
 
         if !self.cfg.xattr {
@@ -2470,6 +2606,10 @@ impl FileSystem for PassthroughFs {
     }
 
     fn listxattr(&self, _ctx: Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
+        if let Some(fs) = &self.restricted {
+            return fs.listxattr(_ctx, inode, size);
+        }
+
         if !self.cfg.xattr {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
@@ -2535,6 +2675,10 @@ impl FileSystem for PassthroughFs {
     }
 
     fn removexattr(&self, _ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
+        if let Some(fs) = &self.restricted {
+            return fs.removexattr(_ctx, inode, name);
+        }
+
         if !self.cfg.xattr {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
@@ -2572,14 +2716,11 @@ impl FileSystem for PassthroughFs {
         offset: u64,
         length: u64,
     ) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        if let Some(fs) = &self.restricted {
+            return fs.fallocate(ctx, inode, handle, mode, offset, length);
+        }
+
+        let data = self.handle_data(inode, handle)?;
 
         let fd = data.file.write().unwrap().as_raw_fd();
 
@@ -2666,14 +2807,11 @@ impl FileSystem for PassthroughFs {
         offset: u64,
         whence: u32,
     ) -> io::Result<u64> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        if let Some(fs) = &self.restricted {
+            return fs.lseek(_ctx, inode, handle, offset, whence);
+        }
+
+        let data = self.handle_data(inode, handle)?;
 
         // SEEK_DATA and SEEK_HOLE have slightly different semantics
         // in Linux vs. macOS, which means we can't support them.
@@ -2711,6 +2849,10 @@ impl FileSystem for PassthroughFs {
         shm_size: u64,
         map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
+        if self.restricted.is_some() {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
         if map_sender.is_none() {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
@@ -2787,6 +2929,10 @@ impl FileSystem for PassthroughFs {
         shm_size: u64,
         map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
+        if self.restricted.is_some() {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
         if map_sender.is_none() {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
@@ -2827,5 +2973,119 @@ impl FileSystem for PassthroughFs {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_utils::TestDir;
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn lookup_does_not_replace_invalid_filename_bytes() {
+        let dir = TestDir::new();
+        let name = c"file\xff";
+        fs::write(dir.0.join("file\u{fffd}"), b"contents").unwrap();
+        let fs = PassthroughFs::new(
+            Config {
+                root_dir: dir.0.to_str().unwrap().to_owned(),
+                semantics: PermissionSemantics::Restricted,
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        assert!(
+            fs.lookup(
+                Context {
+                    uid: 0,
+                    gid: 0,
+                    pid: 0,
+                },
+                fuse::ROOT_ID,
+                name,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn handle_lookup_requires_matching_inode() {
+        let dir = TestDir::new();
+        let fs = PassthroughFs::new(
+            Config {
+                root_dir: dir.0.to_str().unwrap().to_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let (handle, _) = fs
+            .opendir(
+                Context {
+                    uid: 0,
+                    gid: 0,
+                    pid: 0,
+                },
+                fuse::ROOT_ID,
+                0,
+            )
+            .unwrap();
+        let handle = handle.unwrap();
+        assert!(fs.handle_data(fuse::ROOT_ID, handle).is_ok());
+        assert!(fs.handle_data(fuse::ROOT_ID + 1, handle).is_err());
+        fs.do_release(fuse::ROOT_ID, handle).unwrap();
+        assert!(fs.handle_data(fuse::ROOT_ID, handle).is_err());
+    }
+    #[test]
+    fn restricted_personality_dispatches_without_legacy_paths() {
+        let dir = TestDir::new();
+        fs::write(dir.0.join("file"), b"contents").unwrap();
+        let fs = PassthroughFs::new(
+            Config {
+                root_dir: dir.0.to_str().unwrap().to_owned(),
+                semantics: PermissionSemantics::Restricted,
+                xattr: true,
+                writeback: true,
+                cache_policy: CachePolicy::Always,
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        let ctx = Context {
+            uid: 1000,
+            gid: 1000,
+            pid: 1,
+        };
+        assert!(fs.init(FsOptions::all()).unwrap().is_empty());
+        let entry = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+        assert!(fs.inodes.read().unwrap().get(&entry.inode).is_none());
+        assert_eq!(entry.attr.st_uid, ctx.uid);
+        assert_eq!(entry.attr_timeout, Duration::ZERO);
+        assert!(
+            fs.open(ctx, entry.inode, false, 0)
+                .unwrap()
+                .1
+                .contains(OpenOptions::DIRECT_IO)
+        );
+        assert!(fs.getxattr(ctx, entry.inode, c"user.test", 0).is_err());
+        assert!(
+            fs.setxattr(ctx, entry.inode, c"user.test", b"value", 0)
+                .is_err()
+        );
+        assert!(fs.listxattr(ctx, entry.inode, 0).is_err());
+        assert!(fs.removexattr(ctx, entry.inode, c"user.test").is_err());
+        assert!(
+            fs.setupmapping(ctx, entry.inode, 0, 0, 4096, 0, 0, 0, 4096, &None)
+                .is_err()
+        );
+        assert!(fs.removemapping(ctx, Vec::new(), 0, 4096, &None).is_err());
+        fs::hard_link(dir.0.join("file"), dir.0.join("linked")).unwrap();
+        assert!(fs.getattr(ctx, entry.inode, None).is_err());
+        fs.destroy();
     }
 }

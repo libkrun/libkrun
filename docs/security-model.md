@@ -27,6 +27,20 @@ When exposing a host directory to the guest through `FsDevice` (virtiofs):
 - **Filesystem Traversal**: Do not treat the virtio-fs export path as a sandbox for the VMM process. The passthrough implementation recommends a mount namespace and `pivot_root` when a specific directory must be confined. Export only the paths the guest needs.
 - **Resource Exhaustion**: A guest may exhaust host filesystem resources such as inode limits, file descriptor limits, and disk capacity. Storage quotas and resource limits should be enforced on the host.
 
+On macOS, call `FsDevice::set_permission_semantics(PermissionSemantics::Restricted)` before attaching a host-backed filesystem to enable restricted access. This is available for both writable and read-only exports. It uses `LinuxSimplified` permissions: the guest sees its requesting UID/GID, and permission bits are stored on the host.
+
+Restricted access pins the export root and tracked inodes with file descriptors. Every inode and open-handle operation checks that the object remains beneath that root. Root-relative traversal opens each component without dereferencing host symlinks. When an operation requires a symlink target, the backend expands its contents manually: absolute targets start at the export root, relative targets start at the link's directory, and `..` cannot leave the export. Normal guest symlink traversal still uses FUSE lookup/readlink and the guest's mount namespace.
+
+This mode deliberately restricts filesystem semantics:
+
+- Non-directory objects with multiple hard links are rejected, including when a host hard link is added after a guest opens a file. Creating hard links is rejected.
+- Only regular files, directories, and symbolic links are accessible. Device nodes, FIFOs, and sockets are rejected. Changing symlink permissions or size is rejected.
+- Moved-out, unlinked, and overwritten objects become inaccessible, including through existing open handles. Handles can still be released. Moving the export root preserves the original directory's identity.
+- Cross-device traversal, xattrs, security-context extensions, idmaps, writeback caching, and DAX are unavailable. File opens use direct I/O and metadata has zero cache lifetime. Both `set_dax_window_size()` and `set_permission_semantics()` reject combining a DAX window with restricted access, leaving the previous configuration unchanged.
+- Empty names, names containing `/`, and explicit `.`/`..` lookup or mutation names are rejected. Symlink expansion is limited to 40 links. Rename whiteouts are unsupported.
+
+The configured export path must contain no symbolic-link components. Containment checks and filesystem operations are separate syscalls: concurrent host renames, replacements, or hard-link creation can race them. Restricted access prevents guest-directed traversal under a stable host namespace; deployments requiring protection against concurrent host namespace changes must additionally restrict the VMM with host OS isolation. Each tracked inode retains a descriptor, so descriptor limits should account for the guest's lookup workload.
+
 ### 2. virtio-vsock + TSI (Transparent Socket Impersonation)
 
 When TSI is enabled on `VsockDevice`:

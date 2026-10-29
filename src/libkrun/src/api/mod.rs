@@ -39,6 +39,8 @@ pub use device_builders::NetFlags;
     any(target_os = "linux", target_os = "windows")
 ))]
 pub use device_builders::PciDeviceManager;
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub use device_builders::PermissionSemantics;
 #[cfg(not(feature = "tee"))]
 pub use device_builders::RngDevice;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
@@ -140,6 +142,8 @@ ffier::library_definition!("krun", library_tag = 1,
     enum devices::virtio::balloon::FreePageReportingMode,
     enum crate::api::logging::LogLevel,
     enum crate::api::logging::LogStyle,
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    enum crate::api::device_builders::PermissionSemantics,
     fn crate::api::logging::init_log,
     fn crate::api::vmm_builder::check_nested_virt,
     bitflags crate::api::logging::LogOptions,

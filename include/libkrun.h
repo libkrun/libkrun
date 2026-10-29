@@ -160,6 +160,12 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 #define KRUN_LOG_STYLE_ALWAYS 1
 #define KRUN_LOG_STYLE_NEVER 2
 
+/* PermissionSemantics ----------------------------------------------- */
+
+#define KRUN_PERMISSION_SEMANTICS_LINUX_COMPLETE 0
+#define KRUN_PERMISSION_SEMANTICS_LINUX_SIMPLIFIED 1
+#define KRUN_PERMISSION_SEMANTICS_RESTRICTED 2
+
 /* LogOptions -------------------------------------------------------- */
 
 #define KRUN_LOG_OPTIONS_NO_ENV 1
@@ -246,9 +252,24 @@ typedef void (*krun_fs_device_set_overlay_fn)(KrunFsDevice handle, KrunFsOverlay
  * When set, the guest can memory-map files from the shared filesystem
  * directly into its address space, avoiding data copies. If not set,
  * no DAX window is allocated.
+ *
+ * Returns `InvalidParam` without changing the configuration when
+ * `Restricted` permission semantics are selected.
  */
-void krun_fs_device_set_dax_window_size(KrunFsDevice handle, uint64_t bytes);
-typedef void (*krun_fs_device_set_dax_window_size_fn)(KrunFsDevice handle, uint64_t bytes);
+KrunResult krun_fs_device_set_dax_window_size(KrunFsDevice handle, uint64_t bytes, KrunError* err_out);
+typedef KrunResult (*krun_fs_device_set_dax_window_size_fn)(KrunFsDevice handle, uint64_t bytes, KrunError* err_out);
+/**
+ * Select the permission semantics before attaching this device.
+ *
+ * Defaults to `LinuxComplete`. `LinuxSimplified` disables xattrs and idmaps
+ * and disables attribute caching because ownership depends on the requester.
+ * `Restricted` confines macOS operations to the export root and cannot be combined
+ * with a DAX window. Concurrent host namespace changes require host OS isolation.
+ * Other hosts return `FeatureDisabled` for `Restricted`.
+ * A NullFs device has no host permission semantics and returns `InvalidParam`.
+ */
+KrunResult krun_fs_device_set_permission_semantics(KrunFsDevice handle, uint32_t semantics, KrunError* err_out);
+typedef KrunResult (*krun_fs_device_set_permission_semantics_fn)(KrunFsDevice handle, uint32_t semantics, KrunError* err_out);
 void krun_fs_device_destroy(KrunFsDevice handle);
 typedef void (*krun_fs_device_destroy_fn)(KrunFsDevice handle);
 

@@ -35,7 +35,7 @@ use devices::virtio::block::{DiskFormat, SyncMode};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-use devices::virtio::passthrough::PermissionSemantics;
+use devices::virtio::passthrough::PermissionSemantics as PassthroughPermissionSemantics;
 use devices::virtio::{PortDescription, VirtioDevice, VirtioShmRegion, VmmExitObserver, port_io};
 #[cfg(feature = "input")]
 use krun_input;
@@ -591,6 +591,29 @@ impl<'a> FsOverlay<'a> {
     }
 }
 
+/// Permission semantics used by a host-backed virtio-fs filesystem.
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(cfg = "not(any(feature = \"tee\", feature = \"aws-nitro\"))")
+)]
+#[cfg_attr(
+    not(feature = "ffi"),
+    cfg(not(any(feature = "tee", feature = "aws-nitro")))
+)]
+#[repr(u32)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionSemantics {
+    /// Emulate Linux ownership and permission semantics as closely as possible.
+    #[default]
+    LinuxComplete = 0,
+    /// Use simplified ownership and permissions without xattrs or idmaps.
+    LinuxSimplified = 1,
+    /// Confine operations to the export root with simplified permissions.
+    /// Only macOS supports this personality; other hosts return `FeatureDisabled`.
+    /// Hard links, special files, xattrs, idmaps, writeback caching and DAX are unavailable.
+    Restricted = 2,
+}
+
 /// A virtio-fs (virtiofs) shared filesystem device.
 ///
 /// Exposes a host directory to the guest as a shared filesystem.
@@ -652,8 +675,57 @@ impl<'a> FsDevice<'a> {
     /// When set, the guest can memory-map files from the shared filesystem
     /// directly into its address space, avoiding data copies. If not set,
     /// no DAX window is allocated.
-    pub fn set_dax_window_size(&mut self, bytes: u64) {
+    ///
+    /// Returns `InvalidParam` without changing the configuration when
+    /// `Restricted` permission semantics are selected.
+    pub fn set_dax_window_size(&mut self, bytes: u64) -> Result<(), VmmError> {
+        #[cfg(target_os = "macos")]
+        if self.inner.lock().unwrap().is_restricted() {
+            return Err(VmmError::InvalidParam());
+        }
         self.shm_size = Some(bytes as usize);
+        Ok(())
+    }
+
+    /// Select the permission semantics before attaching this device.
+    ///
+    /// Defaults to `LinuxComplete`. `LinuxSimplified` disables xattrs and idmaps
+    /// and disables attribute caching because ownership depends on the requester.
+    /// `Restricted` confines macOS operations to the export root and cannot be combined
+    /// with a DAX window. Concurrent host namespace changes require host OS isolation.
+    /// Other hosts return `FeatureDisabled` for `Restricted`.
+    /// A NullFs device has no host permission semantics and returns `InvalidParam`.
+    pub fn set_permission_semantics(
+        &mut self,
+        semantics: PermissionSemantics,
+    ) -> Result<(), VmmError> {
+        #[cfg(target_os = "macos")]
+        if matches!(semantics, PermissionSemantics::Restricted) && self.shm_size.is_some() {
+            return Err(VmmError::InvalidParam());
+        }
+        let semantics = match semantics {
+            PermissionSemantics::LinuxComplete => PassthroughPermissionSemantics::LinuxComplete,
+            PermissionSemantics::LinuxSimplified => PassthroughPermissionSemantics::LinuxSimplified,
+            PermissionSemantics::Restricted => {
+                #[cfg(target_os = "macos")]
+                {
+                    PassthroughPermissionSemantics::Restricted
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    return Err(VmmError::FeatureDisabled());
+                }
+            }
+        };
+        if !self
+            .inner
+            .lock()
+            .unwrap()
+            .set_permission_semantics(semantics)
+        {
+            return Err(VmmError::InvalidParam());
+        }
+        Ok(())
     }
 }
 
@@ -663,7 +735,7 @@ impl<'a> FsDevice<'a> {
         let exit_code = Arc::new(AtomicI32::new(i32::MAX));
         let fs = devices::virtio::Fs::new(
             tag.to_string(),
-            PermissionSemantics::LinuxComplete,
+            PassthroughPermissionSemantics::LinuxComplete,
             host_path,
             exit_code.clone(),
             read_only,
@@ -700,6 +772,10 @@ impl<'a> AttachDevice<'a> for FsDevice<'a> {
 
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        #[cfg(target_os = "macos")]
+        if self.inner.lock().unwrap().is_restricted() && self.shm_size.is_some() {
+            return Err(VmmError::InvalidParam());
+        }
         {
             let mut fs = self.inner.lock().unwrap();
             // Wire exit code from VMM into the fs device
@@ -2092,4 +2168,60 @@ fn resolve_parent_dirs<'a, 'b>(
         }
     }
     Ok(current)
+}
+
+#[cfg(all(
+    test,
+    target_os = "macos",
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
+mod restricted_fs_tests {
+    use super::*;
+
+    #[test]
+    fn restricted_mode_is_available_for_writable_and_read_only_exports() {
+        let mut writable = FsDevice::new("shared", "/").unwrap();
+        writable
+            .set_permission_semantics(PermissionSemantics::Restricted)
+            .unwrap();
+        assert!(writable.inner.lock().unwrap().is_restricted());
+        let mut read_only = FsDevice::new_read_only("shared", "/").unwrap();
+        read_only
+            .set_permission_semantics(PermissionSemantics::Restricted)
+            .unwrap();
+        assert!(read_only.inner.lock().unwrap().is_restricted());
+    }
+
+    #[test]
+    fn restricted_mode_rejects_null_filesystems_and_dax_windows() {
+        let mut null = FsDevice::new_null("null").unwrap();
+        assert!(matches!(
+            null.set_permission_semantics(PermissionSemantics::Restricted),
+            Err(VmmError::InvalidParam())
+        ));
+        let mut dax = FsDevice::new("shared", "/").unwrap();
+        dax.set_dax_window_size(4096).unwrap();
+        assert!(matches!(
+            dax.set_permission_semantics(PermissionSemantics::Restricted),
+            Err(VmmError::InvalidParam())
+        ));
+        assert!(!dax.inner.lock().unwrap().is_restricted());
+    }
+
+    #[test]
+    fn dax_window_rejects_restricted_semantics_without_changing_configuration() {
+        let mut fs = FsDevice::new("shared", "/").unwrap();
+        fs.set_permission_semantics(PermissionSemantics::Restricted)
+            .unwrap();
+        assert!(matches!(
+            fs.set_dax_window_size(4096),
+            Err(VmmError::InvalidParam())
+        ));
+        assert_eq!(fs.shm_size, None);
+        assert!(fs.inner.lock().unwrap().is_restricted());
+        fs.set_permission_semantics(PermissionSemantics::LinuxSimplified)
+            .unwrap();
+        fs.set_dax_window_size(4096).unwrap();
+        assert_eq!(fs.shm_size, Some(4096));
+    }
 }
