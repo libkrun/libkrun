@@ -1,6 +1,8 @@
 use std::cmp;
 use std::io::Write;
 use std::mem::size_of;
+use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
@@ -71,6 +73,38 @@ impl FreeRange {
     }
 }
 
+/// How often the device logs how much of the free page reports it skipped because they were in
+/// locked guest memory, at most.
+const LOCKED_SKIPPED_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Splits the `len` bytes at `addr` of a free page report into the parts that aren't in any of
+/// the ranges of `locked`, which are sorted and don't overlap, and returns them with the number
+/// of bytes that are.
+fn trim_locked(locked: &[Range<u64>], addr: u64, len: u64) -> (Vec<(u64, u64)>, u64) {
+    // A range that wraps around isn't in guest memory, and process_frq() ignores it.
+    let Some(end) = addr.checked_add(len) else {
+        return (vec![(addr, len)], 0);
+    };
+    let mut parts = Vec::new();
+    let mut skipped = 0;
+    let mut start = addr;
+    for range in locked {
+        if range.end <= start || range.start >= end {
+            continue;
+        }
+        if range.start > start {
+            parts.push((start, range.start - start));
+        }
+        let skipped_end = range.end.min(end);
+        skipped += skipped_end - start.max(range.start);
+        start = skipped_end;
+    }
+    if start < end {
+        parts.push((start, end - start));
+    }
+    (parts, skipped)
+}
+
 /// Merges the ranges of a report that are adjacent in the same region of guest memory, so that
 /// each run of them is released with a single system call.
 pub(super) fn coalesce(mem: &GuestMemoryMmap, mut ranges: Vec<FreeRange>) -> Vec<FreeRange> {
@@ -99,6 +133,13 @@ pub struct Balloon {
     pub(crate) device_state: DeviceState,
     config: VirtioBalloonConfig,
     pub(super) reclaim: FreePageReclaim,
+    /// Guest memory that the VMM locks into host memory, whose free pages aren't given back to
+    /// the host.
+    locked: Vec<Range<u64>>,
+    /// The bytes of free page reports that were skipped because they were in `locked`.
+    locked_skipped_bytes: u64,
+    /// When the skipped bytes were logged last, and how many there were then.
+    locked_skipped_logged: Option<(Instant, u64)>,
 }
 
 impl Balloon {
@@ -112,11 +153,51 @@ impl Balloon {
             device_state: DeviceState::Inactive,
             config: VirtioBalloonConfig::default(),
             reclaim: Default::default(),
+            locked: Vec::new(),
+            locked_skipped_bytes: 0,
+            locked_skipped_logged: None,
         })
     }
 
     pub fn id(&self) -> &str {
         defs::BALLOON_DEV_ID
+    }
+
+    /// Set the ranges of guest physical addresses of the guest memory that the VMM locks into
+    /// host memory. The device doesn't give the free pages that the guest reports in them back to
+    /// the host: madvise() wouldn't release them, or would fail on Linux, and replacing them
+    /// would silently unlock them on macOS, where a MAP_FIXED mmap() over locked memory leaves
+    /// the new pages unlocked.
+    pub fn set_locked_ranges(&mut self, mut ranges: Vec<Range<u64>>) {
+        ranges.sort_unstable_by_key(|range| range.start);
+        self.locked = ranges;
+    }
+
+    /// The bytes of free page reports that the device didn't give back to the host because they
+    /// were in locked guest memory.
+    pub fn locked_skipped_bytes(&self) -> u64 {
+        self.locked_skipped_bytes
+    }
+
+    /// Logs the bytes of free page reports that were skipped because they were in locked guest
+    /// memory, if that changed, at most every LOCKED_SKIPPED_LOG_INTERVAL.
+    fn log_locked_skipped_bytes(&mut self) {
+        let skipped = self.locked_skipped_bytes;
+        let now = Instant::now();
+        let log = match self.locked_skipped_logged {
+            None => skipped != 0,
+            Some((at, logged)) => {
+                skipped != logged && now.duration_since(at) >= LOCKED_SKIPPED_LOG_INTERVAL
+            }
+        };
+        if log {
+            info!(
+                "balloon: locked_skipped_bytes={skipped}: free page reports in locked guest \
+                 memory that weren't given back to the host ({} MiB)",
+                skipped >> 20
+            );
+            self.locked_skipped_logged = Some((now, skipped));
+        }
     }
 
     pub fn process_frq(&mut self) -> bool {
@@ -142,20 +223,32 @@ impl Balloon {
             let index = head.index;
             let mut ranges = Vec::new();
             for desc in head.into_iter() {
-                // The range comes from the guest. Releasing one that runs past the end of
-                // a guest memory region would discard whatever the VMM has mapped after it.
-                let Some(range) = FreeRange::new(mem, desc.addr, desc.len as usize) else {
-                    warn!(
-                        "balloon: ignoring free page report outside guest memory: guest_addr={:?} len={}",
+                // Locked guest memory stays where it is, whichever way the reclaimer would give
+                // it back.
+                let (parts, skipped) = trim_locked(&self.locked, desc.addr.0, desc.len.into());
+                if skipped != 0 {
+                    debug!(
+                        "balloon: skipping {skipped} bytes in locked guest memory of guest_addr={:?} len={}",
                         desc.addr, desc.len
                     );
-                    continue;
-                };
-                debug!(
-                    "balloon: should release guest_addr={:?} host_addr={:p} len={}",
-                    range.guest_addr, range.host_addr, range.len
-                );
-                ranges.push(range);
+                    self.locked_skipped_bytes += skipped;
+                }
+                for (addr, len) in parts {
+                    // The range comes from the guest. Releasing one that runs past the end of
+                    // a guest memory region would discard whatever the VMM has mapped after it.
+                    let Some(range) = FreeRange::new(mem, GuestAddress(addr), len as usize) else {
+                        warn!(
+                            "balloon: ignoring free page report outside guest memory: guest_addr={:#x} len={}",
+                            addr, len
+                        );
+                        continue;
+                    };
+                    debug!(
+                        "balloon: should release guest_addr={:?} host_addr={:p} len={}",
+                        range.guest_addr, range.host_addr, range.len
+                    );
+                    ranges.push(range);
+                }
             }
 
             if self.reclaim.release(mem, index, ranges) {
@@ -171,6 +264,7 @@ impl Balloon {
             }
         }
 
+        self.log_locked_skipped_bytes();
         have_used
     }
 }
@@ -536,5 +630,110 @@ mod tests {
     #[test]
     fn test_coalesce_single_range() {
         assert_coalesced(&[(0x1000, 0x1000)], &[(0x1000, 0x1000)]);
+    }
+
+    #[test]
+    fn test_trim_locked() {
+        let locked = [0x10_0000..0x20_0000, 0x40_0000..0x50_0000];
+        let trim = |addr, len| trim_locked(&locked, addr, len);
+        // Outside, and right next to a locked range on either side.
+        assert_eq!(trim(0x2000, 0x1000), (vec![(0x2000, 0x1000)], 0));
+        assert_eq!(trim(0xf_f000, 0x1000), (vec![(0xf_f000, 0x1000)], 0));
+        assert_eq!(trim(0x20_0000, 0x1000), (vec![(0x20_0000, 0x1000)], 0));
+        // Inside.
+        assert_eq!(trim(0x10_0000, 0x10_0000), (vec![], 0x10_0000));
+        assert_eq!(trim(0x18_0000, 0x1000), (vec![], 0x1000));
+        // Across the start or the end of a locked range.
+        assert_eq!(
+            trim(0xf_0000, 0x2_0000),
+            (vec![(0xf_0000, 0x1_0000)], 0x1_0000)
+        );
+        assert_eq!(
+            trim(0x1f_0000, 0x2_0000),
+            (vec![(0x20_0000, 0x1_0000)], 0x1_0000)
+        );
+        // Around a locked range, and across both.
+        assert_eq!(
+            trim(0xf_0000, 0x12_0000),
+            (vec![(0xf_0000, 0x1_0000), (0x20_0000, 0x1_0000)], 0x10_0000)
+        );
+        assert_eq!(
+            trim(0x1f_0000, 0x32_0000),
+            (
+                vec![(0x20_0000, 0x20_0000), (0x50_0000, 0x1_0000)],
+                0x11_0000
+            )
+        );
+        // Without locked memory, and wrapping around, a range is left as it is.
+        assert_eq!(
+            trim_locked(&[], 0x10_0000, 0x1000),
+            (vec![(0x10_0000, 0x1000)], 0)
+        );
+        assert_eq!(
+            trim(u64::MAX - 0x1000, 0x2000),
+            (vec![(u64::MAX - 0x1000, 0x2000)], 0)
+        );
+    }
+
+    /// RAM, with the free page reporting queue at its start, and locked guest memory in a region
+    /// of its own, as in the VMM's layout.
+    fn guest_memory_with_locked() -> (GuestMemoryMmap, Range<u64>) {
+        let locked = 32 * MIB..36 * MIB;
+        let mem = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), (16 * MIB) as usize),
+            (
+                GuestAddress(locked.start),
+                (locked.end - locked.start) as usize,
+            ),
+        ])
+        .unwrap();
+        (mem, locked)
+    }
+
+    #[test]
+    fn test_report_in_locked_memory_is_used_and_counted() {
+        let (mem, locked) = guest_memory_with_locked();
+        let mut dev = TestDevice::new(&mem);
+        dev.balloon.set_locked_ranges(vec![locked.clone()]);
+        dev.report(&[(locked.start, 2 * MIB as u32), (4 * MIB, 2 * MIB as u32)]);
+        dev.notify();
+
+        assert_eq!(dev.used(), 1);
+        assert!(dev.signaled());
+        assert_eq!(dev.pending(&mem), 0);
+        assert_eq!(dev.balloon.locked_skipped_bytes(), 2 * MIB);
+
+        // Only what is in locked memory counts.
+        dev.report(&[(locked.end - MIB, 2 * MIB as u32)]);
+        dev.notify();
+        assert_eq!(dev.used(), 2);
+        assert_eq!(dev.balloon.locked_skipped_bytes(), 3 * MIB);
+    }
+
+    #[test]
+    fn test_locked_skipped_bytes_are_logged_when_they_change() {
+        let (mem, locked) = guest_memory_with_locked();
+        let mut dev = TestDevice::new(&mem);
+        dev.balloon.set_locked_ranges(vec![locked.clone()]);
+        dev.notify();
+        assert_eq!(dev.balloon.locked_skipped_logged, None);
+
+        dev.report(&[(locked.start, 2 * MIB as u32)]);
+        dev.notify();
+        let (at, logged) = dev.balloon.locked_skipped_logged.unwrap();
+        assert_eq!(logged, 2 * MIB);
+
+        // Not again before LOCKED_SKIPPED_LOG_INTERVAL.
+        dev.report(&[(locked.start, 2 * MIB as u32)]);
+        dev.notify();
+        assert_eq!(dev.balloon.locked_skipped_logged, Some((at, 2 * MIB)));
+        assert_eq!(dev.balloon.locked_skipped_bytes(), 4 * MIB);
+
+        let earlier = at - LOCKED_SKIPPED_LOG_INTERVAL;
+        dev.balloon.locked_skipped_logged = Some((earlier, 2 * MIB));
+        dev.notify();
+        let (at, logged) = dev.balloon.locked_skipped_logged.unwrap();
+        assert!(at > earlier);
+        assert_eq!(logged, 4 * MIB);
     }
 }

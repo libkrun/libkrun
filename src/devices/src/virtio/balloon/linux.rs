@@ -82,6 +82,35 @@ mod tests {
     }
 
     #[test]
+    fn test_process_frq_does_not_release_locked_memory() {
+        const MIB: usize = 1 << 20;
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 2 * MIB)]).unwrap();
+        // The free page reporting queue is at the start of guest memory.
+        let first = 8 * PAGE;
+        mem.write_slice(&vec![0xff; 2 * MIB - first], GuestAddress(first as u64))
+            .unwrap();
+
+        let mut dev = TestDevice::new(&mem);
+        // Pages 12 to 15 are locked, and the report covers pages 10 to 17.
+        let locked = (12 * PAGE) as u64..(16 * PAGE) as u64;
+        dev.balloon.set_locked_ranges(vec![locked]);
+        dev.report(&[((10 * PAGE) as u64, (8 * PAGE) as u32)]);
+        assert!(dev.balloon.process_frq());
+        assert_eq!(dev.used(), 1);
+        assert_eq!(dev.balloon.locked_skipped_bytes(), 4 * PAGE as u64);
+
+        let mut contents = vec![0; 2 * MIB - first];
+        mem.read_slice(&mut contents, GuestAddress(first as u64))
+            .unwrap();
+        for (page, contents) in contents.chunks(PAGE).enumerate() {
+            let page = page + first / PAGE;
+            let is_released = (10..12).contains(&page) || (16..18).contains(&page);
+            let expected = if is_released { 0 } else { 0xff };
+            assert!(contents.iter().all(|&b| b == expected), "page {page}");
+        }
+    }
+
+    #[test]
     fn test_process_frq_releases_only_reported_ranges_within_guest_memory() {
         const MIB: usize = 1 << 20;
         // A hole of 3 MiB between two regions.
