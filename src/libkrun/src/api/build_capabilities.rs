@@ -50,3 +50,42 @@ pub fn build_capability_flags() -> BuildCapabilityFlags {
 
     flags
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expected_build_capability_flags() -> BuildCapabilityFlags {
+        let flags = BuildCapabilityFlags::empty();
+
+        #[cfg(feature = "blk")]
+        let flags = flags | BuildCapabilityFlags::BLK;
+        #[cfg(feature = "net")]
+        let flags = flags | BuildCapabilityFlags::NET;
+        #[cfg(feature = "gpu")]
+        let flags = flags | BuildCapabilityFlags::GPU;
+        #[cfg(feature = "input")]
+        let flags = flags | BuildCapabilityFlags::INPUT;
+        #[cfg(all(feature = "vhost-user", target_os = "linux"))]
+        let flags = flags | BuildCapabilityFlags::VHOST_USER;
+        #[cfg(feature = "virgl_resource_map2")]
+        let flags = flags | BuildCapabilityFlags::VIRGL_RESOURCE_MAP2;
+        #[cfg(feature = "aws-nitro")]
+        let flags = flags | BuildCapabilityFlags::AWS_NITRO;
+        #[cfg(feature = "tee")]
+        let flags = flags | BuildCapabilityFlags::TEE;
+        #[cfg(feature = "amd-sev")]
+        let flags = flags | BuildCapabilityFlags::AMD_SEV;
+        #[cfg(feature = "tdx")]
+        let flags = flags | BuildCapabilityFlags::TDX;
+        #[cfg(feature = "timesync")]
+        let flags = flags | BuildCapabilityFlags::TIMESYNC;
+
+        flags
+    }
+
+    #[test]
+    fn reports_enabled_cargo_features() {
+        assert_eq!(build_capability_flags(), expected_build_capability_flags());
+    }
+}
