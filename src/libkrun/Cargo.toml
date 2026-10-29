@@ -55,7 +55,7 @@ utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 bzip2 = "0.5"
 cpuid = { package = "krun-cpuid", version = "=0.1.0-2.0.0-dev", path = "../cpuid" }
-zstd = "0.13"
+zstd = "0.14.3"
 
 [target.'cfg(unix)'.dependencies]
 linux-loader = { version = "0.14.0", features = ["bzimage", "elf", "pe"] }

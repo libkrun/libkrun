@@ -13,7 +13,6 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::ptr::null_mut;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -33,6 +32,7 @@ use super::super::filesystem::{
 use super::super::fuse;
 use super::super::inode_alloc::InodeAllocator;
 use super::super::multikey::MultikeyBTreeMap;
+pub use super::super::{CachePolicy, PermissionSemantics};
 
 const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
 const SECURITY_CAPABILITY: &[u8] = b"security.capability\0";
@@ -491,57 +491,6 @@ fn istat(
         InodeHandle::Fd(fd) => fstat(ctx, semantics, *fd, host),
         InodeHandle::Path(c_path) => lstat(ctx, semantics, c_path, host),
     }
-}
-
-/// The caching policy that the file system should report to the FUSE client. By default the FUSE
-/// protocol uses close-to-open consistency. This means that any cached contents of the file are
-/// invalidated the next time that file is opened.
-#[derive(Debug, Default, Clone)]
-pub enum CachePolicy {
-    /// The client should never cache file data and all I/O should be directly forwarded to the
-    /// server. This policy must be selected when file contents may change without the knowledge of
-    /// the FUSE client (i.e., the file system does not have exclusive access to the directory).
-    Never,
-
-    /// The client is free to choose when and how to cache file data. This is the default policy and
-    /// uses close-to-open consistency as described in the enum documentation.
-    #[default]
-    Auto,
-
-    /// The client should always cache file data. This means that the FUSE client will not
-    /// invalidate any cached data that was returned by the file system the last time the file was
-    /// opened. This policy should only be selected when the file system has exclusive access to the
-    /// directory.
-    Always,
-}
-
-impl FromStr for CachePolicy {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "never" | "Never" | "NEVER" => Ok(CachePolicy::Never),
-            "auto" | "Auto" | "AUTO" => Ok(CachePolicy::Auto),
-            "always" | "Always" | "ALWAYS" => Ok(CachePolicy::Always),
-            _ => Err("invalid cache policy"),
-        }
-    }
-}
-
-/// The permission semantics to be emulated by this file system personality.
-#[derive(Debug, Default, Clone, Copy)]
-pub enum PermissionSemantics {
-    /// Be as close as possible to the common semantics of Linux file systems.
-    #[default]
-    LinuxComplete,
-
-    /// As `LinuxComplete`, with the following simplifications:
-    ///  - Extended attributes are not supported.
-    ///  - Idmaps are not supported.
-    ///  - Ownership bits are ignored, always returning the uid/gid from the process
-    ///    requesting the operation within the guest (obtained from `Context`).
-    ///  - Permissions bits are stored in the host, not as extended attributes.
-    LinuxSimplified,
 }
 
 /// Options that configure the behavior of the file system.
@@ -1384,6 +1333,14 @@ impl FileSystem for PassthroughFs {
             self.announce_submounts.store(true, Ordering::Relaxed);
         }
 
+        // Every lookup costs a round trip through the VMM, so let the kernel fetch a directory's
+        // attributes along with its entries, and look up names in one directory concurrently.
+        // Neither `readdirplus` nor `lookup` takes a lock on the directory.
+        opts |= capable
+            & (FsOptions::DO_READDIRPLUS
+                | FsOptions::READDIRPLUS_AUTO
+                | FsOptions::PARALLEL_DIROPS);
+
         Ok(opts)
     }
 
@@ -1585,16 +1542,30 @@ impl FileSystem for PassthroughFs {
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
         self.do_readdir(inode, handle, size, offset, |dir_entry| {
-            // Safe because the kernel guarantees that the buffer is nul-terminated. Additionally,
-            // the kernel will pad the name with '\0' bytes up to 8-byte alignment and there's no
-            // way for us to know exactly how many padding bytes there are. This would cause
-            // `CStr::from_bytes_with_nul` to return an error because it would think there are
-            // interior '\0' bytes. We trust the kernel to provide us with properly formatted data
-            // so we'll just skip the checks here.
-            let name = unsafe { CStr::from_bytes_with_nul_unchecked(dir_entry.name) };
-            let entry = self.lookup(ctx, inode, name)?;
-
-            add_entry(dir_entry, entry)
+            // The directory stream keeps each name without a NUL, and without "." and "..".
+            let name = CString::new(dir_entry.name).map_err(|_| einval())?;
+            let entry = match self.lookup(ctx, inode, &name) {
+                Ok(entry) => entry,
+                // A name removed since the directory was read still lists, without attributes,
+                // instead of ending the reply early.
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                    return add_entry(dir_entry, Entry::without_attributes());
+                }
+                Err(e) => return Err(e),
+            };
+            let looked_up = entry.inode;
+            match add_entry(dir_entry, entry) {
+                // The entry did not fit, so the kernel never saw the reference this lookup took.
+                Ok(0) => {
+                    forget_one(&mut self.inodes.write().unwrap(), looked_up, 1);
+                    Ok(0)
+                }
+                Err(e) => {
+                    forget_one(&mut self.inodes.write().unwrap(), looked_up, 1);
+                    Err(e)
+                }
+                added => added,
+            }
         })
     }
 

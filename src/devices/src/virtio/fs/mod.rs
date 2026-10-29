@@ -38,6 +38,56 @@ pub use self::defs::uapi::VIRTIO_ID_FS as TYPE_FS;
 pub use self::device::Fs;
 pub use self::filesystem::ExportTable;
 
+/// Guest file-data caching policy for a host-backed virtio-fs filesystem.
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(cfg = "not(any(feature = \"tee\", feature = \"aws-nitro\"))")
+)]
+#[repr(u32)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CachePolicy {
+    /// Forward file-data I/O to the server without caching it in the guest. Use this when
+    /// file contents may change outside the guest.
+    Never = 0,
+    /// Let the guest cache file data with close-to-open consistency: cached contents are
+    /// invalidated when the file is opened again.
+    #[default]
+    Auto = 1,
+    /// Keep cached file data across opens. Use this only when the filesystem has exclusive
+    /// access to the shared directory.
+    Always = 2,
+}
+
+impl FromStr for CachePolicy {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        match s {
+            "never" | "Never" | "NEVER" => Ok(CachePolicy::Never),
+            "auto" | "Auto" | "AUTO" => Ok(CachePolicy::Auto),
+            "always" | "Always" | "ALWAYS" => Ok(CachePolicy::Always),
+            _ => Err("invalid cache policy"),
+        }
+    }
+}
+
+/// Permission semantics used by a host-backed virtio-fs filesystem.
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(cfg = "not(any(feature = \"tee\", feature = \"aws-nitro\"))")
+)]
+#[repr(u32)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionSemantics {
+    /// Emulate Linux ownership and permission semantics as closely as possible.
+    #[default]
+    LinuxComplete = 0,
+    /// Report ownership as the requesting guest process's uid and gid, ignore ownership
+    /// changes, and store permission bits on the host without extended attributes or idmaps.
+    /// Unsupported on Linux hosts.
+    LinuxSimplified = 1,
+}
+
 mod defs {
     use super::super::QueueConfig;
 
@@ -57,11 +107,15 @@ mod defs {
 
 use std::ffi::{FromBytesWithNulError, FromVecWithNulError};
 use std::io;
+use std::result;
+use std::str::FromStr;
 
 use descriptor_utils::Error as DescriptorError;
 
 #[derive(Debug)]
 pub enum FsError {
+    /// The host does not implement the selected permission semantics.
+    UnsupportedPermissionSemantics,
     /// Failed to decode protocol messages.
     DecodeMessage(io::Error),
     /// Failed to encode protocol messages.

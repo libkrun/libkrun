@@ -538,13 +538,27 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
         handle: Handle,
         size: u32,
         offset: u64,
-        add_entry: F,
+        mut add_entry: F,
     ) -> io::Result<()>
     where
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
-        self.inner
-            .readdirplus(ctx, inode, handle, size, offset, add_entry)
+        let has_overlay_children = self
+            .name_to_inode
+            .read()
+            .unwrap()
+            .keys()
+            .any(|(parent, _)| *parent == inode);
+        if has_overlay_children {
+            // Let lookup resolve overlay names without consuming one-shot entries here.
+            self.inner
+                .readdir(ctx, inode, handle, size, offset, |entry| {
+                    add_entry(entry, Entry::without_attributes())
+                })
+        } else {
+            self.inner
+                .readdirplus(ctx, inode, handle, size, offset, add_entry)
+        }
     }
 
     fn fsyncdir(
@@ -759,5 +773,150 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
                 ctx, inode, handle, flags, cmd, arg, in_size, out_size, exit_code,
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CTX: Context = Context {
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    };
+    const HOST_INODE: Inode = 100;
+
+    struct DirectoryFs;
+
+    impl FileSystem for DirectoryFs {
+        type Inode = Inode;
+        type Handle = Handle;
+
+        fn lookup(&self, _ctx: Context, _parent: Inode, _name: &CStr) -> io::Result<Entry> {
+            let mut entry = Entry::without_attributes();
+            entry.inode = HOST_INODE;
+            entry.attr.st_ino = HOST_INODE;
+            entry.attr.st_mode = libc::S_IFREG as _;
+            entry.attr.st_size = 4;
+            Ok(entry)
+        }
+
+        fn readdir<F>(
+            &self,
+            _ctx: Context,
+            _inode: Inode,
+            _handle: Handle,
+            size: u32,
+            offset: u64,
+            mut add_entry: F,
+        ) -> io::Result<()>
+        where
+            F: FnMut(DirEntry) -> io::Result<usize>,
+        {
+            if size != 0 && offset == 0 {
+                add_entry(DirEntry {
+                    ino: HOST_INODE,
+                    offset: 1,
+                    type_: 0,
+                    name: b"shadowed",
+                })?;
+            }
+            Ok(())
+        }
+
+        fn readdirplus<F>(
+            &self,
+            ctx: Context,
+            inode: Inode,
+            handle: Handle,
+            size: u32,
+            offset: u64,
+            mut add_entry: F,
+        ) -> io::Result<()>
+        where
+            F: FnMut(DirEntry, Entry) -> io::Result<usize>,
+        {
+            self.readdir(ctx, inode, handle, size, offset, |entry| {
+                add_entry(entry, self.lookup(ctx, inode, c"shadowed")?)
+            })
+        }
+    }
+
+    fn overlay_fs(one_shot: bool) -> AugmentFs<DirectoryFs> {
+        AugmentFs::new(
+            DirectoryFs,
+            &Arc::new(InodeAllocator::new()),
+            vec![VirtualDirEntry {
+                name: c"shadowed".into(),
+                entry: VirtualEntry {
+                    mode: 0o444,
+                    one_shot,
+                    content: VirtualEntryContent::File { data: b"virtual" },
+                },
+            }],
+        )
+    }
+
+    #[test]
+    fn readdirplus_defers_overlay_lookups() {
+        let fs = overlay_fs(false);
+        let mut names = Vec::new();
+        fs.readdirplus(CTX, fuse::ROOT_ID, 0, 4096, 0, |dir_entry, entry| {
+            names.push(dir_entry.name.to_vec());
+            assert_eq!(entry.inode, 0);
+            assert_eq!(entry.attr_timeout, Duration::ZERO);
+            assert_eq!(entry.entry_timeout, Duration::ZERO);
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(names, vec![b"shadowed".to_vec()]);
+
+        let entry = fs.lookup(CTX, fuse::ROOT_ID, c"shadowed").unwrap();
+        assert_ne!(entry.inode, HOST_INODE);
+        assert_eq!(entry.attr.st_size, 7);
+        let next = fs.lookup(CTX, fuse::ROOT_ID, c"shadowed").unwrap();
+        assert_eq!(entry.inode, next.inode);
+    }
+
+    #[test]
+    fn readdirplus_does_not_consume_one_shot_entries() {
+        let fs = overlay_fs(true);
+        for added in [0, 1] {
+            let mut count = 0;
+            fs.readdirplus(CTX, fuse::ROOT_ID, 0, 4096, 0, |_, entry| {
+                count += 1;
+                assert_eq!(entry.inode, 0);
+                Ok(added)
+            })
+            .unwrap();
+            assert_eq!(count, 1);
+        }
+
+        let entry = fs.lookup(CTX, fuse::ROOT_ID, c"shadowed").unwrap();
+        assert_ne!(entry.inode, HOST_INODE);
+        assert_eq!(entry.attr.st_size, 7);
+        let next = fs.lookup(CTX, fuse::ROOT_ID, c"shadowed").unwrap();
+        assert_eq!(next.inode, HOST_INODE);
+
+        fs.readdirplus(CTX, fuse::ROOT_ID, 0, 4096, 0, |_, entry| {
+            assert_eq!(entry.inode, HOST_INODE);
+            Ok(1)
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn readdirplus_keeps_attributes_in_directories_without_overlay_children() {
+        let fs = overlay_fs(false);
+        let mut count = 0;
+        fs.readdirplus(CTX, HOST_INODE + 1, 0, 4096, 0, |_, entry| {
+            count += 1;
+            assert_eq!(entry.inode, HOST_INODE);
+            assert_eq!(entry.attr.st_size, 4);
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(count, 1);
     }
 }

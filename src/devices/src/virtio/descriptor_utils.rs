@@ -157,7 +157,7 @@ impl<'a> DescriptorChainConsumer<'a> {
                 // its `size` value in the call to `position` above.
                 let front = other.pop_front().expect("empty VecDeque after split");
                 self.buffers
-                    .push_back(front.offset(rem).map_err(Error::VolatileMemoryError)?);
+                    .push_back(front.subslice(0, rem).map_err(Error::VolatileMemoryError)?);
                 other.push_front(front.offset(rem).map_err(Error::VolatileMemoryError)?);
             }
 
@@ -343,26 +343,36 @@ pub struct Writer<'a> {
 impl<'a> Writer<'a> {
     /// Construct a new Writer wrapper over `desc_chain`.
     pub fn new(mem: &'a GuestMemoryMmap, chain: DescriptorChain<'a>) -> Result<Writer<'a>> {
+        Self::from_guest_buffers(
+            mem,
+            chain
+                .into_iter()
+                .writable()
+                .map(|desc| (desc.addr, desc.len)),
+        )
+    }
+
+    /// Construct a Writer from guest memory buffers previously captured from a descriptor chain.
+    pub(crate) fn from_guest_buffers(
+        mem: &'a GuestMemoryMmap,
+        buffers: impl IntoIterator<Item = (GuestAddress, u32)>,
+    ) -> Result<Writer<'a>> {
         let mut total_len: usize = 0;
-        let buffers = chain
+        let buffers = buffers
             .into_iter()
-            .writable()
-            .map(|desc| {
+            .map(|(addr, len)| {
                 // Verify that summing the descriptor sizes does not overflow.
                 // This can happen if a driver tricks a device into writing more data than
                 // fits in a `usize`.
                 total_len = total_len
-                    .checked_add(desc.len as usize)
+                    .checked_add(len as usize)
                     .ok_or(Error::DescriptorChainOverflow)?;
 
-                let region = mem.find_region(desc.addr).ok_or(Error::FindMemoryRegion)?;
-                let offset = desc
-                    .addr
-                    .checked_sub(region.start_addr().raw_value())
-                    .unwrap();
+                let region = mem.find_region(addr).ok_or(Error::FindMemoryRegion)?;
+                let offset = addr.checked_sub(region.start_addr().raw_value()).unwrap();
                 region
                     .deref()
-                    .get_slice(offset.raw_value() as usize, desc.len as usize)
+                    .get_slice(offset.raw_value() as usize, len as usize)
                     .map_err(Error::VolatileMemoryError)
             })
             .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
@@ -457,10 +467,7 @@ impl io::Write for Writer<'_> {
             for vs in bufs {
                 let copy_len = cmp::min(rem.len(), vs.len());
 
-                // Safe because we have already verified that `vs` points to valid memory.
-                unsafe {
-                    copy_nonoverlapping(rem.as_ptr(), vs.ptr_guard_mut().as_ptr(), copy_len);
-                }
+                vs.copy_from(&rem[..copy_len]);
                 rem = &rem[copy_len..];
                 total += copy_len;
             }
@@ -621,6 +628,46 @@ mod tests {
 
         assert_eq!(writer.available_bytes(), 0);
         assert_eq!(writer.bytes_written(), 106);
+    }
+
+    #[test]
+    fn writer_from_guest_buffers_preserves_descriptor_order() {
+        use DescriptorType::*;
+
+        let memory_start_addr = GuestAddress(0x0);
+        let memory = GuestMemoryMmap::from_ranges(&[(memory_start_addr, 0x10000)]).unwrap();
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0x0),
+            GuestAddress(0x100),
+            vec![(Readable, 8), (Writable, 4), (Writable, 1)],
+            0,
+        )
+        .expect("create_descriptor_chain failed");
+        let buffers: Vec<_> = chain
+            .into_iter()
+            .writable()
+            .map(|desc| (desc.addr, desc.len))
+            .collect();
+
+        {
+            let mut writer = Writer::from_guest_buffers(&memory, buffers.iter().copied())
+                .expect("failed to create Writer from guest buffers");
+            writer
+                .write_all(&[0x11, 0x22, 0x33, 0x44, 0x55])
+                .expect("failed to write guest buffers");
+        }
+
+        let mut first = [0; 4];
+        let mut second = [0; 1];
+        memory
+            .read_slice(&mut first, GuestAddress(0x108))
+            .expect("failed to read first guest buffer");
+        memory
+            .read_slice(&mut second, GuestAddress(0x10c))
+            .expect("failed to read second guest buffer");
+        assert_eq!(first, [0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(second, [0x55]);
     }
 
     #[test]

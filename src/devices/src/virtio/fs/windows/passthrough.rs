@@ -3,6 +3,7 @@
 // Alternate Data Streams (ADS) for extended-attribute emulation.
 
 use super::super::inode_alloc::InodeAllocator;
+pub use super::super::{CachePolicy, PermissionSemantics};
 use std::collections::BTreeMap;
 use std::ffi::{CStr, OsString};
 use std::fs::{self, File};
@@ -11,7 +12,6 @@ use std::mem::{self, ManuallyDrop};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -167,43 +167,6 @@ struct CachedDirEntry {
     ino: u64,
     name: Vec<u8>,
     type_: u32,
-}
-
-// CachePolicy — mirrors the macOS version
-#[derive(Debug, Default, Clone)]
-pub enum CachePolicy {
-    Never,
-    #[default]
-    Auto,
-    Always,
-}
-
-impl FromStr for CachePolicy {
-    type Err = &'static str;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "never" | "Never" | "NEVER" => Ok(CachePolicy::Never),
-            "auto" | "Auto" | "AUTO" => Ok(CachePolicy::Auto),
-            "always" | "Always" | "ALWAYS" => Ok(CachePolicy::Always),
-            _ => Err("invalid cache policy"),
-        }
-    }
-}
-
-/// The permission semantics to be emulated by this file system personality.
-#[derive(Debug, Default, Clone, Copy)]
-pub enum PermissionSemantics {
-    /// Be as close as possible to the common semantics of Linux file systems.
-    #[default]
-    LinuxComplete,
-
-    /// As `LinuxComplete`, with the following simplifications:
-    ///  - Extended attributes are not supported.
-    ///  - Idmaps are not supported.
-    ///  - Ownership bits are ignored, always returning the uid/gid from the process
-    ///    requesting the operation within the guest (obtained from `Context`).
-    ///  - Permissions bits are stored in the host, not as extended attributes.
-    LinuxSimplified,
 }
 
 /// Options that configure the behavior of the file system.

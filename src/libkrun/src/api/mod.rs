@@ -25,6 +25,8 @@ pub use device_builders::BalloonDevice;
 #[cfg(feature = "blk")]
 pub use device_builders::BlockDevice;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub use device_builders::CachePolicy;
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use device_builders::FsDevice;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use device_builders::FsOverlay;
@@ -39,8 +41,12 @@ pub use device_builders::NetFlags;
     any(target_os = "linux", target_os = "windows")
 ))]
 pub use device_builders::PciDeviceManager;
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub use device_builders::PermissionSemantics;
 #[cfg(not(feature = "tee"))]
 pub use device_builders::RngDevice;
+#[cfg(target_os = "linux")]
+pub use device_builders::RtcDevice;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
 pub use device_builders::VhostUserDevice;
 pub use device_builders::{
@@ -94,6 +100,10 @@ ffier::library_definition!("krun", library_tag = 1,
     crate::api::device_builders::BalloonDevice = 14,
     #[cfg(not(feature = "tee"))]
     crate::api::device_builders::RngDevice = 15,
+    #[cfg(target_os = "linux")]
+    crate::api::device_builders::RtcDevice = 27,
+    #[cfg(target_os = "linux")]
+    crate::api::device_builders::AttachDevice for crate::api::device_builders::RtcDevice,
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     crate::api::device_builders::AttachDevice for crate::api::device_builders::FsDevice,
     crate::api::device_builders::AttachDevice for crate::api::device_builders::ConsoleDevice,
@@ -140,6 +150,10 @@ ffier::library_definition!("krun", library_tag = 1,
     enum devices::virtio::balloon::FreePageReportingMode,
     enum crate::api::logging::LogLevel,
     enum crate::api::logging::LogStyle,
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    enum devices::virtio::fs::PermissionSemantics,
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    enum devices::virtio::fs::CachePolicy,
     fn crate::api::logging::init_log,
     fn crate::api::vmm_builder::check_nested_virt,
     bitflags crate::api::logging::LogOptions,

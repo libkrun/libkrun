@@ -19,6 +19,8 @@ use kvm_ioctls::{IoEventAddress, VmFd};
 #[cfg(target_arch = "aarch64")]
 use utils::eventfd::EventFd;
 
+use crate::vmm::device_manager::irq::{IrqAllocator, IrqsExhausted};
+
 /// Errors for MMIO device manager.
 #[allow(clippy::enum_variant_names)]
 #[allow(unused)]
@@ -69,6 +71,12 @@ impl From<devices::virtio::CreateMmioTransportError> for Error {
     }
 }
 
+impl From<IrqsExhausted> for Error {
+    fn from(_: IrqsExhausted) -> Self {
+        Self::IrqsExhausted
+    }
+}
+
 type Result<T> = ::std::result::Result<T, Error>;
 
 /// This represents the size of the mmio device specified to the kernel as a cmdline option
@@ -81,21 +89,19 @@ const MMIO_LEN: u64 = 0x1000;
 pub struct MMIODeviceManager {
     pub bus: devices::Bus,
     mmio_base: u64,
-    irq: u32,
-    last_irq: u32,
+    irqs: IrqAllocator,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
 }
 
 impl MMIODeviceManager {
     /// Create a new DeviceManager handling mmio devices (virtio net, block).
-    pub fn new(mmio_base: &mut u64, irq_interval: (u32, u32)) -> MMIODeviceManager {
+    pub fn new(mmio_base: &mut u64, irqs: IrqAllocator) -> MMIODeviceManager {
         if cfg!(any(target_arch = "aarch64", target_arch = "riscv64")) {
             *mmio_base += MMIO_LEN;
         }
         MMIODeviceManager {
             mmio_base: *mmio_base,
-            irq: irq_interval.0,
-            last_irq: irq_interval.1,
+            irqs,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
         }
@@ -126,9 +132,7 @@ impl MMIODeviceManager {
         type_id: u32,
         device_id: String,
     ) -> Result<(u64, u32)> {
-        if self.irq > self.last_irq {
-            return Err(Error::IrqsExhausted);
-        }
+        let irq = self.irqs.alloc()?;
 
         for (i, queue_evt) in mmio_device.queue_evts().iter().enumerate() {
             let io_addr = IoEventAddress::Mmio(
@@ -139,25 +143,24 @@ impl MMIODeviceManager {
                 .map_err(Error::RegisterIoEvent)?;
         }
 
-        vm.register_irqfd(mmio_device.interrupt_evt(), self.irq)
+        vm.register_irqfd(mmio_device.interrupt_evt(), irq)
             .map_err(Error::RegisterIrqFd)?;
 
-        mmio_device.set_irq_line(self.irq);
+        mmio_device.set_irq_line(irq);
 
         self.bus
             .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
-        let ret = (self.mmio_base, self.irq);
+        let ret = (self.mmio_base, irq);
         self.id_to_dev_info.insert(
             (DeviceType::Virtio(type_id), device_id),
             MMIODeviceInfo {
                 addr: self.mmio_base,
                 _len: MMIO_LEN,
-                _irq: self.irq,
+                _irq: irq,
             },
         );
         self.mmio_base += MMIO_LEN;
-        self.irq += 1;
 
         Ok(ret)
     }
@@ -192,17 +195,15 @@ impl MMIODeviceManager {
         intc: IrqChip,
         serial: Arc<Mutex<devices::legacy::Serial>>,
     ) -> Result<()> {
-        if self.irq > self.last_irq {
-            return Err(Error::IrqsExhausted);
-        }
+        let irq = self.irqs.alloc()?;
 
-        vm.register_irqfd(serial.lock().unwrap().interrupt_evt(), self.irq)
+        vm.register_irqfd(serial.lock().unwrap().interrupt_evt(), irq)
             .map_err(Error::RegisterIrqFd)?;
 
         {
             let mut serial = serial.lock().unwrap();
             serial.set_intc(intc);
-            serial.set_irq_line(self.irq);
+            serial.set_irq_line(irq);
         }
 
         self.bus
@@ -225,12 +226,11 @@ impl MMIODeviceManager {
             MMIODeviceInfo {
                 addr: ret,
                 _len: MMIO_LEN,
-                _irq: self.irq,
+                _irq: irq,
             },
         );
 
         self.mmio_base += MMIO_LEN;
-        self.irq += 1;
 
         Ok(())
     }
@@ -238,14 +238,12 @@ impl MMIODeviceManager {
     #[cfg(target_arch = "aarch64")]
     /// Register a MMIO RTC device.
     pub fn register_mmio_rtc(&mut self, vm: &VmFd) -> Result<()> {
-        if self.irq > self.last_irq {
-            return Err(Error::IrqsExhausted);
-        }
+        let irq = self.irqs.alloc()?;
 
         // Attaching the RTC device.
         let rtc_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
         let device = devices::legacy::RTC::new(rtc_evt.try_clone().map_err(Error::EventFd)?);
-        vm.register_irqfd(&rtc_evt, self.irq)
+        vm.register_irqfd(&rtc_evt, irq)
             .map_err(Error::RegisterIrqFd)?;
 
         self.bus
@@ -258,12 +256,11 @@ impl MMIODeviceManager {
             MMIODeviceInfo {
                 addr: ret,
                 _len: MMIO_LEN,
-                _irq: self.irq,
+                _irq: irq,
             },
         );
 
         self.mmio_base += MMIO_LEN;
-        self.irq += 1;
 
         Ok(())
     }
@@ -421,8 +418,10 @@ mod tests {
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
         let mut arch_mem_info = arch::ArchMemoryInfo::default();
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
-        let mut device_manager =
-            MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
+        let mut device_manager = MMIODeviceManager::new(
+            &mut 0xd000_0000,
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+        );
         #[cfg(target_arch = "x86_64")]
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
         #[cfg(target_arch = "aarch64")]
@@ -446,8 +445,10 @@ mod tests {
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
         let mut arch_mem_info = arch::ArchMemoryInfo::default();
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
-        let mut device_manager =
-            MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
+        let mut device_manager = MMIODeviceManager::new(
+            &mut 0xd000_0000,
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+        );
         #[cfg(target_arch = "x86_64")]
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
         #[cfg(target_arch = "aarch64")]
@@ -494,8 +495,10 @@ mod tests {
 
     #[test]
     fn test_error_messages() {
-        let device_manager =
-            MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
+        let device_manager = MMIODeviceManager::new(
+            &mut 0xd000_0000,
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+        );
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
         let e = Error::Cmdline(
             cmdline
@@ -505,7 +508,7 @@ mod tests {
                         "{}K@0x{:08x}:{}",
                         MMIO_LEN / 1024,
                         device_manager.mmio_base,
-                        device_manager.irq
+                        arch::IRQ_BASE
                     ),
                 )
                 .unwrap_err(),
@@ -546,8 +549,10 @@ mod tests {
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
         let mut arch_mem_info = arch::ArchMemoryInfo::default();
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
-        let mut device_manager =
-            MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
+        let mut device_manager = MMIODeviceManager::new(
+            &mut 0xd000_0000,
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+        );
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
 
@@ -579,8 +584,10 @@ mod tests {
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
         let mut arch_mem_info = arch::ArchMemoryInfo::default();
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
-        let mut device_manager =
-            MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
+        let mut device_manager = MMIODeviceManager::new(
+            &mut 0xd000_0000,
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+        );
         #[cfg(target_arch = "x86_64")]
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
         #[cfg(target_arch = "aarch64")]

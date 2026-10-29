@@ -10,7 +10,6 @@ use std::fs::File;
 use std::io;
 use std::mem::{self, MaybeUninit, size_of};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -27,6 +26,7 @@ use super::super::filesystem::{
 use super::super::fuse;
 use super::super::inode_alloc::InodeAllocator;
 use super::super::multikey::MultikeyBTreeMap;
+pub use super::super::{CachePolicy, PermissionSemantics};
 
 const CURRENT_DIR_CSTR: &[u8] = b".\0";
 const PARENT_DIR_CSTR: &[u8] = b"..\0";
@@ -243,57 +243,6 @@ fn statx(f: &File) -> io::Result<(libc::stat64, u64)> {
     } else {
         Err(io::Error::last_os_error())
     }
-}
-
-/// The caching policy that the file system should report to the FUSE client. By default the FUSE
-/// protocol uses close-to-open consistency. This means that any cached contents of the file are
-/// invalidated the next time that file is opened.
-#[derive(Default, Debug, Clone)]
-pub enum CachePolicy {
-    /// The client should never cache file data and all I/O should be directly forwarded to the
-    /// server. This policy must be selected when file contents may change without the knowledge of
-    /// the FUSE client (i.e., the file system does not have exclusive access to the directory).
-    Never,
-
-    /// The client is free to choose when and how to cache file data. This is the default policy and
-    /// uses close-to-open consistency as described in the enum documentation.
-    #[default]
-    Auto,
-
-    /// The client should always cache file data. This means that the FUSE client will not
-    /// invalidate any cached data that was returned by the file system the last time the file was
-    /// opened. This policy should only be selected when the file system has exclusive access to the
-    /// directory.
-    Always,
-}
-
-impl FromStr for CachePolicy {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "never" | "Never" | "NEVER" => Ok(CachePolicy::Never),
-            "auto" | "Auto" | "AUTO" => Ok(CachePolicy::Auto),
-            "always" | "Always" | "ALWAYS" => Ok(CachePolicy::Always),
-            _ => Err("invalid cache policy"),
-        }
-    }
-}
-
-/// The permission semantics to be emulated by this file system personality.
-#[derive(Debug, Default, Clone, Copy)]
-pub enum PermissionSemantics {
-    /// Be as close as possible to the common semantics of Linux file systems.
-    #[default]
-    LinuxComplete,
-
-    /// As `LinuxComplete`, with the following simplifications:
-    ///  - Extended attributes are not supported.
-    ///  - Idmaps are not supported.
-    ///  - Ownership bits are ignored, always returning the uid/gid from the process
-    ///    requesting the operation within the guest (obtained from `Context`).
-    ///  - Permissions bits are stored in the host, not as extended attributes.
-    LinuxSimplified,
 }
 
 /// Options that configure the behavior of the file system.

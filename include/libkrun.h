@@ -21,6 +21,7 @@ typedef void* KrunVmm;
 typedef void* KrunVmmHandle;
 typedef void* KrunBalloonDevice;
 typedef void* KrunRngDevice;
+typedef void* KrunRtcDevice;
 typedef void* KrunVsockDevice;
 typedef void* KrunBlockDevice;
 typedef void* KrunNetDevice;
@@ -29,7 +30,7 @@ typedef void* KrunVhostUserDevice;
 typedef void* KrunDisplayBackend;
 typedef void* KrunGpuDevice;
 typedef void* KrunInputDevice;
-typedef void* KrunAttachDevice; /* KrunFsDevice | KrunConsoleDevice | KrunBlockDevice | KrunNetDevice | KrunGpuDevice | KrunInputDevice | KrunVhostUserDevice | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice */
+typedef void* KrunAttachDevice; /* KrunRtcDevice | KrunFsDevice | KrunConsoleDevice | KrunBlockDevice | KrunNetDevice | KrunGpuDevice | KrunInputDevice | KrunVhostUserDevice | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice */
 typedef void* KrunDeviceManager; /* KrunMmioDeviceManager | KrunPciDeviceManager */
 typedef void* KrunError; /* KrunVmmError | KrunVtableError */
 typedef void* KrunPushStr; /* KrunVtablePushStr */
@@ -37,7 +38,7 @@ typedef void* KrunPushStr; /* KrunVtablePushStr */
 #ifndef KRUN_PRIMITIVES_DEFINED
 #define KRUN_PRIMITIVES_DEFINED
 
-typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice */
+typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunRtcDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice */
 
 typedef uint64_t KrunResult;
 #define KRUN_RESULT_SUCCESS 0
@@ -160,6 +161,17 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 #define KRUN_LOG_STYLE_ALWAYS 1
 #define KRUN_LOG_STYLE_NEVER 2
 
+/* PermissionSemantics ----------------------------------------------- */
+
+#define KRUN_PERMISSION_SEMANTICS_LINUX_COMPLETE 0
+#define KRUN_PERMISSION_SEMANTICS_LINUX_SIMPLIFIED 1
+
+/* CachePolicy ------------------------------------------------------- */
+
+#define KRUN_CACHE_POLICY_NEVER 0
+#define KRUN_CACHE_POLICY_AUTO 1
+#define KRUN_CACHE_POLICY_ALWAYS 2
+
 /* LogOptions -------------------------------------------------------- */
 
 #define KRUN_LOG_OPTIONS_NO_ENV 1
@@ -249,6 +261,28 @@ typedef void (*krun_fs_device_set_overlay_fn)(KrunFsDevice handle, KrunFsOverlay
  */
 void krun_fs_device_set_dax_window_size(KrunFsDevice handle, uint64_t bytes);
 typedef void (*krun_fs_device_set_dax_window_size_fn)(KrunFsDevice handle, uint64_t bytes);
+/**
+ * Select the permission semantics before attaching this device.
+ *
+ * Defaults to `LinuxComplete`. `LinuxSimplified` disables xattrs and idmaps
+ * and disables attribute caching because ownership depends on the requester.
+ * Selecting `LinuxSimplified` on a Linux host returns `InvalidParam` without changing
+ * the device configuration.
+ * A NullFs device has no host permission semantics and returns `InvalidParam`.
+ */
+KrunResult krun_fs_device_set_permission_semantics(KrunFsDevice handle, uint32_t semantics, KrunError* err_out);
+typedef KrunResult (*krun_fs_device_set_permission_semantics_fn)(KrunFsDevice handle, uint32_t semantics, KrunError* err_out);
+/**
+ * Select guest file-data caching before attaching this device.
+ *
+ * Defaults to `Auto`, which uses close-to-open consistency. `Never` forwards file-data
+ * I/O to the server without caching it in the guest. `Always` keeps cached file data
+ * across opens and should only be used when the filesystem has exclusive access to
+ * the shared directory. Attribute caching is controlled by the permission semantics.
+ * A NullFs device has no host-backed file data and returns `InvalidParam`.
+ */
+KrunResult krun_fs_device_set_cache_policy(KrunFsDevice handle, uint32_t policy, KrunError* err_out);
+typedef KrunResult (*krun_fs_device_set_cache_policy_fn)(KrunFsDevice handle, uint32_t policy, KrunError* err_out);
 void krun_fs_device_destroy(KrunFsDevice handle);
 typedef void (*krun_fs_device_destroy_fn)(KrunFsDevice handle);
 
@@ -500,6 +534,13 @@ typedef KrunRngDevice (*krun_rng_device_new_fn)(KrunError* err_out);
 void krun_rng_device_destroy(KrunRngDevice handle);
 typedef void (*krun_rng_device_destroy_fn)(KrunRngDevice handle);
 
+/* RtcDevice --------------------------------------------------------- */
+
+KrunRtcDevice krun_rtc_device_new(KrunError* err_out);
+typedef KrunRtcDevice (*krun_rtc_device_new_fn)(KrunError* err_out);
+void krun_rtc_device_destroy(KrunRtcDevice handle);
+typedef void (*krun_rtc_device_destroy_fn)(KrunRtcDevice handle);
+
 /* VsockDevice ------------------------------------------------------- */
 
 /**
@@ -524,7 +565,7 @@ typedef void (*krun_vsock_device_destroy_fn)(KrunVsockDevice handle);
  * Create a new block device.
  *
  * Defaults to read-write (`read_only = false`), cached I/O (`direct_io = false`),
- * and [`SyncMode::Relaxed`].
+ * [`SyncMode::Relaxed`], and serialized reads (`parallel_reads = false`).
  */
 KrunBlockDevice krun_block_device_new(KrunStr id, KrunStr disk_image_path, uint32_t format, KrunError* err_out);
 typedef KrunBlockDevice (*krun_block_device_new_fn)(KrunStr id, KrunStr disk_image_path, uint32_t format, KrunError* err_out);
@@ -542,6 +583,23 @@ typedef void (*krun_block_device_set_direct_io_fn)(KrunBlockDevice handle, bool 
  */
 void krun_block_device_set_sync_mode(KrunBlockDevice handle, uint32_t sync_mode);
 typedef void (*krun_block_device_set_sync_mode_fn)(KrunBlockDevice handle, uint32_t sync_mode);
+/**
+ * Serve guest reads on a host thread pool with out-of-order completion.
+ *
+ * Disabled by default. Writes, flushes, and discards stay on the device thread.
+ * The pool size is automatic unless overridden with [`set_read_pool_size`](Self::set_read_pool_size).
+ */
+void krun_block_device_set_parallel_reads(KrunBlockDevice handle, bool enabled);
+typedef void (*krun_block_device_set_parallel_reads_fn)(KrunBlockDevice handle, bool enabled);
+/**
+ * Set the requested number of worker threads for parallel reads.
+ *
+ * Only applies when parallel reads are enabled. If the requested size is greater than the
+ * available host parallelism, or it cannot be determined, reads remain serialized. Pass 0
+ * to restore automatic pool sizing.
+ */
+void krun_block_device_set_read_pool_size(KrunBlockDevice handle, size_t size);
+typedef void (*krun_block_device_set_read_pool_size_fn)(KrunBlockDevice handle, size_t size);
 void krun_block_device_destroy(KrunBlockDevice handle);
 typedef void (*krun_block_device_destroy_fn)(KrunBlockDevice handle);
 

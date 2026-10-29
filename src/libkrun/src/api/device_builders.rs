@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::IsTerminal;
 use std::marker::PhantomData;
+#[cfg(feature = "blk")]
+use std::num::NonZeroUsize;
 #[cfg(all(feature = "net", not(target_os = "windows")))]
 use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
@@ -35,7 +37,7 @@ use devices::virtio::block::{DiskFormat, SyncMode};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-use devices::virtio::passthrough::PermissionSemantics;
+pub use devices::virtio::fs::{CachePolicy, PermissionSemantics};
 use devices::virtio::{PortDescription, VirtioDevice, VirtioShmRegion, VmmExitObserver, port_io};
 #[cfg(feature = "input")]
 use krun_input;
@@ -47,7 +49,7 @@ use vm_memory::{Address, GuestMemoryBackend};
 use super::error::VmmError;
 use super::export_bitflags;
 
-/// Requirements a device declares before the VM's memory layout is fixed.
+/// Requirements a device declares before the VM's memory and legacy devices are configured.
 /// `#[non_exhaustive]` allows adding new fields in minor releases.
 #[derive(Default)]
 #[non_exhaustive]
@@ -60,6 +62,8 @@ pub struct DeviceRequirements {
     pub gpu_shm: Option<usize>,
     /// Whether this device needs process-shareable memory (vhost-user).
     pub process_shareable_memory: bool,
+    /// Supplies the guest RTC, suppressing any legacy or implicit RTC.
+    pub replaces_legacy_rtc: bool,
 }
 
 /// Context provided to devices during attachment.
@@ -654,6 +658,42 @@ impl<'a> FsDevice<'a> {
     /// no DAX window is allocated.
     pub fn set_dax_window_size(&mut self, bytes: u64) {
         self.shm_size = Some(bytes as usize);
+    }
+
+    /// Select the permission semantics before attaching this device.
+    ///
+    /// Defaults to `LinuxComplete`. `LinuxSimplified` disables xattrs and idmaps
+    /// and disables attribute caching because ownership depends on the requester.
+    /// Selecting `LinuxSimplified` on a Linux host returns `InvalidParam` without changing
+    /// the device configuration.
+    /// A NullFs device has no host permission semantics and returns `InvalidParam`.
+    pub fn set_permission_semantics(
+        &mut self,
+        semantics: PermissionSemantics,
+    ) -> Result<(), VmmError> {
+        if !self
+            .inner
+            .lock()
+            .unwrap()
+            .set_permission_semantics(semantics)
+        {
+            return Err(VmmError::InvalidParam());
+        }
+        Ok(())
+    }
+
+    /// Select guest file-data caching before attaching this device.
+    ///
+    /// Defaults to `Auto`, which uses close-to-open consistency. `Never` forwards file-data
+    /// I/O to the server without caching it in the guest. `Always` keeps cached file data
+    /// across opens and should only be used when the filesystem has exclusive access to
+    /// the shared directory. Attribute caching is controlled by the permission semantics.
+    /// A NullFs device has no host-backed file data and returns `InvalidParam`.
+    pub fn set_cache_policy(&mut self, policy: CachePolicy) -> Result<(), VmmError> {
+        if !self.inner.lock().unwrap().set_cache_policy(policy) {
+            return Err(VmmError::InvalidParam());
+        }
+        Ok(())
     }
 }
 
@@ -1335,6 +1375,46 @@ impl<'a> AttachDevice<'a> for RngDevice {
     }
 }
 
+/// A virtio RTC providing UTC, TAI and monotonic clocks on Linux hosts.
+///
+/// Adding this device disables the legacy RTC. The guest kernel must have a
+/// virtio-rtc driver. On riscv64, the VMM adds this device automatically when
+/// no RTC device is supplied.
+#[cfg(target_os = "linux")]
+pub struct RtcDevice {
+    inner: Arc<Mutex<devices::virtio::Rtc>>,
+}
+
+#[cfg_attr(feature = "ffi", ffier::export(cfg = "target_os = \"linux\""))]
+#[cfg_attr(not(feature = "ffi"), cfg(target_os = "linux"))]
+impl RtcDevice {
+    pub fn new() -> Result<Self, VmmError> {
+        let rtc =
+            devices::virtio::Rtc::new().map_err(|e| VmmError::Internal(format!("rtc: {e:?}")))?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(rtc)),
+        })
+    }
+}
+
+#[cfg_attr(feature = "ffi", ffier::export(cfg = "target_os = \"linux\""))]
+#[cfg_attr(not(feature = "ffi"), cfg(target_os = "linux"))]
+impl<'a> AttachDevice<'a> for RtcDevice {
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    fn requirements(&self) -> DeviceRequirements {
+        DeviceRequirements {
+            replaces_legacy_rtc: true,
+            ..Default::default()
+        }
+    }
+
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        ctx.subscribe_events(self.inner.clone())?;
+        ctx.register("rtc", self.inner)
+    }
+}
+
 export_bitflags! {
     bitflags::bitflags! {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1430,6 +1510,8 @@ pub struct BlockDevice {
     is_read_only: bool,
     direct_io: bool,
     sync_mode: SyncMode,
+    parallel_reads: bool,
+    read_pool_size: Option<NonZeroUsize>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
@@ -1438,7 +1520,7 @@ impl BlockDevice {
     /// Create a new block device.
     ///
     /// Defaults to read-write (`read_only = false`), cached I/O (`direct_io = false`),
-    /// and [`SyncMode::Relaxed`].
+    /// [`SyncMode::Relaxed`], and serialized reads (`parallel_reads = false`).
     pub fn new(id: &str, disk_image_path: &str, format: DiskFormat) -> Result<Self, VmmError> {
         Ok(Self {
             id: id.to_string(),
@@ -1447,6 +1529,8 @@ impl BlockDevice {
             is_read_only: false,
             direct_io: false,
             sync_mode: SyncMode::default(),
+            parallel_reads: false,
+            read_pool_size: None,
         })
     }
 
@@ -1467,6 +1551,23 @@ impl BlockDevice {
     pub fn set_sync_mode(&mut self, sync_mode: SyncMode) {
         self.sync_mode = sync_mode;
     }
+
+    /// Serve guest reads on a host thread pool with out-of-order completion.
+    ///
+    /// Disabled by default. Writes, flushes, and discards stay on the device thread.
+    /// The pool size is automatic unless overridden with [`set_read_pool_size`](Self::set_read_pool_size).
+    pub fn set_parallel_reads(&mut self, enabled: bool) {
+        self.parallel_reads = enabled;
+    }
+
+    /// Set the requested number of worker threads for parallel reads.
+    ///
+    /// Only applies when parallel reads are enabled. If the requested size is greater than the
+    /// available host parallelism, or it cannot be determined, reads remain serialized. Pass 0
+    /// to restore automatic pool sizing.
+    pub fn set_read_pool_size(&mut self, size: usize) {
+        self.read_pool_size = NonZeroUsize::new(size);
+    }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
@@ -1485,6 +1586,8 @@ impl<'a> AttachDevice<'a> for BlockDevice {
             self.is_read_only,
             self.direct_io,
             self.sync_mode,
+            self.parallel_reads,
+            self.read_pool_size,
         )
         .map_err(|e| VmmError::Internal(format!("block: {e}")))?;
 

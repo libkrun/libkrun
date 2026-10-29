@@ -96,6 +96,9 @@ pub enum Error {
     /// Unable to enable KVM hypercall exits.
     #[cfg(feature = "tee")]
     HypercallExitEnable(kvm_ioctls::Error),
+    #[cfg(target_arch = "riscv64")]
+    /// Error detecting the host RISC-V ISA.
+    IsaDetection(arch::riscv64::linux::kvm::IsaError),
     /// The host kernel reports an invalid KVM API version.
     KvmApiVersion(i32),
     /// Cannot initialize the KVM context due to missing capabilities.
@@ -321,6 +324,8 @@ impl Display for Error {
                 f,
                 "Error configuring the general purpose riscv64 registers: {e:?}"
             ),
+            #[cfg(target_arch = "riscv64")]
+            IsaDetection(e) => write!(f, "Error detecting the host RISC-V ISA: {e:?}"),
             #[cfg(target_arch = "x86_64")]
             REGSConfiguration(e) => {
                 write!(f, "Error configuring the general purpose registers: {e:?}")
@@ -1307,6 +1312,16 @@ impl Vcpu {
         arch::riscv64::regs::setup_regs(&self.fd, self.id, kernel_load_addr.raw_value(), guest_mem)
             .map_err(Error::REGSConfiguration)?;
         Ok(())
+    }
+
+    /// Detects the host RISC-V ISA (base extensions, multi-letter
+    /// extensions, cache block sizes) by querying this vCPU's KVM
+    /// registers. Must be called on an already-created vCPU (e.g. vCPU 0),
+    /// since `detect_host_isa()` reads existing registers rather than
+    /// creating a new vCPU.
+    #[cfg(target_arch = "riscv64")]
+    pub fn detect_riscv_isa(&self) -> Result<arch::riscv64::linux::kvm::RiscvIsaInfo> {
+        arch::riscv64::linux::kvm::detect_host_isa(&self.fd).map_err(Error::IsaDetection)
     }
 
     /// Moves the vcpu to its own thread and constructs a VcpuHandle.

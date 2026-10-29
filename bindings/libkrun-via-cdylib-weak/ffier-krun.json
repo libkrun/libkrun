@@ -46,6 +46,13 @@
         "fd"
       ]
     },
+    "CachePolicy": {
+      "kind": {
+        "enum": {
+          "alias_of": "u32"
+        }
+      }
+    },
     "ConsoleBuilder": {
       "kind": {
         "handle": {
@@ -280,6 +287,13 @@
         "a"
       ]
     },
+    "PermissionSemantics": {
+      "kind": {
+        "enum": {
+          "alias_of": "u32"
+        }
+      }
+    },
     "PushStr": {
       "kind": {
         "trait": {
@@ -304,6 +318,14 @@
         }
       },
       "type_tag": 16777231
+    },
+    "RtcDevice": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunRtcDevice"
+        }
+      },
+      "type_tag": 16777243
     },
     "Self": {
       "kind": {
@@ -651,6 +673,60 @@
             "return_kind": "void"
           },
           "ffi_name": "krun_fs_device_set_dax_window_size"
+        },
+        {
+          "name": "set_permission_semantics",
+          "doc": [
+            " Select the permission semantics before attaching this device.",
+            "",
+            " Defaults to `LinuxComplete`. `LinuxSimplified` disables xattrs and idmaps",
+            " and disables attribute caching because ownership depends on the requester.",
+            " Selecting `LinuxSimplified` on a Linux host returns `InvalidParam` without changing",
+            " the device configuration.",
+            " A NullFs device has no host permission semantics and returns `InvalidParam`."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "semantics",
+              "param_kind": "regular",
+              "type": "PermissionSemantics"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_fs_device_set_permission_semantics"
+        },
+        {
+          "name": "set_cache_policy",
+          "doc": [
+            " Select guest file-data caching before attaching this device.",
+            "",
+            " Defaults to `Auto`, which uses close-to-open consistency. `Never` forwards file-data",
+            " I/O to the server without caching it in the guest. `Always` keeps cached file data",
+            " across opens and should only be used when the filesystem has exclusive access to",
+            " the shared directory. Attribute caching is controlled by the permission semantics.",
+            " A NullFs device has no host-backed file data and returns `InvalidParam`."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "policy",
+              "param_kind": "regular",
+              "type": "CachePolicy"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_fs_device_set_cache_policy"
         }
       ],
       "cfg": "not(any(feature = \"tee\", feature = \"aws-nitro\"))"
@@ -1718,6 +1794,28 @@
       "cfg": "not(feature = \"tee\")"
     },
     {
+      "name": "RtcDevice",
+      "destroy_ffi_name": "krun_rtc_device_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "new",
+          "receiver": "none",
+          "params": [],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "RtcDevice"
+            },
+            "err_type": "VmmError",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_rtc_device_new"
+        }
+      ],
+      "cfg": "target_os = \"linux\""
+    },
+    {
       "name": "VsockDevice",
       "destroy_ffi_name": "krun_vsock_device_destroy",
       "is_builder_type": false,
@@ -1816,7 +1914,7 @@
             " Create a new block device.",
             "",
             " Defaults to read-write (`read_only = false`), cached I/O (`direct_io = false`),",
-            " and [`SyncMode::Relaxed`]."
+            " [`SyncMode::Relaxed`], and serialized reads (`parallel_reads = false`)."
           ],
           "receiver": "none",
           "params": [
@@ -1904,6 +2002,49 @@
             "return_kind": "void"
           },
           "ffi_name": "krun_block_device_set_sync_mode"
+        },
+        {
+          "name": "set_parallel_reads",
+          "doc": [
+            " Serve guest reads on a host thread pool with out-of-order completion.",
+            "",
+            " Disabled by default. Writes, flushes, and discards stay on the device thread.",
+            " The pool size is automatic unless overridden with [`set_read_pool_size`](Self::set_read_pool_size)."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "enabled",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_block_device_set_parallel_reads"
+        },
+        {
+          "name": "set_read_pool_size",
+          "doc": [
+            " Set the requested number of worker threads for parallel reads.",
+            "",
+            " Only applies when parallel reads are enabled. If the requested size is greater than the",
+            " available host parallelism, or it cannot be determined, reads remain serialized. Pass 0",
+            " to restore automatic pool sizing."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "size",
+              "param_kind": "regular",
+              "type": "usize"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_block_device_set_read_pool_size"
         }
       ],
       "cfg": "feature = \"blk\""
@@ -2730,6 +2871,43 @@
           "value": 2
         }
       ]
+    },
+    {
+      "name": "PermissionSemantics",
+      "variants": [
+        {
+          "name": "LinuxComplete",
+          "c_name": "KRUN_PERMISSION_SEMANTICS_LINUX_COMPLETE",
+          "value": 0
+        },
+        {
+          "name": "LinuxSimplified",
+          "c_name": "KRUN_PERMISSION_SEMANTICS_LINUX_SIMPLIFIED",
+          "value": 1
+        }
+      ],
+      "cfg": "not(any(feature = \"tee\", feature = \"aws-nitro\"))"
+    },
+    {
+      "name": "CachePolicy",
+      "variants": [
+        {
+          "name": "Never",
+          "c_name": "KRUN_CACHE_POLICY_NEVER",
+          "value": 0
+        },
+        {
+          "name": "Auto",
+          "c_name": "KRUN_CACHE_POLICY_AUTO",
+          "value": 1
+        },
+        {
+          "name": "Always",
+          "c_name": "KRUN_CACHE_POLICY_ALWAYS",
+          "value": 2
+        }
+      ],
+      "cfg": "not(any(feature = \"tee\", feature = \"aws-nitro\"))"
     }
   ],
   "bitflags_constants": [
@@ -3050,6 +3228,18 @@
         }
       ],
       "cfg": "all(target_arch = \"x86_64\", any(target_os = \"linux\", target_os = \"windows\"))"
+    },
+    {
+      "trait_name": "AttachDevice",
+      "struct_name": "RtcDevice",
+      "lifetimes": [
+        "a"
+      ],
+      "trait_lifetime_args": [
+        "a"
+      ],
+      "methods": [],
+      "cfg": "target_os = \"linux\""
     },
     {
       "trait_name": "AttachDevice",
