@@ -16,6 +16,11 @@ mod test_invariant_tsc;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use test_invariant_tsc::TestInvariantTsc;
 
+#[cfg(feature = "host")]
+mod test_build_capabilities;
+#[cfg(feature = "host")]
+use test_build_capabilities::TestBuildCapabilities;
+
 #[cfg(any(feature = "guest", target_os = "macos", target_os = "linux"))]
 mod test_vm_pause;
 #[cfg(any(feature = "guest", target_os = "macos", target_os = "linux"))]
@@ -180,6 +185,8 @@ pub fn test_cases() -> Vec<TestCase> {
     }
 
     vec![
+        #[cfg(feature = "host")]
+        TestCase::new("build-capabilities", Box::new(TestBuildCapabilities)),
         TestCase::new(
             "configure-vm-1cpu-256MiB",
             Box::new(TestVmConfig {
