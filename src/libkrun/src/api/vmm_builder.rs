@@ -25,6 +25,7 @@ use super::payload::Payload;
 pub struct VmmBuilder<'a> {
     vcpus: Option<u8>,
     ram_mib: Option<u32>,
+    locked_memory_mib: u32,
     payload: Option<Payload>,
     device_manager: Option<Box<dyn DeviceManager<'a> + 'a>>,
     #[cfg(unix)]
@@ -56,6 +57,33 @@ impl<'a> VmmBuilder<'a> {
             return Err(VmmError::OutOfRange());
         }
         self.ram_mib = Some(mib);
+        Ok(self)
+    }
+
+    /// Give the VM `mib` MiB of locked guest memory, on top of [`VmmBuilder::ram_mib`]: memory
+    /// that libkrun locks into host memory with mlock(), so that the host never pages it out or
+    /// compresses it, and that the guest sees as a NUMA node of its own (node 1) without CPUs.
+    /// The guest decides what to keep there, for example by binding a process to the node. The
+    /// balloon device never gives this memory back to the host, so it's taken from the host for
+    /// as long as the VM runs.
+    ///
+    /// `mib` must be a multiple of 2, or this fails with [`VmmError::InvalidParam`]. 0, the
+    /// default, means none. If the memory can't be locked, for example because of
+    /// RLIMIT_MEMLOCK or, on macOS, the sysctl vm.user_wire_limit, [`VmmBuilder::build`] fails
+    /// instead of starting the VM without it.
+    ///
+    /// Only aarch64 supports locked guest memory. Elsewhere, a size other than 0 fails with
+    /// [`VmmError::FeatureDisabled`].
+    pub fn locked_memory_mib(mut self, mib: u32) -> Result<Self, VmmError> {
+        if mib != 0 && !cfg!(target_arch = "aarch64") {
+            return Err(VmmError::FeatureDisabled());
+        }
+        // 2 MiB is a multiple of the page size of every host (4, 16 or 64 KiB), so the locked
+        // region is page aligned.
+        if !mib.is_multiple_of(2) {
+            return Err(VmmError::InvalidParam());
+        }
+        self.locked_memory_mib = mib;
         Ok(self)
     }
 
@@ -412,6 +440,10 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
 
     vm_resources.kernel_cmdline.prolog = Some(payload.cmdline);
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        vm_resources.locked_mem_mib = builder_cfg.locked_memory_mib;
+    }
     vm_resources.nested_enabled = builder_cfg.nested_virt;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
     vm_resources.acpi_enabled = builder_cfg.acpi;
@@ -492,4 +524,39 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         },
         _lifetime: PhantomData,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_locked_memory_mib() {
+        let builder = VmmBuilder::new().locked_memory_mib(256).unwrap();
+        assert_eq!(builder.locked_memory_mib, 256);
+        let builder = builder.locked_memory_mib(2).unwrap();
+        assert_eq!(builder.locked_memory_mib, 2);
+        let builder = builder.locked_memory_mib(0).unwrap();
+        assert_eq!(builder.locked_memory_mib, 0);
+
+        // Not a multiple of 2 MiB, which isn't rounded either way.
+        for mib in [1, 3, 255, u32::MAX] {
+            assert!(matches!(
+                VmmBuilder::new().locked_memory_mib(mib),
+                Err(VmmError::InvalidParam())
+            ));
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    #[test]
+    fn test_locked_memory_mib_is_not_supported() {
+        assert!(matches!(
+            VmmBuilder::new().locked_memory_mib(256),
+            Err(VmmError::FeatureDisabled())
+        ));
+        let builder = VmmBuilder::new().locked_memory_mib(0).unwrap();
+        assert_eq!(builder.locked_memory_mib, 0);
+    }
 }
