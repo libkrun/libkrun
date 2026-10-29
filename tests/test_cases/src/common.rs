@@ -52,9 +52,8 @@ use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
 #[cfg(feature = "dynamic-linking")]
 static LIBKRUN: OnceLock<Library> = OnceLock::new();
 
-/// Load libkrun (dlopen in ffi mode) and initialize logging.
-pub fn init_krun() -> anyhow::Result<()> {
-    #[cfg(feature = "dynamic-linking")]
+#[cfg(feature = "dynamic-linking")]
+pub fn load_libkrun() {
     LIBKRUN.get_or_init(|| {
         let name = if cfg!(target_os = "macos") {
             "libkrun.dylib"
@@ -64,6 +63,12 @@ pub fn init_krun() -> anyhow::Result<()> {
         unsafe { Library::open(Some(name), RTLD_NOW | RTLD_GLOBAL) }
             .expect("failed to dlopen libkrun")
     });
+}
+
+/// Load libkrun (dlopen in ffi mode) and initialize logging.
+pub fn init_krun() -> anyhow::Result<()> {
+    #[cfg(feature = "dynamic-linking")]
+    load_libkrun();
 
     #[cfg(feature = "dynamic-linking")]
     require_vm_symbols().context("failed to load core VM symbols")?;
@@ -82,15 +87,7 @@ pub fn init_krun() -> anyhow::Result<()> {
 /// In static mode this is a no-op (if it compiles, symbols are available).
 #[cfg(feature = "dynamic-linking")]
 pub fn require_vm_symbols() -> Result<(), libloading::Error> {
-    LIBKRUN.get_or_init(|| {
-        let name = if cfg!(target_os = "macos") {
-            "libkrun.dylib"
-        } else {
-            "libkrun.so"
-        };
-        unsafe { Library::open(Some(name), RTLD_NOW | RTLD_GLOBAL) }
-            .expect("failed to dlopen libkrun")
-    });
+    load_libkrun();
     use krun::Symbol::*;
     krun::require(
         None,
