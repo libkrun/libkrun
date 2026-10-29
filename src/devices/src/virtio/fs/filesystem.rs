@@ -58,6 +58,21 @@ pub struct Entry {
     pub entry_timeout: Duration,
 }
 
+impl Entry {
+    /// A `readdirplus` entry with inode 0 does not populate the kernel's lookup cache.
+    pub fn without_attributes() -> Self {
+        Self {
+            inode: 0,
+            generation: 0,
+            // Safe because stat64 is plain data, for which all-zero bytes are a valid value.
+            attr: unsafe { mem::zeroed() },
+            attr_flags: 0,
+            attr_timeout: Duration::ZERO,
+            entry_timeout: Duration::ZERO,
+        }
+    }
+}
+
 impl From<Entry> for fuse::EntryOut {
     fn from(entry: Entry) -> fuse::EntryOut {
         fuse::EntryOut {

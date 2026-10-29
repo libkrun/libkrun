@@ -1279,20 +1279,6 @@ fn clear_suid_sgid(mode: u32) -> u32 {
     new_mode
 }
 
-/// A `readdirplus` entry with inode 0, which tells the kernel the attributes are not included,
-/// so it takes no lookup reference.
-fn entry_without_attributes() -> Entry {
-    Entry {
-        inode: 0,
-        generation: 0,
-        // Safe because stat64 is plain data, for which all-zero bytes are a valid value.
-        attr: unsafe { std::mem::zeroed() },
-        attr_flags: 0,
-        attr_timeout: Duration::ZERO,
-        entry_timeout: Duration::ZERO,
-    }
-}
-
 fn forget_one(
     inodes: &mut MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>,
     inode: Inode,
@@ -1620,7 +1606,7 @@ impl FileSystem for PassthroughFs {
                 // A name removed since the directory was read still lists, without attributes,
                 // instead of ending the reply early.
                 Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
-                    return add_entry(dir_entry, entry_without_attributes());
+                    return add_entry(dir_entry, Entry::without_attributes());
                 }
                 Err(e) => return Err(e),
             };
