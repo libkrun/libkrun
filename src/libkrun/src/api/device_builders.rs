@@ -47,7 +47,7 @@ use vm_memory::{Address, GuestMemoryBackend};
 use super::error::VmmError;
 use super::export_bitflags;
 
-/// Requirements a device declares before the VM's memory layout is fixed.
+/// Requirements a device declares before the VM's memory and legacy devices are configured.
 /// `#[non_exhaustive]` allows adding new fields in minor releases.
 #[derive(Default)]
 #[non_exhaustive]
@@ -60,6 +60,8 @@ pub struct DeviceRequirements {
     pub gpu_shm: Option<usize>,
     /// Whether this device needs process-shareable memory (vhost-user).
     pub process_shareable_memory: bool,
+    /// Supplies the guest RTC, suppressing any legacy or implicit RTC.
+    pub replaces_legacy_rtc: bool,
 }
 
 /// Context provided to devices during attachment.
@@ -1332,6 +1334,46 @@ impl<'a> AttachDevice<'a> for RngDevice {
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         ctx.subscribe_events(self.inner.clone())?;
         ctx.register("rng", self.inner)
+    }
+}
+
+/// A virtio RTC providing UTC, TAI and monotonic clocks on Linux hosts.
+///
+/// Adding this device disables the legacy RTC. The guest kernel must have a
+/// virtio-rtc driver. On riscv64, the VMM adds this device automatically when
+/// no RTC device is supplied.
+#[cfg(target_os = "linux")]
+pub struct RtcDevice {
+    inner: Arc<Mutex<devices::virtio::Rtc>>,
+}
+
+#[cfg_attr(feature = "ffi", ffier::export(cfg = "target_os = \"linux\""))]
+#[cfg_attr(not(feature = "ffi"), cfg(target_os = "linux"))]
+impl RtcDevice {
+    pub fn new() -> Result<Self, VmmError> {
+        let rtc =
+            devices::virtio::Rtc::new().map_err(|e| VmmError::Internal(format!("rtc: {e:?}")))?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(rtc)),
+        })
+    }
+}
+
+#[cfg_attr(feature = "ffi", ffier::export(cfg = "target_os = \"linux\""))]
+#[cfg_attr(not(feature = "ffi"), cfg(target_os = "linux"))]
+impl<'a> AttachDevice<'a> for RtcDevice {
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    fn requirements(&self) -> DeviceRequirements {
+        DeviceRequirements {
+            replaces_legacy_rtc: true,
+            ..Default::default()
+        }
+    }
+
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        ctx.subscribe_events(self.inner.clone())?;
+        ctx.register("rtc", self.inner)
     }
 }
 

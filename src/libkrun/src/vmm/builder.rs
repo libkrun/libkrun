@@ -29,6 +29,8 @@ use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 
 use super::{Error, Vmm};
 
+#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+use crate::api::{AttachContext, AttachDevice, RtcDevice};
 use crate::vmm::device_manager::irq::IrqAllocator;
 #[cfg(target_arch = "x86_64")]
 use crate::vmm::device_manager::legacy::PortIODeviceManager;
@@ -779,6 +781,8 @@ pub fn build_microvm(
     };
 
     let requirements = device_manager.requirements();
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    let legacy_rtc = !requirements.iter().any(|r| r.replaces_legacy_rtc);
     #[cfg(all(
         target_arch = "x86_64",
         any(target_os = "linux", target_os = "windows")
@@ -1284,6 +1288,7 @@ pub fn build_microvm(
             &mut kernel_cmdline,
             intc.clone(),
             serial_devices,
+            legacy_rtc,
         )?;
     }
 
@@ -1385,6 +1390,22 @@ pub fn build_microvm(
         setup_terminal_raw_mode(&mut vmm, Some(serial_tty), false);
         #[cfg(windows)]
         setup_terminal_raw_mode(&mut vmm, Some(serial_tty.as_handle()), false);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+    if !requirements.iter().any(|r| r.replaces_legacy_rtc) {
+        let rtc =
+            RtcDevice::new().map_err(|e| StartMicrovmError::AttachDevice(format!("{e:?}")))?;
+        let mut ctx = AttachContext::new_mmio(
+            &mut vmm,
+            event_manager,
+            &_shm_manager,
+            intc.clone(),
+            requirements.len(),
+        );
+        Box::new(rtc)
+            .attach(&mut ctx)
+            .map_err(|e| StartMicrovmError::AttachDevice(format!("{e:?}")))?;
     }
 
     device_manager
@@ -2362,6 +2383,7 @@ fn attach_legacy_devices(
     kernel_cmdline: &mut kernel::cmdline::Cmdline,
     intc: IrqChip,
     serial: Vec<Arc<Mutex<Serial>>>,
+    #[cfg(target_arch = "aarch64")] legacy_rtc: bool,
 ) -> std::result::Result<(), StartMicrovmError> {
     for s in serial {
         mmio_device_manager
@@ -2370,11 +2392,13 @@ fn attach_legacy_devices(
             .map_err(StartMicrovmError::Internal)?;
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-    mmio_device_manager
-        .register_mmio_rtc(vm.fd())
-        .map_err(Error::RegisterMMIODevice)
-        .map_err(StartMicrovmError::Internal)?;
+    #[cfg(target_arch = "aarch64")]
+    if legacy_rtc {
+        mmio_device_manager
+            .register_mmio_rtc(vm.fd())
+            .map_err(Error::RegisterMMIODevice)
+            .map_err(StartMicrovmError::Internal)?;
+    }
 
     Ok(())
 }

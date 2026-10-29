@@ -41,6 +41,8 @@ pub use device_builders::NetFlags;
 pub use device_builders::PciDeviceManager;
 #[cfg(not(feature = "tee"))]
 pub use device_builders::RngDevice;
+#[cfg(target_os = "linux")]
+pub use device_builders::RtcDevice;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
 pub use device_builders::VhostUserDevice;
 pub use device_builders::{
@@ -94,6 +96,10 @@ ffier::library_definition!("krun", library_tag = 1,
     crate::api::device_builders::BalloonDevice = 14,
     #[cfg(not(feature = "tee"))]
     crate::api::device_builders::RngDevice = 15,
+    #[cfg(target_os = "linux")]
+    crate::api::device_builders::RtcDevice = 27,
+    #[cfg(target_os = "linux")]
+    crate::api::device_builders::AttachDevice for crate::api::device_builders::RtcDevice,
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     crate::api::device_builders::AttachDevice for crate::api::device_builders::FsDevice,
     crate::api::device_builders::AttachDevice for crate::api::device_builders::ConsoleDevice,

@@ -101,6 +101,11 @@ mod test_virtio_pci;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use test_virtio_pci::TestVirtioPci;
 
+#[cfg(target_os = "linux")]
+mod test_virtio_rtc;
+#[cfg(target_os = "linux")]
+use test_virtio_rtc::TestVirtioRtc;
+
 pub enum TestOutcome {
     Pass,
     Fail(String),
@@ -215,6 +220,10 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("virtiofs-misc", Box::new(TestVirtioFsMisc)),
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         TestCase::new("virtio-pci", Box::new(TestVirtioPci)),
+        #[cfg(target_os = "linux")]
+        TestCase::new("rtc-default", Box::new(TestVirtioRtc { enabled: false })),
+        #[cfg(target_os = "linux")]
+        TestCase::new("virtio-rtc", Box::new(TestVirtioRtc { enabled: true })),
         TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
         TestCase::new("perf-net-passt-tx", Box::new(TestNetPerf::new_passt_tx())),
         TestCase::new("perf-net-passt-rx", Box::new(TestNetPerf::new_passt_rx())),

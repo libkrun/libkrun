@@ -1,7 +1,7 @@
 // Copyright 2026 The libkrun Authors. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! virtio-rtc: the default RTC device on Linux/KVM.
+//! virtio-rtc: an RTC device on Linux/KVM.
 //!
 //! The device offers three clocks to the guest: UTC (with an alarm), TAI
 //! and monotonic. It supports the virtio-rtc requests for reading the

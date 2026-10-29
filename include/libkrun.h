@@ -21,6 +21,7 @@ typedef void* KrunVmm;
 typedef void* KrunVmmHandle;
 typedef void* KrunBalloonDevice;
 typedef void* KrunRngDevice;
+typedef void* KrunRtcDevice;
 typedef void* KrunVsockDevice;
 typedef void* KrunBlockDevice;
 typedef void* KrunNetDevice;
@@ -29,7 +30,7 @@ typedef void* KrunVhostUserDevice;
 typedef void* KrunDisplayBackend;
 typedef void* KrunGpuDevice;
 typedef void* KrunInputDevice;
-typedef void* KrunAttachDevice; /* KrunFsDevice | KrunConsoleDevice | KrunBlockDevice | KrunNetDevice | KrunGpuDevice | KrunInputDevice | KrunVhostUserDevice | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice */
+typedef void* KrunAttachDevice; /* KrunRtcDevice | KrunFsDevice | KrunConsoleDevice | KrunBlockDevice | KrunNetDevice | KrunGpuDevice | KrunInputDevice | KrunVhostUserDevice | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice */
 typedef void* KrunDeviceManager; /* KrunMmioDeviceManager | KrunPciDeviceManager */
 typedef void* KrunError; /* KrunVmmError | KrunVtableError */
 typedef void* KrunPushStr; /* KrunVtablePushStr */
@@ -37,7 +38,7 @@ typedef void* KrunPushStr; /* KrunVtablePushStr */
 #ifndef KRUN_PRIMITIVES_DEFINED
 #define KRUN_PRIMITIVES_DEFINED
 
-typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice */
+typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunRtcDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice */
 
 typedef uint64_t KrunResult;
 #define KRUN_RESULT_SUCCESS 0
@@ -499,6 +500,13 @@ KrunRngDevice krun_rng_device_new(KrunError* err_out);
 typedef KrunRngDevice (*krun_rng_device_new_fn)(KrunError* err_out);
 void krun_rng_device_destroy(KrunRngDevice handle);
 typedef void (*krun_rng_device_destroy_fn)(KrunRngDevice handle);
+
+/* RtcDevice --------------------------------------------------------- */
+
+KrunRtcDevice krun_rtc_device_new(KrunError* err_out);
+typedef KrunRtcDevice (*krun_rtc_device_new_fn)(KrunError* err_out);
+void krun_rtc_device_destroy(KrunRtcDevice handle);
+typedef void (*krun_rtc_device_destroy_fn)(KrunRtcDevice handle);
 
 /* VsockDevice ------------------------------------------------------- */
 

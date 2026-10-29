@@ -47,6 +47,23 @@ Create an `MmioDeviceManager` with `MmioDeviceManager::new()` (C API: `krun_mmio
 - **Acceleration & GUI**: `GpuDevice` (Venus / native context) and `InputDevice` (mouse/keyboard).
 - **vhost-user**: `VhostUserDevice` for external virtio backends (RNG, RTC, GPU, Sound, CAN, Media).
 - **Utilities**: `RngDevice` (virtio-rng) and `BalloonDevice` (virtio-balloon page reporting).
+- **RTC**: on x86_64 and aarch64 Linux/KVM, add `RtcDevice::new()?` to the device manager to
+  enable virtio-rtc. It offers a UTC clock with an alarm, a TAI clock and a
+  monotonic clock, which a compatible guest driver exposes as PTP clocks and
+  an RTC. Cross-timestamping is not supported. Adding this device suppresses
+  the legacy PL031 RTC on aarch64. Without it, the legacy RTC remains in use.
+  On x86_64/Linux, CMOS only supplies memory configuration and remains present.
+  On riscv64, which has no legacy RTC, the VMM adds virtio-rtc implicitly unless
+  an RTC device is already supplied through the device manager.
+
+```rust
+let mut devices = MmioDeviceManager::new();
+devices.add(RtcDevice::new()?);
+```
+
+The C API provides `krun_rtc_device_new()`; pass its handle to
+`krun_mmio_device_manager_add()` or `krun_pci_device_manager_add()`.
+The caller must ensure its guest kernel supports virtio-rtc before enabling it.
 
 ## 4. VMM Builder
 

@@ -305,6 +305,14 @@
       },
       "type_tag": 16777231
     },
+    "RtcDevice": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunRtcDevice"
+        }
+      },
+      "type_tag": 16777243
+    },
     "Self": {
       "kind": {
         "primitive": {
@@ -1718,6 +1726,28 @@
       "cfg": "not(feature = \"tee\")"
     },
     {
+      "name": "RtcDevice",
+      "destroy_ffi_name": "krun_rtc_device_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "new",
+          "receiver": "none",
+          "params": [],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "RtcDevice"
+            },
+            "err_type": "VmmError",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_rtc_device_new"
+        }
+      ],
+      "cfg": "target_os = \"linux\""
+    },
+    {
       "name": "VsockDevice",
       "destroy_ffi_name": "krun_vsock_device_destroy",
       "is_builder_type": false,
@@ -3050,6 +3080,18 @@
         }
       ],
       "cfg": "all(target_arch = \"x86_64\", any(target_os = \"linux\", target_os = \"windows\"))"
+    },
+    {
+      "trait_name": "AttachDevice",
+      "struct_name": "RtcDevice",
+      "lifetimes": [
+        "a"
+      ],
+      "trait_lifetime_args": [
+        "a"
+      ],
+      "methods": [],
+      "cfg": "target_os = \"linux\""
     },
     {
       "trait_name": "AttachDevice",
