@@ -37,6 +37,8 @@ use crate::vmm::device_manager::irq::IrqAllocator;
 #[cfg(target_arch = "x86_64")]
 use crate::vmm::device_manager::legacy::PortIODeviceManager;
 use crate::vmm::device_manager::mmio::MMIODeviceManager;
+#[cfg(target_arch = "aarch64")]
+use crate::vmm::locked_memory;
 use crate::vmm::resources::VmResources;
 #[cfg(not(target_os = "windows"))]
 use crate::vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
@@ -181,6 +183,8 @@ pub enum StartMicrovmError {
     KernelFormatUnsupported,
     /// Cannot load command line string.
     LoadCommandline(kernel::cmdline::Error),
+    /// Cannot lock the given number of bytes of guest memory into host memory.
+    LockGuestMemory(u64, io::Error),
     /// The start command was issued more than once.
     MicroVMAlreadyRunning,
     /// Cannot start the VM because the kernel was not configured.
@@ -390,6 +394,25 @@ impl Display for StartMicrovmError {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");
                 write!(f, "Cannot load command line string. {err_msg}")
+            }
+            LockGuestMemory(len, ref err) => {
+                write!(
+                    f,
+                    "Cannot lock {} MiB of guest memory into host memory: {err}. ",
+                    len >> 20
+                )?;
+                if cfg!(target_os = "macos") {
+                    write!(
+                        f,
+                        "Check the sysctls vm.user_wire_limit and vm.global_user_wire_limit, \
+                         and RLIMIT_MEMLOCK (ulimit -l)."
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Check RLIMIT_MEMLOCK (ulimit -l), or give the process CAP_IPC_LOCK."
+                    )
+                }
             }
             MicroVMAlreadyRunning => write!(f, "Microvm already running."),
             MissingKernelConfig => write!(f, "Cannot start microvm without kernel configuration."),
@@ -2200,6 +2223,9 @@ pub fn create_guest_memory(
     let ram_in_blocks =
         ram_in_blocks && map_ram_in_blocks(&guest_mem, &arch_mem_info, map_guest_ram_in_blocks);
 
+    #[cfg(target_arch = "aarch64")]
+    lock_guest_memory(&guest_mem, &arch_mem_info)?;
+
     let LoadedPayload {
         guest_mem,
         entry_addr,
@@ -2238,6 +2264,36 @@ pub fn create_guest_memory(
     arch_mem_info.guest_last_addr = guest_mem.last_addr().raw_value();
 
     Ok((guest_mem, arch_mem_info, shm_manager, payload_config))
+}
+
+/// Locks the locked guest memory into host memory.
+///
+/// This is done before the hypervisor maps guest memory, so that a VM whose memory can't be
+/// locked fails before any hypervisor state exists. HVF keeps memory that is locked before
+/// hv_vm_map() wired, as it does when mlock() comes after it.
+#[cfg(target_arch = "aarch64")]
+fn lock_guest_memory(
+    guest_mem: &GuestMemoryMmap,
+    arch_mem_info: &ArchMemoryInfo,
+) -> std::result::Result<(), StartMicrovmError> {
+    let Some(locked) = arch_mem_info.locked_range() else {
+        return Ok(());
+    };
+    let len = locked.end - locked.start;
+    let host_addr = guest_mem
+        .get_slice(GuestAddress(locked.start), len as usize)
+        .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
+        .ptr_guard_mut()
+        .as_ptr();
+    locked_memory::lock(host_addr, len as usize)
+        .map_err(|e| StartMicrovmError::LockGuestMemory(len, e))?;
+    info!(
+        "locked guest memory: {} MiB locked (guest {:#x}-{:#x})",
+        len >> 20,
+        locked.start,
+        locked.end
+    );
+    Ok(())
 }
 
 #[cfg(all(target_arch = "x86_64", any(not(feature = "tee"), feature = "tdx")))]
@@ -3000,5 +3056,98 @@ pub mod tests {
     fn test_kernel_cmdline_err_to_startuvm_err() {
         let err = StartMicrovmError::from(kernel::cmdline::Error::HasSpace);
         let _ = format!("{err}{err:?}");
+    }
+
+    #[test]
+    fn test_lock_guest_memory_err_names_the_limits() {
+        let err = StartMicrovmError::LockGuestMemory(
+            256 << 20,
+            io::Error::from_raw_os_error(libc::EAGAIN),
+        );
+        let msg = format!("{err}");
+        assert!(msg.contains("256 MiB"), "{msg}");
+        assert!(msg.contains(&format!("os error {}", libc::EAGAIN)), "{msg}");
+        assert!(msg.contains("RLIMIT_MEMLOCK"), "{msg}");
+        #[cfg(target_os = "macos")]
+        assert!(msg.contains("vm.user_wire_limit"), "{msg}");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn guest_memory_with_locked(
+        locked_mem_mib: u32,
+    ) -> std::result::Result<
+        (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
+        StartMicrovmError,
+    > {
+        create_guest_memory(
+            64,
+            locked_mem_mib,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            &Payload::Empty,
+            #[cfg(target_os = "macos")]
+            false,
+        )
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_create_guest_memory_locks_only_the_locked_region() {
+        if !locked_memory::testing::limit_allows_locking() {
+            eprintln!("skipping, RLIMIT_MEMLOCK doesn't let this test lock 2 MiB");
+            return;
+        }
+        let (guest_mem, info, _shm, _payload) = guest_memory_with_locked(2).unwrap();
+
+        let locked = info.locked_range().unwrap();
+        assert_eq!(locked.end - locked.start, 2 << 20);
+        let wired = |addr: u64, len: u64| {
+            let host_addr = guest_mem.get_host_address(GuestAddress(addr)).unwrap();
+            locked_memory::testing::wired_bytes(host_addr, len as usize).unwrap()
+        };
+        assert_eq!(wired(locked.start, 2 << 20), 2 << 20);
+        assert_eq!(
+            wired(
+                info.ram_start_addr,
+                info.ram_last_addr - info.ram_start_addr
+            ),
+            0
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_create_guest_memory_without_locked_memory() {
+        let (_guest_mem, info, _shm, _payload) = guest_memory_with_locked(0).unwrap();
+        assert_eq!(info.locked_range(), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_create_guest_memory_maps_ram_in_blocks_and_keeps_the_locked_region_locked() {
+        if !locked_memory::testing::limit_allows_locking() {
+            eprintln!("skipping, RLIMIT_MEMLOCK doesn't let this test lock 2 MiB");
+            return;
+        }
+        let (guest_mem, info, _shm, payload_config) =
+            create_guest_memory(64, 2, None, None, &[], None, false, &Payload::Empty, true)
+                .unwrap();
+        assert!(payload_config.ram_in_blocks);
+        let host_addr = |addr: u64| guest_mem.get_host_address(GuestAddress(addr)).unwrap();
+
+        for addr in [info.ram_start_addr, info.ram_last_addr - 1] {
+            let entry = crate::vmm::macos::vm_map::entry(host_addr(addr) as u64);
+            assert_eq!(entry.size, RECLAIM_BLOCK_SIZE, "guest {addr:#x}");
+        }
+        // Only RAM is mapped in blocks: a MAP_FIXED mmap() over the locked region would leave
+        // its pages unlocked.
+        let locked = info.locked_range().unwrap();
+        assert_eq!(
+            locked_memory::testing::wired_bytes(host_addr(locked.start), 2 << 20).unwrap(),
+            2 << 20
+        );
     }
 }
