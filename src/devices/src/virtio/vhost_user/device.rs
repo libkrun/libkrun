@@ -6,22 +6,25 @@
 //! This module provides a wrapper around the vhost crate's Frontend,
 //! adapting it to work with libkrun's VirtioDevice trait.
 
-use std::io::{self, ErrorKind, IoSlice, Read, Result as IoResult, Write};
+use std::io::{self, ErrorKind, IoSlice, IoSliceMut, Read, Result as IoResult, Write};
+use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
 use krun_display::{
-    DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, ResourceFormat,
+    DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, DmabufExport,
+    ResourceFormat,
 };
 use log::{debug, error, warn};
-use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vhost::vhost_user::gpu_message::{
-    GpuBackendReq, VhostUserGpuHeaderFlag, VhostUserGpuScanout, VhostUserGpuUpdate,
-    VirtioGpuDisplayOne, VirtioGpuRect, VirtioGpuRespDisplayInfo, VirtioGpuRespGetEdid,
+    GpuBackendReq, VhostUserGpuDMABUFScanout, VhostUserGpuDMABUFScanout2, VhostUserGpuHeaderFlag,
+    VhostUserGpuScanout, VhostUserGpuUpdate, VirtioGpuDisplayOne, VirtioGpuRect,
+    VirtioGpuRespDisplayInfo, VirtioGpuRespGetEdid,
 };
 use vhost::vhost_user::message::{
     FrontendReq, VhostUserConfigFlags, VhostUserMMap, VhostUserMMapFlags,
@@ -54,6 +57,12 @@ impl AsRawFd for BorrowedFd {
     }
 }
 
+fn close_fds_on_error(fds: Vec<RawFd>) {
+    for fd in fds {
+        unsafe { libc::close(fd) };
+    }
+}
+
 /// Helper function to send GPU_SET_SOCKET message to vhost-user backend.
 /// Following QEMU's vhost_user_gpu_set_socket() pattern - sends message without waiting for ACK.
 ///
@@ -73,7 +82,7 @@ fn send_gpu_set_socket(
 
     // SAFETY: header is a local [u32; 3] array, valid for its entire lifetime here.
     let header_bytes = unsafe {
-        std::slice::from_raw_parts(header.as_ptr() as *const u8, std::mem::size_of_val(&header))
+        std::slice::from_raw_parts(header.as_ptr() as *const u8, mem::size_of_val(&header))
     };
 
     let iov = [IoSlice::new(header_bytes)];
@@ -245,8 +254,8 @@ pub struct VhostUserDevice {
     /// GPU socket for receiving GPU protocol messages (GPU devices only)
     gpu_socket: Option<UnixStream>,
 
-    /// User-configured display resolution for GPU devices (display size, not guest scanout).
-    gpu_display_info: Option<DisplayInfo>,
+    /// User-configured display resolutions for GPU devices (indexed by scanout_id).
+    gpu_display_info: Vec<DisplayInfo>,
 
     /// Shared memory region for devices that need it (e.g., media, GPU)
     shm_region: Option<VirtioShmRegion>,
@@ -299,7 +308,7 @@ impl VhostUserDevice {
         device_name: String,
         num_queues: u16,
         queue_sizes: &[u16],
-        gpu_display: Option<DisplayInfo>,
+        gpu_displays: Vec<DisplayInfo>,
         display_backend: Option<DisplayBackend<'static>>,
     ) -> IoResult<Self> {
         debug!(
@@ -340,6 +349,9 @@ impl VhostUserDevice {
             if protocol_features.contains(VhostUserProtocolFeatures::SHMEM) {
                 negotiated_protocol_features |= VhostUserProtocolFeatures::SHMEM;
             }
+            if protocol_features.contains(VhostUserProtocolFeatures::BACKEND_SEND_FD) {
+                negotiated_protocol_features |= VhostUserProtocolFeatures::BACKEND_SEND_FD;
+            }
 
             frontend
                 .set_protocol_features(negotiated_protocol_features)
@@ -376,9 +388,13 @@ impl VhostUserDevice {
             .collect();
 
         let gpu_display_info = if device_type == VIRTIO_ID_GPU {
-            Some(gpu_display.unwrap_or_else(|| DisplayInfo::new(1024, 768)))
+            if gpu_displays.is_empty() {
+                vec![DisplayInfo::new(1024, 768)]
+            } else {
+                gpu_displays
+            }
         } else {
-            None
+            Vec::new()
         };
 
         Ok(Self {
@@ -573,7 +589,7 @@ impl VhostUserDevice {
                     error!("{}: set_vring_kick failed: {:?}", self.device_name, e);
                     io::Error::other(e)
                 })?;
-            std::mem::forget(kick_fd); // Don't close the fd twice
+            mem::forget(kick_fd); // Don't close the fd twice
 
             let call_fd = unsafe { VhostEventFd::from_raw_fd(vring_call_event.as_raw_fd()) };
             frontend
@@ -582,7 +598,7 @@ impl VhostUserDevice {
                     error!("{}: set_vring_call failed: {:?}", self.device_name, e);
                     io::Error::other(e)
                 })?;
-            std::mem::forget(call_fd); // Don't close the fd twice
+            mem::forget(call_fd); // Don't close the fd twice
 
             // Per QEMU vhost.c: when VHOST_USER_F_PROTOCOL_FEATURES is not negotiated,
             // the rings start directly in the enabled state, and set_vring_enable will fail.
@@ -784,86 +800,133 @@ impl VhostUserDevice {
         }
 
         if let Some(ref mut gpu_socket) = self.gpu_socket {
-            // TODO: vhost crate should provide GpuSocket::read_message() API
-            // VhostUserGpuMsgHeader exists internally but isn't exposed
-            let mut header = [0u32; 3];
-            // SAFETY: header is a local [u32; 3] array, valid for the duration of this block.
-            let header_bytes = unsafe {
-                std::slice::from_raw_parts_mut(
-                    header.as_mut_ptr() as *mut u8,
-                    std::mem::size_of_val(&header),
-                )
+            // TODO: vhost crate should provide GpuFrontend::read_message() API that handles:
+            // 1. Reading VhostUserGpuMsgHeader (which exists internally but isn't exposed)
+            // 2. recvmsg() for SCM_RIGHTS FD passing (DMABUF_SCANOUT sends FDs)
+            // 3. Payload reading with proper partial-read handling
+            // This message parsing logic is protocol-level and shouldn't be duplicated by consumers.
+
+            // VhostUserGpuMsgHeader is [request: u32, flags: u32, size: u32]
+            const HEADER_SIZE: usize = mem::size_of::<u32>() * 3;
+
+            // Step 1: recvmsg() with exact header size - receives header + FDs
+            // Matches vhost crate's recv_header() pattern
+            let mut header_buf = [0u8; HEADER_SIZE];
+            let mut fds = Vec::new();
+
+            let mut iov = [IoSliceMut::new(&mut header_buf)];
+            let mut cmsg_buf = nix::cmsg_space!([RawFd; 4]);
+
+            let bytes_read = match recvmsg::<()>(
+                gpu_socket.as_raw_fd(),
+                &mut iov,
+                Some(&mut cmsg_buf),
+                MsgFlags::empty(),
+            ) {
+                Ok(msg) => {
+                    if let Ok(cmsgs) = msg.cmsgs() {
+                        for cmsg in cmsgs {
+                            if let ControlMessageOwned::ScmRights(received_fds) = cmsg {
+                                fds = received_fds;
+                            }
+                        }
+                    }
+                    msg.bytes
+                }
+                Err(e) => {
+                    error!("{}: failed to recv header: {}", self.device_name, e);
+                    self.gpu_socket = None;
+                    return;
+                }
             };
 
-            if let Err(e) = gpu_socket.read_exact(header_bytes) {
+            if bytes_read != HEADER_SIZE {
                 error!(
-                    "{}: failed to read GPU message header: {}",
-                    self.device_name, e
+                    "{}: partial header: got {} bytes, expected {}",
+                    self.device_name, bytes_read, HEADER_SIZE
                 );
                 self.gpu_socket = None;
                 return;
             }
 
-            let request = header[0];
-            let flags = header[1];
-            let size = header[2];
+            // Parse header
+            let request = u32::from_ne_bytes(header_buf[0..4].try_into().unwrap());
+            let size = u32::from_ne_bytes(header_buf[8..12].try_into().unwrap()) as usize;
 
-            let mut payload = vec![0u8; size as usize];
-            if size > 0
-                && let Err(e) = gpu_socket.read_exact(&mut payload)
-            {
-                error!(
-                    "{}: failed to read GPU message payload: {}",
-                    self.device_name, e
-                );
-                self.gpu_socket = None;
-                return;
+            // Step 2: read exact payload size
+            // Use read_exact() - handles partial reads automatically (needed for large gfxstream framebuffers)
+            let payload = if size > 0 {
+                let mut buf = vec![0u8; size];
+                match Read::read_exact(&mut *gpu_socket, &mut buf) {
+                    Ok(()) => buf,
+                    Err(e) => {
+                        error!("{}: failed to recv payload: {}", self.device_name, e);
+                        self.gpu_socket = None;
+                        return;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+
+            // Convert u32 request to GpuBackendReq and dispatch
+            match GpuBackendReq::try_from(request) {
+                Ok(req) => self.handle_gpu_message_with_fds(req, &payload, fds),
+                Err(_) => warn!("{}: unhandled GPU message: {}", self.device_name, request),
             }
-
-            self.handle_gpu_message(request, flags, &payload);
         }
     }
 
-    fn handle_gpu_message(&mut self, request: u32, _flags: u32, payload: &[u8]) {
+    fn handle_gpu_message_with_fds(
+        &mut self,
+        request: GpuBackendReq,
+        payload: &[u8],
+        fds: Vec<RawFd>,
+    ) {
         debug!(
-            "{}: GPU message: request={}, payload_len={}",
+            "{}: GPU message: request={:?}, payload_len={}, fds={}",
             self.device_name,
             request,
-            payload.len()
+            payload.len(),
+            fds.len()
         );
-        match GpuBackendReq::try_from(request) {
-            Ok(GpuBackendReq::GET_DISPLAY_INFO) => self.send_gpu_display_info(request),
-            Ok(GpuBackendReq::GET_EDID) => self.send_gpu_edid(request, payload),
-            Ok(GpuBackendReq::SCANOUT) => self.handle_gpu_scanout(payload),
-            Ok(GpuBackendReq::UPDATE) => self.handle_gpu_update(payload),
+        match request {
+            GpuBackendReq::GET_DISPLAY_INFO => self.send_gpu_display_info(request),
+            GpuBackendReq::GET_EDID => self.send_gpu_edid(request, payload),
+            GpuBackendReq::SCANOUT => self.handle_gpu_scanout(payload),
+            GpuBackendReq::UPDATE => self.handle_gpu_update(payload),
+            GpuBackendReq::DMABUF_SCANOUT | GpuBackendReq::DMABUF_SCANOUT2 => {
+                self.handle_gpu_dmabuf_scanout(request, payload, fds)
+            }
+            GpuBackendReq::DMABUF_UPDATE => self.handle_gpu_dmabuf_update(payload, request),
             _ => {
-                warn!("{}: unhandled GPU message: {}", self.device_name, request);
+                warn!("{}: unhandled GPU message: {:?}", self.device_name, request);
             }
         }
     }
 
     /// Helper to send GPU protocol responses
     /// TODO: This should be part of vhost crate's GPU message handling
-    fn send_gpu_response<T>(&mut self, request: u32, response: &T) -> IoResult<()> {
+    fn send_gpu_response<T>(&mut self, request: GpuBackendReq, response: &T) -> IoResult<()> {
         if self.gpu_socket.is_none() {
             return Ok(());
         }
 
         let msg_header = [
-            request,
+            request as u32,
             VhostUserGpuHeaderFlag::REPLY.bits(),
-            std::mem::size_of::<T>() as u32,
+            mem::size_of::<T>() as u32,
         ];
         // SAFETY: msg_header is a local [u32; 3] array, valid for the duration of this block.
         let header_bytes = unsafe {
             std::slice::from_raw_parts(
                 msg_header.as_ptr() as *const u8,
-                std::mem::size_of_val(&msg_header),
+                mem::size_of_val(&msg_header),
             )
         };
         // SAFETY: response is a reference to a POD type T, valid and aligned for size_of::<T>() bytes.
         let response_bytes = unsafe {
-            std::slice::from_raw_parts(response as *const T as *const u8, std::mem::size_of::<T>())
+            std::slice::from_raw_parts(response as *const T as *const u8, mem::size_of::<T>())
         };
 
         let result = self
@@ -879,22 +942,27 @@ impl VhostUserDevice {
         result
     }
 
-    fn send_gpu_display_info(&mut self, request: u32) {
+    fn send_gpu_display_info(&mut self, request: GpuBackendReq) {
         const VIRTIO_GPU_RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 
         let mut display_info = VirtioGpuRespDisplayInfo::default();
         display_info.hdr.type_ = VIRTIO_GPU_RESP_OK_DISPLAY_INFO;
 
-        display_info.pmodes[0] = VirtioGpuDisplayOne {
-            r: VirtioGpuRect {
-                x: 0,
-                y: 0,
-                width: self.gpu_display_info.as_ref().map_or(0, |d| d.width),
-                height: self.gpu_display_info.as_ref().map_or(0, |d| d.height),
-            },
-            enabled: 1,
-            flags: 0,
-        };
+        for (idx, display) in self.gpu_display_info.iter().enumerate() {
+            if idx >= display_info.pmodes.len() {
+                break;
+            }
+            display_info.pmodes[idx] = VirtioGpuDisplayOne {
+                r: VirtioGpuRect {
+                    x: 0,
+                    y: 0,
+                    width: display.width,
+                    height: display.height,
+                },
+                enabled: 1,
+                flags: 0,
+            };
+        }
 
         if let Err(e) = self.send_gpu_response(request, &display_info) {
             error!("{}: failed to send DISPLAY_INFO: {}", self.device_name, e);
@@ -920,7 +988,7 @@ impl VhostUserDevice {
     }
 
     fn handle_gpu_scanout(&mut self, payload: &[u8]) {
-        let header_size = std::mem::size_of::<VhostUserGpuScanout>();
+        let header_size = mem::size_of::<VhostUserGpuScanout>();
         if payload.len() < header_size {
             error!("{}: SCANOUT payload too short", self.device_name);
             return;
@@ -932,11 +1000,12 @@ impl VhostUserDevice {
 
         let scanout_id = scanout.scanout_id;
 
-        // Validate scanout ID - frontend only advertises scanout 0
-        if scanout_id != 0 {
+        if scanout_id as usize >= self.gpu_display_info.len() {
             error!(
-                "{}: invalid scanout_id {} (only 0 is supported)",
-                self.device_name, scanout_id
+                "{}: invalid scanout_id {} (max {})",
+                self.device_name,
+                scanout_id,
+                self.gpu_display_info.len() - 1
             );
             return;
         }
@@ -956,9 +1025,9 @@ impl VhostUserDevice {
             self.device_name, scanout.width, scanout.height
         );
 
-        let display_info = self.gpu_display_info.as_ref();
-        let display_width = display_info.map_or(scanout.width, |d| d.width);
-        let display_height = display_info.map_or(scanout.height, |d| d.height);
+        let display_info = &self.gpu_display_info[scanout_id as usize];
+        let display_width = display_info.width;
+        let display_height = display_info.height;
 
         if let Some(display) = self.get_display_instance()
             && let Err(e) = display.configure_scanout(
@@ -975,7 +1044,7 @@ impl VhostUserDevice {
     }
 
     fn handle_gpu_update(&mut self, payload: &[u8]) {
-        let header_size = std::mem::size_of::<VhostUserGpuUpdate>();
+        let header_size = mem::size_of::<VhostUserGpuUpdate>();
         if payload.len() < header_size {
             error!("{}: UPDATE payload too short", self.device_name);
             return;
@@ -993,10 +1062,12 @@ impl VhostUserDevice {
         let update_width = update.width as usize;
         let update_height = update.height as usize;
 
-        if scanout_id != 0 {
+        if scanout_id as usize >= self.gpu_display_info.len() {
             error!(
-                "{}: invalid scanout_id {} (only 0 is supported)",
-                self.device_name, scanout_id
+                "{}: invalid scanout_id {} (max {})",
+                self.device_name,
+                scanout_id,
+                self.gpu_display_info.len() - 1
             );
             return;
         }
@@ -1007,14 +1078,9 @@ impl VhostUserDevice {
             return;
         }
 
-        let scanout_width = self
-            .gpu_display_info
-            .as_ref()
-            .map_or(update_width, |d| d.width as usize);
-        let scanout_height = self
-            .gpu_display_info
-            .as_ref()
-            .map_or(update_height, |d| d.height as usize);
+        let display_info = &self.gpu_display_info[scanout_id as usize];
+        let scanout_width = display_info.width as usize;
+        let scanout_height = display_info.height as usize;
 
         if update_x + update_width > scanout_width || update_y + update_height > scanout_height {
             error!(
@@ -1059,25 +1125,208 @@ impl VhostUserDevice {
         }
     }
 
-    fn send_gpu_edid(&mut self, request: u32, _payload: &[u8]) {
+    fn send_gpu_edid(&mut self, request: GpuBackendReq, payload: &[u8]) {
         const VIRTIO_GPU_RESP_OK_EDID: u32 = 0x1104;
 
-        // EDID reflects the display (monitor) capabilities, not the current guest scanout.
-        // The same EDID is returned for all scanout IDs the backend queries.
-        let Some(ref display_info) = self.gpu_display_info else {
+        if payload.len() < 4 {
+            error!("{}: GET_EDID payload too short", self.device_name);
             return;
-        };
-        let edid_bytes = display_info.edid_bytes();
+        }
+
+        let scanout_id = u32::from_ne_bytes(payload[0..4].try_into().unwrap());
 
         let mut edid_resp = VirtioGpuRespGetEdid::default();
         edid_resp.hdr.type_ = VIRTIO_GPU_RESP_OK_EDID;
-        edid_resp.size = edid_bytes.len() as u32;
 
-        let copy_len = edid_bytes.len().min(edid_resp.edid.len());
-        edid_resp.edid[..copy_len].copy_from_slice(&edid_bytes[..copy_len]);
+        // Return empty EDID for scanouts beyond configured displays
+        if let Some(display_info) = self.gpu_display_info.get(scanout_id as usize) {
+            let edid_bytes = display_info.edid_bytes();
+            edid_resp.size = edid_bytes.len() as u32;
+            let copy_len = edid_bytes.len().min(edid_resp.edid.len());
+            edid_resp.edid[..copy_len].copy_from_slice(&edid_bytes[..copy_len]);
+        } else {
+            // size=0 indicates no EDID (scanout has no display)
+            edid_resp.size = 0;
+        }
 
         if let Err(e) = self.send_gpu_response(request, &edid_resp) {
             error!("{}: failed to send EDID: {}", self.device_name, e);
+        }
+    }
+
+    // Unified handler for both DMABUF_SCANOUT and DMABUF_SCANOUT2
+    fn handle_gpu_dmabuf_scanout(
+        &mut self,
+        request: GpuBackendReq,
+        payload: &[u8],
+        fds: Vec<RawFd>,
+    ) {
+        let header_size = mem::size_of::<VhostUserGpuDMABUFScanout>();
+        if payload.len() < header_size {
+            error!("{}: DMABUF_SCANOUT payload too short", self.device_name);
+            return;
+        }
+
+        let mut scanout = VhostUserGpuDMABUFScanout::default();
+        scanout
+            .as_mut_slice()
+            .copy_from_slice(&payload[..header_size]);
+
+        let scanout_id = scanout.scanout_id;
+        if scanout_id as usize >= self.gpu_display_info.len() {
+            error!(
+                "{}: invalid scanout_id {} (max {})",
+                self.device_name,
+                scanout_id,
+                self.gpu_display_info.len() - 1
+            );
+            close_fds_on_error(fds);
+            return;
+        }
+
+        // If no FD, this is a disable scanout message
+        if fds.is_empty() {
+            if let Some(display) = self.get_display_instance()
+                && let Err(e) = display.disable_scanout(scanout_id)
+            {
+                error!("{}: disable_scanout failed: {e}", self.device_name);
+            }
+            close_fds_on_error(fds);
+            return;
+        }
+
+        if scanout.width == 0 || scanout.height == 0 {
+            if let Some(display) = self.get_display_instance()
+                && let Err(e) = display.disable_scanout(scanout_id)
+            {
+                error!("{}: disable_scanout failed: {e}", self.device_name);
+            }
+            close_fds_on_error(fds);
+            return;
+        }
+
+        // DMABUF_SCANOUT2 includes modifier, DMABUF_SCANOUT doesn't
+        let modifier = if request == GpuBackendReq::DMABUF_SCANOUT2 {
+            if payload.len() < mem::size_of::<VhostUserGpuDMABUFScanout2>() {
+                error!("{}: DMABUF_SCANOUT2 payload too short", self.device_name);
+                close_fds_on_error(fds);
+                return;
+            }
+            let mut scanout2 = VhostUserGpuDMABUFScanout2::default();
+            scanout2
+                .as_mut_slice()
+                .copy_from_slice(&payload[..mem::size_of::<VhostUserGpuDMABUFScanout2>()]);
+            scanout2.modifier
+        } else {
+            0xffffffffffffffff // DRM_FORMAT_MOD_INVALID
+        };
+
+        let display_info = &self.gpu_display_info[scanout_id as usize];
+        let display_width = display_info.width;
+        let display_height = display_info.height;
+
+        let Some(display) = self.get_display_instance() else {
+            close_fds_on_error(fds);
+            return;
+        };
+
+        let dmabuf_export = DmabufExport {
+            dmabuf_fds: [fds.first().copied().unwrap_or(-1), -1, -1, -1],
+            n_planes: 1,
+            width: scanout.fd_width,
+            height: scanout.fd_height,
+            fourcc: scanout.fd_drm_fourcc,
+            modifier,
+            strides: [scanout.fd_stride, 0, 0, 0],
+            offsets: [0, 0, 0, 0],
+        };
+
+        match display.import_dmabuf(&dmabuf_export) {
+            Ok(dmabuf_id) => {
+                mem::forget(fds);
+                if let Err(e) = display.configure_scanout_dmabuf(
+                    scanout_id,
+                    display_width,
+                    display_height,
+                    dmabuf_id,
+                    None,
+                ) {
+                    error!("{}: configure_scanout_dmabuf failed: {e}", self.device_name);
+                }
+            }
+            Err(e) => {
+                error!("{}: import_dmabuf failed: {e}", self.device_name);
+            }
+        }
+    }
+
+    fn handle_gpu_dmabuf_update(&mut self, payload: &[u8], request: GpuBackendReq) {
+        if payload.len() < mem::size_of::<VirtioGpuRect>() + 4 {
+            error!("{}: DMABUF_UPDATE payload too short", self.device_name);
+            self.send_gpu_empty_response(request);
+            return;
+        }
+
+        let scanout_id = u32::from_ne_bytes(payload[0..4].try_into().unwrap());
+        let mut rect = VirtioGpuRect::default();
+        rect.as_mut_slice()
+            .copy_from_slice(&payload[4..4 + mem::size_of::<VirtioGpuRect>()]);
+
+        if scanout_id as usize >= self.gpu_display_info.len() {
+            error!(
+                "{}: invalid scanout_id {} (max {})",
+                self.device_name,
+                scanout_id,
+                self.gpu_display_info.len() - 1
+            );
+            self.send_gpu_empty_response(request);
+            return;
+        }
+
+        let damage = if rect.width > 0 && rect.height > 0 {
+            Some(krun_display::Rect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            })
+        } else {
+            None
+        };
+
+        if let Some(display) = self.get_display_instance()
+            && let Err(e) = display.present_dmabuf(scanout_id, damage.as_ref())
+        {
+            error!("{}: present_dmabuf failed: {e}", self.device_name);
+        }
+
+        // DMABUF_UPDATE requires an ACK response
+        self.send_gpu_empty_response(request);
+    }
+
+    fn send_gpu_empty_response(&mut self, request: GpuBackendReq) {
+        if self.gpu_socket.is_none() {
+            return;
+        }
+
+        let msg_header = [
+            request as u32,
+            VhostUserGpuHeaderFlag::REPLY.bits(),
+            0, // size = 0 for empty response
+        ];
+        // SAFETY: msg_header is a local [u32; 3] array, valid for the duration of this block.
+        let header_bytes = unsafe {
+            std::slice::from_raw_parts(
+                msg_header.as_ptr() as *const u8,
+                mem::size_of_val(&msg_header),
+            )
+        };
+
+        if let Some(socket) = &mut self.gpu_socket {
+            if let Err(e) = socket.write_all(header_bytes) {
+                error!("{}: failed to send empty ACK: {}", self.device_name, e);
+                self.gpu_socket = None;
+            }
         }
     }
 
