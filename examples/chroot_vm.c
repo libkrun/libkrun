@@ -78,6 +78,7 @@ static void print_help(char *const name)
         "              --vhost-user-console=PATH Use vhost-user console backend at socket PATH\n"
         "\n"
         "NET_MODE can be either TSI (default) or PASST\n"
+        "Use of PASST requires target system support (libkrun built with NET=1)\n"
         "Use of vhost-user devices require target system support\n"
         "PCI transport is only supported on x86_64 Linux; MMIO is the default\n"
         "PCI transport does not currently support vhost-user devices\n"
@@ -177,6 +178,12 @@ struct vhost_user_support {
     krun_vhost_user_device_new_fn device_new;
 };
 
+struct net_unixstream_fns {
+    krun_net_device_new_unixstream_path_fn path_fn;
+    krun_net_device_new_unixstream_fd_fn fd_fn;
+};
+
+
 static KrunDeviceManager virtio_devices_new(enum transport_mode transport_mode)
 {
 #if KRUN_PCI_TRANSPORT_SUPPORTED
@@ -223,6 +230,29 @@ static bool vhost_user_support_load(struct vhost_user_support *support)
         return false;
     }
 
+    return true;
+}
+
+static bool get_net_unixstream_fns(struct net_unixstream_fns *fns)
+{
+    const char *err;
+
+    if ((krun_build_capability_flags() & KRUN_BUILD_CAPABILITY_FLAGS_NET) == 0) {
+        fprintf(stderr, "This libkrun was built without net support\n");
+        return false;
+    }
+
+    fns->path_fn = dlsym(RTLD_DEFAULT, "krun_net_device_new_unixstream_path");
+    fns->fd_fn = dlsym(RTLD_DEFAULT, "krun_net_device_new_unixstream_fd");
+    err = dlerror();
+    if (err || !fns->path_fn) {
+        perror("Failed to find krun_net_device_new_unixstream_path");
+       return false;
+    }
+    if (err || !fns->fd_fn) {
+        perror("Failed to find krun_net_device_new_unixstream_fd");
+       return false;
+    }
     return true;
 }
 
@@ -421,6 +451,7 @@ int main(int argc, char *const argv[])
     struct rlimit rlim;
     bool use_vhost_user;
     struct vhost_user_support vhost_user = { 0 };
+    struct net_unixstream_fns net_fns = { 0 };
 
     if (!parse_cmdline(argc, argv, &cmdline)) {
         putchar('\n');
@@ -442,6 +473,13 @@ int main(int argc, char *const argv[])
     }
 
     if (use_vhost_user && !vhost_user_support_load(&vhost_user)) {
+        print_help(argv[0]);
+        return -1;
+    }
+
+    if ((cmdline.net_mode == NET_MODE_PASST ||
+         cmdline.vhost_user_vsock_socket != NULL) &&
+        !(get_net_unixstream_fns(&net_fns))) {
         print_help(argv[0]);
         return -1;
     }
@@ -594,14 +632,14 @@ int main(int argc, char *const argv[])
         uint8_t mac[] = {0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee};
         KrunNetDevice net;
         if (cmdline.passt_socket_path != NULL) {
-            net = krun_net_device_new_unixstream_path(KRUN_STR("net0"),
+            net = (net_fns.path_fn)(KRUN_STR("net0"),
                 KRUN_STR(cmdline.passt_socket_path), KRUN_BYTES(mac), COMPAT_NET_FEATURES, 0, &krun_err);
         } else {
             int passt_fd = start_passt();
             if (passt_fd < 0) {
                 return -1;
             }
-            net = krun_net_device_new_unixstream_fd(KRUN_STR("net0"),
+            net = (net_fns.fd_fn)(KRUN_STR("net0"),
                 passt_fd, KRUN_BYTES(mac), COMPAT_NET_FEATURES, 0, &krun_err);
         }
         if (krun_err) {
