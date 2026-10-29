@@ -454,7 +454,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         sender.clone(),
         device_manager,
     )
-    .map_err(|e| VmmError::BootError(format!("{e:?}")))?;
+    .map_err(|e| VmmError::BootError(e.to_string()))?;
 
     let needs_worker = {
         #[cfg(any(feature = "amd-sev", feature = "tdx"))]
