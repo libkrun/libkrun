@@ -11,7 +11,7 @@ use std::ops::Deref;
 use std::ptr::copy_nonoverlapping;
 use std::result;
 
-use crate::virtio::queue::DescriptorChain;
+use crate::virtio::queue::{DescriptorChain, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryError,
     GuestMemoryMmap, GuestMemoryRegion, Le16, Le32, Le64, VolatileMemory, VolatileMemoryError,
@@ -191,29 +191,57 @@ pub struct Reader<'a> {
 impl<'a> Reader<'a> {
     /// Construct a new Reader wrapper over `desc_chain`.
     pub fn new(mem: &'a GuestMemoryMmap, chain: DescriptorChain<'a>) -> Result<Reader<'a>> {
-        let mut total_len: usize = 0;
-        let buffers = chain
-            .into_iter()
-            .readable()
-            .map(|desc| {
-                // Verify that summing the descriptor sizes does not overflow.
-                // This can happen if a driver tricks a device into reading more data than
-                // fits in a `usize`.
-                total_len = total_len
-                    .checked_add(desc.len as usize)
-                    .ok_or(Error::DescriptorChainOverflow)?;
+        Self::from_chain(mem, chain, false)
+    }
 
-                let region = mem.find_region(desc.addr).ok_or(Error::FindMemoryRegion)?;
-                let offset = desc
-                    .addr
-                    .checked_sub(region.start_addr().raw_value())
-                    .unwrap();
+    /// Construct a Reader that rejects device-writable descriptors anywhere in the chain.
+    pub fn new_read_only(
+        mem: &'a GuestMemoryMmap,
+        chain: DescriptorChain<'a>,
+    ) -> Result<Reader<'a>> {
+        Self::from_chain(mem, chain, true)
+    }
+
+    fn from_chain(
+        mem: &'a GuestMemoryMmap,
+        chain: DescriptorChain<'a>,
+        read_only: bool,
+    ) -> Result<Reader<'a>> {
+        let mut total_len = 0usize;
+        let mut buffers = VecDeque::new();
+        let mut descriptor = Some(chain);
+        while let Some(desc) = descriptor {
+            if desc.flags & !(VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE) != 0 {
+                return Err(Error::InvalidChain);
+            }
+            if desc.is_write_only() {
+                if read_only {
+                    return Err(Error::InvalidChain);
+                }
+                break;
+            }
+
+            total_len = total_len
+                .checked_add(desc.len as usize)
+                .ok_or(Error::DescriptorChainOverflow)?;
+            let region = mem.find_region(desc.addr).ok_or(Error::FindMemoryRegion)?;
+            let offset = desc
+                .addr
+                .checked_sub(region.start_addr().raw_value())
+                .unwrap();
+            buffers.push_back(
                 region
                     .deref()
                     .get_slice(offset.raw_value() as usize, desc.len as usize)
-                    .map_err(Error::VolatileMemoryError)
-            })
-            .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
+                    .map_err(Error::VolatileMemoryError)?,
+            );
+
+            descriptor = desc.next_descriptor();
+            // has_next() also hides TTL exhaustion, which must not truncate a malformed chain.
+            if desc.flags & VIRTQ_DESC_F_NEXT != 0 && descriptor.is_none() {
+                return Err(Error::InvalidChain);
+            }
+        }
         Ok(Reader {
             buffer: DescriptorChainConsumer {
                 buffers,
@@ -481,9 +509,6 @@ impl io::Write for Writer<'_> {
     }
 }
 
-const VIRTQ_DESC_F_NEXT: u16 = 0x1;
-const VIRTQ_DESC_F_WRITE: u16 = 0x2;
-
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum DescriptorType {
     Readable,
@@ -546,7 +571,121 @@ pub fn create_descriptor_chain(
 
 #[cfg(test)]
 mod tests {
+    use std::array;
+
     use super::*;
+
+    #[test]
+    fn reader_rejects_malformed_chains() {
+        use crate::virtio::queue::tests::VirtQueue;
+
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let queue = VirtQueue::new(GuestAddress(0), &memory, 8);
+        let cases = [
+            ("self loop", vec![(8, VIRTQ_DESC_F_NEXT, 0)]),
+            ("zero length loop", vec![(0, VIRTQ_DESC_F_NEXT, 0)]),
+            (
+                "cycle",
+                vec![(4, VIRTQ_DESC_F_NEXT, 1), (4, VIRTQ_DESC_F_NEXT, 0)],
+            ),
+            (
+                "invalid tail link",
+                vec![(8, VIRTQ_DESC_F_NEXT, 1), (0, VIRTQ_DESC_F_NEXT, 8)],
+            ),
+            ("indirect", vec![(8, 4, 0)]),
+            ("reserved flag", vec![(8, 8, 0)]),
+        ];
+        for (name, descriptors) in cases {
+            for (index, (len, flags, next)) in descriptors.into_iter().enumerate() {
+                queue.dtable[index].set(0x4000, len, flags, next);
+            }
+            let chain = DescriptorChain::checked_new(&memory, GuestAddress(0), 8, 0).unwrap();
+            assert!(
+                matches!(
+                    Reader::new(&memory, chain.clone()),
+                    Err(Error::InvalidChain)
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    Reader::new_read_only(&memory, chain),
+                    Err(Error::InvalidChain)
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_reader_rejects_writable_tail() {
+        for len in [0, 8] {
+            let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+            let chain = create_descriptor_chain(
+                &memory,
+                GuestAddress(0),
+                GuestAddress(0x100),
+                vec![
+                    (DescriptorType::Readable, 8),
+                    (DescriptorType::Writable, len),
+                ],
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                Reader::new(&memory, chain.clone())
+                    .unwrap()
+                    .available_bytes(),
+                8
+            );
+            assert!(matches!(
+                Reader::new_read_only(&memory, chain),
+                Err(Error::InvalidChain)
+            ));
+        }
+    }
+
+    #[test]
+    fn read_only_reader_accepts_full_chain() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0),
+            GuestAddress(0x2000),
+            vec![(DescriptorType::Readable, 1); 256],
+            0,
+        )
+        .unwrap();
+        let mut reader = Reader::new_read_only(&memory, chain).unwrap();
+        let expected: [u8; 256] = array::from_fn(|index| index as u8);
+        memory.write_slice(&expected, GuestAddress(0x2000)).unwrap();
+        assert_eq!(reader.available_bytes(), 256);
+        let mut data = [0; 256];
+        reader.read_exact(&mut data).unwrap();
+        assert_eq!(data, expected);
+        assert_eq!(reader.available_bytes(), 0);
+    }
+
+    #[test]
+    fn read_only_reader_follows_descriptor_links() {
+        use crate::virtio::queue::tests::VirtQueue;
+
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let queue = VirtQueue::new(GuestAddress(0), &memory, 8);
+        queue.dtable[3].set(0x4000, 2, VIRTQ_DESC_F_NEXT, 1);
+        queue.dtable[1].set(0x5000, 3, VIRTQ_DESC_F_NEXT, 6);
+        queue.dtable[6].set(0x6000, 3, 0, 0);
+        memory.write_slice(b"ab", GuestAddress(0x4000)).unwrap();
+        memory.write_slice(b"cde", GuestAddress(0x5000)).unwrap();
+        memory.write_slice(b"fgh", GuestAddress(0x6000)).unwrap();
+
+        let chain = DescriptorChain::checked_new(&memory, GuestAddress(0), 8, 3).unwrap();
+        let mut reader = Reader::new_read_only(&memory, chain).unwrap();
+        let mut data = [0; 8];
+        reader.read_exact(&mut data).unwrap();
+        assert_eq!(&data, b"abcdefgh");
+        assert_eq!(reader.available_bytes(), 0);
+    }
 
     #[test]
     fn reader_test_simple_chain() {
