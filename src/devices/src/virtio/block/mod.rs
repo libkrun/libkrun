@@ -4,6 +4,8 @@
 #[cfg(feature = "blk")]
 pub mod device;
 #[cfg(feature = "blk")]
+mod flush;
+#[cfg(feature = "blk")]
 mod worker;
 
 #[cfg(feature = "blk")]

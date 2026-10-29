@@ -39,6 +39,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
 };
 
+use super::flush::HostSync;
 use super::worker::BlockWorker;
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, TYPE_BLOCK, VirtioDevice},
@@ -245,6 +246,9 @@ pub struct Block {
     cache_type: CacheType,
     disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
+    /// Set when FLUSH requests are made stable by a flush engine rather than
+    /// by the worker through the format layer.
+    host_sync: Option<HostSync>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
 
@@ -276,12 +280,12 @@ impl Block {
         direct_io: bool,
         sync_mode: SyncMode,
     ) -> io::Result<Block> {
-        let disk_image = OpenOptions::new()
+        let host_file = OpenOptions::new()
             .read(true)
             .write(!is_disk_read_only)
             .open(PathBuf::from(&disk_image_path))?;
 
-        let disk_image_id = DiskProperties::build_disk_image_id(&disk_image, &id);
+        let disk_image_id = DiskProperties::build_disk_image_id(&host_file, &id);
 
         let file_opts = StorageOpenOptions::new()
             .write(!is_disk_read_only)
@@ -318,6 +322,21 @@ impl Block {
         };
 
         let disk_image = Arc::new(Mutex::new(disk_image));
+
+        // A raw image buffers nothing in its format layer, so a sync of the
+        // image file alone makes every completed write stable. Other formats
+        // must write out their metadata under the format lock first. Without
+        // VIRTIO_BLK_F_FLUSH the guest sends no FLUSH to batch.
+        let host_sync = (disk_image_format == DiskFormat::Raw
+            && cache_type == CacheType::Writeback
+            && sync_mode != SyncMode::None)
+            .then(|| {
+                HostSync::new(
+                    host_file,
+                    #[cfg(target_os = "macos")]
+                    (sync_mode == SyncMode::Relaxed),
+                )
+            });
 
         let disk_properties =
             DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
@@ -358,6 +377,7 @@ impl Block {
             cache_type,
             disk_image,
             disk_image_id,
+            host_sync,
             avail_features,
             acked_features: 0u64,
             device_state: DeviceState::Inactive,
@@ -458,11 +478,20 @@ impl VirtioDevice for Block {
             .map_err(|_| ActivateError::BadActivate)?,
         };
 
+        let flush_engine = match self.host_sync.as_ref().map(HostSync::start).transpose() {
+            Ok(engine) => engine,
+            Err(e) => {
+                error!("Cannot start the block flush engine: {e}");
+                return Err(ActivateError::BadActivate);
+            }
+        };
+
         let worker = BlockWorker::new(
             blk_q,
             interrupt.clone(),
             mem.clone(),
             disk,
+            flush_engine,
             self.worker_stopfd.try_clone().unwrap(),
         );
         self.worker_thread = Some(worker.run());
