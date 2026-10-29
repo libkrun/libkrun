@@ -14,6 +14,9 @@ const WORKING_PORT: u32 = 1237;
 #[host]
 mod host {
     use super::*;
+    #[cfg(feature = "dynamic-linking")]
+    use krun::DeviceManager;
+
     use std::io::Write;
     use std::mem;
     use std::os::unix::net::UnixListener;

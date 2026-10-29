@@ -14,6 +14,9 @@ const SERVICE_PORT: u32 = 1235;
 #[host]
 mod host {
     use super::*;
+    #[cfg(feature = "dynamic-linking")]
+    use krun::DeviceManager;
+
     use nix::errno::Errno;
     use nix::libc::{EMFILE, rlim_t};
     use nix::sys::resource::{Resource, getrlimit, setrlimit};
