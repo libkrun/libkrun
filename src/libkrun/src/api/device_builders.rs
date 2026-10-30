@@ -5,6 +5,8 @@ use std::io::IsTerminal;
 use std::marker::PhantomData;
 #[cfg(feature = "blk")]
 use std::num::NonZeroUsize;
+#[cfg(target_arch = "aarch64")]
+use std::ops::Range;
 #[cfg(all(feature = "net", not(target_os = "windows")))]
 use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
@@ -247,6 +249,13 @@ impl<'a> AttachContext<'a> {
         &self,
     ) -> Option<crossbeam_channel::Sender<utils::worker_message::WorkerMessage>> {
         self.map_sender.clone()
+    }
+
+    /// The guest physical addresses of the guest memory that the VMM locks into host memory, if
+    /// there is any.
+    #[cfg(target_arch = "aarch64")]
+    pub fn locked_memory_range(&self) -> Option<Range<u64>> {
+        self.vmm.arch_memory_info.locked_range()
     }
 
     /// Append a string to the kernel command line.
@@ -1336,6 +1345,10 @@ impl BalloonDevice {
 impl<'a> AttachDevice<'a> for BalloonDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        #[cfg(target_arch = "aarch64")]
+        if let Some(locked) = ctx.locked_memory_range() {
+            self.inner.lock().unwrap().set_locked_ranges(vec![locked]);
+        }
         #[cfg(target_os = "macos")]
         self.inner
             .lock()

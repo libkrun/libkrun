@@ -157,7 +157,7 @@ mod tests {
         let kvm = Kvm::new().unwrap();
         let vm = kvm.create_vm().unwrap();
         let vcpu = vm.create_vcpu(0).unwrap();
-        let (mem_info, _regions) = arch_memory_regions(layout::FDT_MAX_SIZE + 0x1000, 0, None);
+        let (mem_info, _regions) = arch_memory_regions(layout::FDT_MAX_SIZE + 0x1000, 0, 0, None);
 
         match setup_regs(&vcpu, 0, 0x0, &mem_info).unwrap_err() {
             Error::SetCoreRegister(ref e) => assert_eq!(e.errno(), libc::ENOEXEC),

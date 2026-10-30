@@ -24,6 +24,11 @@ pub struct ArchMemoryInfo {
     pub firmware_addr: u64,
     #[cfg(target_os = "macos")]
     pub ipa_size: u32,
+    /// Guest memory that the VMM locks into host memory. See [`ArchMemoryInfo::locked_range`].
+    #[cfg(target_arch = "aarch64")]
+    pub locked_start_addr: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub locked_size: u64,
 }
 
 /// Module for aarch64 related functionality.

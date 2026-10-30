@@ -712,6 +712,78 @@ mod tests {
         }
     }
 
+    /// Waits until the device used `reports` reports.
+    fn wait_used(dev: &mut TestDevice, reports: u16) {
+        let deadline = Instant::now() + TIMEOUT;
+        while dev.used() < reports {
+            assert!(Instant::now() < deadline, "reports not used");
+            sleep(Duration::from_millis(1));
+            dev.handle_reclaim_done();
+        }
+    }
+
+    #[test]
+    fn test_locked_memory_is_not_reclaimed() {
+        let mem = guest_memory();
+        let locked = 4 << 20..8 << 20;
+        let mut dev = TestDevice::new(&mem, Some(FreePageReportingMode::Replace));
+        dev.balloon.set_locked_ranges(vec![locked.clone()]);
+
+        // Replacing the pages of locked memory would unlock them. The report is used right away.
+        dev.report(&[(locked.start, 2 << 20), (locked.start + (2 << 20), 2 << 20)]);
+        assert!(dev.balloon.process_frq());
+        assert_eq!(dev.used(), 1);
+        assert!(dev.worker.try_recv().is_err());
+        assert_eq!(dev.balloon.locked_skipped_bytes(), 4 << 20);
+
+        // Only the parts of a report that aren't in locked memory are reclaimed.
+        dev.report(&[(2 << 20, 4 << 20), (6 << 20, 6 << 20)]);
+        assert!(!dev.balloon.process_frq());
+        for expected in [(2 << 20, 2 << 20), (8 << 20, 4 << 20)] {
+            let WorkerMessage::ReclaimMemory(reply_sender, guest_addr, len) =
+                dev.worker.recv_timeout(TIMEOUT).unwrap()
+            else {
+                panic!("unexpected worker message");
+            };
+            assert_eq!((guest_addr, len), expected);
+            reply_sender.send(true).unwrap();
+        }
+        wait_used(&mut dev, 2);
+        assert!(dev.worker.try_recv().is_err());
+        assert_eq!(dev.balloon.locked_skipped_bytes(), 8 << 20);
+    }
+
+    #[test]
+    fn test_locked_memory_is_not_marked_as_free() {
+        // A multiple of the page size of every host.
+        const PAGE: usize = 64 << 10;
+        const FIRST: usize = 1 << 20;
+        const PAGES: usize = 32;
+        let mem = guest_memory();
+        mem.write_slice(&vec![0xff; PAGES * PAGE], GuestAddress(FIRST as u64))
+            .unwrap();
+        let host_addr = FreeRange::new(&mem, GuestAddress(FIRST as u64), PAGES * PAGE)
+            .unwrap()
+            .host_addr;
+
+        let mut dev = TestDevice::new(&mem, None);
+        // Pages 8 to 15 are locked, and the report covers pages 4 to 19.
+        let locked = (FIRST + 8 * PAGE) as u64..(FIRST + 16 * PAGE) as u64;
+        dev.balloon.set_locked_ranges(vec![locked]);
+        dev.report(&[((FIRST + 4 * PAGE) as u64, (16 * PAGE) as u32)]);
+        assert!(dev.balloon.process_frq());
+        assert_eq!(dev.used(), 1);
+
+        let pages = page_query::pages(host_addr, PAGES * PAGE);
+        for (block, pages) in pages.chunks(pages.len() / PAGES).enumerate() {
+            let is_released = (4..8).contains(&block) || (16..20).contains(&block);
+            for &(modified, _) in pages {
+                assert_eq!(modified, !is_released, "page {block}");
+            }
+        }
+        assert_eq!(dev.balloon.locked_skipped_bytes(), (8 * PAGE) as u64);
+    }
+
     #[test]
     fn test_ranges_outside_guest_memory_are_not_reclaimed() {
         let mem = guest_memory();

@@ -74,6 +74,7 @@ The caller must ensure its guest kernel supports virtio-rtc before enabling it.
 
 - `vcpus(count)`: Number of virtual CPUs.
 - `ram_mib(size_mib)`: Guest physical memory size in MiB.
+- `locked_memory_mib(size_mib)`: Guest memory on top of `ram_mib` that is locked into host memory and that the guest sees as a NUMA node without CPUs (aarch64 only).
 - `payload(payload)`: The configured boot payload.
 - `devices(device_manager)`: The registered MMIO devices.
 - `split_irqchip(enabled)`: Configures interrupt controller mode on x86_64.

@@ -1413,6 +1413,42 @@
           "ffi_name": "krun_vmm_builder_ram_mib"
         },
         {
+          "name": "locked_memory_mib",
+          "doc": [
+            " Give the VM `mib` MiB of locked guest memory, on top of [`VmmBuilder::ram_mib`]: memory",
+            " that libkrun locks into host memory with mlock(), so that the host never pages it out or",
+            " compresses it, and that the guest sees as a NUMA node of its own (node 1) without CPUs.",
+            " The guest decides what to keep there, for example by binding a process to the node. The",
+            " balloon device never gives this memory back to the host, so it's taken from the host for",
+            " as long as the VM runs.",
+            "",
+            " `mib` must be a multiple of 2, or this fails with [`VmmError::InvalidParam`]. 0, the",
+            " default, means none. If the memory can't be locked, for example because of",
+            " RLIMIT_MEMLOCK or, on macOS, the sysctl vm.user_wire_limit, [`VmmBuilder::build`] fails",
+            " instead of starting the VM without it.",
+            "",
+            " Only aarch64 supports locked guest memory. Elsewhere, a size other than 0 fails with",
+            " [`VmmError::FeatureDisabled`]."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "mib",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vmm_builder_locked_memory_mib"
+        },
+        {
           "name": "payload",
           "receiver": "value",
           "params": [

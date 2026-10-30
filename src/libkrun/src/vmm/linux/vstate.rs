@@ -1983,6 +1983,7 @@ mod tests {
         let kvm = KvmContext::new().unwrap();
         let (guest_memory, arch_memory_info, _shm_manager, _payload_config) = create_guest_memory(
             128,
+            0,
             None,
             #[cfg(feature = "tee")]
             None,

@@ -420,6 +420,24 @@ KrunResult krun_vmm_builder_vcpus(KrunVmmBuilder* handle, uint8_t count, KrunErr
 typedef KrunResult (*krun_vmm_builder_vcpus_fn)(KrunVmmBuilder* handle, uint8_t count, KrunError* err_out);
 KrunResult krun_vmm_builder_ram_mib(KrunVmmBuilder* handle, uint32_t mib, KrunError* err_out);
 typedef KrunResult (*krun_vmm_builder_ram_mib_fn)(KrunVmmBuilder* handle, uint32_t mib, KrunError* err_out);
+/**
+ * Give the VM `mib` MiB of locked guest memory, on top of [`VmmBuilder::ram_mib`]: memory
+ * that libkrun locks into host memory with mlock(), so that the host never pages it out or
+ * compresses it, and that the guest sees as a NUMA node of its own (node 1) without CPUs.
+ * The guest decides what to keep there, for example by binding a process to the node. The
+ * balloon device never gives this memory back to the host, so it's taken from the host for
+ * as long as the VM runs.
+ *
+ * `mib` must be a multiple of 2, or this fails with [`VmmError::InvalidParam`]. 0, the
+ * default, means none. If the memory can't be locked, for example because of
+ * RLIMIT_MEMLOCK or, on macOS, the sysctl vm.user_wire_limit, [`VmmBuilder::build`] fails
+ * instead of starting the VM without it.
+ *
+ * Only aarch64 supports locked guest memory. Elsewhere, a size other than 0 fails with
+ * [`VmmError::FeatureDisabled`].
+ */
+KrunResult krun_vmm_builder_locked_memory_mib(KrunVmmBuilder* handle, uint32_t mib, KrunError* err_out);
+typedef KrunResult (*krun_vmm_builder_locked_memory_mib_fn)(KrunVmmBuilder* handle, uint32_t mib, KrunError* err_out);
 void krun_vmm_builder_payload(KrunVmmBuilder* handle, KrunPayload payload);
 typedef void (*krun_vmm_builder_payload_fn)(KrunVmmBuilder* handle, KrunPayload payload);
 /**
