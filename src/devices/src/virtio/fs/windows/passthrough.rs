@@ -2435,19 +2435,25 @@ impl FileSystem for PassthroughFs {
     fn flush(
         &self,
         _ctx: Context,
-        inode: Inode,
-        handle: Handle,
+        _inode: Inode,
+        _handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
-        // On Windows, to perform a flush we need to have a file handle with write access.
-        // If the file has been open as read-only, there is nothing to flush
-        if is_handle_read_only(handle) {
-            return Ok(());
-        }
-
-        let file = self.reopen_inode(inode, handle, GENERIC_READ | GENERIC_WRITE)?;
-
-        file.sync_all().map_err(win_err_to_linux)
+        // FUSE `flush` is called on every guest close(2) to give userspace filesystems
+        // a chance to flush internal process buffers and return write errors (e.g., ENOSPC).
+        // POSIX close(2) carries no durability guarantees; it only expects dirty userspace
+        // buffers to reach the OS page cache.
+        //
+        // Because all guest writes are already dispatched directly to host Windows handles
+        // via WriteFile(), there are no uncommitted user-mode buffers held in this VMM process.
+        // We intentionally do NOT call FlushFileBuffers() here, as forcing a physical disk sync
+        // on every file close adds severe millisecond-level latency. Guests requiring data
+        // durability issue fsync(2), which is properly handled by FlushFileBuffers() in `fsync`.
+        //
+        // With nothing to do, ENOSYS makes the guest kernel stop sending FLUSH altogether,
+        // saving a full round trip on every close(2). POSIX locks are not supported either,
+        // so no lock owner state needs to be released here
+        Err(enosys())
     }
 
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
