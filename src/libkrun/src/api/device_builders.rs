@@ -1511,7 +1511,8 @@ pub struct BlockDevice {
     direct_io: bool,
     sync_mode: SyncMode,
     parallel_reads: bool,
-    read_pool_size: Option<NonZeroUsize>,
+    parallel_writes: bool,
+    pool_size: Option<NonZeroUsize>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
@@ -1520,7 +1521,8 @@ impl BlockDevice {
     /// Create a new block device.
     ///
     /// Defaults to read-write (`read_only = false`), cached I/O (`direct_io = false`),
-    /// [`SyncMode::Relaxed`], and serialized reads (`parallel_reads = false`).
+    /// [`SyncMode::Relaxed`], and serialized reads and writes (`parallel_reads = false`,
+    /// `parallel_writes = false`).
     pub fn new(id: &str, disk_image_path: &str, format: DiskFormat) -> Result<Self, VmmError> {
         Ok(Self {
             id: id.to_string(),
@@ -1530,7 +1532,8 @@ impl BlockDevice {
             direct_io: false,
             sync_mode: SyncMode::default(),
             parallel_reads: false,
-            read_pool_size: None,
+            parallel_writes: false,
+            pool_size: None,
         })
     }
 
@@ -1554,19 +1557,30 @@ impl BlockDevice {
 
     /// Serve guest reads on a host thread pool with out-of-order completion.
     ///
-    /// Disabled by default. Writes, flushes, and discards stay on the device thread.
-    /// The pool size is automatic unless overridden with [`set_read_pool_size`](Self::set_read_pool_size).
+    /// Disabled by default. Flushes and discards stay on the device thread, and so do writes
+    /// unless [`set_parallel_writes`](Self::set_parallel_writes) is enabled.
+    /// The pool size is automatic unless overridden with [`set_pool_size`](Self::set_pool_size).
     pub fn set_parallel_reads(&mut self, enabled: bool) {
         self.parallel_reads = enabled;
     }
 
-    /// Set the requested number of worker threads for parallel reads.
+    /// Set the requested number of worker threads for parallel reads and writes.
     ///
-    /// Only applies when parallel reads are enabled. If the requested size is greater than the
-    /// available host parallelism, or it cannot be determined, reads remain serialized. Pass 0
-    /// to restore automatic pool sizing.
-    pub fn set_read_pool_size(&mut self, size: usize) {
-        self.read_pool_size = NonZeroUsize::new(size);
+    /// Only applies when parallel reads or writes are enabled. If the requested size is greater
+    /// than the available host parallelism, or it cannot be determined, they remain serialized.
+    /// Pass 0 to restore automatic pool sizing.
+    pub fn set_pool_size(&mut self, size: usize) {
+        self.pool_size = NonZeroUsize::new(size);
+    }
+
+    /// Serve guest writes on a host thread pool with out-of-order completion, straight from the
+    /// guest's buffers.
+    ///
+    /// Disabled by default. The pool is shared with parallel reads, and sized by
+    /// [`set_pool_size`](Self::set_pool_size). Flushes, discards, and write-zeroes wait for the
+    /// I/O in flight on the pool before they run.
+    pub fn set_parallel_writes(&mut self, enabled: bool) {
+        self.parallel_writes = enabled;
     }
 }
 
@@ -1587,7 +1601,8 @@ impl<'a> AttachDevice<'a> for BlockDevice {
             self.direct_io,
             self.sync_mode,
             self.parallel_reads,
-            self.read_pool_size,
+            self.parallel_writes,
+            self.pool_size,
         )
         .map_err(|e| VmmError::Internal(format!("block: {e}")))?;
 
