@@ -45,6 +45,8 @@ use crate::vmm::resources::TeeConfig;
 use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
 #[cfg(target_arch = "x86_64")]
 use cpuid::{VmSpec, c3, filter_cpuid, t2};
+#[cfg(target_arch = "x86_64")]
+use devices::legacy::IOAPIC_EOI_ADDRESS;
 #[cfg(not(feature = "tee"))]
 use kvm_bindings::kvm_userspace_memory_region;
 #[cfg(target_arch = "x86_64")]
@@ -1563,6 +1565,16 @@ impl Vcpu {
                 VcpuExit::MmioWrite(addr, data) => {
                     if let Some(ref mmio_bus) = self.mmio_bus {
                         mmio_bus.write(0, addr, data);
+                    }
+                    Ok(VcpuEmulation::Handled)
+                }
+                // With a split irqchip, KVM exits here when the guest ends a
+                // level-triggered interrupt (EOI). Forward it to the userspace
+                // IOAPIC by writing the vector to its EOI register.
+                #[cfg(target_arch = "x86_64")]
+                VcpuExit::IoapicEoi(vector) => {
+                    if let Some(ref mmio_bus) = self.mmio_bus {
+                        mmio_bus.write(0, IOAPIC_EOI_ADDRESS, &u32::from(vector).to_ne_bytes());
                     }
                     Ok(VcpuEmulation::Handled)
                 }

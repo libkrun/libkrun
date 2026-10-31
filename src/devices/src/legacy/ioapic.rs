@@ -19,6 +19,9 @@ const IO_REG_SEL: u64 = 0x00;
 const IO_WIN: u64 = 0x10;
 const IO_EOI: u64 = 0x40;
 
+/// The guest-physical address of the EOI register.
+pub const IOAPIC_EOI_ADDRESS: u64 = IOAPIC_BASE as u64 + IO_EOI;
+
 const IO_APIC_ID: u8 = 0x00;
 const IO_APIC_VER: u8 = 0x01;
 const IO_APIC_ARB: u8 = 0x02;
