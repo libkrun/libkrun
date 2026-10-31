@@ -1065,6 +1065,9 @@ int32_t krun_check_nested_virt(void);
  * KRUN_FREE_PAGE_REPORTING_MODE_REPLACE has the VMM replace the reported pages with
  * fresh memory on macOS instead, which does release them. This costs a few system
  * calls per report, and the guest's next access to each page faults it in again.
+ * It also has the VMM map guest RAM in blocks of 2 MiB, one map entry each, and
+ * replace whole blocks only. If it can't map RAM like that, the VM starts anyway
+ * and uses KRUN_FREE_PAGE_REPORTING_MODE_DEFAULT.
  * Other platforms don't implement it, and use KRUN_FREE_PAGE_REPORTING_MODE_DEFAULT
  * instead.
  *
