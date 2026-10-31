@@ -86,6 +86,10 @@ pub enum PermissionSemantics {
     /// changes, and store permission bits on the host without extended attributes or idmaps.
     /// Unsupported on Linux hosts.
     LinuxSimplified = 1,
+    /// As `LinuxSimplified`, but report ownership as the uid and gid set with
+    /// `set_fixed_owner`, so attributes are the same for every caller and stay cacheable.
+    /// Supported on macOS hosts only.
+    LinuxSimplifiedFixedOwner = 2,
 }
 
 mod defs {

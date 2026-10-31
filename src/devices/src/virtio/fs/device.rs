@@ -117,20 +117,57 @@ impl Fs {
         if cfg!(target_os = "linux") && matches!(semantics, PermissionSemantics::LinuxSimplified) {
             return false;
         }
+        if cfg!(not(target_os = "macos"))
+            && matches!(semantics, PermissionSemantics::LinuxSimplifiedFixedOwner)
+        {
+            return false;
+        }
         let Some(cfg) = self.passthrough_cfg.as_mut() else {
             return false;
         };
         let complete = matches!(semantics, PermissionSemantics::LinuxComplete);
         cfg.semantics = semantics;
-        // Simplified ownership is context-dependent, so attributes cannot be cached.
-        cfg.attr_timeout = if complete {
-            Duration::from_secs(5)
-        } else {
+        // Requester ownership is context-dependent, so attributes cannot be cached.
+        cfg.attr_timeout = if matches!(semantics, PermissionSemantics::LinuxSimplified) {
             Duration::ZERO
+        } else {
+            Duration::from_secs(5)
         };
         cfg.xattr = complete;
+        #[cfg(target_os = "macos")]
+        {
+            cfg.fixed_owner = None;
+        }
         self.allow_idmap = complete;
         true
+    }
+
+    /// Sets the owner that `LinuxSimplifiedFixedOwner` reports; fails in any other mode.
+    pub fn set_fixed_owner(&mut self, uid: u32, gid: u32) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Some(cfg) = self.passthrough_cfg.as_mut()
+            && matches!(
+                cfg.semantics,
+                PermissionSemantics::LinuxSimplifiedFixedOwner
+            )
+        {
+            cfg.fixed_owner = Some((uid, gid));
+            return true;
+        }
+        let _ = (uid, gid);
+        false
+    }
+
+    /// Whether the device is in `LinuxSimplifiedFixedOwner` mode with no owner set.
+    pub fn lacks_fixed_owner(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Some(cfg) = self.passthrough_cfg.as_ref() {
+            return matches!(
+                cfg.semantics,
+                PermissionSemantics::LinuxSimplifiedFixedOwner
+            ) && cfg.fixed_owner.is_none();
+        }
+        false
     }
 
     pub fn set_cache_policy(&mut self, policy: CachePolicy) -> bool {
@@ -326,6 +363,56 @@ mod tests {
                 assert!(!fs.allow_idmap);
             }
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fixed_owner_semantics_keep_attributes_cacheable() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplifiedFixedOwner));
+        assert!(fs.lacks_fixed_owner());
+        assert!(fs.set_fixed_owner(1234, 5678));
+        assert!(!fs.lacks_fixed_owner());
+        let cfg = fs.passthrough_cfg.as_ref().unwrap();
+        assert_eq!(cfg.fixed_owner, Some((1234, 5678)));
+        assert_eq!(cfg.attr_timeout, Duration::from_secs(5));
+        assert!(!cfg.xattr);
+        assert!(!fs.allow_idmap);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fixed_owner_is_rejected_in_other_semantics() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        for semantics in [
+            PermissionSemantics::LinuxComplete,
+            PermissionSemantics::LinuxSimplified,
+        ] {
+            assert!(fs.set_permission_semantics(semantics));
+            assert!(!fs.set_fixed_owner(1234, 5678));
+            assert!(!fs.lacks_fixed_owner());
+            assert_eq!(fs.passthrough_cfg.as_ref().unwrap().fixed_owner, None);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn changing_semantics_clears_the_fixed_owner() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplifiedFixedOwner));
+        assert!(fs.set_fixed_owner(1234, 5678));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplified));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplifiedFixedOwner));
+        assert!(fs.lacks_fixed_owner());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn fixed_owner_semantics_are_rejected_off_macos() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        assert!(!fs.set_permission_semantics(PermissionSemantics::LinuxSimplifiedFixedOwner));
+        assert!(!fs.set_fixed_owner(1234, 5678));
+        assert!(!fs.lacks_fixed_owner());
     }
 
     #[test]

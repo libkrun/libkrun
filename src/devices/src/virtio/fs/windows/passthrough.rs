@@ -390,7 +390,8 @@ fn file_info_to_stat64(
     } else {
         let is_readonly = (file_attributes & FILE_ATTRIBUTE_READONLY) != 0;
         let mode_bits = match semantics {
-            PermissionSemantics::LinuxSimplified => {
+            PermissionSemantics::LinuxSimplified
+            | PermissionSemantics::LinuxSimplifiedFixedOwner => {
                 if is_readonly {
                     0o444
                 } else {
@@ -429,7 +430,7 @@ fn file_info_to_stat64(
     };
 
     match semantics {
-        PermissionSemantics::LinuxSimplified => {
+        PermissionSemantics::LinuxSimplified | PermissionSemantics::LinuxSimplifiedFixedOwner => {
             st.st_uid = ctx.uid;
             st.st_gid = ctx.gid;
         }
@@ -1861,7 +1862,8 @@ impl FileSystem for PassthroughFs {
         let path = self.inode_path(inode)?;
 
         match self.cfg.semantics {
-            PermissionSemantics::LinuxSimplified => {
+            PermissionSemantics::LinuxSimplified
+            | PermissionSemantics::LinuxSimplifiedFixedOwner => {
                 // In LinuxSimplified mode:
                 // 1. UID/GID changes (chown) are ignored since ownership is dynamically returned as ctx.uid/gid.
                 // 2. Extended attribute (ADS) overrides are not written.
