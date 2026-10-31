@@ -2094,6 +2094,13 @@
       "methods": [
         {
           "name": "pause",
+          "doc": [
+            " Request a VM pause. Success means the request was queued.",
+            " The VMM processes it asynchronously and logs any execution failures.",
+            "",
+            " Returns [`VmmError::FeatureDisabled`] on Windows, for SEV and TDX guests,",
+            " and with a split irqchip."
+          ],
           "receiver": "ref",
           "params": [],
           "ret": {
@@ -2106,6 +2113,12 @@
         },
         {
           "name": "resume",
+          "doc": [
+            " Request that a paused VM resume. Success means the request was queued.",
+            " The VMM processes it asynchronously and logs any execution failures.",
+            "",
+            " Returns [`VmmError::FeatureDisabled`] where [`VmmHandle::pause`] does."
+          ],
           "receiver": "ref",
           "params": [],
           "ret": {

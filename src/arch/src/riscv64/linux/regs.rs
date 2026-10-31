@@ -5,7 +5,7 @@ use std::mem::offset_of;
 use std::result;
 
 use super::super::get_fdt_addr;
-use kvm_bindings::{KVM_REG_RISCV_CORE, kvm_riscv_core};
+use kvm_bindings::{KVM_REG_RISCV_CORE, KVM_REG_RISCV_TIMER, kvm_riscv_core, kvm_riscv_timer};
 use kvm_ioctls::VcpuFd;
 
 use vm_memory::GuestMemoryMmap;
@@ -15,6 +15,10 @@ use vm_memory::GuestMemoryMmap;
 pub enum Error {
     /// Failed to set core register (PC, A0, A1 or general purpose ones).
     SetCoreRegister(kvm_ioctls::Error),
+    /// Failed to get a timer register.
+    GetTimerRegister(kvm_ioctls::Error),
+    /// Failed to set a timer register.
+    SetTimerRegister(kvm_ioctls::Error),
 }
 type Result<T> = result::Result<T, Error>;
 
@@ -76,6 +80,26 @@ pub fn setup_regs(vcpu: &VcpuFd, cpu_id: u8, boot_ip: u64, mem: &GuestMemoryMmap
         &get_fdt_addr(mem).to_le_bytes(),
     )
     .map_err(Error::SetCoreRegister)?;
+    Ok(())
+}
+
+/// Read the guest's time.
+pub fn read_counter(vcpu: &VcpuFd) -> Result<u64> {
+    let offset = offset_of!(kvm_riscv_timer, time);
+    let mut data = [0u8; 8];
+    vcpu.get_one_reg(riscv64_core_reg!(KVM_REG_RISCV_TIMER, offset), &mut data)
+        .map_err(Error::GetTimerRegister)?;
+    Ok(u64::from_le_bytes(data))
+}
+
+/// Set the guest's time.
+pub fn write_counter(vcpu: &VcpuFd, value: u64) -> Result<()> {
+    let offset = offset_of!(kvm_riscv_timer, time);
+    vcpu.set_one_reg(
+        riscv64_core_reg!(KVM_REG_RISCV_TIMER, offset),
+        &value.to_le_bytes(),
+    )
+    .map_err(Error::SetTimerRegister)?;
     Ok(())
 }
 
