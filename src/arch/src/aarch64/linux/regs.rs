@@ -25,6 +25,8 @@ pub enum Error {
     SetCoreRegister(kvm_ioctls::Error),
     /// Failed to get a system register.
     GetSysRegister(kvm_ioctls::Error),
+    /// Failed to set a system register.
+    SetSysRegister(kvm_ioctls::Error),
     /// The value returned for the MPIDR register is bigger than 64 bits.
     MpidrTooBig(TryFromIntError),
 }
@@ -99,6 +101,8 @@ macro_rules! arm64_sys_reg {
 // Constant imported from the Linux kernel:
 // https://elixir.bootlin.com/linux/v4.20.17/source/arch/arm64/include/asm/sysreg.h#L135
 arm64_sys_reg!(MPIDR_EL1, 3, 0, 0, 0, 5);
+// KVM_REG_ARM_TIMER_CNT in arch/arm64/include/uapi/asm/kvm.h.
+arm64_sys_reg!(TIMER_CNT, 3, 3, 14, 3, 2);
 
 /// Configure core registers for a given CPU.
 ///
@@ -144,6 +148,21 @@ pub fn read_mpidr(vcpu: &VcpuFd) -> Result<u64> {
     vcpu.get_one_reg(MPIDR_EL1, &mut data)
         .map_err(Error::GetSysRegister)?;
     Ok(u64::from_le_bytes(data))
+}
+
+/// Read the guest's virtual counter.
+pub fn read_counter(vcpu: &VcpuFd) -> Result<u64> {
+    let mut data = [0u8; 8];
+    vcpu.get_one_reg(TIMER_CNT, &mut data)
+        .map_err(Error::GetSysRegister)?;
+    Ok(u64::from_le_bytes(data))
+}
+
+/// Set the guest's virtual counter.
+pub fn write_counter(vcpu: &VcpuFd, value: u64) -> Result<()> {
+    vcpu.set_one_reg(TIMER_CNT, &value.to_le_bytes())
+        .map_err(Error::SetSysRegister)?;
+    Ok(())
 }
 
 #[cfg(test)]

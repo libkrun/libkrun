@@ -622,8 +622,21 @@ typedef void (*krun_vmm_destroy_fn)(KrunVmm handle);
 
 /* VmmHandle --------------------------------------------------------- */
 
+/**
+ * Request a VM pause. Success means the request was queued.
+ * The VMM processes it asynchronously and logs any execution failures.
+ *
+ * Returns [`VmmError::FeatureDisabled`] on Windows, for SEV and TDX guests,
+ * and with a split irqchip.
+ */
 KrunResult krun_vmm_handle_pause(KrunVmmHandle handle, KrunError* err_out);
 typedef KrunResult (*krun_vmm_handle_pause_fn)(KrunVmmHandle handle, KrunError* err_out);
+/**
+ * Request that a paused VM resume. Success means the request was queued.
+ * The VMM processes it asynchronously and logs any execution failures.
+ *
+ * Returns [`VmmError::FeatureDisabled`] where [`VmmHandle::pause`] does.
+ */
 KrunResult krun_vmm_handle_resume(KrunVmmHandle handle, KrunError* err_out);
 typedef KrunResult (*krun_vmm_handle_resume_fn)(KrunVmmHandle handle, KrunError* err_out);
 /**

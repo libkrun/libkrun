@@ -91,4 +91,8 @@ The caller must ensure its guest kernel supports virtio-rtc before enabling it.
 Building the `VmmBuilder` produces a `Vmm` instance:
 
 - **Foreground Execution**: Calling `vmm.run()` (C API: `krun_vmm_run()`) starts vCPUs, enters the guest event loop, and blocks until VM termination.
-- **Background Control**: Call `vmm.handle()` (C API: `krun_vmm_handle`) on the built `Vmm` before `vmm.run()` consumes it, then move the `VmmHandle` to another thread. Pause and resume are supported on macOS. Shutdown is supported on aarch64 macOS when `VmmBuilder::shutdown_support(true)` was enabled. These control methods return `FeatureDisabled` on Linux.
+- **Background Control**. Call `vmm.handle()` (`krun_vmm_handle` in C) on the built `Vmm` before `vmm.run()` consumes it, then move the `VmmHandle` to another thread.
+  Pause and resume are supported on macOS and Linux, except for SEV and TDX guests and with a split irqchip, where they return `FeatureDisabled`.
+  A successful call queues the request for asynchronous processing, and the VMM logs any execution failures.
+  The guest's clock is held while paused. On x86_64 Linux this applies to kvmclock, so a guest timing with the TSC sees the pause.
+  Shutdown is supported on aarch64 macOS when `VmmBuilder::shutdown_support(true)` was enabled, and returns `FeatureDisabled` elsewhere.

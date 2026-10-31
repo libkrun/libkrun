@@ -7,6 +7,10 @@
 
 #[cfg(target_arch = "aarch64")]
 use arch::ArchMemoryInfo;
+#[cfg(target_arch = "aarch64")]
+use arch::aarch64::regs::{read_counter, write_counter};
+#[cfg(target_arch = "riscv64")]
+use arch::riscv64::regs::{read_counter, write_counter};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use libc::{c_int, c_void, siginfo_t};
 use std::cell::Cell;
@@ -1682,13 +1686,9 @@ impl Vcpu {
         match self.event_receiver.try_recv() {
             // Running ---- Pause ----> Paused
             Ok(VcpuEvent::Pause) => {
-                // Nothing special to do.
                 self.response_sender
-                    .send(VcpuResponse::Paused)
+                    .send(self.pause_response())
                     .expect("failed to send pause status");
-
-                // TODO: we should call `KVM_KVMCLOCK_CTRL` here to make sure
-                // TODO continued: the guest soft lockup watchdog does not panic on Resume.
 
                 // Move to 'paused' state.
                 state = StateMachine::next(Self::paused);
@@ -1697,6 +1697,13 @@ impl Vcpu {
                 self.response_sender
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
+            }
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+            Ok(VcpuEvent::RestoreCounter { reply, .. }) => {
+                let _ = reply.send(Err(format!(
+                    "vcpu {}: cannot restore the guest's counter while running",
+                    self.id
+                )));
             }
             // Unhandled exit of the other end.
             Err(TryRecvError::Disconnected) => {
@@ -1710,6 +1717,27 @@ impl Vcpu {
         state
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn pause_response(&self) -> VcpuResponse {
+        // Keeps the guest's soft lockup watchdog quiet on resume. Fails when the
+        // guest doesn't use kvmclock.
+        if let Err(e) = self.fd.kvmclock_ctrl() {
+            debug!("KVM_KVMCLOCK_CTRL: {e}");
+        }
+        VcpuResponse::Paused
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    fn pause_response(&self) -> VcpuResponse {
+        match read_counter(&self.fd) {
+            Ok(counter) => VcpuResponse::PausedAt(counter),
+            Err(e) => VcpuResponse::PauseFailed(format!(
+                "vcpu {}: failed to read the guest's counter: {e:?}",
+                self.id
+            )),
+        }
+    }
+
     // This is the main loop of the `Paused` state.
     fn paused(&mut self) -> StateMachine<Self> {
         match self.event_receiver.recv() {
@@ -1721,6 +1749,17 @@ impl Vcpu {
                     .expect("failed to send resume status");
                 // Move to 'running' state.
                 StateMachine::next(Self::running)
+            }
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+            Ok(VcpuEvent::RestoreCounter { counter, reply }) => {
+                let result = write_counter(&self.fd, counter).map_err(|e| {
+                    format!(
+                        "vcpu {}: failed to restore the guest's counter: {e:?}",
+                        self.id
+                    )
+                });
+                let _ = reply.send(result);
+                StateMachine::next(Self::paused)
             }
             // All other events have no effect on current 'paused' state.
             Ok(_) => StateMachine::next(Self::paused),
@@ -1804,7 +1843,12 @@ pub enum VcpuEvent {
     Pause,
     /// Event that should resume the Vcpu.
     Resume,
-    // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
+    /// Set the guest's counter while paused.
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    RestoreCounter {
+        counter: u64,
+        reply: Sender<result::Result<(), String>>,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1813,6 +1857,12 @@ pub enum VcpuEvent {
 pub enum VcpuResponse {
     /// Vcpu is paused.
     Paused,
+    /// Vcpu is paused, with the guest's counter at the given value.
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    PausedAt(u64),
+    /// The vCPU stopped but its counter could not be read.
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    PauseFailed(String),
     /// Vcpu is resumed.
     Resumed,
     /// Vcpu is stopped.
