@@ -1373,7 +1373,7 @@ pub fn build_microvm(
     // We use this atomic to record the exit code set by init/init.c in the VM.
     let exit_code = Arc::new(AtomicI32::new(i32::MAX));
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let (vm_ctl_tx, vm_ctl_rx) = utils::pollable_channel::pollable_channel()
         .map_err(Error::EventFd)
         .map_err(StartMicrovmError::Internal)?;
@@ -1397,16 +1397,23 @@ pub fn build_microvm(
             any(target_os = "linux", target_os = "windows")
         ))]
         pci_device_manager,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         vm_ctl_tx,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         vm_ctl_rx,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         paused: false,
         #[cfg(target_os = "macos")]
         paused_at: 0,
         #[cfg(target_os = "macos")]
         ram_in_blocks: payload_config.ram_in_blocks,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        paused_clock: None,
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "riscv64")
+        ))]
+        paused_counter: None,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.

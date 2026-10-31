@@ -2034,6 +2034,10 @@
       "methods": [
         {
           "name": "pause",
+          "doc": [
+            " Pause the VM. Returns [`VmmError::FeatureDisabled`] on Windows, for",
+            " SEV and TDX guests, and with a split irqchip."
+          ],
           "receiver": "ref",
           "params": [],
           "ret": {
@@ -2046,6 +2050,10 @@
         },
         {
           "name": "resume",
+          "doc": [
+            " Resume a paused VM. Returns [`VmmError::FeatureDisabled`] where",
+            " [`VmmHandle::pause`] does."
+          ],
           "receiver": "ref",
           "params": [],
           "ret": {

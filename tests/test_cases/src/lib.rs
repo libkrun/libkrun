@@ -11,9 +11,9 @@ extern crate krun_init_cdylib as krun_init;
 mod test_vm_config;
 use test_vm_config::TestVmConfig;
 
-#[cfg(any(feature = "guest", target_os = "macos"))]
+#[cfg(any(feature = "guest", target_os = "macos", target_os = "linux"))]
 mod test_vm_pause;
-#[cfg(any(feature = "guest", target_os = "macos"))]
+#[cfg(any(feature = "guest", target_os = "macos", target_os = "linux"))]
 use test_vm_pause::TestVmPause;
 
 mod test_acpi_smp;
@@ -179,7 +179,7 @@ pub fn test_cases() -> Vec<TestCase> {
                 ram_mib: 1024,
             }),
         ),
-        #[cfg(any(feature = "guest", target_os = "macos"))]
+        #[cfg(any(feature = "guest", target_os = "macos", target_os = "linux"))]
         TestCase::new("vm-pause", Box::new(TestVmPause)),
         TestCase::new("acpi-smp-4cpu", Box::new(TestAcpiSmp { num_cpus: 4 })),
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
