@@ -66,6 +66,8 @@ const SYNCHRONIZE: u32 = 0x0010_0000;
 const DELETE: u32 = 0x0001_0000;
 const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+// IO_STATUS_BLOCK.Information after NtCreateFile made a new file.
+const FILE_CREATED: usize = 2;
 
 const S_ISUID: u32 = 0o04_000;
 const S_IXGRP: u32 = 0o00_010;
@@ -893,6 +895,11 @@ fn parse_linux_open_flags(linux_flags: i32, writeback: bool) -> OpenFlags {
 
 /// Open a file via NtCreateFile with case-sensitive semantics.
 fn open_handle(path: &Path, flags: &OpenFlags) -> io::Result<HANDLE> {
+    open_handle_reporting_creation(path, flags).map(|(h, _)| h)
+}
+
+/// Like `open_handle`, also telling whether the call created the file.
+fn open_handle_reporting_creation(path: &Path, flags: &OpenFlags) -> io::Result<(HANDLE, bool)> {
     let mut nt_path = path_to_nt_wide(path);
     let byte_len = (nt_path.len() - 1) * 2; // excluding null terminator
 
@@ -931,7 +938,7 @@ fn open_handle(path: &Path, flags: &OpenFlags) -> io::Result<HANDLE> {
     };
 
     if status >= 0 {
-        Ok(handle)
+        Ok((handle, iosb.Information == FILE_CREATED))
     } else {
         Err(nt_status_to_io_error(status))
     }
@@ -1277,11 +1284,33 @@ impl PassthroughFs {
             create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
         };
         let handle = HandleGuard(open_handle(&child_path, &flags)?);
-        let file_info = get_file_info_by_handle(handle.as_raw()).map_err(win_err_to_linux)?;
+        self.entry_from_handle(
+            ctx,
+            parent,
+            &parent_data,
+            &child_path,
+            handle.as_raw(),
+            None,
+        )
+    }
+
+    /// Register the child opened as `handle` and build its entry. `handle`
+    /// must refer to `child_path` itself, not to a reparse point's target.
+    /// `known_override` spares reading back an override_stat just written.
+    fn entry_from_handle(
+        &self,
+        ctx: &Context,
+        parent: Inode,
+        parent_data: &InodeData,
+        child_path: &Path,
+        handle: HANDLE,
+        known_override: Option<OverrideStat>,
+    ) -> io::Result<Entry> {
+        let file_info = get_file_info_by_handle(handle).map_err(win_err_to_linux)?;
         let volume_serial = if parent_data.is_mount_point {
             // Fail rather than guess: a wrong serial would let file indexes
             // from two volumes collide in the inode map.
-            get_volume_serial_by_handle(handle.as_raw()).map_err(win_err_to_linux)?
+            get_volume_serial_by_handle(handle).map_err(win_err_to_linux)?
         } else {
             parent_data.volume_serial
         };
@@ -1293,7 +1322,7 @@ impl PassthroughFs {
         let inode = {
             let handle_existing = |existing: &Arc<InodeData>| {
                 existing.refcount.fetch_add(1, Ordering::Acquire);
-                existing.update_path_if_changed(&child_path);
+                existing.update_path_if_changed(child_path);
                 existing.inode
             };
 
@@ -1323,8 +1352,8 @@ impl PassthroughFs {
                             is_mount_point: file_info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT
                                 != 0
                                 && file_info.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT,
-                            path: RwLock::new(Arc::new(child_path.clone())),
-                            wide_path: RwLock::new(Arc::new(path_to_wide(&child_path))),
+                            path: RwLock::new(Arc::new(child_path.to_path_buf())),
+                            wide_path: RwLock::new(Arc::new(path_to_wide(child_path))),
                             refcount: AtomicU64::new(1),
                         }),
                     );
@@ -1333,14 +1362,24 @@ impl PassthroughFs {
             }
         };
 
-        let st = file_info_to_stat64(
-            ctx,
-            self.cfg.semantics,
-            &file_info,
-            inode,
-            &child_path,
-            handle.as_raw(),
-        );
+        let st = match known_override {
+            Some(override_stat) => build_stat64(
+                ctx,
+                self.cfg.semantics,
+                &file_info,
+                inode,
+                handle,
+                Some(override_stat),
+            ),
+            None => file_info_to_stat64(
+                ctx,
+                self.cfg.semantics,
+                &file_info,
+                inode,
+                child_path,
+                handle,
+            ),
+        };
 
         let mut attr_flags = 0u32;
         if st.st_mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32
@@ -1824,16 +1863,26 @@ impl FileSystem for PassthroughFs {
             .map_err(win_err_to_linux)?,
         );
 
+        let dir_mode = mode & !umask;
         if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
             if let Some(secctx) = extensions.secctx {
                 let stream_name = format!(":{}", secctx.name.to_string_lossy());
                 write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
             }
 
-            let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, mode & !umask);
+            let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, dir_mode);
             write_ads_by_handle(child_g.as_raw(), OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
         }
-        self.do_lookup(&ctx, parent, name)
+
+        let child_path = parent_data.get_path().join(cstr_to_path(name));
+        self.entry_from_handle(
+            &ctx,
+            parent,
+            &parent_data,
+            &child_path,
+            child_g.as_raw(),
+            Some((Some(ctx.uid), Some(ctx.gid), Some(dir_mode))),
+        )
     }
 
     fn rmdir(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
@@ -2298,6 +2347,7 @@ impl FileSystem for PassthroughFs {
             .map_err(win_err_to_linux)?,
         );
 
+        let node_mode = mode & !umask;
         if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
             // Write security context via the active handle
             if let Some(secctx) = extensions.secctx {
@@ -2308,11 +2358,19 @@ impl FileSystem for PassthroughFs {
             // Write ownership and mode to ADS via the active handle
             // Note: The `mode` parameter naturally contains the file type bits
             // (S_IFIFO, S_IFCHR, S_IFSOCK, etc.) which will be persisted here.
-            let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, mode & !umask);
+            let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, node_mode);
             write_ads_by_handle(child_g.as_raw(), OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
         }
 
-        self.do_lookup(&ctx, parent, name)
+        let child_path = parent_data.get_path().join(cstr_to_path(name));
+        self.entry_from_handle(
+            &ctx,
+            parent,
+            &parent_data,
+            &child_path,
+            child_g.as_raw(),
+            Some((Some(ctx.uid), Some(ctx.gid), Some(node_mode))),
+        )
     }
 
     // There is one minor edge-case to be aware of
@@ -2452,47 +2510,48 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
         }
 
-        let parent_path = self.inode_path(parent)?;
-        let child_path = parent_path.join(cstr_to_path(name));
+        let parent_data = self.inode_data(parent)?;
+        let child_path = parent_data.get_path().join(cstr_to_path(name));
 
         let wb = self.writeback.load(Ordering::Relaxed);
-        let oflags = parse_linux_open_flags(flags as i32 | LINUX_O_CREAT, wb);
-        let h = open_handle(&child_path, &oflags).map_err(win_err_to_linux)?;
+        let mut oflags = parse_linux_open_flags(flags as i32 | LINUX_O_CREAT, wb);
+        // The entry of a created file is built from this handle's metadata.
+        oflags.desired_access |= FILE_READ_ATTRIBUTES;
+        let (h, created) =
+            open_handle_reporting_creation(&child_path, &oflags).map_err(win_err_to_linux)?;
+        let guard = HandleGuard(h);
+        let linux_complete = matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete);
 
-        if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
-            if let Some(secctx) = extensions.secctx {
-                let stream_name = format!(":{}", secctx.name.to_string_lossy());
-                if let Err(e) = write_ads_by_handle(h, &stream_name, &secctx.secctx) {
-                    unsafe { CloseHandle(h) };
-                    return Err(e);
+        let entry = if created {
+            let file_mode = S_IFREG as u32 | (mode & !(umask & 0o777));
+            if linux_complete {
+                if let Some(secctx) = extensions.secctx {
+                    let stream_name = format!(":{}", secctx.name.to_string_lossy());
+                    write_ads_by_handle(h, &stream_name, &secctx.secctx)?;
                 }
+
+                let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, file_mode);
+                write_ads_by_handle(h, OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
             }
 
-            // Write the ownership and mode using the open handle directly
-            let stat_str = format!(
-                "{}:{}:0{:o}",
-                ctx.uid,
-                ctx.gid,
-                S_IFREG as u32 | (mode & !(umask & 0o777))
-            );
-            if let Err(e) = write_ads_by_handle(h, OVERRIDE_STAT_STREAM, stat_str.as_bytes()) {
-                unsafe { CloseHandle(h) };
-                return Err(e);
-            }
-
-            // If O_TRUNC and kill_priv are set, strip capabilities
-            if (flags as i32 & LINUX_O_TRUNC) != 0 && kill_priv {
+            self.entry_from_handle(
+                &ctx,
+                parent,
+                &parent_data,
+                &child_path,
+                h,
+                Some((Some(ctx.uid), Some(ctx.gid), Some(file_mode))),
+            )?
+        } else {
+            if linux_complete && (flags as i32 & LINUX_O_TRUNC) != 0 && kill_priv {
                 remove_security_capability(&child_path);
             }
-        }
 
-        let entry = match self.do_lookup(&ctx, parent, name) {
-            Ok(e) => e,
-            Err(e) => {
-                unsafe { CloseHandle(h) };
-                return Err(e);
-            }
+            // An existing name may be a symlink, in which case `h` refers to
+            // its target while the entry must describe the link itself.
+            self.do_lookup(&ctx, parent, name)?
         };
+        mem::forget(guard);
 
         let mut opts = OpenOptions::empty();
         match self.cfg.cache_policy {
