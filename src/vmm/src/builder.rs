@@ -64,6 +64,8 @@ use crate::vmm_config::block::BlockBuilder;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use crate::vmm_config::fs::FsDeviceConfig;
 use crate::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
+#[cfg(target_os = "macos")]
+use crate::vstate::map_guest_ram_in_blocks;
 #[cfg(target_os = "linux")]
 use crate::vstate::KvmContext;
 #[cfg(all(target_os = "linux", feature = "tee"))]
@@ -91,6 +93,8 @@ use nix::unistd::isatty;
 use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
 use utils::worker_message::WorkerMessage;
+#[cfg(target_os = "macos")]
+use utils::worker_message::RECLAIM_BLOCK_SIZE;
 #[cfg(all(target_arch = "x86_64", not(feature = "efi"), not(feature = "tee")))]
 use vm_memory::mmap::MmapRegion;
 use vm_memory::Address;
@@ -1531,6 +1535,23 @@ pub fn create_guest_memory(
     let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
         .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
 
+    // Before anything is written to RAM, which this throws away.
+    #[cfg(target_os = "macos")]
+    if vm_resources.balloon_free_page_reporting_mode == FreePageReportingMode::Replace {
+        let ram = arch_mem_info.ram_start_addr..arch_mem_info.ram_last_addr;
+        match map_guest_ram_in_blocks(&guest_mem, ram.clone()) {
+            Ok(()) => info!(
+                "guest RAM: mapped in {} blocks of {} MiB",
+                (ram.end - ram.start).div_ceil(RECLAIM_BLOCK_SIZE),
+                RECLAIM_BLOCK_SIZE >> 20
+            ),
+            Err(e) => warn!(
+                "guest RAM: couldn't map it in blocks of {} MiB: {e}",
+                RECLAIM_BLOCK_SIZE >> 20
+            ),
+        }
+    }
+
     let (guest_mem, entry_addr, initrd_config, cmdline) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
 
@@ -2404,6 +2425,27 @@ pub mod tests {
         });
 
         create_guest_memory(mem_size_mib, &vm_resources, &Payload::Empty)
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_create_guest_memory_maps_ram_in_blocks_only_when_asked() {
+        const MIB: u64 = 1 << 20;
+        for (mode, entry_size) in [
+            (FreePageReportingMode::Replace, RECLAIM_BLOCK_SIZE),
+            (FreePageReportingMode::Default, 64 * MIB),
+        ] {
+            let mut vm_resources = VmResources::default();
+            vm_resources.balloon_free_page_reporting_mode = mode;
+            let (guest_memory, info, _shm_manager, _payload_config) =
+                create_guest_memory(64, &vm_resources, &Payload::Empty).unwrap();
+            assert_eq!(info.ram_last_addr - info.ram_start_addr, 64 * MIB);
+            for addr in [info.ram_start_addr, info.ram_last_addr - 1] {
+                let host_addr = guest_memory.get_host_address(GuestAddress(addr)).unwrap();
+                let entry = crate::macos::vm_map::entry(host_addr as u64);
+                assert_eq!(entry.size, entry_size, "{mode:?}, guest {addr:#x}");
+            }
+        }
     }
 
     #[test]
