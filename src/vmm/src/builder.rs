@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read};
+#[cfg(target_os = "macos")]
+use std::ops::Range;
 #[cfg(feature = "gpu")]
 use std::os::fd::RawFd;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
@@ -981,6 +983,8 @@ pub fn build_microvm(
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
+        #[cfg(target_os = "macos")]
+        ram_in_blocks: payload_config.ram_in_blocks,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -1449,6 +1453,38 @@ pub struct PayloadConfig {
     entry_addr: GuestAddress,
     initrd_config: Option<InitrdConfig>,
     kernel_cmdline: Option<String>,
+    /// Whether guest RAM is mapped in blocks, see [`map_guest_ram_in_blocks`].
+    #[cfg(target_os = "macos")]
+    ram_in_blocks: bool,
+}
+
+/// Maps guest RAM in blocks with `map`, and returns whether it worked. If it didn't, the VM still
+/// has all of its RAM, and the balloon madvise()s the pages of free page reports instead of
+/// replacing them, see `Balloon::set_guest_ram_in_blocks()`.
+#[cfg(target_os = "macos")]
+fn map_ram_in_blocks(
+    guest_mem: &GuestMemoryMmap,
+    info: &ArchMemoryInfo,
+    map: impl FnOnce(&GuestMemoryMmap, Range<u64>) -> io::Result<()>,
+) -> bool {
+    let ram = info.ram_start_addr..info.ram_last_addr;
+    match map(guest_mem, ram.clone()) {
+        Ok(()) => {
+            info!(
+                "guest RAM: mapped in {} blocks of {} MiB",
+                (ram.end - ram.start).div_ceil(RECLAIM_BLOCK_SIZE),
+                RECLAIM_BLOCK_SIZE >> 20
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                "guest RAM: couldn't map it in blocks of {} MiB: {e}",
+                RECLAIM_BLOCK_SIZE >> 20
+            );
+            false
+        }
+    }
 }
 
 pub fn create_guest_memory(
@@ -1537,20 +1573,9 @@ pub fn create_guest_memory(
 
     // Before anything is written to RAM, which this throws away.
     #[cfg(target_os = "macos")]
-    if vm_resources.balloon_free_page_reporting_mode == FreePageReportingMode::Replace {
-        let ram = arch_mem_info.ram_start_addr..arch_mem_info.ram_last_addr;
-        match map_guest_ram_in_blocks(&guest_mem, ram.clone()) {
-            Ok(()) => info!(
-                "guest RAM: mapped in {} blocks of {} MiB",
-                (ram.end - ram.start).div_ceil(RECLAIM_BLOCK_SIZE),
-                RECLAIM_BLOCK_SIZE >> 20
-            ),
-            Err(e) => warn!(
-                "guest RAM: couldn't map it in blocks of {} MiB: {e}",
-                RECLAIM_BLOCK_SIZE >> 20
-            ),
-        }
-    }
+    let ram_in_blocks = vm_resources.balloon_free_page_reporting_mode
+        == FreePageReportingMode::Replace
+        && map_ram_in_blocks(&guest_mem, &arch_mem_info, map_guest_ram_in_blocks);
 
     let (guest_mem, entry_addr, initrd_config, cmdline) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
@@ -1569,6 +1594,8 @@ pub fn create_guest_memory(
         entry_addr,
         initrd_config,
         kernel_cmdline: cmdline.clone(),
+        #[cfg(target_os = "macos")]
+        ram_in_blocks,
     };
 
     arch_mem_info.guest_last_addr = guest_mem.last_addr().raw_value();
@@ -2257,6 +2284,7 @@ fn attach_balloon_device(
     {
         let mut balloon = balloon.lock().unwrap();
         balloon.set_free_page_reporting_mode(free_page_reporting_mode);
+        balloon.set_guest_ram_in_blocks(vmm.ram_in_blocks);
         balloon
             .set_map_sender(map_sender)
             .map_err(CreateBalloonDevice)?;
@@ -2437,8 +2465,12 @@ pub mod tests {
         ] {
             let mut vm_resources = VmResources::default();
             vm_resources.balloon_free_page_reporting_mode = mode;
-            let (guest_memory, info, _shm_manager, _payload_config) =
+            let (guest_memory, info, _shm_manager, payload_config) =
                 create_guest_memory(64, &vm_resources, &Payload::Empty).unwrap();
+            assert_eq!(
+                payload_config.ram_in_blocks,
+                mode == FreePageReportingMode::Replace
+            );
             assert_eq!(info.ram_last_addr - info.ram_start_addr, 64 * MIB);
             for addr in [info.ram_start_addr, info.ram_last_addr - 1] {
                 let host_addr = guest_memory.get_host_address(GuestAddress(addr)).unwrap();
@@ -2446,6 +2478,23 @@ pub mod tests {
                 assert_eq!(entry.size, entry_size, "{mode:?}, guest {addr:#x}");
             }
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_ram_that_cant_be_mapped_in_blocks_is_reported() {
+        let (guest_memory, info, _shm_manager, _payload_config) =
+            create_guest_memory(64, &VmResources::default(), &Payload::Empty).unwrap();
+
+        let mut asked = None;
+        let in_blocks = map_ram_in_blocks(&guest_memory, &info, |_, ram| {
+            asked = Some(ram);
+            Err(io::Error::from_raw_os_error(libc::ENOMEM))
+        });
+        assert!(!in_blocks);
+        assert_eq!(asked, Some(info.ram_start_addr..info.ram_last_addr));
+
+        assert!(map_ram_in_blocks(&guest_memory, &info, |_, _| Ok(())));
     }
 
     #[test]

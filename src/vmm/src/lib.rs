@@ -209,6 +209,9 @@ pub struct Vmm {
     mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
+    /// Whether guest RAM is mapped in blocks, see `map_guest_ram_in_blocks()`.
+    #[cfg(target_os = "macos")]
+    ram_in_blocks: bool,
 }
 
 impl Vmm {
