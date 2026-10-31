@@ -41,7 +41,8 @@ pub enum FreePageReportingMode {
     #[default]
     Default = 0,
     /// On macOS, have the VMM replace the reported pages with fresh memory, which releases them
-    /// even if the guest has written to them, at the cost of a few system calls per report.
+    /// even if the guest has written to them, at the cost of a few system calls per report. For
+    /// this, the VMM maps guest RAM in blocks of 2 MiB, and replaces whole blocks only.
     /// Other platforms don't implement this, and use [`FreePageReportingMode::Default`].
     Replace = 1,
 }
