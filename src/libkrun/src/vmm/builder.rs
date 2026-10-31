@@ -72,6 +72,8 @@ use crate::vmm::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
 use crate::vmm::vstate::KvmContext;
 #[cfg(all(target_os = "linux", feature = "tee"))]
 use crate::vmm::vstate::MeasuredRegion;
+#[cfg(target_os = "macos")]
+use crate::vmm::vstate::map_guest_ram_in_blocks;
 use crate::vmm::vstate::{Error as VstateError, Vcpu, VcpuConfig, Vm};
 use arch::{ArchMemoryInfo, InitrdConfig};
 use device_manager::shm::ShmManager;
@@ -84,6 +86,8 @@ use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 use linux_loader::loader::{self, KernelLoader};
 use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
+#[cfg(target_os = "macos")]
+use utils::worker_message::RECLAIM_BLOCK_SIZE;
 use utils::worker_message::WorkerMessage;
 use vm_memory::Bytes;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
@@ -812,6 +816,8 @@ pub fn build_microvm(
     #[cfg(not(feature = "gpu"))]
     let gpu_shm_size: Option<usize> = None;
     let use_vhost_user = requirements.iter().any(|r| r.process_shareable_memory);
+    #[cfg(target_os = "macos")]
+    let ram_in_blocks = requirements.iter().any(|r| r.replaces_guest_ram);
 
     #[cfg(feature = "tdx")]
     let td_shim_parsed = match &vm_resources.tee_firmware_config {
@@ -848,6 +854,8 @@ pub fn build_microvm(
         gpu_shm_size,
         use_vhost_user,
         &payload,
+        #[cfg(target_os = "macos")]
+        ram_in_blocks,
         #[cfg(feature = "tee")]
         fw_range_for_mem,
     )?;
@@ -1983,6 +1991,7 @@ pub fn create_guest_memory(
     gpu_shm_size: Option<usize>,
     use_vhost_user: bool,
     payload: &Payload,
+    #[cfg(target_os = "macos")] ram_in_blocks: bool,
     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
 ) -> std::result::Result<
     (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
@@ -2133,6 +2142,23 @@ pub fn create_guest_memory(
         GuestMemoryMmap::from_ranges(&arch_mem_regions)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
     };
+
+    // Before anything is written to RAM, which this throws away.
+    #[cfg(target_os = "macos")]
+    if ram_in_blocks {
+        let ram = arch_mem_info.ram_start_addr..arch_mem_info.ram_last_addr;
+        match map_guest_ram_in_blocks(&guest_mem, ram.clone()) {
+            Ok(()) => info!(
+                "guest RAM: mapped in {} blocks of {} MiB",
+                (ram.end - ram.start).div_ceil(RECLAIM_BLOCK_SIZE),
+                RECLAIM_BLOCK_SIZE >> 20
+            ),
+            Err(e) => warn!(
+                "guest RAM: couldn't map it in blocks of {} MiB: {e}",
+                RECLAIM_BLOCK_SIZE >> 20
+            ),
+        }
+    }
 
     let LoadedPayload {
         guest_mem,
@@ -2706,9 +2732,36 @@ pub mod tests {
             None,
             false,
             &Payload::Empty,
+            #[cfg(target_os = "macos")]
+            false,
             #[cfg(feature = "tee")]
             None,
         )
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_create_guest_memory_maps_ram_in_blocks_only_when_asked() {
+        const MIB: u64 = 1 << 20;
+        for (ram_in_blocks, entry_size) in [(true, RECLAIM_BLOCK_SIZE), (false, 64 * MIB)] {
+            let (guest_memory, info, _shm_manager, _payload_config) = create_guest_memory(
+                64,
+                None,
+                None,
+                &[],
+                None,
+                false,
+                &Payload::Empty,
+                ram_in_blocks,
+            )
+            .unwrap();
+            assert_eq!(info.ram_last_addr - info.ram_start_addr, 64 * MIB);
+            for addr in [info.ram_start_addr, info.ram_last_addr - 1] {
+                let host_addr = guest_memory.get_host_address(GuestAddress(addr)).unwrap();
+                let entry = crate::vmm::macos::vm_map::entry(host_addr as u64);
+                assert_eq!(entry.size, entry_size, "{ram_in_blocks}, guest {addr:#x}");
+            }
+        }
     }
 
     #[test]

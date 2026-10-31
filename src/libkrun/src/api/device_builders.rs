@@ -64,6 +64,11 @@ pub struct DeviceRequirements {
     pub process_shareable_memory: bool,
     /// Supplies the guest RTC, suppressing any legacy or implicit RTC.
     pub replaces_legacy_rtc: bool,
+    /// Whether this device replaces ranges of guest RAM with fresh memory to give it back to
+    /// the host. On macOS, that only frees the memory if RAM is mapped in blocks, which the
+    /// VMM then does.
+    #[cfg(target_os = "macos")]
+    pub replaces_guest_ram: bool,
 }
 
 /// Context provided to devices during attachment.
@@ -1335,6 +1340,16 @@ impl BalloonDevice {
 #[cfg_attr(not(feature = "ffi"), cfg(not(feature = "tee")))]
 impl<'a> AttachDevice<'a> for BalloonDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
+    fn requirements(&self) -> DeviceRequirements {
+        DeviceRequirements {
+            #[cfg(target_os = "macos")]
+            replaces_guest_ram: self.inner.lock().unwrap().free_page_reporting_mode()
+                == FreePageReportingMode::Replace,
+            ..Default::default()
+        }
+    }
+
+    #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         #[cfg(target_os = "macos")]
         self.inner
@@ -2195,4 +2210,21 @@ fn resolve_parent_dirs<'a, 'b>(
         }
     }
     Ok(current)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_balloon_replaces_guest_ram_only_in_the_replace_mode() {
+        let mut balloon = BalloonDevice::new().unwrap();
+        assert!(!balloon.requirements().replaces_guest_ram);
+
+        balloon.set_free_page_reporting_mode(FreePageReportingMode::Replace);
+        assert!(balloon.requirements().replaces_guest_ram);
+
+        balloon.set_free_page_reporting_mode(FreePageReportingMode::Default);
+        assert!(!balloon.requirements().replaces_guest_ram);
+    }
 }

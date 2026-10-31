@@ -9,6 +9,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::io;
+use std::ops::Range;
 use std::result;
 use std::sync::Arc;
 use std::thread;
@@ -130,6 +131,28 @@ unsafe fn map_fresh_blocks(host_addr: *mut u8, guest_addr: u64, len: u64) -> io:
         addr = block_end;
     }
     first_err.map_or(Ok(()), Err)
+}
+
+/// Maps the guest memory in `ram` in blocks of `RECLAIM_BLOCK_SIZE`, so that [`Vm::reclaim_memory`]
+/// can free each block on its own. Other regions, like the firmware and SHM ones, stay as they
+/// are.
+///
+/// This throws away the contents of `ram`, so call it before anything is written there and before
+/// the hypervisor maps it.
+pub fn map_guest_ram_in_blocks(guest_mem: &GuestMemoryMmap, ram: Range<u64>) -> io::Result<()> {
+    for region in guest_mem.iter() {
+        let start = region.start_addr().raw_value().max(ram.start);
+        let end = (region.start_addr().raw_value() + region.len()).min(ram.end);
+        if start >= end {
+            continue;
+        }
+        let host_addr = guest_mem
+            .get_host_address(GuestAddress(start))
+            .map_err(io::Error::other)?;
+        // SAFETY: the range is within one region of guest memory, which holds nothing yet.
+        unsafe { map_fresh_blocks(host_addr, start, end - start)? };
+    }
+    Ok(())
 }
 
 /// A wrapper around creating and using a VM.
@@ -750,7 +773,6 @@ mod tests {
     use arch::aarch64::layout::DRAM_MEM_START_EFI;
     use devices::legacy::VcpuList;
     use std::collections::HashSet;
-    use std::ops::Range;
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
     /// The tests don't run the vCPUs, so any IPA size that HVF supports will do.
@@ -897,19 +919,6 @@ mod tests {
             .all(|addr| gm.read_obj::<u8>(GuestAddress(addr)).unwrap() == byte)
     }
 
-    /// Maps `ram` in blocks, as the VMM does for the memory that the balloon replaces.
-    fn map_in_blocks(gm: &GuestMemoryMmap, ram: &Range<u64>) {
-        // SAFETY: the range is a region of `gm`, which holds nothing yet.
-        unsafe {
-            map_fresh_blocks(
-                host_addr(gm, ram.start) as *mut u8,
-                ram.start,
-                ram.end - ram.start,
-            )
-        }
-        .unwrap();
-    }
-
     /// Checks that the blocks in `range` are map entries of their own that have no pages, neither
     /// mapped nor in their VM object. An object is judged by its pages and not by its id, because
     /// XNU may give the id of an object that it has just freed to the next new one.
@@ -926,7 +935,7 @@ mod tests {
     #[test]
     fn test_map_fresh_blocks_gives_each_block_an_object() {
         let (gm, ram) = ram_memory(DRAM_MEM_START_EFI, 16 * MIB);
-        map_in_blocks(&gm, &ram);
+        map_guest_ram_in_blocks(&gm, ram.clone()).unwrap();
         touch(&gm, ram.clone(), 1);
 
         let mut objects = HashSet::new();
@@ -941,11 +950,28 @@ mod tests {
     }
 
     #[test]
+    fn test_map_guest_ram_in_blocks_leaves_other_regions_alone() {
+        let ram = DRAM_MEM_START_EFI..DRAM_MEM_START_EFI + 8 * MIB;
+        let gm = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 4 * MIB as usize),
+            (GuestAddress(ram.start), (ram.end - ram.start) as usize),
+        ])
+        .unwrap();
+        map_guest_ram_in_blocks(&gm, ram.clone()).unwrap();
+
+        assert_eq!(vm_map::entry(host_addr(&gm, 0)).size, 4 * MIB);
+        for block in ram.step_by(RECLAIM_BLOCK_SIZE as usize) {
+            let entry = vm_map::entry(host_addr(&gm, block));
+            assert_eq!(entry.size, RECLAIM_BLOCK_SIZE, "block {block:#x}");
+        }
+    }
+
+    #[test]
     fn test_map_fresh_blocks_follows_guest_physical_blocks() {
         // RAM that starts and ends in the middle of a block has a shorter first and last block.
         let start = DRAM_MEM_START_EFI + MIB;
         let (gm, ram) = ram_memory(start, 6 * MIB);
-        map_in_blocks(&gm, &ram);
+        map_guest_ram_in_blocks(&gm, ram.clone()).unwrap();
         touch(&gm, ram, 1);
 
         let entries: Vec<_> = [start, start + MIB, start + 3 * MIB, start + 5 * MIB]
@@ -969,7 +995,7 @@ mod tests {
     #[test]
     fn test_map_fresh_blocks_frees_the_pages_of_whole_blocks() {
         let (gm, ram) = ram_memory(DRAM_MEM_START_EFI, 16 * MIB);
-        map_in_blocks(&gm, &ram);
+        map_guest_ram_in_blocks(&gm, ram.clone()).unwrap();
         touch(&gm, ram.clone(), 1);
         let run = ram.start + 2 * MIB..ram.start + 8 * MIB;
 
@@ -999,7 +1025,7 @@ mod tests {
         let mut vm = test_vm();
         // Where no other test maps memory into the same VM.
         let (gm, ram) = ram_memory(DRAM_MEM_START_EFI + (1 << 30), 16 * MIB);
-        map_in_blocks(&gm, &ram);
+        map_guest_ram_in_blocks(&gm, ram.clone()).unwrap();
         vm.memory_init(&gm).unwrap();
         touch(&gm, ram.clone(), 1);
         let run = ram.start + 2 * MIB..ram.start + 8 * MIB;
@@ -1023,7 +1049,7 @@ mod tests {
     fn test_reclaim_memory_refuses_what_is_not_whole_blocks() {
         let mut vm = test_vm();
         let (gm, ram) = ram_memory(DRAM_MEM_START_EFI + (2 << 30), 16 * MIB);
-        map_in_blocks(&gm, &ram);
+        map_guest_ram_in_blocks(&gm, ram.clone()).unwrap();
         vm.memory_init(&gm).unwrap();
         touch(&gm, ram.clone(), 1);
         let objects = || -> Vec<_> {
