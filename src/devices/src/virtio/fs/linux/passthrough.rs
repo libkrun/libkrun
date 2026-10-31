@@ -11,7 +11,7 @@ use std::io;
 use std::mem::{self, MaybeUninit, size_of};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use caps::{CapSet, Capability, has_cap};
@@ -50,6 +50,8 @@ struct InodeData {
     dev: u64,
     mnt_id: u64,
     refcount: AtomicU64,
+    // mtime, ctime and size of the host file at its previous open; see `keep_cache_on_open`.
+    open_key: Mutex<Option<[i64; 5]>>,
 }
 
 struct HandleData {
@@ -615,6 +617,31 @@ impl PassthroughFs {
         Ok(())
     }
 
+    /// Under `CachePolicy::Auto` the guest kernel drops a file's page cache on every open
+    /// (close-to-open consistency), including the pages other guest processes have mapped: a shared
+    /// library or a mapped data file is read from the host again whenever anything opens it, and every
+    /// process using it page-faults. Keep the cache when the host file is unchanged since its previous
+    /// open (same mtime, ctime and size); any host-side change still invalidates it on the next open.
+    fn keep_cache_on_open(&self, inode: Inode, file: &File) -> bool {
+        let Ok(st) = stat(file) else {
+            return false;
+        };
+        let key = [
+            st.st_mtime,
+            st.st_mtime_nsec,
+            st.st_ctime,
+            st.st_ctime_nsec,
+            st.st_size,
+        ];
+        let Some(data) = self.inodes.read().unwrap().get(&inode).cloned() else {
+            return false;
+        };
+        let mut last = data.open_key.lock().unwrap();
+        let keep = *last == Some(key);
+        *last = Some(key);
+        keep
+    }
+
     fn do_open(
         &self,
         inode: Inode,
@@ -636,8 +663,12 @@ impl PassthroughFs {
             } else {
                 None
             };
-            RwLock::new(self.open_inode(inode, flags as i32)?)
+            self.open_inode(inode, flags as i32)?
         };
+        let keep_cache = matches!(self.cfg.cache_policy, CachePolicy::Auto)
+            && flags & (libc::O_DIRECTORY as u32) == 0
+            && self.keep_cache_on_open(inode, &file);
+        let file = RwLock::new(file);
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let data = HandleData {
@@ -662,7 +693,7 @@ impl PassthroughFs {
                     opts |= OpenOptions::CACHE_DIR;
                 }
             }
-            _ => {}
+            CachePolicy::Auto => opts.set(OpenOptions::KEEP_CACHE, keep_cache),
         };
 
         Ok((Some(handle), opts))
@@ -842,6 +873,7 @@ impl FileSystem for PassthroughFs {
                 dev: st.st_dev,
                 mnt_id,
                 refcount: AtomicU64::new(2),
+                open_key: Mutex::new(None),
             }),
         );
 
@@ -949,6 +981,7 @@ impl FileSystem for PassthroughFs {
                     dev: st.st_dev,
                     mnt_id,
                     refcount: AtomicU64::new(1),
+                    open_key: Mutex::new(None),
                 }),
             );
 
