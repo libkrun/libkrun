@@ -2950,6 +2950,11 @@
           "value": 2
         },
         {
+          "name": "USE_SURFACELESS",
+          "c_name": "KRUN_VIRGL_RENDERER_FLAGS_USE_SURFACELESS",
+          "value": 8
+        },
+        {
           "name": "VENUS",
           "c_name": "KRUN_VIRGL_RENDERER_FLAGS_VENUS",
           "value": 64
