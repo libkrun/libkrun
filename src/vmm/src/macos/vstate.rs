@@ -22,6 +22,7 @@ use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use devices::legacy::VcpuList;
 use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
 use utils::eventfd::EventFd;
+use utils::worker_message::RECLAIM_BLOCK_SIZE;
 use vm_memory::{
     Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
 };
@@ -89,6 +90,43 @@ impl Display for Error {
 }
 
 pub type Result<T> = result::Result<T, Error>;
+
+/// Maps fresh anonymous memory over the `len` bytes of guest memory at `guest_addr`, whose host
+/// address is `host_addr`, with one mmap() for each block of `RECLAIM_BLOCK_SIZE` guest physical
+/// addresses (the part of it that is in the range). XNU keeps these mappings apart, as the tests
+/// check, so each block is a VM object of its own, which is freed with all of its pages when the
+/// block is replaced.
+///
+/// A block that can't be replaced keeps its pages, because XNU puts them back when a MAP_FIXED
+/// mmap() fails. The other blocks are replaced anyway, and the first error is returned.
+///
+/// # Safety
+///
+/// The range must be within one region of guest memory, whose contents the caller gives up.
+unsafe fn map_fresh_blocks(host_addr: *mut u8, guest_addr: u64, len: u64) -> io::Result<()> {
+    let end = guest_addr + len;
+    let mut first_err = None;
+    let mut addr = guest_addr;
+    while addr < end {
+        let block_end = (addr + 1).next_multiple_of(RECLAIM_BLOCK_SIZE).min(end);
+        // SAFETY: the block is within the range, which the caller vouches for.
+        let ret = unsafe {
+            libc::mmap(
+                host_addr.add((addr - guest_addr) as usize).cast(),
+                (block_end - addr) as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if ret == libc::MAP_FAILED && first_err.is_none() {
+            first_err = Some(io::Error::last_os_error());
+        }
+        addr = block_end;
+    }
+    first_err.map_or(Ok(()), Err)
+}
 
 /// A wrapper around creating and using a VM.
 pub struct Vm {
@@ -164,6 +202,10 @@ impl Vm {
     /// gives them back to the system and leaves the range reading as zeroes. madvise() can't do
     /// this: it doesn't release the pages that the guest has written to.
     ///
+    /// The range is replaced one block of `RECLAIM_BLOCK_SIZE` at a time, and has to be made of
+    /// whole blocks: replacing part of a larger VM object leaves the pages of that part in
+    /// memory, owned by no process. The hypervisor still unmaps and maps the range as a whole.
+    ///
     /// Returns whether the pages were replaced. If they weren't, the range is mapped as before.
     /// An error means that it couldn't be mapped into the guest again.
     pub fn reclaim_memory(
@@ -172,6 +214,15 @@ impl Vm {
         guest_addr: u64,
         len: u64,
     ) -> Result<bool> {
+        if len == 0
+            || !guest_addr.is_multiple_of(RECLAIM_BLOCK_SIZE)
+            || !len.is_multiple_of(RECLAIM_BLOCK_SIZE)
+        {
+            warn!(
+                "Not reclaiming memory that isn't made of whole blocks: guest_addr={guest_addr:x}, len={len}"
+            );
+            return Ok(false);
+        }
         // A range that isn't within a single region of guest memory would make mmap() replace
         // whatever else the VMM has mapped after the region.
         let Ok(slice) = guest_mem.get_slice(GuestAddress(guest_addr), len as usize) else {
@@ -188,24 +239,13 @@ impl Vm {
 
         // SAFETY: the range is within one region of guest memory, so only guest memory is
         // replaced, and it stays mapped for the VMM's accesses.
-        let ret = unsafe {
-            libc::mmap(
-                host_addr.cast(),
-                len as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
+        let reclaimed = match unsafe { map_fresh_blocks(host_addr, guest_addr, len) } {
+            Ok(()) => true,
+            Err(e) => {
+                error!("Error replacing guest memory: {e}");
+                false
+            }
         };
-        let reclaimed = ret != libc::MAP_FAILED;
-        if !reclaimed {
-            // XNU puts the old pages back when a MAP_FIXED mmap() fails.
-            error!(
-                "Error replacing guest memory: {}",
-                io::Error::last_os_error()
-            );
-        }
 
         self.hvf_vm
             .map_memory(host_addr as u64, guest_addr, len)
@@ -657,7 +697,7 @@ enum VcpuEmulation {
 mod tests {
     #[cfg(target_arch = "x86_64")]
     use crossbeam_channel::RecvTimeoutError;
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
     #[cfg(target_arch = "x86_64")]
     use std::time::Duration;
 
@@ -665,6 +705,7 @@ mod tests {
     use crate::macos::vm_map;
     use arch::aarch64::layout::DRAM_MEM_START_EFI;
     use devices::legacy::VcpuList;
+    use std::collections::HashSet;
     use std::ops::Range;
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
@@ -699,10 +740,19 @@ mod tests {
         assert!(vcpu.mmio_bus.is_some());
     }
 
+    /// HVF has one VM per process, and Vm doesn't destroy it, so the tests that need one share it.
+    fn test_vm() -> MutexGuard<'static, Vm> {
+        static VM: LazyLock<Mutex<Vm>> = LazyLock::new(|| {
+            Mutex::new(
+                Vm::new(&mut arch::ArchMemoryInfo::default(), false).expect("Cannot create new vm"),
+            )
+        });
+        VM.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn test_vm_memory_init() {
-        let mut vm =
-            Vm::new(&mut arch::ArchMemoryInfo::default(), false).expect("Cannot create new vm");
+        let mut vm = test_vm();
 
         // Use a realistic guest physical address; hv_vm_map rejects GPA 0.
         let gm = GuestMemoryMmap::from_ranges(&[(
@@ -796,6 +846,176 @@ mod tests {
         }
     }
 
+    /// Whether the first byte of each page in `range` is `byte`.
+    fn reads(gm: &GuestMemoryMmap, range: Range<u64>, byte: u8) -> bool {
+        range
+            .step_by(page_size() as usize)
+            .all(|addr| gm.read_obj::<u8>(GuestAddress(addr)).unwrap() == byte)
+    }
+
+    /// Maps `ram` in blocks, as the VMM does for the memory that the balloon replaces.
+    fn map_in_blocks(gm: &GuestMemoryMmap, ram: &Range<u64>) {
+        // SAFETY: the range is a region of `gm`, which holds nothing yet.
+        unsafe {
+            map_fresh_blocks(
+                host_addr(gm, ram.start) as *mut u8,
+                ram.start,
+                ram.end - ram.start,
+            )
+        }
+        .unwrap();
+    }
+
+    /// Checks that the blocks in `range` are map entries of their own that have no pages, neither
+    /// mapped nor in their VM object. An object is judged by its pages and not by its id, because
+    /// XNU may give the id of an object that it has just freed to the next new one.
+    fn assert_blocks_are_empty(gm: &GuestMemoryMmap, range: Range<u64>) {
+        for block in range.step_by(RECLAIM_BLOCK_SIZE as usize) {
+            let entry = vm_map::entry(host_addr(gm, block));
+            assert_eq!(entry.start, host_addr(gm, block), "block {block:#x}");
+            assert_eq!(entry.size, RECLAIM_BLOCK_SIZE, "block {block:#x}");
+            assert_eq!(entry.resident, 0, "block {block:#x}");
+            assert_eq!(entry.object_resident, 0, "block {block:#x}");
+        }
+    }
+
+    #[test]
+    fn test_map_fresh_blocks_gives_each_block_an_object() {
+        let (gm, ram) = ram_memory(DRAM_MEM_START_EFI, 16 * MIB);
+        map_in_blocks(&gm, &ram);
+        touch(&gm, ram.clone(), 1);
+
+        let mut objects = HashSet::new();
+        for block in ram.clone().step_by(RECLAIM_BLOCK_SIZE as usize) {
+            let entry = vm_map::entry(host_addr(&gm, block));
+            assert_eq!(entry.start, host_addr(&gm, block), "block {block:#x}");
+            assert_eq!(entry.size, RECLAIM_BLOCK_SIZE, "block {block:#x}");
+            assert_eq!(entry.offset, 0, "block {block:#x}");
+            assert!(objects.insert(entry.object_id), "block {block:#x}");
+        }
+        assert!(reads(&gm, ram, 1));
+    }
+
+    #[test]
+    fn test_map_fresh_blocks_follows_guest_physical_blocks() {
+        // RAM that starts and ends in the middle of a block has a shorter first and last block.
+        let start = DRAM_MEM_START_EFI + MIB;
+        let (gm, ram) = ram_memory(start, 6 * MIB);
+        map_in_blocks(&gm, &ram);
+        touch(&gm, ram, 1);
+
+        let entries: Vec<_> = [start, start + MIB, start + 3 * MIB, start + 5 * MIB]
+            .into_iter()
+            .map(|addr| {
+                let entry = vm_map::entry(host_addr(&gm, addr));
+                (entry.start, entry.size)
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                (host_addr(&gm, start), MIB),
+                (host_addr(&gm, start + MIB), 2 * MIB),
+                (host_addr(&gm, start + 3 * MIB), 2 * MIB),
+                (host_addr(&gm, start + 5 * MIB), MIB),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_map_fresh_blocks_frees_the_pages_of_whole_blocks() {
+        let (gm, ram) = ram_memory(DRAM_MEM_START_EFI, 16 * MIB);
+        map_in_blocks(&gm, &ram);
+        touch(&gm, ram.clone(), 1);
+        let run = ram.start + 2 * MIB..ram.start + 8 * MIB;
+
+        // SAFETY: the run is within the memory, and its contents aren't needed.
+        unsafe {
+            map_fresh_blocks(
+                host_addr(&gm, run.start) as *mut u8,
+                run.start,
+                run.end - run.start,
+            )
+        }
+        .unwrap();
+
+        assert_blocks_are_empty(&gm, run.clone());
+        assert!(reads(&gm, run.clone(), 0));
+        assert!(reads(&gm, ram.start..run.start, 1));
+        assert!(reads(&gm, run.end..ram.end, 1));
+        // The blocks around the run still have their pages, and all of them are mapped.
+        for block in ram.step_by(RECLAIM_BLOCK_SIZE as usize) {
+            let entry = vm_map::entry(host_addr(&gm, block));
+            assert!(entry.object_resident <= entry.resident, "block {block:#x}");
+        }
+    }
+
+    #[test]
+    fn test_reclaim_memory_replaces_whole_blocks_and_maps_them_back() {
+        let mut vm = test_vm();
+        // Where no other test maps memory into the same VM.
+        let (gm, ram) = ram_memory(DRAM_MEM_START_EFI + (1 << 30), 16 * MIB);
+        map_in_blocks(&gm, &ram);
+        vm.memory_init(&gm).unwrap();
+        touch(&gm, ram.clone(), 1);
+        let run = ram.start + 2 * MIB..ram.start + 8 * MIB;
+
+        assert!(vm
+            .reclaim_memory(&gm, run.start, run.end - run.start)
+            .unwrap());
+
+        assert_blocks_are_empty(&gm, run.clone());
+        assert!(reads(&gm, run.clone(), 0));
+        assert!(reads(&gm, ram.start..run.start, 1));
+        assert!(reads(&gm, run.end..ram.end, 1));
+        // The run is mapped into the guest again, so unmapping it works.
+        vm.hvf_vm
+            .unmap_memory(run.start, run.end - run.start)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_reclaim_memory_refuses_what_is_not_whole_blocks() {
+        let mut vm = test_vm();
+        let (gm, ram) = ram_memory(DRAM_MEM_START_EFI + (2 << 30), 16 * MIB);
+        map_in_blocks(&gm, &ram);
+        vm.memory_init(&gm).unwrap();
+        touch(&gm, ram.clone(), 1);
+        let objects = || -> Vec<_> {
+            ram.clone()
+                .step_by(RECLAIM_BLOCK_SIZE as usize)
+                .map(|block| {
+                    let entry = vm_map::entry(host_addr(&gm, block));
+                    (entry.start, entry.size, entry.object_id, entry.resident)
+                })
+                .collect()
+        };
+        let before = objects();
+
+        // Nothing, less than a block, a part of a block, a block that starts in the middle of
+        // one, and a run that ends in the middle of one.
+        for (addr, len) in [
+            (ram.start + 2 * MIB, 0),
+            (ram.start + 2 * MIB, MIB),
+            (ram.start + 2 * MIB, RECLAIM_BLOCK_SIZE - page_size()),
+            (ram.start + 3 * MIB, RECLAIM_BLOCK_SIZE),
+            (ram.start + 2 * MIB, 3 * MIB),
+            (ram.start + 2 * MIB, 6 * MIB + page_size()),
+        ] {
+            assert!(
+                !vm.reclaim_memory(&gm, addr, len).unwrap(),
+                "guest {addr:#x}, len {len:#x}"
+            );
+        }
+
+        // Nothing was replaced, and the hypervisor mapping wasn't touched either.
+        assert_eq!(objects(), before);
+        assert!(reads(&gm, ram.clone(), 1));
+        vm.hvf_vm
+            .unmap_memory(ram.start, ram.end - ram.start)
+            .unwrap();
+    }
+
     /// The reason why the memory that the balloon replaces has to be mapped in blocks: XNU keeps
     /// the pages of the part of a VM object that is replaced while the rest of the object is
     /// still mapped. If this test fails, XNU has changed and the blocks may not be needed.
@@ -805,7 +1025,7 @@ mod tests {
         let replaced = ram.end - 4 * MIB..ram.end;
         touch(&gm, replaced.clone(), 1);
 
-        // This is what Vm::reclaim_memory() does to the range of a free page report.
+        // Replace the range with fresh memory in one mmap(), as for a free page report.
         // SAFETY: the range is within the mapping of the memory, whose contents aren't needed.
         let ret = unsafe {
             libc::mmap(

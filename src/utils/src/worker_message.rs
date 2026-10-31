@@ -1,3 +1,8 @@
+/// The granularity of [`WorkerMessage::ReclaimMemory`] in guest physical addresses: the VMM
+/// replaces whole blocks only, and the balloon only asks for ranges of whole blocks.
+#[cfg(target_os = "macos")]
+pub const RECLAIM_BLOCK_SIZE: u64 = 2 << 20;
+
 #[derive(Debug)]
 pub struct MemoryProperties {
     pub gpa: u64,
@@ -19,7 +24,8 @@ pub enum WorkerMessage {
     #[cfg(target_os = "macos")]
     GpuRemoveMapping(crossbeam_channel::Sender<bool>, u64, u64),
     /// Gives the host pages backing a range of guest RAM back to the system; the range reads
-    /// as zeroes afterwards. Replies whether they were given back.
+    /// as zeroes afterwards. Replies whether they were given back. The range is made of whole
+    /// blocks of [`RECLAIM_BLOCK_SIZE`], or the VMM leaves it as it is.
     #[cfg(target_os = "macos")]
     ReclaimMemory(crossbeam_channel::Sender<bool>, u64, u64),
     ConvertMemory(crossbeam_channel::Sender<bool>, MemoryProperties),
