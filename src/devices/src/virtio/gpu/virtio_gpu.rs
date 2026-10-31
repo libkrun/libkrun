@@ -49,6 +49,7 @@ use crate::virtio::{InterruptTransport, VirtioShmRegion};
 
 // These constants match libkrun.h and virglrenderer.
 const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
+const VIRGLRENDERER_USE_SURFACELESS: u32 = 1 << 3;
 const VIRGLRENDERER_USE_GLES: u32 = 1 << 4;
 const VIRGLRENDERER_VENUS: u32 = 1 << 6;
 const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
@@ -306,12 +307,14 @@ impl VirtioGpu {
 
         let use_egl = virgl_flags & VIRGLRENDERER_USE_EGL != 0;
         let use_gles = virgl_flags & VIRGLRENDERER_USE_GLES != 0;
+        let use_surfaceless = virgl_flags & VIRGLRENDERER_USE_SURFACELESS != 0;
         let use_render_server = virgl_flags & VIRGLRENDERER_RENDER_SERVER != 0;
 
         let mut builder = RutabagaBuilder::new(capset_mask, fence)
             .set_default_component(rutabaga_gfx::RutabagaComponentType::VirglRenderer)
             .set_use_egl(use_egl)
             .set_use_gles(use_gles)
+            .set_use_surfaceless(use_surfaceless)
             .set_rutabaga_paths(Some(rutabaga_paths))
             .set_use_render_server(use_render_server);
 
