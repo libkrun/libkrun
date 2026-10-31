@@ -88,7 +88,7 @@ use utils::worker_message::WorkerMessage;
 use vm_memory::Bytes;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
 use vm_memory::FileOffset;
-#[cfg(feature = "tdx")]
+#[cfg(any(feature = "tdx", target_os = "linux"))]
 use vm_memory::GuestMemoryRegion;
 #[cfg(all(
     target_arch = "x86_64",
@@ -2133,6 +2133,18 @@ pub fn create_guest_memory(
         GuestMemoryMmap::from_ranges(&arch_mem_regions)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
     };
+
+    #[cfg(target_os = "linux")]
+    for region in guest_mem.iter() {
+        // SAFETY: the range is the region's own mapping, and the advice keeps its contents.
+        unsafe {
+            libc::madvise(
+                region.as_ptr().cast(),
+                region.len() as usize,
+                libc::MADV_HUGEPAGE,
+            )
+        };
+    }
 
     let LoadedPayload {
         guest_mem,
