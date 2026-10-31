@@ -184,6 +184,16 @@ impl Balloon {
         self.reclaim.mode
     }
 
+    /// Tell the balloon whether the VMM mapped guest RAM in blocks, which replacing pages needs
+    /// to free them. If it didn't, [`FreePageReportingMode::Replace`] becomes
+    /// [`FreePageReportingMode::Default`]. Must be called before [`Balloon::set_map_sender`].
+    pub fn set_guest_ram_in_blocks(&mut self, in_blocks: bool) {
+        if self.reclaim.mode == FreePageReportingMode::Replace && !in_blocks {
+            warn!("balloon: guest RAM isn't mapped in blocks, so free page reports are madvise()d");
+            self.reclaim.mode = FreePageReportingMode::Default;
+        }
+    }
+
     /// Set the channel to the VMM worker, and start reclaiming reported pages through it in
     /// [`FreePageReportingMode::Replace`].
     pub fn set_map_sender(&mut self, map_sender: Sender<WorkerMessage>) -> Result<()> {
@@ -383,6 +393,26 @@ mod tests {
             assert!(dev.worker.try_recv().is_err());
             assert_eq!(dev.balloon.reclaim.done_fd(), None);
         }
+    }
+
+    #[test]
+    fn test_replace_mode_madvises_if_ram_is_not_in_blocks() {
+        let mem = guest_memory();
+        let mut dev = test_util::TestDevice::new(&mem);
+        dev.balloon
+            .set_free_page_reporting_mode(FreePageReportingMode::Replace);
+        dev.balloon.set_guest_ram_in_blocks(false);
+        let (map_sender, worker) = unbounded();
+        dev.balloon.set_map_sender(map_sender).unwrap();
+
+        assert_eq!(
+            dev.balloon.free_page_reporting_mode(),
+            FreePageReportingMode::Default
+        );
+        dev.report(&[(0x40_0000, 2 << 20)]);
+        assert!(dev.balloon.process_frq());
+        assert_eq!(dev.used(), 1);
+        assert!(worker.try_recv().is_err());
     }
 
     #[test]
