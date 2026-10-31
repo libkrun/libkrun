@@ -184,6 +184,9 @@ pub struct Vmm {
     pub(crate) paused: bool,
     #[cfg(target_os = "macos")]
     pub(crate) paused_at: u64,
+    /// Whether guest RAM is mapped in blocks, see `map_guest_ram_in_blocks()`.
+    #[cfg(target_os = "macos")]
+    pub(crate) ram_in_blocks: bool,
 }
 
 /// Out-of-band request to the running VM's event loop.
