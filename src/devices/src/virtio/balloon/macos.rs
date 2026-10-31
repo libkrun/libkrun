@@ -203,6 +203,10 @@ impl Balloon {
         self.reclaim.mode = mode;
     }
 
+    pub fn free_page_reporting_mode(&self) -> FreePageReportingMode {
+        self.reclaim.mode
+    }
+
     /// Set the channel to the VMM worker, and start reclaiming reported pages through it in
     /// [`FreePageReportingMode::Replace`].
     pub fn set_map_sender(&mut self, map_sender: Sender<WorkerMessage>) -> Result<()> {
