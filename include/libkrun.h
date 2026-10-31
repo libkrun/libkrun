@@ -519,8 +519,11 @@ typedef KrunBalloonDevice (*krun_balloon_device_new_fn)(KrunError* err_out);
  * On macOS, madvise() doesn't release guest memory that the guest has written to.
  * [`FreePageReportingMode::Replace`] has the VMM replace the reported pages with fresh
  * memory instead, which does release them. This costs a few system calls per report, and
- * the guest's next access to each page faults it in again. Other platforms don't implement
- * [`FreePageReportingMode::Replace`], and use [`FreePageReportingMode::Default`] instead.
+ * the guest's next access to each page faults it in again. It also has the VMM map guest
+ * RAM in blocks of 2 MiB, one map entry each, and replace whole blocks only. If it can't
+ * map RAM like that, the VM starts anyway and uses [`FreePageReportingMode::Default`].
+ * Other platforms don't implement [`FreePageReportingMode::Replace`], and use
+ * [`FreePageReportingMode::Default`] instead.
  */
 void krun_balloon_device_set_free_page_reporting_mode(KrunBalloonDevice handle, uint32_t mode);
 typedef void (*krun_balloon_device_set_free_page_reporting_mode_fn)(KrunBalloonDevice handle, uint32_t mode);
