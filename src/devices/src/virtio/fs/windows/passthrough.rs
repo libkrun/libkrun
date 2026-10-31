@@ -376,33 +376,24 @@ fn as_file_handle(handle: Handle) -> Option<HANDLE> {
     (handle != 0 && (handle & (1 << 63)) == 0).then_some(handle as HANDLE)
 }
 
+/// The access rights granted to `handle`.
+fn handle_access(handle: HANDLE) -> Option<u32> {
+    let mut access_info: FILE_ACCESS_INFORMATION = unsafe { mem::zeroed() };
+    (query_information(handle, &mut access_info, FileAccessInformation) >= 0)
+        .then_some(access_info.AccessFlags)
+}
+
 pub fn is_handle_read_only(handle: u64) -> bool {
     // Ignore directory entries
     let Some(raw_handle) = as_file_handle(handle) else {
         return true;
     };
 
-    let mut iosb: IO_STATUS_BLOCK = unsafe { mem::zeroed() };
-    let mut access_info: FILE_ACCESS_INFORMATION = unsafe { mem::zeroed() };
-
-    let status = unsafe {
-        NtQueryInformationFile(
-            raw_handle,
-            &mut iosb,
-            &mut access_info as *mut _ as *mut core::ffi::c_void,
-            mem::size_of::<FILE_ACCESS_INFORMATION>() as u32,
-            FileAccessInformation,
-        )
-    };
-
-    if status >= 0 {
-        // If the handle lacks both standard WRITE and APPEND permissions, it was opened Read-Only
-        (access_info.AccessFlags & (FILE_WRITE_DATA | FILE_APPEND_DATA)) == 0
-    } else {
-        // Fallback: If the kernel query fails for some reason, assume it's writable
-        // to let standard error handling catch any violations later.
-        false
-    }
+    // If the handle lacks both standard WRITE and APPEND permissions, it was opened Read-Only.
+    // If the kernel query fails for some reason, assume it's writable to let standard error
+    // handling catch any violations later.
+    handle_access(raw_handle)
+        .is_some_and(|access| access & (FILE_WRITE_DATA | FILE_APPEND_DATA) == 0)
 }
 
 /// Build a `stat64` from `FILE_STAT_INFORMATION`, applying the override_stat xattr when available.
@@ -1038,6 +1029,31 @@ fn open_relative(parent_handle: HANDLE, name: &CStr, flags: &OpenFlags) -> io::R
     }
 }
 
+/// Duplicate a handle within this process, with the same access rights.
+fn duplicate_handle(handle: HANDLE) -> io::Result<HANDLE> {
+    const DUPLICATE_SAME_ACCESS: u32 = 2;
+    let current_process = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+    let mut dup_h: HANDLE = INVALID_HANDLE_VALUE;
+
+    let res = unsafe {
+        windows_sys::Win32::Foundation::DuplicateHandle(
+            current_process,
+            handle,
+            current_process,
+            &mut dup_h,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+
+    if res != 0 {
+        Ok(dup_h)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Mark an open handle for deletion. The actual removal happens on close.
 fn set_delete_disposition(handle: HANDLE) -> io::Result<()> {
     let info = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
@@ -1194,6 +1210,9 @@ pub struct PassthroughFs {
     writeback: AtomicBool,
     announce_submounts: AtomicBool,
     cfg: Config,
+
+    /// Guest file handles currently open, per inode.
+    open_files: Mutex<BTreeMap<Inode, Vec<Handle>>>,
 }
 
 // Windows HANDLEs (*mut c_void) are thread-safe to move and share across OS threads.
@@ -1221,6 +1240,7 @@ impl PassthroughFs {
             writeback: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
             cfg,
+            open_files: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -1424,6 +1444,9 @@ impl PassthroughFs {
 
         let (raw_h, _guard) = match handle.and_then(as_file_handle) {
             Some(h) => (h as HANDLE, None),
+            None if let Some(guard) = self.dup_open_file(inode, FILE_READ_ATTRIBUTES) => {
+                (guard.as_raw(), Some(guard))
+            }
             _ => {
                 let h = open_handle(
                     &path,
@@ -1508,14 +1531,16 @@ impl PassthroughFs {
             _ => {}
         }
 
+        self.register_open_file(inode, h as u64);
         Ok((Some(h as u64), opts))
     }
 
-    fn do_release(&self, _inode: Inode, handle: Handle) -> io::Result<()> {
+    fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
         // Check if it's a tagged directory handle or a raw file handle
         if handle & (1 << 63) != 0 {
             self.dir_caches.write().unwrap().remove(&handle);
         } else {
+            self.unregister_open_file(inode, handle);
             let h = handle as HANDLE;
             if h != INVALID_HANDLE_VALUE && !h.is_null() {
                 unsafe { CloseHandle(h) };
@@ -1524,34 +1549,54 @@ impl PassthroughFs {
         Ok(())
     }
 
+    fn register_open_file(&self, inode: Inode, handle: Handle) {
+        self.open_files
+            .lock()
+            .unwrap()
+            .entry(inode)
+            .or_default()
+            .push(handle);
+    }
+
+    fn unregister_open_file(&self, inode: Inode, handle: Handle) {
+        let mut open_files = self.open_files.lock().unwrap();
+        if let Some(handles) = open_files.get_mut(&inode) {
+            handles.retain(|&h| h != handle);
+            if handles.is_empty() {
+                open_files.remove(&inode);
+            }
+        }
+    }
+
+    /// Duplicate a guest file handle of `inode` that grants `desired_access`.
+    ///
+    /// Requests without a file handle (e.g. utimensat() or stat() by path)
+    /// often target a file the guest still holds open: close(2) returns
+    /// before the kernel sends RELEASE, so an extractor restoring timestamps
+    /// right after writing a file races its own release. Reopening such a
+    /// file is expensive, as filter drivers (e.g. antivirus) process the new
+    /// open and closing it is the last-handle close that commits NTFS
+    /// metadata. A duplicate shares the open file instead, and closing it is
+    /// cheap since the guest's handle keeps the file open.
+    fn dup_open_file(&self, inode: Inode, desired_access: u32) -> Option<HandleGuard> {
+        let open_files = self.open_files.lock().unwrap();
+        let handle = open_files
+            .get(&inode)?
+            .iter()
+            .map(|&h| h as HANDLE)
+            .find(|&h| handle_access(h).is_some_and(|a| a & desired_access == desired_access))?;
+        duplicate_handle(handle).ok().map(HandleGuard)
+    }
+
     /// Open a fresh file handle via `open_by_id` (falling back to
     /// path-based open).  The caller owns the returned `File`; the
     /// underlying handle is closed on drop.
     fn reopen_inode(&self, inode: Inode, handle: Handle, desired_access: u32) -> io::Result<File> {
         // If the handle is a valid persistent raw file handle (not zero, and no directory tag bit)
         if let Some(raw_handle) = as_file_handle(handle) {
-            const DUPLICATE_SAME_ACCESS: u32 = 2;
-            let current_process =
-                unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
-            let mut dup_h: HANDLE = INVALID_HANDLE_VALUE;
-
-            let res = unsafe {
-                windows_sys::Win32::Foundation::DuplicateHandle(
-                    current_process,
-                    raw_handle,
-                    current_process,
-                    &mut dup_h,
-                    0,
-                    0,
-                    DUPLICATE_SAME_ACCESS,
-                )
-            };
-
-            if res != 0 {
-                return Ok(unsafe { File::from_raw_handle(dup_h as RawHandle) });
-            } else {
-                return Err(win_err_to_linux(io::Error::last_os_error()));
-            }
+            return duplicate_handle(raw_handle)
+                .map(|dup_h| unsafe { File::from_raw_handle(dup_h as RawHandle) })
+                .map_err(win_err_to_linux);
         }
 
         let data = self.inode_data(inode)?;
@@ -1728,6 +1773,7 @@ impl FileSystem for PassthroughFs {
 
     fn destroy(&self) {
         self.dir_caches.write().unwrap().clear();
+        self.open_files.lock().unwrap().clear();
         self.inodes.write().unwrap().clear();
         let h = std::mem::replace(
             &mut *self.root_handle.write().unwrap(),
@@ -2133,7 +2179,10 @@ impl FileSystem for PassthroughFs {
                 if valid.contains(SetattrValid::SIZE) {
                     desired_access |= FILE_WRITE_DATA;
                 }
-                let guard = self.open_for_setattr(&data, desired_access)?;
+                let guard = match self.dup_open_file(inode, desired_access) {
+                    Some(guard) => guard,
+                    None => self.open_for_setattr(&data, desired_access)?,
+                };
                 (guard.as_raw(), Some(guard))
             }
         };
@@ -2562,6 +2611,7 @@ impl FileSystem for PassthroughFs {
             _ => {}
         }
 
+        self.register_open_file(entry.inode, h as u64);
         Ok((entry, Some(h as u64), opts))
     }
 
