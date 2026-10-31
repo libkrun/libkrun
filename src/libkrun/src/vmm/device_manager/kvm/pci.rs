@@ -4,16 +4,19 @@
 //! PCI root and virtio-pci registration for the x86_64 KVM backend.
 
 use std::fmt::{Display, Formatter};
+use std::io;
 use std::sync::{Arc, Mutex};
 
 use devices::Bus;
 use devices::pci::{
-    BarWindow, ConfigMechanism1, Ecam, PciAddress, PciFunction, PciIntxLine, PciRootError,
+    BarWindow, ConfigMechanism1, Ecam, PciAddress, PciFunction, PciIntxLine, PciQueueNotifications,
+    PciRootError,
 };
 use devices::virtio::{
     CreatePciTransportError, VIRTIO_PCI_BAR0_SIZE, VirtioDevice, VirtioPciTransport,
 };
-use kvm_ioctls::VmFd;
+use kvm_ioctls::{IoEventAddress, NoDatamatch, VmFd};
+use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
 
 use crate::vmm::device_manager::irq::IrqAllocator;
@@ -59,6 +62,33 @@ impl PciIntxLine for KvmPciIntxLine {
         self.vm
             .set_irq_line(self.gsi, asserted)
             .map_err(|err| std::io::Error::from_raw_os_error(err.errno()))
+    }
+}
+
+/// Registers a function's queue notify addresses as KVM ioeventfds.
+struct KvmQueueNotifications {
+    vm: Arc<VmFd>,
+    events: Vec<(u64, Arc<EventFd>)>,
+}
+
+impl PciQueueNotifications for KvmQueueNotifications {
+    fn relocate(&self, from: Option<u64>, to: Option<u64>) -> io::Result<()> {
+        let errno = |err: kvm_ioctls::Error| io::Error::from_raw_os_error(err.errno());
+        if let Some(base) = from {
+            for (offset, event) in &self.events {
+                self.vm
+                    .unregister_ioevent(event, &IoEventAddress::Mmio(base + offset), NoDatamatch)
+                    .map_err(errno)?;
+            }
+        }
+        if let Some(base) = to {
+            for (offset, event) in &self.events {
+                self.vm
+                    .register_ioevent(event, &IoEventAddress::Mmio(base + offset), NoDatamatch)
+                    .map_err(errno)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -116,10 +146,15 @@ impl PciHostManager {
             return Err(Error::IrqsExhausted);
         }
         let irq = self.irqs.alloc().map_err(|_| Error::IrqsExhausted)?;
-        let intx_line = Arc::new(KvmPciIntxLine { vm, gsi: irq });
-        let transport =
+        let intx_line = Arc::new(KvmPciIntxLine {
+            vm: vm.clone(),
+            gsi: irq,
+        });
+        let mut transport =
             VirtioPciTransport::new(guest_memory, device, irq as u8, intx_line, bar_base as u32)
                 .map_err(Error::CreateTransport)?;
+        let events = transport.queue_notify_events();
+        transport.set_queue_notifications(Arc::new(KvmQueueNotifications { vm, events }));
 
         let function: Arc<Mutex<dyn PciFunction>> = Arc::new(Mutex::new(transport));
         self.root
