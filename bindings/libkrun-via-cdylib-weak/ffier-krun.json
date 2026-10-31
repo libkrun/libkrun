@@ -2009,7 +2009,7 @@
             " Serve guest reads on a host thread pool with out-of-order completion.",
             "",
             " Disabled by default. Writes, flushes, and discards stay on the device thread.",
-            " The pool size is automatic unless overridden with [`set_read_pool_size`](Self::set_read_pool_size)."
+            " The pool size is automatic unless overridden with [`set_pool_size`](Self::set_pool_size)."
           ],
           "receiver": "mut",
           "params": [
@@ -2025,7 +2025,7 @@
           "ffi_name": "krun_block_device_set_parallel_reads"
         },
         {
-          "name": "set_read_pool_size",
+          "name": "set_pool_size",
           "doc": [
             " Set the requested number of worker threads for parallel reads.",
             "",
@@ -2044,7 +2044,7 @@
           "ret": {
             "return_kind": "void"
           },
-          "ffi_name": "krun_block_device_set_read_pool_size"
+          "ffi_name": "krun_block_device_set_pool_size"
         }
       ],
       "cfg": "feature = \"blk\""

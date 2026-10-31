@@ -1511,7 +1511,7 @@ pub struct BlockDevice {
     direct_io: bool,
     sync_mode: SyncMode,
     parallel_reads: bool,
-    read_pool_size: Option<NonZeroUsize>,
+    pool_size: Option<NonZeroUsize>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
@@ -1530,7 +1530,7 @@ impl BlockDevice {
             direct_io: false,
             sync_mode: SyncMode::default(),
             parallel_reads: false,
-            read_pool_size: None,
+            pool_size: None,
         })
     }
 
@@ -1555,7 +1555,7 @@ impl BlockDevice {
     /// Serve guest reads on a host thread pool with out-of-order completion.
     ///
     /// Disabled by default. Writes, flushes, and discards stay on the device thread.
-    /// The pool size is automatic unless overridden with [`set_read_pool_size`](Self::set_read_pool_size).
+    /// The pool size is automatic unless overridden with [`set_pool_size`](Self::set_pool_size).
     pub fn set_parallel_reads(&mut self, enabled: bool) {
         self.parallel_reads = enabled;
     }
@@ -1565,8 +1565,8 @@ impl BlockDevice {
     /// Only applies when parallel reads are enabled. If the requested size is greater than the
     /// available host parallelism, or it cannot be determined, reads remain serialized. Pass 0
     /// to restore automatic pool sizing.
-    pub fn set_read_pool_size(&mut self, size: usize) {
-        self.read_pool_size = NonZeroUsize::new(size);
+    pub fn set_pool_size(&mut self, size: usize) {
+        self.pool_size = NonZeroUsize::new(size);
     }
 }
 
@@ -1587,7 +1587,7 @@ impl<'a> AttachDevice<'a> for BlockDevice {
             self.direct_io,
             self.sync_mode,
             self.parallel_reads,
-            self.read_pool_size,
+            self.pool_size,
         )
         .map_err(|e| VmmError::Internal(format!("block: {e}")))?;
 

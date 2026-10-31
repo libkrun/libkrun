@@ -99,7 +99,7 @@ impl Drop for ReadBufferPermit {
     }
 }
 
-struct ReadPool {
+struct IoPool {
     jobs: Option<Sender<ReadJob>>,
     completions: Receiver<ReadCompletion>,
     event: EventFd,
@@ -107,7 +107,7 @@ struct ReadPool {
     pending: usize,
 }
 
-impl ReadPool {
+impl IoPool {
     fn new(size: usize, disk: &DiskProperties) -> Self {
         let (jobs, rx) = unbounded::<ReadJob>();
         // Workers must be able to finish while the dispatcher joins them on drop.
@@ -120,7 +120,7 @@ impl ReadPool {
                 let event = event.try_clone().unwrap();
                 let disk = disk.file.clone();
                 thread::Builder::new()
-                    .name(format!("block read worker {i}"))
+                    .name(format!("block pool worker {i}"))
                     .spawn(move || {
                         while let Ok(job) = rx.recv() {
                             let data = (|| {
@@ -161,12 +161,12 @@ impl ReadPool {
     }
 }
 
-impl Drop for ReadPool {
+impl Drop for IoPool {
     fn drop(&mut self) {
         self.jobs.take();
         for worker in self.workers.drain(..) {
             if let Err(e) = worker.join() {
-                error!("error waiting for read worker thread: {e:?}");
+                error!("error waiting for pool worker thread: {e:?}");
             }
         }
     }
@@ -227,7 +227,7 @@ pub struct BlockWorker {
     disk: DiskProperties,
     stop_fd: EventFd,
     parallel_reads: bool,
-    read_pool_size: Option<NonZeroUsize>,
+    pool_size: Option<NonZeroUsize>,
 }
 
 impl BlockWorker {
@@ -238,7 +238,7 @@ impl BlockWorker {
         disk: DiskProperties,
         stop_fd: EventFd,
         parallel_reads: bool,
-        read_pool_size: Option<NonZeroUsize>,
+        pool_size: Option<NonZeroUsize>,
     ) -> Self {
         Self {
             device_queue,
@@ -247,7 +247,7 @@ impl BlockWorker {
             disk,
             stop_fd,
             parallel_reads,
-            read_pool_size,
+            pool_size,
         }
     }
 
@@ -261,16 +261,16 @@ impl BlockWorker {
     fn work(mut self) {
         let virtq_ev_fd = self.device_queue.event.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
-        let read_pool_size = if self.parallel_reads {
-            resolve_read_pool_size(
-                self.read_pool_size,
+        let pool_size = if self.parallel_reads {
+            resolve_pool_size(
+                self.pool_size,
                 thread::available_parallelism().ok().map(|n| n.get()),
             )
         } else {
             None
         };
-        let mut read_pool = read_pool_size.map(|size| ReadPool::new(size, &self.disk));
-        let read_completion_ev_fd = read_pool.as_ref().map(|pool| pool.event.as_raw_fd());
+        let mut pool = pool_size.map(|size| IoPool::new(size, &self.disk));
+        let pool_completion_ev_fd = pool.as_ref().map(|pool| pool.event.as_raw_fd());
         let mut epoll = Epoll::new().unwrap();
 
         let _ = epoll.ctl(
@@ -285,7 +285,7 @@ impl BlockWorker {
             &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
         );
 
-        if let Some(fd) = read_completion_ev_fd {
+        if let Some(fd) = pool_completion_ev_fd {
             let _ = epoll.ctl(
                 ControlOperation::Add,
                 fd,
@@ -305,20 +305,20 @@ impl BlockWorker {
                                 if let Err(e) = self.device_queue.event.read() {
                                     error!("Failed to get queue event: {e:?}");
                                 } else {
-                                    self.process_virtio_queues(read_pool.as_mut());
+                                    self.process_virtio_queues(pool.as_mut());
                                 }
                             }
-                            EventSet::IN if Some(source) == read_completion_ev_fd => {
-                                let pool = read_pool.as_mut().unwrap();
+                            EventSet::IN if Some(source) == pool_completion_ev_fd => {
+                                let pool = pool.as_mut().unwrap();
                                 if let Err(e) = pool.event.read() {
                                     error!("Failed to get read completion event: {e:?}");
                                 }
-                                self.process_read_completions(pool);
+                                self.process_pool_completions(pool);
                             }
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
-                                if let Some(pool) = read_pool.as_mut() {
+                                if let Some(pool) = pool.as_mut() {
                                     pool.jobs.take();
                                     for completion in pool.completions.iter() {
                                         let (head, len) =
@@ -362,7 +362,7 @@ impl BlockWorker {
         }
     }
 
-    fn process_read_completions(&mut self, pool: &mut ReadPool) {
+    fn process_pool_completions(&mut self, pool: &mut IoPool) {
         let pending = pool.pending;
         for completion in pool.completions.try_iter() {
             pool.pending -= 1;
@@ -374,12 +374,12 @@ impl BlockWorker {
         }
     }
 
-    fn process_virtio_queues(&mut self, mut read_pool: Option<&mut ReadPool>) {
+    fn process_virtio_queues(&mut self, mut pool: Option<&mut IoPool>) {
         let mem = self.mem.clone();
         loop {
             self.device_queue.queue.disable_notification(&mem).unwrap();
             while let Some(head) = self.device_queue.queue.pop(&mem) {
-                self.dispatch_request(&mem, read_pool.as_deref_mut(), head);
+                self.dispatch_request(&mem, pool.as_deref_mut(), head);
             }
             if !self.device_queue.queue.enable_notification(&mem).unwrap() {
                 break;
@@ -390,7 +390,7 @@ impl BlockWorker {
     fn dispatch_request(
         &mut self,
         mem: &GuestMemoryMmap,
-        read_pool: Option<&mut ReadPool>,
+        pool: Option<&mut IoPool>,
         head: DescriptorChain<'_>,
     ) {
         let head_index = head.index;
@@ -441,9 +441,9 @@ impl BlockWorker {
         };
 
         if request_header.request_type == VIRTIO_BLK_T_IN
-            && let Some(pool) = read_pool
+            && let Some(pool) = pool
         {
-            self.process_read_completions(pool);
+            self.process_pool_completions(pool);
             if pool.pending == pool.workers.len() {
                 let completion = pool.completions.recv().unwrap();
                 pool.pending -= 1;
@@ -602,7 +602,7 @@ impl BlockWorker {
     }
 }
 
-fn resolve_read_pool_size(
+fn resolve_pool_size(
     requested: Option<NonZeroUsize>,
     available_parallelism: Option<usize>,
 ) -> Option<usize> {
@@ -645,7 +645,7 @@ mod tests {
         .unwrap()
     }
 
-    fn wait_for_completion(pool: &ReadPool) {
+    fn wait_for_completion(pool: &IoPool) {
         let mut epoll = Epoll::new().unwrap();
         epoll
             .ctl(
@@ -713,7 +713,7 @@ mod tests {
                 parallel,
                 None,
             );
-            let mut pool = parallel.then(|| ReadPool::new(2, &worker.disk));
+            let mut pool = parallel.then(|| IoPool::new(2, &worker.disk));
             worker.dispatch_request(&mem, pool.as_mut(), head);
             if let Some(pool) = pool.as_mut()
                 && pool.pending != 0
@@ -721,7 +721,7 @@ mod tests {
                 assert_eq!(mem.read_obj::<u8>(status_addr).unwrap(), 0xff);
                 mem.write_slice(&[0; 32], GuestAddress(0)).unwrap();
                 wait_for_completion(pool);
-                worker.process_read_completions(pool);
+                worker.process_pool_completions(pool);
             }
 
             assert_eq!(mem.read_obj::<u8>(status_addr).unwrap(), status as u8);
@@ -740,12 +740,12 @@ mod tests {
     }
 
     #[test]
-    fn read_pool_wakes_dispatcher_and_drains_overlapping_reads_on_drop() {
+    fn pool_wakes_dispatcher_and_drains_overlapping_reads_on_drop() {
         for direct_io in [false, true] {
             let disk = test_disk(direct_io);
             let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
             mem.write_slice(&[0xff; 513], GuestAddress(0x100)).unwrap();
-            let mut pool = ReadPool::new(2, &disk);
+            let mut pool = IoPool::new(2, &disk);
             let completions = pool.completions.clone();
             for sector in 0..2 {
                 pool.jobs
@@ -791,20 +791,17 @@ mod tests {
     }
 
     #[test]
-    fn explicit_read_pool_size_requires_enough_available_parallelism() {
-        assert_eq!(
-            resolve_read_pool_size(NonZeroUsize::new(4), Some(4)),
-            Some(4)
-        );
-        assert_eq!(resolve_read_pool_size(NonZeroUsize::new(5), Some(4)), None);
-        assert_eq!(resolve_read_pool_size(NonZeroUsize::new(4), None), None);
+    fn explicit_pool_size_requires_enough_available_parallelism() {
+        assert_eq!(resolve_pool_size(NonZeroUsize::new(4), Some(4)), Some(4));
+        assert_eq!(resolve_pool_size(NonZeroUsize::new(5), Some(4)), None);
+        assert_eq!(resolve_pool_size(NonZeroUsize::new(4), None), None);
     }
 
     #[test]
-    fn automatic_read_pool_size_uses_existing_sizing() {
-        assert_eq!(resolve_read_pool_size(None, Some(1)), Some(2));
-        assert_eq!(resolve_read_pool_size(None, Some(16)), Some(8));
-        assert_eq!(resolve_read_pool_size(None, None), Some(4));
+    fn automatic_pool_size_uses_existing_sizing() {
+        assert_eq!(resolve_pool_size(None, Some(1)), Some(2));
+        assert_eq!(resolve_pool_size(None, Some(16)), Some(8));
+        assert_eq!(resolve_pool_size(None, None), Some(4));
     }
 
     #[test]
