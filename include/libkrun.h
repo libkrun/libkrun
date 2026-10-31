@@ -165,6 +165,7 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 
 #define KRUN_PERMISSION_SEMANTICS_LINUX_COMPLETE 0
 #define KRUN_PERMISSION_SEMANTICS_LINUX_SIMPLIFIED 1
+#define KRUN_PERMISSION_SEMANTICS_LINUX_SIMPLIFIED_FIXED_OWNER 2
 
 /* CachePolicy ------------------------------------------------------- */
 
@@ -266,12 +267,31 @@ typedef void (*krun_fs_device_set_dax_window_size_fn)(KrunFsDevice handle, uint6
  *
  * Defaults to `LinuxComplete`. `LinuxSimplified` disables xattrs and idmaps
  * and disables attribute caching because ownership depends on the requester.
- * Selecting `LinuxSimplified` on a Linux host returns `InvalidParam` without changing
- * the device configuration.
+ * `LinuxSimplifiedFixedOwner` also disables xattrs and idmaps, but keeps attribute
+ * caching, and needs an owner from [`set_fixed_owner`](Self::set_fixed_owner).
+ * Selecting `LinuxSimplified` on a Linux host, or `LinuxSimplifiedFixedOwner` on a host
+ * other than macOS, returns `InvalidParam` without changing the device configuration.
+ * Selecting the semantics again clears the fixed owner.
  * A NullFs device has no host permission semantics and returns `InvalidParam`.
  */
 KrunResult krun_fs_device_set_permission_semantics(KrunFsDevice handle, uint32_t semantics, KrunError* err_out);
 typedef KrunResult (*krun_fs_device_set_permission_semantics_fn)(KrunFsDevice handle, uint32_t semantics, KrunError* err_out);
+/**
+ * Set the owner that `LinuxSimplifiedFixedOwner` reports for every file, before attaching
+ * this device.
+ *
+ * The guest sees `uid`:`gid` as the owner of every file, while files are created and
+ * changed on the host as the user running libkrun. Ownership changes from the guest are
+ * not kept. Attaching a device in `LinuxSimplifiedFixedOwner` without an owner fails.
+ *
+ * The guest sees every set-user-ID and set-group-ID file in the directory as owned by `uid`
+ * and `gid`, so with a `uid` of 0 such a file runs as root in the guest. Mount the share
+ * with `nosuid` unless the guest should allow that.
+ *
+ * Returns `InvalidParam` unless the permission semantics are `LinuxSimplifiedFixedOwner`.
+ */
+KrunResult krun_fs_device_set_fixed_owner(KrunFsDevice handle, uint32_t uid, uint32_t gid, KrunError* err_out);
+typedef KrunResult (*krun_fs_device_set_fixed_owner_fn)(KrunFsDevice handle, uint32_t uid, uint32_t gid, KrunError* err_out);
 /**
  * Select guest file-data caching before attaching this device.
  *

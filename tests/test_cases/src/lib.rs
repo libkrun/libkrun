@@ -96,6 +96,11 @@ mod test_virtiofs_misc;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_virtiofs_misc::TestVirtioFsMisc;
 
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_virtiofs_fixed_owner;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_virtiofs_fixed_owner::TestVirtiofsFixedOwner;
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod test_virtio_pci;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -218,6 +223,8 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("root-disk-remount", Box::new(TestRootDiskRemount)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-misc", Box::new(TestVirtioFsMisc)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("virtiofs-fixed-owner", Box::new(TestVirtiofsFixedOwner)),
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         TestCase::new("virtio-pci", Box::new(TestVirtioPci)),
         #[cfg(target_os = "linux")]
