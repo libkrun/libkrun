@@ -681,8 +681,11 @@
             "",
             " Defaults to `LinuxComplete`. `LinuxSimplified` disables xattrs and idmaps",
             " and disables attribute caching because ownership depends on the requester.",
-            " Selecting `LinuxSimplified` on a Linux host returns `InvalidParam` without changing",
-            " the device configuration.",
+            " `LinuxSimplifiedFixedOwner` also disables xattrs and idmaps, but keeps attribute",
+            " caching, and needs an owner from [`set_fixed_owner`](Self::set_fixed_owner).",
+            " Selecting `LinuxSimplified` on a Linux host, or `LinuxSimplifiedFixedOwner` on a host",
+            " other than macOS, returns `InvalidParam` without changing the device configuration.",
+            " Selecting the semantics again clears the fixed owner.",
             " A NullFs device has no host permission semantics and returns `InvalidParam`."
           ],
           "receiver": "mut",
@@ -700,6 +703,43 @@
             "c_convention": "out_param"
           },
           "ffi_name": "krun_fs_device_set_permission_semantics"
+        },
+        {
+          "name": "set_fixed_owner",
+          "doc": [
+            " Set the owner that `LinuxSimplifiedFixedOwner` reports for every file, before attaching",
+            " this device.",
+            "",
+            " The guest sees `uid`:`gid` as the owner of every file, while files are created and",
+            " changed on the host as the user running libkrun. Ownership changes from the guest are",
+            " not kept. Attaching a device in `LinuxSimplifiedFixedOwner` without an owner fails.",
+            "",
+            " The guest sees every set-user-ID and set-group-ID file in the directory as owned by `uid`",
+            " and `gid`, so with a `uid` of 0 such a file runs as root in the guest. Mount the share",
+            " with `nosuid` unless the guest should allow that.",
+            "",
+            " Returns `InvalidParam` unless the permission semantics are `LinuxSimplifiedFixedOwner`."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "uid",
+              "param_kind": "regular",
+              "type": "u32"
+            },
+            {
+              "name": "gid",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_fs_device_set_fixed_owner"
         },
         {
           "name": "set_cache_policy",
@@ -2884,6 +2924,11 @@
           "name": "LinuxSimplified",
           "c_name": "KRUN_PERMISSION_SEMANTICS_LINUX_SIMPLIFIED",
           "value": 1
+        },
+        {
+          "name": "LinuxSimplifiedFixedOwner",
+          "c_name": "KRUN_PERMISSION_SEMANTICS_LINUX_SIMPLIFIED_FIXED_OWNER",
+          "value": 2
         }
       ],
       "cfg": "not(any(feature = \"tee\", feature = \"aws-nitro\"))"

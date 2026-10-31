@@ -664,8 +664,11 @@ impl<'a> FsDevice<'a> {
     ///
     /// Defaults to `LinuxComplete`. `LinuxSimplified` disables xattrs and idmaps
     /// and disables attribute caching because ownership depends on the requester.
-    /// Selecting `LinuxSimplified` on a Linux host returns `InvalidParam` without changing
-    /// the device configuration.
+    /// `LinuxSimplifiedFixedOwner` also disables xattrs and idmaps, but keeps attribute
+    /// caching, and needs an owner from [`set_fixed_owner`](Self::set_fixed_owner).
+    /// Selecting `LinuxSimplified` on a Linux host, or `LinuxSimplifiedFixedOwner` on a host
+    /// other than macOS, returns `InvalidParam` without changing the device configuration.
+    /// Selecting the semantics again clears the fixed owner.
     /// A NullFs device has no host permission semantics and returns `InvalidParam`.
     pub fn set_permission_semantics(
         &mut self,
@@ -677,6 +680,25 @@ impl<'a> FsDevice<'a> {
             .unwrap()
             .set_permission_semantics(semantics)
         {
+            return Err(VmmError::InvalidParam());
+        }
+        Ok(())
+    }
+
+    /// Set the owner that `LinuxSimplifiedFixedOwner` reports for every file, before attaching
+    /// this device.
+    ///
+    /// The guest sees `uid`:`gid` as the owner of every file, while files are created and
+    /// changed on the host as the user running libkrun. Ownership changes from the guest are
+    /// not kept. Attaching a device in `LinuxSimplifiedFixedOwner` without an owner fails.
+    ///
+    /// The guest sees every set-user-ID and set-group-ID file in the directory as owned by `uid`
+    /// and `gid`, so with a `uid` of 0 such a file runs as root in the guest. Mount the share
+    /// with `nosuid` unless the guest should allow that.
+    ///
+    /// Returns `InvalidParam` unless the permission semantics are `LinuxSimplifiedFixedOwner`.
+    pub fn set_fixed_owner(&mut self, uid: u32, gid: u32) -> Result<(), VmmError> {
+        if !self.inner.lock().unwrap().set_fixed_owner(uid, gid) {
             return Err(VmmError::InvalidParam());
         }
         Ok(())
@@ -742,6 +764,9 @@ impl<'a> AttachDevice<'a> for FsDevice<'a> {
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         {
             let mut fs = self.inner.lock().unwrap();
+            if fs.lacks_fixed_owner() {
+                return Err(VmmError::InvalidParam());
+            }
             // Wire exit code from VMM into the fs device
             fs.set_exit_code(ctx.exit_code().clone());
             // Resolve overlay entries
