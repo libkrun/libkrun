@@ -706,9 +706,11 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::vmm::macos::vm_map;
     use arch::aarch64::layout::DRAM_MEM_START_EFI;
     use devices::legacy::VcpuList;
-    use vm_memory::{GuestAddress, GuestMemoryMmap};
+    use std::ops::Range;
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
     /// The tests don't run the vCPUs, so any IPA size that HVF supports will do.
     const TEST_IPA_SIZE: u32 = 36;
@@ -813,6 +815,65 @@ mod tests {
         vcpu.init_thread_local_data().unwrap();
         // Trying to initialize non-empty TLS should error.
         vcpu.init_thread_local_data().unwrap_err();
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    fn page_size() -> u64 {
+        // SAFETY: sysconf() has no preconditions.
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+    }
+
+    fn ram_memory(start: u64, len: u64) -> (GuestMemoryMmap, Range<u64>) {
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(start), len as usize)]).unwrap();
+        (gm, start..start + len)
+    }
+
+    fn host_addr(gm: &GuestMemoryMmap, guest_addr: u64) -> u64 {
+        gm.get_host_address(GuestAddress(guest_addr)).unwrap() as u64
+    }
+
+    /// Writes `byte` to the first byte of each page in `range`.
+    fn touch(gm: &GuestMemoryMmap, range: Range<u64>, byte: u8) {
+        for addr in range.step_by(page_size() as usize) {
+            gm.write_obj(byte, GuestAddress(addr)).unwrap();
+        }
+    }
+
+    /// The reason why the memory that the balloon replaces has to be mapped in blocks: XNU keeps
+    /// the pages of the part of a VM object that is replaced while the rest of the object is
+    /// still mapped. If this test fails, XNU has changed and the blocks may not be needed.
+    #[test]
+    fn test_xnu_keeps_the_pages_of_a_partly_replaced_mapping() {
+        let (gm, ram) = ram_memory(DRAM_MEM_START_EFI, 16 * MIB);
+        let replaced = ram.end - 4 * MIB..ram.end;
+        touch(&gm, replaced.clone(), 1);
+
+        // This is what Vm::reclaim_memory() does to the range of a free page report.
+        // SAFETY: the range is within the mapping of the memory, whose contents aren't needed.
+        let ret = unsafe {
+            libc::mmap(
+                host_addr(&gm, replaced.start) as *mut libc::c_void,
+                (replaced.end - replaced.start) as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ret, libc::MAP_FAILED);
+
+        let kept = vm_map::entry(host_addr(&gm, ram.start));
+        assert_eq!(kept.start, host_addr(&gm, ram.start));
+        assert_eq!(kept.size, 12 * MIB);
+        assert_eq!(kept.offset, 0);
+        assert_ne!(kept.object_id, 0);
+        assert_eq!(kept.resident, 0);
+        let orphans = u64::from(kept.object_resident) * page_size();
+        assert!(
+            orphans >= 2 * MIB,
+            "only {orphans} bytes of the replaced range are still in the object"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
