@@ -1914,7 +1914,8 @@
             " Create a new block device.",
             "",
             " Defaults to read-write (`read_only = false`), cached I/O (`direct_io = false`),",
-            " [`SyncMode::Relaxed`], and serialized reads (`parallel_reads = false`)."
+            " [`SyncMode::Relaxed`], and serialized reads and writes (`parallel_reads = false`,",
+            " `parallel_writes = false`)."
           ],
           "receiver": "none",
           "params": [
@@ -2008,7 +2009,8 @@
           "doc": [
             " Serve guest reads on a host thread pool with out-of-order completion.",
             "",
-            " Disabled by default. Writes, flushes, and discards stay on the device thread.",
+            " Disabled by default. Flushes and discards stay on the device thread, and so do writes",
+            " unless [`set_parallel_writes`](Self::set_parallel_writes) is enabled.",
             " The pool size is automatic unless overridden with [`set_pool_size`](Self::set_pool_size)."
           ],
           "receiver": "mut",
@@ -2027,11 +2029,11 @@
         {
           "name": "set_pool_size",
           "doc": [
-            " Set the requested number of worker threads for parallel reads.",
+            " Set the requested number of worker threads for parallel reads and writes.",
             "",
-            " Only applies when parallel reads are enabled. If the requested size is greater than the",
-            " available host parallelism, or it cannot be determined, reads remain serialized. Pass 0",
-            " to restore automatic pool sizing."
+            " Only applies when parallel reads or writes are enabled. If the requested size is greater",
+            " than the available host parallelism, or it cannot be determined, they remain serialized.",
+            " Pass 0 to restore automatic pool sizing."
           ],
           "receiver": "mut",
           "params": [
@@ -2045,6 +2047,29 @@
             "return_kind": "void"
           },
           "ffi_name": "krun_block_device_set_pool_size"
+        },
+        {
+          "name": "set_parallel_writes",
+          "doc": [
+            " Serve guest writes on a host thread pool with out-of-order completion, straight from the",
+            " guest's buffers.",
+            "",
+            " Disabled by default. The pool is shared with parallel reads, and sized by",
+            " [`set_pool_size`](Self::set_pool_size). Flushes, discards, and write-zeroes wait for the",
+            " I/O in flight on the pool before they run."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "enabled",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_block_device_set_parallel_writes"
         }
       ],
       "cfg": "feature = \"blk\""

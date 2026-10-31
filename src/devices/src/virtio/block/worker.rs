@@ -77,6 +77,34 @@ struct ReadCompletion {
     data: Option<Vec<u8>>,
 }
 
+/// A write served by the pool: the data is written to the image straight
+/// from the guest's buffers, which a write only reads, so it needs no copy.
+#[derive(Debug)]
+struct WriteJob {
+    head_index: u16,
+    sector: u64,
+    data_len: usize,
+    // The request's readable buffers, header included, and its writable
+    // ones: the status byte.
+    readable: Vec<(GuestAddress, u32)>,
+    writable: Vec<(GuestAddress, u32)>,
+}
+
+struct WriteCompletion {
+    job: WriteJob,
+    ok: bool,
+}
+
+enum PoolJob {
+    Read(ReadJob),
+    Write(WriteJob),
+}
+
+enum PoolCompletion {
+    Read(ReadCompletion),
+    Write(WriteCompletion),
+}
+
 // Aliased guest descriptors can make a read's total length exceed guest RAM and exhaust host memory.
 const PARALLEL_READ_BUFFER_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
@@ -100,29 +128,50 @@ impl Drop for ReadBufferPermit {
 }
 
 struct IoPool {
-    jobs: Option<Sender<ReadJob>>,
-    completions: Receiver<ReadCompletion>,
+    jobs: Option<Sender<PoolJob>>,
+    completions: Receiver<PoolCompletion>,
     event: EventFd,
     workers: Vec<JoinHandle<()>>,
     pending: usize,
 }
 
 impl IoPool {
-    fn new(size: usize, disk: &DiskProperties) -> Self {
-        let (jobs, rx) = unbounded::<ReadJob>();
+    fn new(size: usize, disk: &DiskProperties, mem: &GuestMemoryMmap) -> Self {
+        let (jobs, rx) = unbounded::<PoolJob>();
         // Workers must be able to finish while the dispatcher joins them on drop.
         let (tx, completions) = unbounded();
         let event = EventFd::new(EFD_NONBLOCK).unwrap();
+        let disk_id = disk.image_id().to_vec();
+        let cache_type = disk.cache_type();
         let workers = (0..size)
             .map(|i| {
                 let rx = rx.clone();
                 let tx = tx.clone();
                 let event = event.try_clone().unwrap();
                 let disk = disk.file.clone();
+                let properties =
+                    DiskProperties::new(disk.clone(), disk_id.clone(), cache_type).unwrap();
+                let mem = mem.clone();
                 thread::Builder::new()
                     .name(format!("block pool worker {i}"))
                     .spawn(move || {
                         while let Ok(job) = rx.recv() {
+                            let job = match job {
+                                PoolJob::Read(job) => job,
+                                PoolJob::Write(job) => {
+                                    let ok = write_from_guest(&mem, &properties, &job);
+                                    if tx
+                                        .send(PoolCompletion::Write(WriteCompletion { job, ok }))
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    if let Err(e) = event.write(1) {
+                                        error!("failed to signal write completion: {e:?}");
+                                    }
+                                    continue;
+                                }
+                            };
                             let data = (|| {
                                 let mut data =
                                     allocate_read_buffer(job.data_len).map_err(io::Error::other)?;
@@ -140,7 +189,10 @@ impl IoPool {
                                     None
                                 }
                             };
-                            if tx.send(ReadCompletion { job, data }).is_err() {
+                            if tx
+                                .send(PoolCompletion::Read(ReadCompletion { job, data }))
+                                .is_err()
+                            {
                                 return;
                             }
                             if let Err(e) = event.write(1) {
@@ -179,6 +231,54 @@ fn allocate_read_buffer(len: usize) -> result::Result<Vec<u8>, TryReserveError> 
     buffer.try_reserve_exact(len)?;
     buffer.resize(len, 0);
     Ok(buffer)
+}
+
+fn write_from_guest(mem: &GuestMemoryMmap, disk: &DiskProperties, job: &WriteJob) -> bool {
+    let result = (|| {
+        let mut reader = Reader::from_guest_buffers(mem, job.readable.iter().copied())
+            .map_err(io::Error::other)?;
+        let mut data = reader
+            .split_at(size_of::<RequestHeader>())
+            .map_err(io::Error::other)?;
+        let offset = job
+            .sector
+            .checked_mul(512)
+            .ok_or_else(|| io::Error::other("invalid write sector"))?;
+        data.read_to_at(disk, job.data_len, offset)
+    })();
+    match result {
+        Ok(_) => true,
+        Err(e) => {
+            error!("error processing write request: {e:?}");
+            false
+        }
+    }
+}
+
+fn write_write_completion(mem: &GuestMemoryMmap, completion: WriteCompletion) -> (u16, u32) {
+    let head_index = completion.job.head_index;
+    let status: u8 = if completion.ok {
+        VIRTIO_BLK_S_OK.try_into().unwrap()
+    } else {
+        VIRTIO_BLK_S_IOERR.try_into().unwrap()
+    };
+    match Writer::from_guest_buffers(mem, completion.job.writable.iter().copied())
+        .map_err(io::Error::other)
+        .and_then(|mut w| w.write_obj(status))
+    {
+        Ok(()) => (head_index, 1),
+        Err(e) => {
+            error!("Failed to write virtio block status: {e:?}");
+            (head_index, 0)
+        }
+    }
+}
+
+fn write_completion(mem: &GuestMemoryMmap, completion: PoolCompletion) -> (u16, u32) {
+    match completion {
+        PoolCompletion::Read(c) => write_read_completion(mem, c),
+        PoolCompletion::Write(c) => write_write_completion(mem, c),
+    }
 }
 
 fn write_read_completion(mem: &GuestMemoryMmap, completion: ReadCompletion) -> (u16, u32) {
@@ -227,10 +327,12 @@ pub struct BlockWorker {
     disk: DiskProperties,
     stop_fd: EventFd,
     parallel_reads: bool,
+    parallel_writes: bool,
     pool_size: Option<NonZeroUsize>,
 }
 
 impl BlockWorker {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device_queue: DeviceQueue,
         interrupt: InterruptTransport,
@@ -238,6 +340,7 @@ impl BlockWorker {
         disk: DiskProperties,
         stop_fd: EventFd,
         parallel_reads: bool,
+        parallel_writes: bool,
         pool_size: Option<NonZeroUsize>,
     ) -> Self {
         Self {
@@ -247,6 +350,7 @@ impl BlockWorker {
             disk,
             stop_fd,
             parallel_reads,
+            parallel_writes,
             pool_size,
         }
     }
@@ -261,7 +365,7 @@ impl BlockWorker {
     fn work(mut self) {
         let virtq_ev_fd = self.device_queue.event.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
-        let pool_size = if self.parallel_reads {
+        let pool_size = if self.parallel_reads || self.parallel_writes {
             resolve_pool_size(
                 self.pool_size,
                 thread::available_parallelism().ok().map(|n| n.get()),
@@ -269,7 +373,7 @@ impl BlockWorker {
         } else {
             None
         };
-        let mut pool = pool_size.map(|size| IoPool::new(size, &self.disk));
+        let mut pool = pool_size.map(|size| IoPool::new(size, &self.disk, &self.mem));
         let pool_completion_ev_fd = pool.as_ref().map(|pool| pool.event.as_raw_fd());
         let mut epoll = Epoll::new().unwrap();
 
@@ -321,8 +425,7 @@ impl BlockWorker {
                                 if let Some(pool) = pool.as_mut() {
                                     pool.jobs.take();
                                     for completion in pool.completions.iter() {
-                                        let (head, len) =
-                                            write_read_completion(&self.mem, completion);
+                                        let (head, len) = write_completion(&self.mem, completion);
                                         self.add_used(head, len);
                                     }
                                     self.signal_used_queue();
@@ -366,12 +469,24 @@ impl BlockWorker {
         let pending = pool.pending;
         for completion in pool.completions.try_iter() {
             pool.pending -= 1;
-            let (head, len) = write_read_completion(&self.mem, completion);
+            let (head, len) = write_completion(&self.mem, completion);
             self.add_used(head, len);
         }
         if pool.pending != pending {
             self.signal_used_queue();
         }
+    }
+
+    /// Waits for everything in flight on the pool, for requests that must come
+    /// after it: flushes, discards and write-zeroes.
+    fn drain_pool(&mut self, pool: &mut IoPool) {
+        while pool.pending > 0 {
+            let completion = pool.completions.recv().unwrap();
+            pool.pending -= 1;
+            let (head, len) = write_completion(&self.mem, completion);
+            self.add_used(head, len);
+        }
+        self.signal_used_queue();
     }
 
     fn process_virtio_queues(&mut self, mut pool: Option<&mut IoPool>) {
@@ -441,13 +556,14 @@ impl BlockWorker {
         };
 
         if request_header.request_type == VIRTIO_BLK_T_IN
+            && self.parallel_reads
             && let Some(pool) = pool
         {
             self.process_pool_completions(pool);
             if pool.pending == pool.workers.len() {
                 let completion = pool.completions.recv().unwrap();
                 pool.pending -= 1;
-                let (head, len) = write_read_completion(mem, completion);
+                let (head, len) = write_completion(mem, completion);
                 self.add_used(head, len);
                 self.signal_used_queue();
             }
@@ -463,17 +579,63 @@ impl BlockWorker {
                 pool.jobs
                     .as_ref()
                     .unwrap()
-                    .send(ReadJob {
+                    .send(PoolJob::Read(ReadJob {
                         head_index,
                         sector: request_header.sector,
                         data_len,
                         buffers,
                         _buffer_permit: permit,
-                    })
+                    }))
                     .unwrap();
                 pool.pending += 1;
                 return;
             }
+        } else if request_header.request_type == VIRTIO_BLK_T_OUT
+            && self.parallel_writes
+            && let Some(pool) = pool
+        {
+            self.process_pool_completions(pool);
+            if pool.pending == pool.workers.len() {
+                let completion = pool.completions.recv().unwrap();
+                pool.pending -= 1;
+                let (head, len) = write_completion(mem, completion);
+                self.add_used(head, len);
+                self.signal_used_queue();
+            }
+            let data_len = reader.available_bytes();
+            if !data_len.is_multiple_of(512) {
+                self.complete_request(
+                    head_index,
+                    status_writer,
+                    Err(RequestError::InvalidDataLength),
+                );
+                return;
+            }
+            let readable = head
+                .clone()
+                .into_iter()
+                .readable()
+                .map(|desc| (desc.addr, desc.len))
+                .collect();
+            pool.jobs
+                .as_ref()
+                .unwrap()
+                .send(PoolJob::Write(WriteJob {
+                    head_index,
+                    sector: request_header.sector,
+                    data_len,
+                    readable,
+                    writable: buffers,
+                }))
+                .unwrap();
+            pool.pending += 1;
+            return;
+        } else if matches!(
+            request_header.request_type,
+            VIRTIO_BLK_T_FLUSH | VIRTIO_BLK_T_DISCARD | VIRTIO_BLK_T_WRITE_ZEROES
+        ) && let Some(pool) = pool
+        {
+            self.drain_pool(pool);
         }
 
         let result = Self::process_request(request_header, &mut reader, &mut writer, &self.disk);
@@ -626,6 +788,10 @@ mod tests {
     use vm_memory::Bytes;
 
     fn test_disk(direct_io: bool) -> DiskProperties {
+        test_disk_with(direct_io, false)
+    }
+
+    fn test_disk_with(direct_io: bool, writable: bool) -> DiskProperties {
         let backing = TempFile::new().unwrap();
         let mut file = backing.as_file();
         file.write_all(&[0x11; 512]).unwrap();
@@ -633,10 +799,11 @@ mod tests {
         let file = File::open(
             StorageOpenOptions::new()
                 .filename(backing.as_path().to_str().unwrap())
-                .direct(direct_io),
+                .direct(direct_io)
+                .write(writable),
         )
         .unwrap();
-        let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), false).unwrap();
+        let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), writable).unwrap();
         DiskProperties::new(
             Arc::new(RwLock::new(FormatAccess::new(raw))),
             Vec::new(),
@@ -711,9 +878,10 @@ mod tests {
                 test_disk(false),
                 EventFd::new(EFD_NONBLOCK).unwrap(),
                 parallel,
+                false,
                 None,
             );
-            let mut pool = parallel.then(|| IoPool::new(2, &worker.disk));
+            let mut pool = parallel.then(|| IoPool::new(2, &worker.disk, &mem));
             worker.dispatch_request(&mem, pool.as_mut(), head);
             if let Some(pool) = pool.as_mut()
                 && pool.pending != 0
@@ -745,19 +913,19 @@ mod tests {
             let disk = test_disk(direct_io);
             let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
             mem.write_slice(&[0xff; 513], GuestAddress(0x100)).unwrap();
-            let mut pool = IoPool::new(2, &disk);
+            let mut pool = IoPool::new(2, &disk, &mem);
             let completions = pool.completions.clone();
             for sector in 0..2 {
                 pool.jobs
                     .as_ref()
                     .unwrap()
-                    .send(ReadJob {
+                    .send(PoolJob::Read(ReadJob {
                         head_index: sector as u16,
                         sector,
                         data_len: 512,
                         buffers: vec![(GuestAddress(0x100), 513)],
                         _buffer_permit: ReadBufferPermit::try_acquire(512).unwrap(),
-                    })
+                    }))
                     .unwrap();
             }
             wait_for_completion(&pool);
@@ -769,6 +937,9 @@ mod tests {
             assert_eq!(data, [0xff; 513]);
             let mut completed = 0;
             for completion in completions.try_iter() {
+                let PoolCompletion::Read(completion) = completion else {
+                    panic!("a read completed as a write");
+                };
                 let head = completion.job.head_index;
                 assert_eq!(write_read_completion(&mem, completion), (head, 513));
                 mem.read_slice(&mut data, GuestAddress(0x100)).unwrap();
@@ -779,6 +950,125 @@ mod tests {
             assert_eq!(completed, 2);
             assert!(completions.recv().is_err());
         }
+    }
+
+    #[test]
+    fn pooled_writes_reach_the_disk_and_complete_with_status_alone() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let queue = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let head = create_descriptor_chain(
+            &mem,
+            GuestAddress(0),
+            GuestAddress(0x1000),
+            vec![
+                (DescriptorType::Readable, 16),
+                (DescriptorType::Readable, 512),
+                (DescriptorType::Writable, 1),
+            ],
+            0,
+        )
+        .unwrap();
+        mem.write_obj(
+            RequestHeader {
+                request_type: VIRTIO_BLK_T_OUT,
+                sector: 1,
+                ..Default::default()
+            },
+            GuestAddress(0x1000),
+        )
+        .unwrap();
+        mem.write_slice(&[0x5a; 512], GuestAddress(0x1010)).unwrap();
+        let status_addr = GuestAddress(0x1210);
+        mem.write_obj(0xff_u8, status_addr).unwrap();
+        let mut worker = BlockWorker::new(
+            DeviceQueue::new(
+                queue.create_queue(),
+                Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+            ),
+            InterruptTransport::new(DummyIrqChip::new().into(), "block test".into()).unwrap(),
+            mem.clone(),
+            test_disk_with(false, true),
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            true,
+            true,
+            None,
+        );
+        let mut pool = IoPool::new(2, &worker.disk, &mem);
+        worker.dispatch_request(&mem, Some(&mut pool), head);
+        assert_eq!(pool.pending, 1);
+        wait_for_completion(&pool);
+        worker.process_pool_completions(&mut pool);
+
+        assert_eq!(pool.pending, 0);
+        assert_eq!(
+            mem.read_obj::<u8>(status_addr).unwrap(),
+            VIRTIO_BLK_S_OK as u8
+        );
+        assert_eq!(queue.used.idx.get(), 1);
+        assert_eq!(queue.used.ring[0].get().len, 1);
+        let mut data = [0; 1024];
+        worker
+            .disk
+            .file
+            .read()
+            .unwrap()
+            .read(&mut data[..], 0)
+            .unwrap();
+        assert_eq!(&data[..512], &[0x11; 512]);
+        assert_eq!(&data[512..], &[0x5a; 512]);
+    }
+
+    #[test]
+    fn reads_stay_serialized_when_only_writes_are_parallel() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let queue = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let head = create_descriptor_chain(
+            &mem,
+            GuestAddress(0),
+            GuestAddress(0x1000),
+            vec![
+                (DescriptorType::Readable, 16),
+                (DescriptorType::Writable, 512),
+                (DescriptorType::Writable, 1),
+            ],
+            0,
+        )
+        .unwrap();
+        mem.write_obj(
+            RequestHeader {
+                request_type: VIRTIO_BLK_T_IN,
+                sector: 0,
+                ..Default::default()
+            },
+            GuestAddress(0x1000),
+        )
+        .unwrap();
+        let status_addr = GuestAddress(0x1210);
+        mem.write_obj(0xff_u8, status_addr).unwrap();
+        let mut worker = BlockWorker::new(
+            DeviceQueue::new(
+                queue.create_queue(),
+                Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+            ),
+            InterruptTransport::new(DummyIrqChip::new().into(), "block test".into()).unwrap(),
+            mem.clone(),
+            test_disk(false),
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            false,
+            true,
+            None,
+        );
+        let mut pool = IoPool::new(2, &worker.disk, &mem);
+        worker.dispatch_request(&mem, Some(&mut pool), head);
+
+        assert_eq!(pool.pending, 0);
+        assert_eq!(
+            mem.read_obj::<u8>(status_addr).unwrap(),
+            VIRTIO_BLK_S_OK as u8
+        );
+        let mut data = [0; 512];
+        mem.read_slice(&mut data, GuestAddress(0x1010)).unwrap();
+        assert_eq!(data, [0x11; 512]);
     }
 
     #[test]

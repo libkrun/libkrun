@@ -249,6 +249,7 @@ pub struct Block {
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
     parallel_reads: bool,
+    parallel_writes: bool,
     pool_size: Option<NonZeroUsize>,
 
     // Virtio fields.
@@ -279,6 +280,7 @@ impl Block {
         direct_io: bool,
         sync_mode: SyncMode,
         parallel_reads: bool,
+        parallel_writes: bool,
         pool_size: Option<NonZeroUsize>,
     ) -> io::Result<Block> {
         let disk_image = OpenOptions::new()
@@ -369,6 +371,7 @@ impl Block {
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
             parallel_reads,
+            parallel_writes,
             pool_size,
         })
     }
@@ -472,6 +475,7 @@ impl VirtioDevice for Block {
             disk,
             self.worker_stopfd.try_clone().unwrap(),
             self.parallel_reads,
+            self.parallel_writes,
             self.pool_size,
         );
         self.worker_thread = Some(worker.run());
