@@ -14,6 +14,8 @@ use std::fs::File;
 #[cfg(not(target_os = "windows"))]
 use std::io::Read;
 use std::io::{self, IsTerminal};
+#[cfg(target_os = "macos")]
+use std::ops::Range;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -1390,6 +1392,8 @@ pub fn build_microvm(
         paused: false,
         #[cfg(target_os = "macos")]
         paused_at: 0,
+        #[cfg(target_os = "macos")]
+        ram_in_blocks: payload_config.ram_in_blocks,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -1974,6 +1978,38 @@ pub struct PayloadConfig {
     pub initrd_config: Option<InitrdConfig>,
     pub kernel_cmdline: Option<String>,
     pub pvh: bool,
+    /// Whether guest RAM is mapped in blocks, see [`map_guest_ram_in_blocks`].
+    #[cfg(target_os = "macos")]
+    pub ram_in_blocks: bool,
+}
+
+/// Maps guest RAM in blocks with `map`, and returns whether it worked. If it didn't, the VM still
+/// has all of its RAM, and the balloon madvise()s the pages of free page reports instead of
+/// replacing them, see `Balloon::set_guest_ram_in_blocks()`.
+#[cfg(target_os = "macos")]
+fn map_ram_in_blocks(
+    guest_mem: &GuestMemoryMmap,
+    info: &ArchMemoryInfo,
+    map: impl FnOnce(&GuestMemoryMmap, Range<u64>) -> io::Result<()>,
+) -> bool {
+    let ram = info.ram_start_addr..info.ram_last_addr;
+    match map(guest_mem, ram.clone()) {
+        Ok(()) => {
+            info!(
+                "guest RAM: mapped in {} blocks of {} MiB",
+                (ram.end - ram.start).div_ceil(RECLAIM_BLOCK_SIZE),
+                RECLAIM_BLOCK_SIZE >> 20
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                "guest RAM: couldn't map it in blocks of {} MiB: {e}",
+                RECLAIM_BLOCK_SIZE >> 20
+            );
+            false
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2145,20 +2181,8 @@ pub fn create_guest_memory(
 
     // Before anything is written to RAM, which this throws away.
     #[cfg(target_os = "macos")]
-    if ram_in_blocks {
-        let ram = arch_mem_info.ram_start_addr..arch_mem_info.ram_last_addr;
-        match map_guest_ram_in_blocks(&guest_mem, ram.clone()) {
-            Ok(()) => info!(
-                "guest RAM: mapped in {} blocks of {} MiB",
-                (ram.end - ram.start).div_ceil(RECLAIM_BLOCK_SIZE),
-                RECLAIM_BLOCK_SIZE >> 20
-            ),
-            Err(e) => warn!(
-                "guest RAM: couldn't map it in blocks of {} MiB: {e}",
-                RECLAIM_BLOCK_SIZE >> 20
-            ),
-        }
-    }
+    let ram_in_blocks =
+        ram_in_blocks && map_ram_in_blocks(&guest_mem, &arch_mem_info, map_guest_ram_in_blocks);
 
     let LoadedPayload {
         guest_mem,
@@ -2191,6 +2215,8 @@ pub fn create_guest_memory(
         initrd_config,
         kernel_cmdline: cmdline,
         pvh,
+        #[cfg(target_os = "macos")]
+        ram_in_blocks,
     };
 
     arch_mem_info.guest_last_addr = guest_mem.last_addr().raw_value();
@@ -2744,7 +2770,7 @@ pub mod tests {
     fn test_create_guest_memory_maps_ram_in_blocks_only_when_asked() {
         const MIB: u64 = 1 << 20;
         for (ram_in_blocks, entry_size) in [(true, RECLAIM_BLOCK_SIZE), (false, 64 * MIB)] {
-            let (guest_memory, info, _shm_manager, _payload_config) = create_guest_memory(
+            let (guest_memory, info, _shm_manager, payload_config) = create_guest_memory(
                 64,
                 None,
                 None,
@@ -2755,6 +2781,7 @@ pub mod tests {
                 ram_in_blocks,
             )
             .unwrap();
+            assert_eq!(payload_config.ram_in_blocks, ram_in_blocks);
             assert_eq!(info.ram_last_addr - info.ram_start_addr, 64 * MIB);
             for addr in [info.ram_start_addr, info.ram_last_addr - 1] {
                 let host_addr = guest_memory.get_host_address(GuestAddress(addr)).unwrap();
@@ -2762,6 +2789,23 @@ pub mod tests {
                 assert_eq!(entry.size, entry_size, "{ram_in_blocks}, guest {addr:#x}");
             }
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_ram_that_cant_be_mapped_in_blocks_is_reported() {
+        let (guest_memory, info, _shm_manager, _payload_config) =
+            create_guest_memory(64, None, None, &[], None, false, &Payload::Empty, false).unwrap();
+
+        let mut asked = None;
+        let in_blocks = map_ram_in_blocks(&guest_memory, &info, |_, ram| {
+            asked = Some(ram);
+            Err(io::Error::from_raw_os_error(libc::ENOMEM))
+        });
+        assert!(!in_blocks);
+        assert_eq!(asked, Some(info.ram_start_addr..info.ram_last_addr));
+
+        assert!(map_ram_in_blocks(&guest_memory, &info, |_, _| Ok(())));
     }
 
     #[test]

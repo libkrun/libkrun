@@ -254,6 +254,14 @@ impl<'a> AttachContext<'a> {
         self.map_sender.clone()
     }
 
+    /// Whether the VMM mapped guest RAM in blocks, which it does for a device that declares
+    /// [`DeviceRequirements::replaces_guest_ram`]. It can fail to, in which case the VM still
+    /// starts, and the device must not replace guest RAM.
+    #[cfg(target_os = "macos")]
+    pub fn guest_ram_in_blocks(&self) -> bool {
+        self.vmm.ram_in_blocks
+    }
+
     /// Append a string to the kernel command line.
     /// Used by devices that need to pass parameters to the guest kernel
     /// (e.g., vsock TSI flags).
@@ -1352,11 +1360,13 @@ impl<'a> AttachDevice<'a> for BalloonDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         #[cfg(target_os = "macos")]
-        self.inner
-            .lock()
-            .unwrap()
-            .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
-            .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+        {
+            let mut balloon = self.inner.lock().unwrap();
+            balloon.set_guest_ram_in_blocks(ctx.guest_ram_in_blocks());
+            balloon
+                .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
+                .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+        }
         ctx.subscribe_events(self.inner.clone())?;
         ctx.register("balloon", self.inner)
     }
