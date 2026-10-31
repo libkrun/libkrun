@@ -538,7 +538,7 @@ impl BlockWorker {
             }
             VIRTIO_BLK_T_FLUSH => match disk.cache_type() {
                 CacheType::Writeback => {
-                    let diskfile = disk.file.write().unwrap();
+                    let diskfile = disk.file.read().unwrap();
                     diskfile.flush().map_err(RequestError::FlushingToDisk)?;
                     diskfile.sync().map_err(RequestError::FlushingToDisk)?;
                     Ok(0)
@@ -576,16 +576,19 @@ impl BlockWorker {
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
                 let unmap = (discard_write_data.flags & VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP) != 0;
-                let mut diskfile = disk.file.write().unwrap();
                 if unmap {
-                    diskfile
+                    disk.file
+                        .write()
+                        .unwrap()
                         .discard_to_zero(
                             discard_write_data.sector * 512,
                             discard_write_data.num_sectors as u64 * 512,
                         )
                         .map_err(RequestError::DiscardingToZero)?;
                 } else {
-                    diskfile
+                    disk.file
+                        .read()
+                        .unwrap()
                         .write_zeroes(
                             discard_write_data.sector * 512,
                             discard_write_data.num_sectors as u64 * 512,
