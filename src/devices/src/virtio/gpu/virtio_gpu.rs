@@ -1000,7 +1000,11 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let shmem_offset = resource.shmem_offset.ok_or(ErrUnspec)?;
+        // The guest unmaps a blob it asked to map even when the mapping
+        // failed, and there's nothing in the window to take back.
+        let Some(shmem_offset) = resource.shmem_offset else {
+            return Ok(OkNoData);
+        };
 
         let addr = shm_region.host_addr + shmem_offset;
 
@@ -1035,7 +1039,11 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         debug!("resource_unmap_blob");
-        let shmem_offset = resource.shmem_offset.ok_or(ErrUnspec)?;
+        // The guest unmaps a blob it asked to map even when the mapping
+        // failed, and there's nothing in the window to take back.
+        let Some(shmem_offset) = resource.shmem_offset else {
+            return Ok(OkNoData);
+        };
 
         let guest_addr = shm_region.guest_addr + shmem_offset;
         debug!(
