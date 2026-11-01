@@ -270,7 +270,7 @@ impl Worker {
                     offset: info.offset,
                 };
 
-                virtio_gpu.transfer_read(ctx_id, resource_id, transfer, None)
+                virtio_gpu.transfer_read(ctx_id, resource_id, transfer)
             }
             GpuCommand::CmdSubmit3d(info) => {
                 if reader.available_bytes() != 0 {
