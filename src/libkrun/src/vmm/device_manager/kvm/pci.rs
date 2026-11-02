@@ -117,9 +117,15 @@ impl PciHostManager {
         }
         let irq = self.irqs.alloc().map_err(|_| Error::IrqsExhausted)?;
         let intx_line = Arc::new(KvmPciIntxLine { vm, gsi: irq });
-        let transport =
-            VirtioPciTransport::new(guest_memory, device, irq as u8, intx_line, bar_base as u32)
-                .map_err(Error::CreateTransport)?;
+        let transport = VirtioPciTransport::new(
+            guest_memory,
+            device,
+            irq as u8,
+            intx_line,
+            None,
+            bar_base as u32,
+        )
+        .map_err(Error::CreateTransport)?;
 
         let function: Arc<Mutex<dyn PciFunction>> = Arc::new(Mutex::new(transport));
         self.root

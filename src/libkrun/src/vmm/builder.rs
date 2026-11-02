@@ -1150,9 +1150,12 @@ pub fn build_microvm(
         any(target_os = "linux", target_os = "windows")
     ))]
     let pci_device_manager = if pci_enabled {
-        Some(device_manager::pci::PciHostManager::new(
-            irq_allocator.clone(),
-        ))
+        #[cfg(target_os = "linux")]
+        let manager = device_manager::pci::PciHostManager::new(irq_allocator.clone());
+        #[cfg(target_os = "windows")]
+        let manager =
+            device_manager::pci::PciHostManager::new(vm.whp_vm().clone(), irq_allocator.clone());
+        Some(manager)
     } else {
         None
     };
