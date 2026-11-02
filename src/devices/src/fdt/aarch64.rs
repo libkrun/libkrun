@@ -343,7 +343,7 @@ fn create_serial_node<T: DeviceInfoForFDT + Clone + Debug>(
     ]);
 
     let node = fdt.begin_node(&format!("uart@{:x}", dev_info.addr()))?;
-    fdt.property_string("compatible", "arm,pl011")?;
+    fdt.property("compatible", b"arm,pl011\0arm,primecell\0")?;
     fdt.property_string("status", "okay")?;
     fdt.property("reg", &serial_reg_prop)?;
     fdt.property_u32("clocks", CLOCK_PHANDLE)?;
