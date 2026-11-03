@@ -1590,6 +1590,34 @@
           "ffi_name": "krun_vmm_builder_split_irqchip"
         },
         {
+          "name": "transparent_huge_pages",
+          "doc": [
+            " Ask for transparent huge pages for guest memory.",
+            "",
+            " Advises `MADV_HUGEPAGE` on guest memory, so a host with THP set to",
+            " `madvise` backs it with huge pages. Building the VM fails if the host",
+            " kernel is built without transparent huge page support. Only supported",
+            " on Linux."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "enabled",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vmm_builder_transparent_huge_pages"
+        },
+        {
           "name": "acpi",
           "doc": [
             " Enable ACPI table generation for x86_64 guests.",

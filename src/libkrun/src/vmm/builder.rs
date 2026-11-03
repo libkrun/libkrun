@@ -94,7 +94,7 @@ use utils::worker_message::WorkerMessage;
 use vm_memory::Bytes;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
 use vm_memory::FileOffset;
-#[cfg(feature = "tdx")]
+#[cfg(any(feature = "tdx", target_os = "linux"))]
 use vm_memory::GuestMemoryRegion;
 #[cfg(all(
     target_arch = "x86_64",
@@ -858,6 +858,8 @@ pub fn build_microvm(
         &payload,
         #[cfg(target_os = "macos")]
         ram_in_blocks,
+        #[cfg(target_os = "linux")]
+        vm_resources.transparent_huge_pages,
         #[cfg(feature = "tee")]
         fw_range_for_mem,
     )?;
@@ -2028,6 +2030,7 @@ pub fn create_guest_memory(
     use_vhost_user: bool,
     payload: &Payload,
     #[cfg(target_os = "macos")] ram_in_blocks: bool,
+    #[cfg(target_os = "linux")] transparent_huge_pages: bool,
     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
 ) -> std::result::Result<
     (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
@@ -2178,6 +2181,26 @@ pub fn create_guest_memory(
         GuestMemoryMmap::from_ranges(&arch_mem_regions)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
     };
+
+    #[cfg(target_os = "linux")]
+    if transparent_huge_pages {
+        for region in guest_mem.iter() {
+            // SAFETY: the range is the region's own mapping, and the advice keeps its contents.
+            let ret = unsafe {
+                libc::madvise(
+                    region.as_ptr().cast(),
+                    region.len() as usize,
+                    libc::MADV_HUGEPAGE,
+                )
+            };
+            if ret != 0 {
+                return Err(StartMicrovmError::GuestMemoryMmap(format!(
+                    "failed to enable transparent huge pages: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+        }
+    }
 
     // Before anything is written to RAM, which this throws away.
     #[cfg(target_os = "macos")]
@@ -2760,9 +2783,35 @@ pub mod tests {
             &Payload::Empty,
             #[cfg(target_os = "macos")]
             false,
+            #[cfg(target_os = "linux")]
+            false,
             #[cfg(feature = "tee")]
             None,
         )
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    fn test_create_guest_memory_advises_huge_pages_only_when_asked() {
+        for thp in [true, false] {
+            let (guest_memory, _info, _shm_manager, _payload_config) =
+                create_guest_memory(64, None, None, &[], None, false, &Payload::Empty, thp)
+                    .unwrap();
+            let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+            for region in guest_memory.iter() {
+                let start = format!("{:x}-", region.as_ptr() as usize);
+                let flags = smaps
+                    .split_inclusive('\n')
+                    .skip_while(|line| !line.starts_with(&start))
+                    .find_map(|line| line.strip_prefix("VmFlags:"))
+                    .unwrap();
+                assert_eq!(
+                    flags.split_whitespace().any(|flag| flag == "hg"),
+                    thp,
+                    "{thp}, {start}"
+                );
+            }
+        }
     }
 
     #[test]

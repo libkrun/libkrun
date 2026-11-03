@@ -2005,6 +2005,7 @@ mod tests {
             None,
             false,
             &Payload::Empty,
+            false,
             #[cfg(feature = "tee")]
             None,
         )
