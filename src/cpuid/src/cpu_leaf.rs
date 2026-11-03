@@ -283,6 +283,14 @@ pub mod leaf_0x80000001 {
     }
 }
 
+pub mod leaf_0x80000007 {
+    pub const LEAF_NUM: u32 = 0x8000_0007;
+
+    pub mod edx {
+        pub const INVARIANT_TSC_BITINDEX: u32 = 8;
+    }
+}
+
 pub mod leaf_0x80000008 {
     pub const LEAF_NUM: u32 = 0x8000_0008;
 

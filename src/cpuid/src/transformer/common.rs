@@ -27,6 +27,19 @@ fn get_max_cpus_per_package(cpu_count: u8) -> Result<u8, Error> {
     Ok(max_cpus_per_package)
 }
 
+pub fn update_invariant_tsc_entry(
+    entry: &mut kvm_cpuid_entry2,
+    vm_spec: &VmSpec,
+) -> Result<(), Error> {
+    use crate::cpu_leaf::leaf_0x80000007::edx::INVARIANT_TSC_BITINDEX;
+
+    entry.edx.write_bit(
+        INVARIANT_TSC_BITINDEX,
+        vm_spec.invariant_tsc && entry.edx.read_bit(INVARIANT_TSC_BITINDEX),
+    );
+    Ok(())
+}
+
 pub fn update_feature_info_entry(
     entry: &mut kvm_cpuid_entry2,
     vm_spec: &VmSpec,
@@ -137,8 +150,40 @@ pub fn use_host_cpuid_function(
 mod tests {
     use super::*;
     use crate::common::tests::get_topoext_fn;
+    use crate::cpu_leaf::leaf_0x80000007::{LEAF_NUM, edx::INVARIANT_TSC_BITINDEX};
     use crate::transformer::VmSpec;
+    use crate::transformer::amd::AmdCpuidTransformer;
+    use crate::transformer::intel::IntelCpuidTransformer;
     use kvm_bindings::kvm_cpuid_entry2;
+
+    #[test]
+    fn test_invariant_tsc_filter() {
+        let transformers: [&dyn CpuidTransformer; 2] =
+            [&IntelCpuidTransformer {}, &AmdCpuidTransformer {}];
+        for transformer in transformers {
+            for expose in [false, true] {
+                for supported in [false, true] {
+                    let vm_spec = VmSpec::new(0, 1, false, false, expose).unwrap();
+                    let mut entry = kvm_cpuid_entry2 {
+                        function: LEAF_NUM,
+                        eax: 1,
+                        ebx: 2,
+                        ecx: 3,
+                        edx: u32::MAX,
+                        ..Default::default()
+                    };
+                    entry.edx.write_bit(INVARIANT_TSC_BITINDEX, supported);
+                    let mut cpuid = CpuId::from_entries(&[entry]).unwrap();
+                    transformer.process_entries(&mut cpuid, &vm_spec).unwrap();
+
+                    entry
+                        .edx
+                        .write_bit(INVARIANT_TSC_BITINDEX, expose && supported);
+                    assert_eq!(cpuid.as_slice(), &[entry]);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_get_max_cpus_per_package() {
@@ -153,7 +198,8 @@ mod tests {
     fn check_update_feature_info_entry(cpu_count: u8, expected_htt: bool) {
         use crate::cpu_leaf::leaf_0x1::*;
 
-        let vm_spec = VmSpec::new(0, cpu_count, false, false).expect("Error creating vm_spec");
+        let vm_spec =
+            VmSpec::new(0, cpu_count, false, false, false).expect("Error creating vm_spec");
         let mut entry = kvm_cpuid_entry2 {
             function: 0x0,
             index: 0,
@@ -179,7 +225,8 @@ mod tests {
     ) {
         use crate::cpu_leaf::leaf_cache_parameters::*;
 
-        let vm_spec = VmSpec::new(0, cpu_count, ht_enabled, false).expect("Error creating vm_spec");
+        let vm_spec =
+            VmSpec::new(0, cpu_count, ht_enabled, false, false).expect("Error creating vm_spec");
         let mut entry = kvm_cpuid_entry2 {
             function: 0x0,
             index: 0,

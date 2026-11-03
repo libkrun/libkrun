@@ -937,7 +937,11 @@ pub fn build_microvm(
     )?;
     #[cfg(all(not(feature = "tee"), target_os = "windows"))]
     #[allow(unused_mut)]
-    let mut vm = setup_vm(&guest_memory, vcpu_config.vcpu_count)?;
+    let mut vm = setup_vm(
+        &guest_memory,
+        vcpu_config.vcpu_count,
+        vm_resources.invariant_tsc,
+    )?;
 
     #[cfg(feature = "tee")]
     let (_kvm, vm) = {
@@ -2292,8 +2296,9 @@ pub(crate) fn setup_vm(
 pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
     vcpu_count: u8,
+    invariant_tsc: bool,
 ) -> std::result::Result<Vm, StartMicrovmError> {
-    let mut vm = Vm::new(vcpu_count)
+    let mut vm = Vm::new(vcpu_count, invariant_tsc)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     vm.memory_init(guest_memory)
@@ -2878,6 +2883,7 @@ pub mod tests {
             ht_enabled: false,
             cpu_template: None,
             nested_enabled: false,
+            invariant_tsc: false,
         };
 
         let (guest_memory, mut arch_memory_info, _shm_manager, _payload_config) =
@@ -2953,6 +2959,7 @@ pub mod tests {
             ht_enabled: false,
             cpu_template: None,
             nested_enabled: false,
+            invariant_tsc: false,
         };
 
         // Dummy entry_addr, vcpus will not boot.
