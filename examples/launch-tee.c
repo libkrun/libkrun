@@ -25,10 +25,8 @@ static bool push_to_stderr(void *userdata, KrunStr s)
     return true;
 }
 
-static KrunVtableHandle krun_stderr_writer = KRUN_VTABLE_HANDLE(
-    KRUN_PUSH_STR_TYPE_TAG,
-    ((KrunPushStrVtable){ .drop = NULL, .push = push_to_stderr }),
-    NULL);
+static KrunPushStrVtable krun_stderr_writer_vtable = KRUN_VTABLE(KrunPushStrVtable, .drop = NULL, .push = push_to_stderr);
+static KrunVtableHandle krun_stderr_writer = KRUN_TEMP_OBJ(KRUN_PUSH_STR_TYPE_TAG, &krun_stderr_writer_vtable, NULL);
 
 #define CHECK(call)                                                            \
     krun_err = NULL;                                                           \

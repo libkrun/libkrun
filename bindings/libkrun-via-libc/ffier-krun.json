@@ -53,6 +53,20 @@
         }
       ]
     },
+    "BorrowedHandle": {
+      "kind": {
+        "alias": {
+          "alias_of": "RawHandle"
+        }
+      },
+      "bless": "borrowed_handle",
+      "lifetime_params": [
+        {
+          "name": "handle",
+          "variance": "covariant"
+        }
+      ]
+    },
     "CachePolicy": {
       "kind": {
         "enum": {
@@ -341,6 +355,14 @@
         }
       },
       "bless": "raw_fd"
+    },
+    "RawHandle": {
+      "kind": {
+        "primitive": {
+          "c_type": "void *"
+        }
+      },
+      "bless": "raw_handle"
     },
     "RngDevice": {
       "kind": {
@@ -3399,6 +3421,48 @@
         "ok": null,
         "err_type": "VmmError",
         "c_convention": "out_param"
+      },
+      "cfg": {
+        "kind": "unix"
+      }
+    },
+    {
+      "name": "init_log",
+      "ffi_name": "krun_init_log",
+      "params": [
+        {
+          "name": "target",
+          "param_kind": "regular",
+          "type": "BorrowedHandle",
+          "type_args": [
+            "static"
+          ],
+          "optional": true
+        },
+        {
+          "name": "level",
+          "param_kind": "regular",
+          "type": "LogLevel"
+        },
+        {
+          "name": "style",
+          "param_kind": "regular",
+          "type": "LogStyle"
+        },
+        {
+          "name": "options",
+          "param_kind": "regular",
+          "type": "LogOptions"
+        }
+      ],
+      "ret": {
+        "return_kind": "result",
+        "ok": null,
+        "err_type": "VmmError",
+        "c_convention": "out_param"
+      },
+      "cfg": {
+        "kind": "windows"
       }
     },
     {
