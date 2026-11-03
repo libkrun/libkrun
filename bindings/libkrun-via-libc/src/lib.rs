@@ -1,4 +1,3 @@
-#![cfg(not(target_os = "windows"))]
 #![allow(
     dead_code,
     unused_unsafe,

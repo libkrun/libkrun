@@ -304,8 +304,10 @@ impl From<ResolvedShmRegion> for VirtioShmRegion {
 /// The [`attach`](AttachDevice::attach) method receives an [`AttachContext`]
 /// with all VMM capabilities. Adding new methods to `AttachContext` is a
 /// non-breaking change, so the trait signature never needs to change.
+#[cfg_attr(feature = "ffi", ffier::export(no_vtable))]
 pub trait AttachDevice<'a>: Send + 'a {
     /// Declare requirements before guest memory is created.
+    #[cfg_attr(feature = "ffi", ffier(skip))]
     fn requirements(&self) -> DeviceRequirements {
         DeviceRequirements::default()
     }
@@ -315,6 +317,7 @@ pub trait AttachDevice<'a>: Send + 'a {
     /// The device should:
     /// 1. Perform any device-specific setup using `ctx` methods
     /// 2. Call [`ctx.register()`](AttachContext::register) to register on the transport bus
+    #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError>;
 }
 
@@ -380,7 +383,7 @@ pub struct PciDeviceManager<'a> {
     devices: Vec<Box<dyn AttachDevice<'a> + 'a>>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export)]
+#[cfg_attr(feature = "ffi", ffier::export(send, invariant('a)))]
 impl<'a> MmioDeviceManager<'a> {
     /// Create an empty device manager.
     pub fn new() -> Self {
@@ -441,6 +444,8 @@ impl sealed::Sealed for MmioDeviceManager<'_> {
 #[cfg_attr(
     feature = "ffi",
     ffier::export(
+        send,
+        invariant('a),
         cfg = "all(target_arch = \"x86_64\", any(target_os = \"linux\", target_os = \"windows\"))"
     )
 )]
@@ -535,7 +540,10 @@ pub struct FsOverlay<'a> {
 
 #[cfg_attr(
     feature = "ffi",
-    ffier::export(cfg = "not(any(feature = \"tee\", feature = \"aws-nitro\"))")
+    ffier::export(
+        covariant('a),
+        cfg = "not(any(feature = \"tee\", feature = \"aws-nitro\"))"
+    )
 )]
 #[cfg_attr(
     not(feature = "ffi"),
@@ -625,7 +633,11 @@ pub struct FsDevice<'a> {
 
 #[cfg_attr(
     feature = "ffi",
-    ffier::export(cfg = "not(any(feature = \"tee\", feature = \"aws-nitro\"))")
+    ffier::export(
+        send,
+        covariant('a),
+        cfg = "not(any(feature = \"tee\", feature = \"aws-nitro\"))"
+    )
 )]
 #[cfg_attr(
     not(feature = "ffi"),
@@ -846,9 +858,10 @@ pub struct ConsoleBuilder<'a> {
     _lifetime: PhantomData<&'a ()>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export)]
+#[cfg_attr(feature = "ffi", ffier::export(send, covariant('a)))]
 impl<'a> ConsoleDevice<'a> {
     /// Create a new console builder.
+    #[cfg(not(target_os = "windows"))]
     pub fn builder() -> ConsoleBuilder<'a> {
         ConsoleBuilder {
             ports: Vec::new(),
@@ -858,7 +871,10 @@ impl<'a> ConsoleDevice<'a> {
     }
 }
 
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "not(target_os = \"windows\")"))]
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(covariant('a), cfg = "not(target_os = \"windows\")")
+)]
 #[cfg_attr(not(feature = "ffi"), cfg(not(target_os = "windows")))]
 #[cfg(not(target_os = "windows"))]
 impl<'a> ConsoleBuilder<'a> {
@@ -1032,7 +1048,10 @@ impl<'a> ConsoleBuilder<'a> {
 }
 
 #[cfg(target_os = "windows")]
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "target_os = \"windows\""))]
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(covariant('a), cfg = "target_os = \"windows\"")
+)]
 #[cfg_attr(not(feature = "ffi"), cfg(target_os = "windows"))]
 impl<'a> ConsoleBuilder<'a> {
     pub fn add_tty_port(
@@ -1338,7 +1357,7 @@ pub struct BalloonDevice {
     pub(crate) inner: Arc<Mutex<devices::virtio::Balloon>>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
+#[cfg_attr(feature = "ffi", ffier::export(send, cfg = "not(feature = \"tee\")"))]
 #[cfg_attr(not(feature = "ffi"), cfg(not(feature = "tee")))]
 impl BalloonDevice {
     pub fn new() -> Result<Self, VmmError> {
@@ -1406,7 +1425,7 @@ pub struct RngDevice {
     pub(crate) inner: Arc<Mutex<devices::virtio::Rng>>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
+#[cfg_attr(feature = "ffi", ffier::export(send, cfg = "not(feature = \"tee\")"))]
 #[cfg_attr(not(feature = "ffi"), cfg(not(feature = "tee")))]
 impl RngDevice {
     pub fn new() -> Result<Self, VmmError> {
@@ -1438,7 +1457,7 @@ pub struct RtcDevice {
     inner: Arc<Mutex<devices::virtio::Rtc>>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "target_os = \"linux\""))]
+#[cfg_attr(feature = "ffi", ffier::export(send, cfg = "target_os = \"linux\""))]
 #[cfg_attr(not(feature = "ffi"), cfg(target_os = "linux"))]
 impl RtcDevice {
     pub fn new() -> Result<Self, VmmError> {
@@ -1486,7 +1505,7 @@ pub struct VsockDevice {
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export)]
+#[cfg_attr(feature = "ffi", ffier::export(send))]
 impl VsockDevice {
     /// Create a new vsock device.
     ///
@@ -1567,7 +1586,7 @@ pub struct BlockDevice {
     read_pool_size: Option<NonZeroUsize>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
+#[cfg_attr(feature = "ffi", ffier::export(send, cfg = "feature = \"blk\""))]
 #[cfg_attr(not(feature = "ffi"), cfg(feature = "blk"))]
 impl BlockDevice {
     /// Create a new block device.
@@ -1668,7 +1687,7 @@ pub struct NetDevice {
     pub(crate) inner: Arc<Mutex<devices::virtio::Net>>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"net\""))]
+#[cfg_attr(feature = "ffi", ffier::export(send, cfg = "feature = \"net\""))]
 #[cfg_attr(not(feature = "ffi"), cfg(feature = "net"))]
 #[cfg(not(target_os = "windows"))]
 impl NetDevice {
@@ -1692,6 +1711,7 @@ impl NetDevice {
     /// Create a net device backed by a Unix datagram socket fd.
     ///
     /// Takes ownership of `fd`; the caller must not close it after this call.
+    #[cfg(unix)]
     pub fn new_unixgram_fd(
         id: &str,
         fd: OwnedFd,
@@ -1730,6 +1750,7 @@ impl NetDevice {
     /// Create a net device backed by a Unix stream socket fd.
     ///
     /// Takes ownership of `fd`; the caller must not close it after this call.
+    #[cfg(unix)]
     pub fn new_unixstream_fd(
         id: &str,
         fd: OwnedFd,
@@ -1747,8 +1768,9 @@ impl NetDevice {
         )
     }
 
-    // FIXME: use #[cfg(target_os = "linux")] on the method once ffier supports
-    // per-method cfg inside #[cfg_attr(feature = "ffi", ffier::export)] impl blocks.
+    // FIXME: use #[cfg(target_os = "linux")] on the method once the TAP test
+    // backend is Linux-gated too; it still calls this on macOS and relies on
+    // the runtime stub below.
     pub fn new_tap(id: &str, tap_name: &str, mac: &[u8], features: u32) -> Result<Self, VmmError> {
         #[cfg(target_os = "linux")]
         {
@@ -1962,7 +1984,7 @@ pub struct GpuDevice {
     shm_size: usize,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"gpu\""))]
+#[cfg_attr(feature = "ffi", ffier::export(send, cfg = "feature = \"gpu\""))]
 #[cfg_attr(not(feature = "ffi"), cfg(feature = "gpu"))]
 impl GpuDevice {
     const DEFAULT_SHM_SIZE: usize = 1 << 33;
@@ -2035,7 +2057,7 @@ pub struct VhostUserDevice {
 
 #[cfg_attr(
     feature = "ffi",
-    ffier::export(cfg = "all(feature = \"vhost-user\", target_os = \"linux\")")
+    ffier::export(send, cfg = "all(feature = \"vhost-user\", target_os = \"linux\")")
 )]
 #[cfg_attr(
     not(feature = "ffi"),
@@ -2127,7 +2149,10 @@ pub struct InputDevice<'a> {
     _lifetime: PhantomData<&'a ()>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"input\""))]
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(send, covariant('a), cfg = "feature = \"input\"")
+)]
 #[cfg_attr(not(feature = "ffi"), cfg(feature = "input"))]
 impl<'a> InputDevice<'a> {
     /// Create from opaque config/events backend vtables.

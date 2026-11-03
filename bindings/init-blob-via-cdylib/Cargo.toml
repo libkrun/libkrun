@@ -1,15 +1,19 @@
 [package]
 name = "krun-init-blob-via-cdylib"
-version = "0.1.0-1.18.1"
+version = "2.0.0-dev"
 edition = "2021"
-description = "Strong Rust client for libkrun-init (links libkrun_init.so)"
+description = "Rust client for libkrun-init (links libkrun_init.so)"
 license = "Apache-2.0"
 repository = "https://github.com/containers/libkrun"
 build = "build.rs"
 
 [features]
-default = ["ffi-client"]
-ffi-client = []
+# The generated client names libkrun's FsOverlay and Payload types
+# unconditionally, so libkrun-via-libc is a required dependency rather than a
+# feature. Its linking mode is not selected here: the final binary picks one
+# for both clients, so this crate must not narrow that choice.
+ffier-strong = []
+ffier-dynlookup = ["dep:libloading"]
 
 [lib]
 # Tests live in the integration test suite, not here. Disable to avoid
@@ -19,9 +23,10 @@ doctest = false
 
 [build-dependencies]
 anyhow = "1"
-ffier-gen-rust-client = { git = "https://github.com/mtjhrc/ffier.git", tag = "0.2.0rc1" }
+ffier-gen-rust-client = { git = "https://github.com/mtjhrc/ffier.git", tag = "v0.3.0" }
 pkg-config = "0.3"
 
 [dependencies]
-ffier = { git = "https://github.com/mtjhrc/ffier.git", tag = "0.2.0rc1" }
-krun-via-cdylib-weak = { path = "../libkrun-via-cdylib-weak" }
+ffier = { git = "https://github.com/mtjhrc/ffier.git", tag = "v0.3.0" }
+libkrun-via-libc = { path = "../libkrun-via-libc" }
+libloading = { version = "0.8", optional = true }
