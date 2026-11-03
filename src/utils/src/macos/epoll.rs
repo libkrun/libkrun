@@ -261,16 +261,21 @@ impl Epoll {
                         ));
                     }
                 }
-                let _ = unsafe {
-                    libc::kevent(
-                        self.queue,
-                        kevs.as_ptr() as *const libc::kevent,
-                        kevs.len() as i32,
-                        ptr::null_mut(),
-                        0,
-                        ptr::null(),
-                    )
-                };
+                // One call per filter: kevent() stops at the first change that fails,
+                // so deleting a READ filter that isn't registered would leave the
+                // WRITE filter in place, firing forever.
+                for kev in &kevs {
+                    let _ = unsafe {
+                        libc::kevent(
+                            self.queue,
+                            kev as *const Kevent as *const libc::kevent,
+                            1,
+                            ptr::null_mut(),
+                            0,
+                            ptr::null(),
+                        )
+                    };
+                }
             }
         }
         Ok(())
