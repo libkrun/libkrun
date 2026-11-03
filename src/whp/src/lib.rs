@@ -175,6 +175,8 @@ fn get_processor_features_banks() -> Result<WHV_PROCESSOR_FEATURES_BANKS, Error>
     }
 }
 
+const TSC_INVARIANT_SUPPORT: u64 = 1 << 1;
+
 // These are WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS bits, not the bit positions
 // returned to the guest in CPUID 0x40000003.EAX. WHP performs that translation.
 const WHP_HYPERVISOR_PRESENT: u64 = 1 << 0;
@@ -294,7 +296,7 @@ impl WhpVm {
     ///                           These properties can only be set before finalization.
     /// WHvSetupPartition — finalizes the partition. After this call, configuration is locked and you can start creating vCPUs.
     ///                     You cannot change the config (like processor count) after this call.
-    pub fn new(vcpu_count: u32) -> Result<Self, Error> {
+    pub fn new(vcpu_count: u32, invariant_tsc: bool) -> Result<Self, Error> {
         let handle = unsafe {
             let mut h: WHV_PARTITION_HANDLE = 0;
             let hr = WHvCreatePartition(&mut h);
@@ -306,7 +308,7 @@ impl WhpVm {
 
         let tsc_freq_hz = Self::detect_tsc_frequency();
 
-        if let Err(e) = Self::configure_partition(handle, vcpu_count, tsc_freq_hz) {
+        if let Err(e) = Self::configure_partition(handle, vcpu_count, tsc_freq_hz, invariant_tsc) {
             let _ = unsafe { WHvDeletePartition(handle) };
             return Err(e);
         }
@@ -319,6 +321,7 @@ impl WhpVm {
         handle: WHV_PARTITION_HANDLE,
         vcpu_count: u32,
         tsc_freq_hz: u64,
+        invariant_tsc: bool,
     ) -> Result<(), Error> {
         Self::set_property(handle, WHvPartitionPropertyCodeProcessorCount, |p| {
             p.ProcessorCount = vcpu_count;
@@ -332,10 +335,12 @@ impl WhpVm {
             },
         )?;
 
-        // Set invariant TSC support
-        // First we need to retrieve the processor features banks and re-set them with the invariant TSC support
-        // otherwise they get lost
         let processor_features_banks = get_processor_features_banks()?;
+        let invariant_tsc = invariant_tsc
+            && processor_features_banks.BanksCount >= 2
+            && unsafe {
+                processor_features_banks.Anonymous.AsUINT64[1] & TSC_INVARIANT_SUPPORT != 0
+            };
         if processor_features_banks.BanksCount >= 2 {
             Self::set_property(
                 handle,
@@ -343,8 +348,11 @@ impl WhpVm {
                 |p| {
                     p.ProcessorFeaturesBanks = processor_features_banks;
 
-                    unsafe {
-                        p.ProcessorFeaturesBanks.Anonymous.AsUINT64[1] |= 0x2; // TscInvariantSupport
+                    if !invariant_tsc {
+                        unsafe {
+                            p.ProcessorFeaturesBanks.Anonymous.AsUINT64[1] &=
+                                !TSC_INVARIANT_SUPPORT;
+                        }
                     }
                 },
             )?;
@@ -371,19 +379,14 @@ impl WhpVm {
             }
         }
 
-        let mut cpuid_results: Vec<WHV_X64_CPUID_RESULT> = Vec::new();
-
-        // invariant tsc
-        if processor_features_banks.BanksCount >= 2 {
-            cpuid_results.push(WHV_X64_CPUID_RESULT {
-                Function: 0x80000007,
-                Reserved: [0; 3],
-                Eax: 0,
-                Ebx: 0,
-                Ecx: 0,
-                Edx: 0x100, // bit 8 (Invariant TSC / nonstop_tsc)
-            });
-        }
+        let mut cpuid_results = vec![WHV_X64_CPUID_RESULT {
+            Function: 0x80000007,
+            Reserved: [0; 3],
+            Eax: 0,
+            Ebx: 0,
+            Ecx: 0,
+            Edx: u32::from(invariant_tsc) << 8,
+        }];
 
         // Standard Intel CPUID leaves (Intel's SDM Vol. 2A)
         if tsc_freq_hz > 0 {
@@ -409,18 +412,16 @@ impl WhpVm {
             });
         }
 
-        if !cpuid_results.is_empty() {
-            let hr = unsafe {
-                WHvSetPartitionProperty(
-                    handle,
-                    WHvPartitionPropertyCodeCpuidResultList,
-                    cpuid_results.as_ptr().cast(),
-                    (cpuid_results.len() * mem::size_of::<WHV_X64_CPUID_RESULT>()) as u32,
-                )
-            };
-            if hr != S_OK {
-                return Err(Error::SetPartitionProperty(hr));
-            }
+        let hr = unsafe {
+            WHvSetPartitionProperty(
+                handle,
+                WHvPartitionPropertyCodeCpuidResultList,
+                cpuid_results.as_ptr().cast(),
+                (cpuid_results.len() * mem::size_of::<WHV_X64_CPUID_RESULT>()) as u32,
+            )
+        };
+        if hr != S_OK {
+            return Err(Error::SetPartitionProperty(hr));
         }
 
         let hr = unsafe { WHvSetupPartition(handle) };

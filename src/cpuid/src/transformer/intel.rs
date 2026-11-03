@@ -201,6 +201,7 @@ impl CpuidTransformer for IntelCpuidTransformer {
             #[cfg(feature = "tdx")]
             0x4000_0001 => Some(intel::update_kvm_features),
             0x8000_0002..=0x8000_0004 => Some(common::update_brand_string_entry),
+            leaf_0x80000007::LEAF_NUM => Some(common::update_invariant_tsc_entry),
             _ => None,
         }
     }
@@ -219,7 +220,7 @@ mod tests {
     fn test_update_feature_info_entry() {
         use crate::cpu_leaf::leaf_0x1::*;
 
-        let vm_spec = VmSpec::new(0, 1, false, false).expect("Error creating vm_spec");
+        let vm_spec = VmSpec::new(0, 1, false, false, false).expect("Error creating vm_spec");
         let mut entry = kvm_cpuid_entry2 {
             function: leaf_0x1::LEAF_NUM,
             index: 0,
@@ -240,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_update_perf_mon_entry() {
-        let vm_spec = VmSpec::new(0, 1, false, false).expect("Error creating vm_spec");
+        let vm_spec = VmSpec::new(0, 1, false, false, false).expect("Error creating vm_spec");
         let mut entry = kvm_cpuid_entry2 {
             function: leaf_0xa::LEAF_NUM,
             index: 0,
@@ -268,7 +269,8 @@ mod tests {
     ) {
         use crate::cpu_leaf::leaf_0x4::*;
 
-        let vm_spec = VmSpec::new(0, cpu_count, ht_enabled, false).expect("Error creating vm_spec");
+        let vm_spec =
+            VmSpec::new(0, cpu_count, ht_enabled, false, false).expect("Error creating vm_spec");
         let mut entry = kvm_cpuid_entry2 {
             function: 0x0,
             index: 0,
@@ -300,7 +302,8 @@ mod tests {
     ) {
         use crate::cpu_leaf::leaf_0xb::*;
 
-        let vm_spec = VmSpec::new(0, cpu_count, ht_enabled, false).expect("Error creating vm_spec");
+        let vm_spec =
+            VmSpec::new(0, cpu_count, ht_enabled, false, false).expect("Error creating vm_spec");
         let mut entry = kvm_cpuid_entry2 {
             function: 0x0,
             index,

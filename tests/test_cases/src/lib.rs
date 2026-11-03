@@ -11,6 +11,11 @@ extern crate krun_init_cdylib as krun_init;
 mod test_vm_config;
 use test_vm_config::TestVmConfig;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod test_invariant_tsc;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use test_invariant_tsc::TestInvariantTsc;
+
 #[cfg(any(feature = "guest", target_os = "macos"))]
 mod test_vm_pause;
 #[cfg(any(feature = "guest", target_os = "macos"))]
@@ -177,6 +182,25 @@ pub fn test_cases() -> Vec<TestCase> {
             Box::new(TestVmConfig {
                 num_cpus: 2,
                 ram_mib: 1024,
+            }),
+        ),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "cpu-invariant-tsc-default",
+            Box::new(TestInvariantTsc { enabled: None }),
+        ),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "cpu-invariant-tsc-disabled",
+            Box::new(TestInvariantTsc {
+                enabled: Some(false),
+            }),
+        ),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "cpu-invariant-tsc-enabled",
+            Box::new(TestInvariantTsc {
+                enabled: Some(true),
             }),
         ),
         #[cfg(any(feature = "guest", target_os = "macos"))]

@@ -101,9 +101,10 @@ pub struct Vm {
 }
 
 impl Vm {
-    pub fn new(vcpu_count: u8) -> Result<Self> {
+    pub fn new(vcpu_count: u8, invariant_tsc: bool) -> Result<Self> {
         whp::check_hypervisor().map_err(Error::WhpNotAvailable)?;
-        let whp_vm = Arc::new(WhpVm::new(vcpu_count as u32).map_err(Error::VmSetup)?);
+        let whp_vm =
+            Arc::new(WhpVm::new(vcpu_count as u32, invariant_tsc).map_err(Error::VmSetup)?);
         Ok(Vm { whp_vm })
     }
 

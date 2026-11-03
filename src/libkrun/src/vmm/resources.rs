@@ -116,6 +116,8 @@ pub struct VmResources {
     pub nested_enabled: bool,
     /// The process exit code when the guest resets instead of powering off.
     pub reset_exit_code: Option<u8>,
+    /// Whether to expose the host's invariant TSC capability.
+    pub invariant_tsc: bool,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// Whether to ask for transparent huge pages for guest memory (Linux).
@@ -146,6 +148,8 @@ impl VmResources {
             cpu_template: self.vm_config().cpu_template,
             #[cfg(target_os = "linux")]
             nested_enabled: self.nested_enabled,
+            #[cfg(target_os = "linux")]
+            invariant_tsc: self.invariant_tsc,
         }
     }
 
@@ -273,6 +277,7 @@ mod tests {
             smbios_oem_strings: None,
             nested_enabled: false,
             reset_exit_code: None,
+            invariant_tsc: false,
             split_irqchip: false,
             #[cfg(target_os = "linux")]
             transparent_huge_pages: false,
@@ -295,6 +300,8 @@ mod tests {
             cpu_template: vm_resources.vm_config().cpu_template,
             #[cfg(target_os = "linux")]
             nested_enabled: vm_resources.nested_enabled,
+            #[cfg(target_os = "linux")]
+            invariant_tsc: vm_resources.invariant_tsc,
         };
 
         let vcpu_config = vm_resources.vcpu_config();
