@@ -147,6 +147,23 @@ impl ShouldRun {
 }
 
 pub fn test_cases() -> Vec<TestCase> {
+    #[cfg(feature = "dynamic-linking")]
+    {
+        use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
+        use std::sync::OnceLock;
+
+        static LIBKRUN: OnceLock<Library> = OnceLock::new();
+        LIBKRUN.get_or_init(|| {
+            let name = if cfg!(target_os = "macos") {
+                "libkrun.dylib"
+            } else {
+                "libkrun.so"
+            };
+            unsafe { Library::open(Some(name), RTLD_NOW | RTLD_GLOBAL) }
+                .expect("failed to dlopen libkrun")
+        });
+    }
+
     vec![
         TestCase::new(
             "configure-vm-1cpu-256MiB",
@@ -310,6 +327,9 @@ compile_error!("Cannot enable both guest and host in the same binary!");
 
 #[cfg(feature = "host")]
 mod common;
+
+#[cfg(feature = "host")]
+pub use common::init_krun;
 
 #[cfg(feature = "host")]
 pub mod common_freebsd;

@@ -23,39 +23,14 @@ mod host {
     use krun::DeviceManager;
     use std::thread;
 
-    use crate::common::{build_init_config, init_krun, setup_standard_devices};
-    use crate::{ShouldRun, Test, TestSetup};
-
-    #[cfg(feature = "dynamic-linking")]
-    fn require_symbols() -> Result<(), libloading::Error> {
-        crate::common::require_vm_symbols()?;
-        krun::require(
-            None,
-            &[
-                krun::Symbol::KrunVsockDeviceNew,
-                krun::Symbol::KrunVsockDeviceDestroy,
-                krun::Symbol::KrunVsockDeviceAddPortForward,
-            ],
-        )
-    }
+    use crate::common::{build_init_config, setup_standard_devices};
+    use crate::{Test, TestSetup};
 
     impl Test for TestTsiTcpGuestListen {
-        fn should_run(&self) -> ShouldRun {
-            #[cfg(feature = "dynamic-linking")]
-            if require_symbols().is_err() {
-                return ShouldRun::No("feature not enabled in this libkrun build");
-            }
-            ShouldRun::Yes
-        }
-
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             thread::spawn(move || {
                 self.tcp_tester.run_client();
             });
-
-            init_krun()?;
-            #[cfg(feature = "dynamic-linking")]
-            require_symbols().unwrap();
 
             let init_config = build_init_config(&test_setup.test_case, &[]);
             let stdin = std::io::stdin();

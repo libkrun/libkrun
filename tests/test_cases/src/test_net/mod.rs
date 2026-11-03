@@ -110,33 +110,17 @@ pub struct TestTapRenew;
 #[host]
 mod host {
     use super::*;
-    use crate::common::{init_config_builder, init_krun, setup_standard_devices_from};
+    use crate::common::{init_config_builder, setup_standard_devices_from};
     use crate::{Test, TestOutcome, TestSetup};
     #[cfg(feature = "dynamic-linking")]
-    use krun::DeviceManager;
+    use krun::{DeviceManager, ffi::Symbol};
 
     use std::thread;
-
-    #[cfg(feature = "dynamic-linking")]
-    fn require_symbols() -> Result<(), libloading::Error> {
-        crate::common::require_vm_symbols()?;
-        krun::require(
-            None,
-            &[
-                krun::Symbol::KrunNetDeviceNewUnixgramPath,
-                krun::Symbol::KrunNetDeviceNewUnixgramFd,
-                krun::Symbol::KrunNetDeviceNewUnixstreamPath,
-                krun::Symbol::KrunNetDeviceNewUnixstreamFd,
-                krun::Symbol::KrunNetDeviceNewTap,
-                krun::Symbol::KrunNetDeviceDestroy,
-            ],
-        )
-    }
 
     impl Test for TestNet {
         fn should_run(&self) -> ShouldRun {
             #[cfg(feature = "dynamic-linking")]
-            if require_symbols().is_err() {
+            if !Symbol::KrunNetDeviceNewUnixstreamPath.is_available() {
                 return ShouldRun::No("feature not enabled in this libkrun build");
             }
             (self.should_run)()
@@ -158,10 +142,6 @@ mod host {
             let tcp_tester = self.tcp_tester;
             let listener = tcp_tester.create_server_socket();
             thread::spawn(move || tcp_tester.run_server(listener));
-
-            init_krun()?;
-            #[cfg(feature = "dynamic-linking")]
-            require_symbols().unwrap();
 
             let init_config = init_config_builder(&test_setup, &[]).dhcp(true).build();
             let stdin = std::io::stdin();
@@ -191,7 +171,7 @@ mod host {
     impl Test for TestTapRenew {
         fn should_run(&self) -> ShouldRun {
             #[cfg(feature = "dynamic-linking")]
-            if require_symbols().is_err() {
+            if !Symbol::KrunNetDeviceNewTap.is_available() {
                 return ShouldRun::No("feature not enabled in this libkrun build");
             }
             tap::should_run()
@@ -218,10 +198,6 @@ mod host {
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            init_krun()?;
-            #[cfg(feature = "dynamic-linking")]
-            require_symbols().unwrap();
-
             let init_config = init_config_builder(&test_setup, &[])
                 .dhcp(true)
                 .dhcp_renew(true)

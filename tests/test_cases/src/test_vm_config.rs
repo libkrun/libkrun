@@ -10,17 +10,9 @@ mod host {
     use super::*;
 
     use crate::common::setup_and_run;
-    use crate::{ShouldRun, Test, TestSetup};
+    use crate::{Test, TestSetup};
 
     impl Test for TestVmConfig {
-        fn should_run(&self) -> ShouldRun {
-            #[cfg(feature = "dynamic-linking")]
-            if crate::common::require_vm_symbols().is_err() {
-                return ShouldRun::No("core VM symbols not available");
-            }
-            ShouldRun::Yes
-        }
-
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             setup_and_run(self.num_cpus, self.ram_mib, test_setup)
         }

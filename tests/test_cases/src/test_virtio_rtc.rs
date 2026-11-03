@@ -11,35 +11,18 @@ mod host {
     #[cfg(feature = "dynamic-linking")]
     use krun::DeviceManager;
 
-    use crate::common::{init_config_builder, init_krun, setup_standard_devices};
+    use crate::common::{init_config_builder, setup_standard_devices};
     use crate::{ShouldRun, Test, TestOutcome, TestSetup};
-
-    #[cfg(feature = "dynamic-linking")]
-    fn require_rtc_symbols() -> Result<(), libloading::Error> {
-        krun::require(
-            None,
-            &[
-                krun::Symbol::KrunRtcDeviceNew,
-                krun::Symbol::KrunRtcDeviceDestroy,
-            ],
-        )
-    }
 
     impl Test for TestVirtioRtc {
         fn should_run(&self) -> ShouldRun {
-            #[cfg(feature = "dynamic-linking")]
-            if crate::common::require_vm_symbols().is_err() {
-                return ShouldRun::No("core VM symbols not available");
-            }
-            #[cfg(feature = "dynamic-linking")]
-            if self.enabled && require_rtc_symbols().is_err() {
-                return ShouldRun::No("virtio-rtc API is unavailable in this library build");
+            if self.enabled && !cfg!(target_os = "linux") {
+                return ShouldRun::No("the RTC device is Linux-only");
             }
             ShouldRun::Yes
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            init_krun()?;
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
@@ -47,9 +30,6 @@ mod host {
             let (mut devices, payload) =
                 setup_standard_devices(&test_setup, &init_config, &stdin, &stdout, &stderr)?;
             if self.enabled {
-                #[cfg(feature = "dynamic-linking")]
-                require_rtc_symbols()?;
-
                 devices
                     .add(krun::RtcDevice::new().map_err(|e| anyhow::anyhow!("RtcDevice: {e:?}"))?);
             }

@@ -19,21 +19,8 @@ mod host {
     use std::time::{Duration, Instant};
     use std::{mem, thread};
 
-    use crate::common::{build_init_config, init_krun, setup_standard_devices};
-    use crate::{ShouldRun, Test, TestOutcome, TestSetup};
-
-    #[cfg(feature = "dynamic-linking")]
-    fn require_symbols() -> Result<(), libloading::Error> {
-        crate::common::require_vm_symbols()?;
-        krun::require(
-            None,
-            &[
-                krun::Symbol::KrunVsockDeviceNew,
-                krun::Symbol::KrunVsockDeviceDestroy,
-                krun::Symbol::KrunVsockDeviceAddUnixPort,
-            ],
-        )
-    }
+    use crate::common::{build_init_config, setup_standard_devices};
+    use crate::{Test, TestOutcome, TestSetup};
 
     /// Registered with `listen=true`, but nothing in the guest ever binds it, so
     /// the guest replies OP_RST to libkrun's OP_REQUEST.
@@ -94,19 +81,7 @@ mod host {
     }
 
     impl Test for TestVsockHostConnectRefused {
-        fn should_run(&self) -> ShouldRun {
-            #[cfg(feature = "dynamic-linking")]
-            if require_symbols().is_err() {
-                return ShouldRun::No("feature not enabled in this libkrun build");
-            }
-            ShouldRun::Yes
-        }
-
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            init_krun()?;
-            #[cfg(feature = "dynamic-linking")]
-            require_symbols().unwrap();
-
             let ready_sock = test_setup.tmp_dir.join("ready.sock");
             let refused_sock = test_setup.tmp_dir.join("refused.sock");
 

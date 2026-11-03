@@ -8,7 +8,9 @@ use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
-use test_cases::{Report, ShouldRun, Test, TestCase, TestOutcome, TestSetup, test_cases};
+use test_cases::{
+    Report, ShouldRun, Test, TestCase, TestOutcome, TestSetup, init_krun, test_cases,
+};
 
 struct TestResult {
     name: String,
@@ -33,6 +35,7 @@ fn start_vm(test_setup: TestSetup) -> anyhow::Result<()> {
         .context("setrlimit RLIMIT_NOFILE")?;
 
     let test = get_test(&test_setup.test_case)?;
+    init_krun()?;
     test.start_vm(test_setup.clone())
         .with_context(|| format!("testcase: {test_setup:?}"))?;
     Ok(())

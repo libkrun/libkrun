@@ -13,19 +13,11 @@ mod host {
     use super::*;
 
     use crate::common::setup_and_run_with_env;
-    use crate::{ShouldRun, Test, TestOutcome, TestSetup};
+    use crate::{Test, TestOutcome, TestSetup};
     use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
 
     impl Test for TestVirtioFsMisc {
-        fn should_run(&self) -> ShouldRun {
-            #[cfg(feature = "dynamic-linking")]
-            if crate::common::require_vm_symbols().is_err() {
-                return ShouldRun::No("core VM symbols not available");
-            }
-            ShouldRun::Yes
-        }
-
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             // Create a host-owned file in the rootfs before entering the VM.
             let root_dir = test_setup.tmp_dir.join("rootfs");
