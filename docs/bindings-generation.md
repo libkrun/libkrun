@@ -16,16 +16,16 @@ Building with `--features ffi` generates machine-readable JSON schemas in `targe
 ### 1. The `libkrun` Bridge
 
 - **Declaration**: `src/libkrun/src/api/mod.rs` registers exported types via `ffier::library_definition!("krun", ...)` and `src/libkrun/src/lib.rs` invokes `ffier::generate_bridge!`.
-- **Schema**: `bindings/libkrun-via-cdylib-weak/ffier-krun.json`.
+- **Schema**: `bindings/libkrun-via-libc/ffier-krun.json`.
 - **C Header**: `include/libkrun.h`.
-- **Rust Client**: `bindings/libkrun-via-cdylib-weak/build.rs` reads the schema and generates a runtime dynamically-loading client into Cargo's `OUT_DIR`.
+- **Rust Client**: `bindings/libkrun-via-libc/build.rs` reads the schema and generates the Rust client into Cargo's `OUT_DIR`.
 
 ### 2. The `init-blob` Bridge
 
 - **Declaration**: `init/init-blob/src/lib.rs` registers types via `ffier::library_definition!("krun_init", ...)` and invokes `ffier::generate_bridge!`.
 - **Schema**: `bindings/init-blob-via-cdylib/ffier-krun_init.json`.
 - **C Header**: `include/libkrun_init.h`.
-- **Rust Client**: `bindings/init-blob-via-cdylib/build.rs` generates strongly linked client code into `OUT_DIR` and links against `libkrun_init`.
+- **Rust Client**: `bindings/init-blob-via-cdylib/build.rs` generates the Rust client into `OUT_DIR`.
 
 ---
 
@@ -35,12 +35,12 @@ Rust applications can consume `libkrun` and `krun-init-blob` in two ways:
 
 1. **Direct Static Linking (In-Process Rust Crates)**:
    - Depend directly on the `krun` crate.
-   - Depend on `krun-init-blob` with `features = ["direct"]` for compile-time type integration with `krun::FsOverlay` and `krun::Payload`.
+   - Depend on `krun-init-blob` with its default `krun` feature for compile-time type integration with `krun::FsOverlay` and `krun::Payload`.
    - Zero FFI overhead and full compiler type safety.
 
 2. **Shared-Library Clients**:
-   - `krun-via-cdylib-weak` resolves `libkrun.so` symbols at runtime, so it does not require the library at link time.
-   - `krun-init-blob-via-cdylib` links against `libkrun_init.so` at build time. The library must be available to the linker and at runtime.
+   - `libkrun-via-libc` uses `ffier-dynlookup` for runtime symbol lookup or `ffier-strong` for linking against `libkrun.so`. Consumers must select a mode; neither is enabled by default.
+   - `krun-init-blob-via-cdylib` uses the same features for `libkrun_init.so`. Select the `libkrun-via-libc` mode separately for its foreign handle types.
 
 ### The `FFI` Build Toggle
 
@@ -63,8 +63,25 @@ Binding generation and C ABI export are gated behind the `ffi` feature:
 Install the `ffier-gen-c-header` binary:
 
 ```bash
-cargo install --git https://github.com/mtjhrc/ffier.git --tag 0.2.0rc1 ffier-gen-c-header
+cargo install --git https://github.com/mtjhrc/ffier.git --tag v0.3.0 --locked ffier-gen-c-header
 ```
+
+### C Header Feature Guards
+
+`make gen-libkrun-bindings` generates one `libkrun.h` for all supported hosts.
+Platform predicates become C preprocessor guards automatically, so each
+consumer sees declarations for its target platform.
+
+TEE and Nitro change which API exists, so generation uses
+`--guard-features tee,aws-nitro`. When compiling a consumer, define
+`KRUN_CFG_FEATURE_TEE` and `KRUN_CFG_FEATURE_AWS_NITRO` only for features
+enabled in its library build; leave them undefined otherwise. These macros
+select header declarations, not the library's build features.
+
+Other optional features, such as `net`, `blk`, `gpu`, `input` and `vhost-user`,
+are assumed enabled during generation. The header can therefore declare
+functions absent from a narrower build. Override `GEN_HEADER_FFIER_FLAGS`
+with `--disable-features` to omit those declarations.
 
 ---
 
