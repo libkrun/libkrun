@@ -25,6 +25,9 @@ use super::worker::FsWorker;
 use super::{CachePolicy, PermissionSemantics, defs, defs::uapi};
 use crate::virtio::InterruptTransport;
 
+// The passthrough backends' default attribute timeout.
+const DEFAULT_ATTR_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Copy, Clone)]
 #[repr(C, packed)]
 struct VirtioFsConfig {
@@ -49,6 +52,8 @@ pub struct Fs {
     device_state: DeviceState,
     config: VirtioFsConfig,
     allow_idmap: bool,
+    // Attribute timeout restored when switching back to LinuxComplete.
+    cached_attr_timeout: Duration,
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: Option<passthrough::Config>,
     read_only: bool,
@@ -89,6 +94,7 @@ impl Fs {
             device_state: DeviceState::Inactive,
             config,
             allow_idmap,
+            cached_attr_timeout: DEFAULT_ATTR_TIMEOUT,
             shm_region: None,
             passthrough_cfg: fs_cfg,
             read_only,
@@ -131,7 +137,7 @@ impl Fs {
         cfg.attr_timeout = if matches!(semantics, PermissionSemantics::LinuxSimplified) {
             Duration::ZERO
         } else {
-            Duration::from_secs(5)
+            self.cached_attr_timeout
         };
         cfg.xattr = complete;
         #[cfg(target_os = "macos")]
@@ -175,6 +181,19 @@ impl Fs {
             return false;
         };
         cfg.cache_policy = policy;
+        true
+    }
+
+    pub fn set_cache_timeouts(&mut self, entry_timeout: Duration, attr_timeout: Duration) -> bool {
+        let Some(cfg) = self.passthrough_cfg.as_mut() else {
+            return false;
+        };
+        cfg.entry_timeout = entry_timeout;
+        self.cached_attr_timeout = attr_timeout;
+        // Requester ownership is context-dependent, so attributes stay uncached.
+        if !matches!(cfg.semantics, PermissionSemantics::LinuxSimplified) {
+            cfg.attr_timeout = attr_timeout;
+        }
         true
     }
 
@@ -460,6 +479,63 @@ mod tests {
                 CachePolicy::Always
             );
         }
+    }
+
+    #[test]
+    fn cache_timeouts_apply_and_survive_permission_changes() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        let entry_timeout = Duration::from_millis(250);
+        let attr_timeout = Duration::ZERO;
+        assert!(fs.set_cache_timeouts(entry_timeout, attr_timeout));
+        let cfg = fs.passthrough_cfg.as_ref().unwrap();
+        assert_eq!(cfg.entry_timeout, entry_timeout);
+        assert_eq!(cfg.attr_timeout, attr_timeout);
+        assert_eq!(cfg.cache_policy, CachePolicy::Auto);
+
+        assert!(fs.set_cache_policy(CachePolicy::Never));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxComplete));
+        let cfg = fs.passthrough_cfg.as_ref().unwrap();
+        assert_eq!(cfg.entry_timeout, entry_timeout);
+        assert_eq!(cfg.attr_timeout, attr_timeout);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn simplified_semantics_keep_attributes_uncached() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplified));
+        let attr_timeout = Duration::from_millis(123);
+        assert!(fs.set_cache_timeouts(Duration::from_secs(1), attr_timeout));
+        assert_eq!(
+            fs.passthrough_cfg.as_ref().unwrap().attr_timeout,
+            Duration::ZERO
+        );
+
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxComplete));
+        assert_eq!(
+            fs.passthrough_cfg.as_ref().unwrap().attr_timeout,
+            attr_timeout
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fixed_owner_semantics_use_the_cache_timeouts() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        let attr_timeout = Duration::from_millis(123);
+        assert!(fs.set_cache_timeouts(Duration::from_secs(1), attr_timeout));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplifiedFixedOwner));
+        assert_eq!(
+            fs.passthrough_cfg.as_ref().unwrap().attr_timeout,
+            attr_timeout
+        );
+    }
+
+    #[test]
+    fn null_filesystems_reject_cache_timeouts() {
+        let mut fs = filesystem(None);
+        assert!(!fs.set_cache_timeouts(Duration::ZERO, Duration::ZERO));
+        assert!(fs.passthrough_cfg.is_none());
     }
 
     #[test]
