@@ -6,6 +6,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#ifndef _WIN32
+#include <sys/types.h>
+#else
+#define ssize_t intptr_t
+#endif
 
 typedef void* KrunInitConfigError;
 typedef void* KrunInitApplyError;
@@ -31,22 +39,36 @@ typedef struct {
 } KrunStr;
 
 #define KRUN_STR(s) ((KrunStr){ .data = (s), .len = (s) ? strlen(s) : 0 })
+/* Count virtual method slots in the caller's vtable type, including gaps, excluding drop. */
+#define KRUN_VTABLE_LEN(T) \
+    ((uint16_t)((sizeof(T) - offsetof(T, drop) - sizeof(((T*)0)->drop)) / sizeof(((T*)0)->drop)))
+
+/* Initialize a vtable with its slot count and zeroed reserved fields. */
+#define KRUN_VTABLE(T, ...) \
+    { ._num_slots = KRUN_VTABLE_LEN(T), ._reserved1 = 0, ._reserved2 = 0, __VA_ARGS__ }
+
 /**
- * Stack-allocated temporary handle for passing vtable-based objects.
- * Only valid for the duration of the call — the callee borrows, not owns.
+ * Construct a temporary object for borrowed parameters.
+ *
+ * Valid ONLY for calls that do not take ownership. The caller owns the
+ * handle, so the callee must not retain or destroy it.
+ *
+ * Do NOT pass it to a function that consumes or retains its argument.
+ * Consuming an unowned object aborts at runtime. To transfer ownership,
+ * use krun_init_vtable_handle_new() instead.
+ *
+ * Both vtable and user_data must remain valid until the call returns.
  */
 typedef struct {
     uint32_t type_tag;
     uint32_t metadata;
     const void *vtable_ptr;
     const void *user_data;
-    uint16_t vtable_size;
 } KrunVtableHandle;
 
-#define KRUN_VTABLE_HANDLE(tag, vtable, self_data) \
+#define KRUN_TEMP_OBJ(tag, vtable, self_data) \
     ((KrunVtableHandle){ .type_tag = (tag), .metadata = 0, \
-      .vtable_ptr = &(vtable), .user_data = (self_data), \
-      .vtable_size = sizeof(vtable) })
+      .vtable_ptr = (vtable), .user_data = (self_data) })
 
 /**
  * Opaque 16-byte handle entry in an object array.
@@ -74,6 +96,20 @@ typedef struct {
     (assert((size_t)(i) < (arr).len), (KrunObject)(void*)&(arr).items[(i)])
 
 #endif /* KRUN_PRIMITIVES_DEFINED */
+
+/**
+ * Allocate a vtable object for parameters that take ownership.
+ *
+ * This is the owned counterpart of KRUN_TEMP_OBJ. The library
+ * allocates the handle so it can free it with the same allocator, so
+ * never allocate the handle yourself.
+ *
+ * The library calls the vtable drop callback when it releases the
+ * object, so release user_data there. Keep vtable and user_data valid
+ * until then.
+ */
+void* krun_init_vtable_handle_new(uint32_t type_tag, const void* vtable, const void* user_data);
+typedef void* (*krun_init_vtable_handle_new_fn)(uint32_t type_tag, const void* vtable, const void* user_data);
 
 /* Free an owned string returned by the library */
 void krun_init_str_free(KrunStr s);
@@ -107,23 +143,9 @@ typedef KrunInitBuilder (*krun_init_config_builder_fn)();
  * The caller must keep this `Config` (or `KrunInitConfig`) alive for the
  * entire lifetime of the VM; `apply` borrows data pointers that remain
  * referenced until the VM exits.
- *
- * Symbols are loaded from the global namespace (`RTLD_DEFAULT`).
  */
 KrunResult krun_init_config_apply(KrunInitConfig handle, KrunFsOverlay overlay, KrunPayload payload, KrunInitError* err_out);
 typedef KrunResult (*krun_init_config_apply_fn)(KrunInitConfig handle, KrunFsOverlay overlay, KrunPayload payload, KrunInitError* err_out);
-/**
- * Like [`apply`](Self::apply), but loads symbols from a specific library
- * handle (e.g. from `dlopen`). Pass null for `RTLD_DEFAULT`.
- *
- * - If `lib_handle` is non-null it must be a valid handle returned by
- *   `dlopen` (or equivalent) that remains open for the duration of
- *   this call.
- * - The caller must keep this `Config` (or `KrunInitConfig`) alive for the
- *   entire lifetime of the VM.
- */
-KrunResult krun_init_config_apply_in(KrunInitConfig handle, void* lib_handle, KrunFsOverlay overlay, KrunPayload payload, KrunInitError* err_out);
-typedef KrunResult (*krun_init_config_apply_in_fn)(KrunInitConfig handle, void* lib_handle, KrunFsOverlay overlay, KrunPayload payload, KrunInitError* err_out);
 void krun_init_config_destroy(KrunInitConfig handle);
 typedef void (*krun_init_config_destroy_fn)(KrunInitConfig handle);
 
@@ -189,6 +211,10 @@ typedef void (*krun_init_builder_destroy_fn)(KrunInitBuilder handle);
 #define KRUN_INIT_PUSH_STR_TYPE_TAG 33554433
 
 typedef struct {
+    uint16_t _num_slots; /* number of virtual method slots (excluding drop), including reserved gaps */
+    uint16_t _reserved1; /* must be zero */
+    uint32_t _reserved2; /* must be zero */
+    /* Releases transferred user_data exactly once; never called for borrowed parameters. */
     void (*drop)(void* self_data);
     bool (*push)(void* self_data, KrunStr s);
 } KrunInitPushStrVtable;
@@ -205,9 +231,13 @@ typedef void (*krun_init_push_str_destroy_fn)(KrunInitPushStr handle);
 #define KRUN_INIT_ERROR_TYPE_TAG 33554434
 
 typedef struct {
+    uint16_t _num_slots; /* number of virtual method slots (excluding drop), including reserved gaps */
+    uint16_t _reserved1; /* must be zero */
+    uint32_t _reserved2; /* must be zero */
+    /* Releases transferred user_data exactly once; never called for borrowed parameters. */
     void (*drop)(void* self_data);
     uint32_t (*code)(void* self_data);
-    void (*message)(void* self_data, KrunInitPushStr writer);
+    void (*message)(void* self_data, KrunInitPushStr writer /* mutable borrowed callback; call-scoped */);
     uint64_t (*result)(void* self_data);
 } KrunInitErrorVtable;
 
@@ -215,23 +245,36 @@ typedef struct {
 
 uint32_t krun_init_error_code(KrunInitError handle);
 typedef uint32_t (*krun_init_error_code_fn)(KrunInitError handle);
-void krun_init_error_message(KrunInitError handle, KrunInitPushStr writer);
-typedef void (*krun_init_error_message_fn)(KrunInitError handle, KrunInitPushStr writer);
+void krun_init_error_message(KrunInitError handle, KrunInitPushStr writer /* mutable borrowed callback; call-scoped */);
+typedef void (*krun_init_error_message_fn)(KrunInitError handle, KrunInitPushStr writer /* mutable borrowed callback; call-scoped */);
 uint64_t krun_init_error_result(KrunInitError handle);
 typedef uint64_t (*krun_init_error_result_fn)(KrunInitError handle);
 void krun_init_error_destroy(KrunInitError handle);
 typedef void (*krun_init_error_destroy_fn)(KrunInitError handle);
 uint32_t krun_init_config_error_code(KrunInitConfigError handle);
 typedef uint32_t (*krun_init_config_error_code_fn)(KrunInitConfigError handle);
-void krun_init_config_error_message(KrunInitConfigError handle, KrunInitPushStr writer);
-typedef void (*krun_init_config_error_message_fn)(KrunInitConfigError handle, KrunInitPushStr writer);
+void krun_init_config_error_message(KrunInitConfigError handle, KrunInitPushStr writer /* mutable borrowed callback; call-scoped */);
+typedef void (*krun_init_config_error_message_fn)(KrunInitConfigError handle, KrunInitPushStr writer /* mutable borrowed callback; call-scoped */);
 uint32_t krun_init_apply_error_code(KrunInitApplyError handle);
 typedef uint32_t (*krun_init_apply_error_code_fn)(KrunInitApplyError handle);
-void krun_init_apply_error_message(KrunInitApplyError handle, KrunInitPushStr writer);
-typedef void (*krun_init_apply_error_message_fn)(KrunInitApplyError handle, KrunInitPushStr writer);
+void krun_init_apply_error_message(KrunInitApplyError handle, KrunInitPushStr writer /* mutable borrowed callback; call-scoped */);
+typedef void (*krun_init_apply_error_message_fn)(KrunInitApplyError handle, KrunInitPushStr writer /* mutable borrowed callback; call-scoped */);
+/* Create an owned fieldless error; returns NULL for payload variants or unknown codes.
+ * Destroy once with error_destroy or transfer ownership to a callback caller. */
+void* krun_init_error_new(KrunResult r);
+typedef void* (*krun_init_error_new_fn)(KrunResult r);
+/* Borrow a field by native tuple index. Invalid/opaque indices and undersized buffers abort.
+ * Returned data must not outlive the error handle. */
+void krun_init_error_payload(const void* handle, size_t index, void* out_buf, size_t buf_size);
+typedef void (*krun_init_error_payload_fn)(const void* handle, size_t index, void* out_buf, size_t buf_size);
+/* Raw variant name, independent of the static message or native Display. */
 KrunStr krun_init_result_name(KrunResult r);
 typedef KrunStr (*krun_init_result_name_fn)(KrunResult r);
 const char* krun_init_result_name_cstr(KrunResult r);
 typedef const char* (*krun_init_result_name_cstr_fn)(KrunResult r);
+/* Static message or raw variant name when omitted. No payload or error handle is needed.
+ * Returned strings remain valid while the library is loaded. */
+KrunStr krun_init_result_message(KrunResult r);
+typedef KrunStr (*krun_init_result_message_fn)(KrunResult r);
 
 #endif /* LIBKRUN_INIT_H */
