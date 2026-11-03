@@ -465,6 +465,15 @@ KrunResult krun_vmm_builder_add_serial_console(KrunVmmBuilder* handle, int input
 typedef KrunResult (*krun_vmm_builder_add_serial_console_fn)(KrunVmmBuilder* handle, int input_fd, int output_fd, KrunError* err_out);
 void krun_vmm_builder_nested_virt(KrunVmmBuilder* handle, bool enabled);
 typedef void (*krun_vmm_builder_nested_virt_fn)(KrunVmmBuilder* handle, bool enabled);
+/**
+ * Expose the host's invariant TSC capability to x86_64 guests.
+ *
+ * Disabled by default so Linux guests can prefer a paravirtual clock.
+ * Enabling this preserves backend support for CPUID.80000007H:EDX[8];
+ * it does not add support when the host lacks it.
+ */
+KrunResult krun_vmm_builder_invariant_tsc(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
+typedef KrunResult (*krun_vmm_builder_invariant_tsc_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 KrunResult krun_vmm_builder_split_irqchip(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 typedef KrunResult (*krun_vmm_builder_split_irqchip_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 /**

@@ -406,7 +406,9 @@ fn file_info_to_stat64(
     handle: HANDLE,
 ) -> stat64 {
     let override_stat = match semantics {
-        PermissionSemantics::LinuxSimplified => None,
+        PermissionSemantics::LinuxSimplified | PermissionSemantics::LinuxSimplifiedFixedOwner => {
+            None
+        }
         PermissionSemantics::LinuxComplete => read_override_stat(path).ok(),
     };
     build_stat64(ctx, semantics, info, ino, handle, override_stat)

@@ -46,7 +46,7 @@ mod brand_string;
 /// let kvm = Kvm::new().unwrap();
 /// let mut kvm_cpuid: CpuId = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES).unwrap();
 ///
-/// let vm_spec = VmSpec::new(0, 1, true, false).unwrap();
+/// let vm_spec = VmSpec::new(0, 1, true, false, false).unwrap();
 ///
 /// filter_cpuid(&mut kvm_cpuid, &vm_spec).unwrap();
 ///

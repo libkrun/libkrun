@@ -940,6 +940,8 @@ pub struct VcpuConfig {
     pub cpu_template: Option<CpuFeaturesTemplate>,
     /// Enable nested virtualization in the CPUID configuration.
     pub nested_enabled: bool,
+    /// Expose the host's invariant TSC capability in the CPUID configuration.
+    pub invariant_tsc: bool,
 }
 
 // Using this for easier explicit type-casting to help IDEs interpret the code.
@@ -1205,6 +1207,7 @@ impl Vcpu {
             vcpu_config.vcpu_count,
             vcpu_config.ht_enabled,
             vcpu_config.nested_enabled,
+            vcpu_config.invariant_tsc,
         )
         .map_err(Error::CpuId)?;
 
@@ -1967,6 +1970,7 @@ mod tests {
             ht_enabled: false,
             cpu_template: None,
             nested_enabled: false,
+            invariant_tsc: false,
         };
 
         assert!(
