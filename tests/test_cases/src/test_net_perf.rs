@@ -152,24 +152,10 @@ impl TestNetPerf {
 #[host]
 mod host {
     use super::*;
-    use crate::common::{init_config_builder, init_krun, setup_standard_devices_from};
+    use crate::common::{init_config_builder, setup_standard_devices_from};
     #[cfg(feature = "dynamic-linking")]
-    use krun::DeviceManager;
+    use krun::{DeviceManager, ffi::Symbol};
 
-    #[cfg(feature = "dynamic-linking")]
-    fn require_symbols() -> Result<(), libloading::Error> {
-        crate::common::require_vm_symbols()?;
-        krun::require(
-            None,
-            &[
-                krun::Symbol::KrunNetDeviceNewUnixgramPath,
-                krun::Symbol::KrunNetDeviceNewUnixgramFd,
-                krun::Symbol::KrunNetDeviceNewUnixstreamFd,
-                krun::Symbol::KrunNetDeviceNewTap,
-                krun::Symbol::KrunNetDeviceDestroy,
-            ],
-        )
-    }
     use crate::{Test, TestOutcome, TestSetup};
 
     use std::process::{Child, Command, Stdio};
@@ -331,7 +317,7 @@ RUN dnf install -y iperf3 && dnf clean all
                 return ShouldRun::No("IPERF_DURATION not set");
             }
             #[cfg(feature = "dynamic-linking")]
-            if require_symbols().is_err() {
+            if !Symbol::KrunNetDeviceNewUnixstreamPath.is_available() {
                 return ShouldRun::No("feature not enabled in this libkrun build");
             }
             let backend_result = (self.should_run)();
@@ -366,10 +352,6 @@ RUN dnf install -y iperf3 && dnf clean all
             if let Some(status) = iperf_server.try_wait()? {
                 anyhow::bail!("iperf3 server exited early: {status}");
             }
-
-            init_krun()?;
-            #[cfg(feature = "dynamic-linking")]
-            require_symbols().unwrap();
 
             let init_config = init_config_builder(&test_setup, &[]).dhcp(true).build();
             let stdin = std::io::stdin();

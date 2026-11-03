@@ -5,10 +5,9 @@ pub struct TestFreeBsdBoot;
 #[host]
 mod host {
     use super::*;
-
-    use crate::common::init_krun;
     #[cfg(feature = "dynamic-linking")]
-    use crate::common_freebsd::require_freebsd_symbols;
+    use krun::ffi::Symbol;
+
     use crate::common_freebsd::{freebsd_assets, normalize_serial_output, setup_kernel_and_enter};
     use crate::{ShouldRun, Test, TestOutcome, TestSetup};
 
@@ -27,15 +26,12 @@ mod host {
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             let assets = freebsd_assets().expect("FreeBSD assets must be present when test runs");
-            init_krun()?;
-            #[cfg(feature = "dynamic-linking")]
-            require_freebsd_symbols().unwrap();
             setup_kernel_and_enter(test_setup, assets, None)
         }
 
         fn should_run(&self) -> ShouldRun {
             #[cfg(feature = "dynamic-linking")]
-            if require_freebsd_symbols().is_err() {
+            if !Symbol::KrunBlockDeviceNew.is_available() {
                 return ShouldRun::No("feature not enabled in this libkrun build");
             }
             match freebsd_assets() {

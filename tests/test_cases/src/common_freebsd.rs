@@ -13,21 +13,6 @@ use crate::test_net::gvproxy::{Gvproxy, wait_for_socket};
 
 type ExtraDevicesFn = Box<dyn FnOnce(&mut krun::MmioDeviceManager<'_>) -> anyhow::Result<()>>;
 
-#[cfg(feature = "dynamic-linking")]
-pub fn require_freebsd_symbols() -> Result<(), libloading::Error> {
-    crate::common::require_vm_symbols()?;
-    krun::require(
-        None,
-        &[
-            krun::Symbol::KrunPayloadLoadExternal,
-            krun::Symbol::KrunBlockDeviceNew,
-            krun::Symbol::KrunBlockDeviceDestroy,
-            krun::Symbol::KrunBlockDeviceSetReadOnly,
-            krun::Symbol::KrunVmmBuilderAddSerialConsole,
-            krun::Symbol::KrunVmmBuilderSetKernelConsole,
-        ],
-    )
-}
 pub struct FreeBsdAssets {
     pub kernel_path: PathBuf,
     pub iso_path: PathBuf,

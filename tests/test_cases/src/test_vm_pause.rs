@@ -53,34 +53,8 @@ mod host {
     use std::os::fd::AsFd;
     use std::time::Duration;
 
-    use crate::common::{build_init_config, init_krun, setup_rootfs};
+    use crate::common::{build_init_config, setup_rootfs};
     use crate::{ShouldRun, Test, TestOutcome, TestSetup};
-
-    // FIXME: remove once ffier marks generated handle wrappers as Send.
-    struct SendHandle(krun::VmmHandle);
-    unsafe impl Send for SendHandle {}
-    impl SendHandle {
-        fn pause(&self) -> Result<(), krun::VmmError> {
-            self.0.pause()
-        }
-        fn resume(&self) -> Result<(), krun::VmmError> {
-            self.0.resume()
-        }
-    }
-
-    #[cfg(feature = "dynamic-linking")]
-    fn require_symbols() -> Result<(), libloading::Error> {
-        crate::common::require_vm_symbols()?;
-        krun::require(
-            None,
-            &[
-                krun::Symbol::KrunVmmHandle,
-                krun::Symbol::KrunVmmHandleDestroy,
-                krun::Symbol::KrunVmmHandlePause,
-                krun::Symbol::KrunVmmHandleResume,
-            ],
-        )
-    }
 
     fn sleep_ms(ms: u64) {
         std::thread::sleep(Duration::from_millis(ms));
@@ -91,10 +65,6 @@ mod host {
             if !cfg!(target_os = "macos") {
                 return ShouldRun::No("pause/resume is macOS/HVF only");
             }
-            #[cfg(feature = "dynamic-linking")]
-            if require_symbols().is_err() {
-                return ShouldRun::No("feature not enabled in this libkrun build");
-            }
             ShouldRun::Yes
         }
 
@@ -103,10 +73,6 @@ mod host {
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            init_krun()?;
-            #[cfg(feature = "dynamic-linking")]
-            require_symbols().unwrap();
-
             let root_dir = setup_rootfs(&test_setup)?;
             let init_config = build_init_config(&test_setup.test_case, &[]);
 
@@ -149,10 +115,9 @@ mod host {
                 .build()
                 .map_err(|e| anyhow::anyhow!("VmmBuilder::build: {e:?}"))?;
 
-            let handle = SendHandle(
-                vmm.handle()
-                    .map_err(|e| anyhow::anyhow!("vmm.handle: {e:?}"))?,
-            );
+            let handle = vmm
+                .handle()
+                .map_err(|e| anyhow::anyhow!("vmm.handle: {e:?}"))?;
 
             let marker = test_setup.tmp_dir.join("resumed");
             std::thread::spawn(move || {
