@@ -118,6 +118,9 @@ pub struct VmResources {
     pub reset_exit_code: Option<u8>,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
+    /// Whether to ask for transparent huge pages for guest memory (Linux).
+    #[cfg(target_os = "linux")]
+    pub transparent_huge_pages: bool,
     /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
     /// discovered via the kernel command line and SMP uses the MP table.
     pub acpi_enabled: bool,
@@ -271,6 +274,8 @@ mod tests {
             nested_enabled: false,
             reset_exit_code: None,
             split_irqchip: false,
+            #[cfg(target_os = "linux")]
+            transparent_huge_pages: false,
             acpi_enabled: false,
             serial_consoles: Vec::new(),
             kernel_console: None,
