@@ -40,6 +40,16 @@ pub struct UnixProxy {
     pub(crate) control_port: u32,
     pub(crate) peer_shutdown: u32,
     pub(crate) host_read_closed: bool,
+    /// Guest data the host socket did not take yet. The guest can't send more than
+    /// the credit we return as we write, so this stays below `CONN_TX_BUF_SIZE`.
+    pub(crate) pending_tx: Vec<u8>,
+    /// The guest shut down its send side while `pending_tx` still had data.
+    /// Only the unix side buffers writes for the host.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub(crate) shutdown_write_pending: bool,
+    /// The guest shut down both sides while `pending_tx` still had data: the
+    /// connection closes once that data is written.
+    pub(crate) close_after_flush: bool,
     pub(crate) peer_fwd_cnt: Wrapping<u32>,
     pub(crate) peer_buf_alloc: u32,
     pub(crate) tx_cnt: Wrapping<u32>,
@@ -49,6 +59,15 @@ pub struct UnixProxy {
 }
 
 impl UnixProxy {
+    /// Resets the guest side and lets the muxer remove this connection.
+    pub(crate) fn close(&mut self) -> ProxyUpdate {
+        self.push_reset();
+        let mut update = self.release();
+        update.polling = Some((self.id, self.as_raw_fd(), EventSet::empty()));
+        update.signal_queue = true;
+        update
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u64,
@@ -75,6 +94,9 @@ impl UnixProxy {
             control_port,
             peer_shutdown: 0,
             host_read_closed: false,
+            pending_tx: Vec::new(),
+            shutdown_write_pending: false,
+            close_after_flush: false,
             peer_fwd_cnt: Wrapping(0),
             peer_buf_alloc: 0,
             tx_cnt: Wrapping(0),
@@ -104,6 +126,9 @@ impl UnixProxy {
             control_port: 0,
             peer_shutdown: 0,
             host_read_closed: false,
+            pending_tx: Vec::new(),
+            shutdown_write_pending: false,
+            close_after_flush: false,
             fd,
             status: ProxyStatus::ReverseInit,
             mem,
@@ -292,12 +317,16 @@ impl Proxy for UnixProxy {
             return ProxyUpdate::default();
         }
 
-        self.push_reset();
-        let mut update = self.release();
         self.status = ProxyStatus::Closed;
-        update.polling = Some((self.id, self.as_raw_fd(), EventSet::empty()));
-        update.signal_queue = true;
-        update
+        if !self.pending_tx.is_empty() {
+            // Data the guest already sent still has to reach the host.
+            self.close_after_flush = true;
+            return ProxyUpdate {
+                polling: Some((self.id, self.as_raw_fd(), EventSet::OUT)),
+                ..Default::default()
+            };
+        }
+        self.close()
     }
 
     fn release(&mut self) -> ProxyUpdate {
