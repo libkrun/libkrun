@@ -8,42 +8,25 @@ pub struct TestVirtioBlkIrq {
 mod host {
     use super::*;
     #[cfg(feature = "dynamic-linking")]
-    use krun::DeviceManager;
+    use krun::{DeviceManager, ffi::Symbol};
 
     use std::fs::File;
 
-    use crate::common::{build_init_config, init_krun, setup_standard_devices};
+    use crate::common::{build_init_config, setup_standard_devices};
     use crate::{ShouldRun, Test, TestSetup};
 
     const DISK_SIZE: u64 = 1024 * 1024 * 1024;
 
-    #[cfg(feature = "dynamic-linking")]
-    fn require_symbols() -> Result<(), libloading::Error> {
-        crate::common::require_vm_symbols()?;
-        krun::require(
-            None,
-            &[
-                krun::Symbol::KrunBlockDeviceNew,
-                krun::Symbol::KrunBlockDeviceDestroy,
-                krun::Symbol::KrunVmmBuilderAcpi,
-            ],
-        )
-    }
-
     impl Test for TestVirtioBlkIrq {
         fn should_run(&self) -> ShouldRun {
             #[cfg(feature = "dynamic-linking")]
-            if require_symbols().is_err() {
+            if !Symbol::KrunBlockDeviceNew.is_available() {
                 return ShouldRun::No("feature not enabled in this libkrun build");
             }
             ShouldRun::Yes
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            init_krun()?;
-            #[cfg(feature = "dynamic-linking")]
-            require_symbols().unwrap();
-
             let disk_path = test_setup.tmp_dir.join("disk.raw");
             File::create(&disk_path)?.set_len(DISK_SIZE)?;
 

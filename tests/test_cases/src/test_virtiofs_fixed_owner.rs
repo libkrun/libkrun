@@ -15,38 +15,18 @@ mod host {
 
     use std::fs;
 
-    use crate::common::{build_and_run, build_init_config, init_krun, setup_rootfs};
+    use crate::common::{build_and_run, build_init_config, setup_rootfs};
     use crate::{ShouldRun, Test, TestOutcome, TestSetup};
-
-    #[cfg(feature = "dynamic-linking")]
-    fn require_symbols() -> Result<(), libloading::Error> {
-        crate::common::require_vm_symbols()?;
-        krun::require(
-            None,
-            &[
-                krun::Symbol::KrunFsDeviceSetPermissionSemantics,
-                krun::Symbol::KrunFsDeviceSetFixedOwner,
-            ],
-        )
-    }
 
     impl Test for TestVirtiofsFixedOwner {
         fn should_run(&self) -> ShouldRun {
             if !cfg!(target_os = "macos") {
                 return ShouldRun::No("a fixed owner takes effect on macOS hosts only");
             }
-            #[cfg(feature = "dynamic-linking")]
-            if require_symbols().is_err() {
-                return ShouldRun::No("krun_fs_device_set_fixed_owner not available");
-            }
             ShouldRun::Yes
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            #[cfg(feature = "dynamic-linking")]
-            require_symbols().unwrap();
-            init_krun()?;
-
             let root_dir = setup_rootfs(&test_setup)?;
             fs::write(root_dir.join(HOST_FILE), b"from the host")?;
 
@@ -61,6 +41,7 @@ mod host {
                 "set_fixed_owner must fail outside LinuxSimplifiedFixedOwner"
             );
 
+            let init_config = build_init_config(&test_setup.test_case, &[]);
             let mut rootfs = krun::FsDevice::new("/dev/root", root_path)
                 .map_err(|e| anyhow::anyhow!("FsDevice::new: {e:?}"))?;
             rootfs
@@ -70,7 +51,6 @@ mod host {
                 .set_fixed_owner(OWNER_UID, OWNER_GID)
                 .map_err(|e| anyhow::anyhow!("set_fixed_owner: {e:?}"))?;
 
-            let init_config = build_init_config(&test_setup.test_case, &[]);
             let mut payload =
                 krun::Payload::load_krunfw().map_err(|e| anyhow::anyhow!("load_krunfw: {e:?}"))?;
             let mut overlay = krun::FsOverlay::new();
