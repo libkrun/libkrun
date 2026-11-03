@@ -303,6 +303,18 @@ typedef KrunResult (*krun_fs_device_set_fixed_owner_fn)(KrunFsDevice handle, uin
  */
 KrunResult krun_fs_device_set_cache_policy(KrunFsDevice handle, uint32_t policy, KrunError* err_out);
 typedef KrunResult (*krun_fs_device_set_cache_policy_fn)(KrunFsDevice handle, uint32_t policy, KrunError* err_out);
+/**
+ * Set how long the guest may cache lookups and attributes, before attaching this device.
+ *
+ * Both default to 5000 ms. Files changed outside the guest can look stale until the
+ * timeouts expire: a file that grew on the host is read with its old size. Use 0 for
+ * directories the host modifies while the guest uses them, at the cost of one more
+ * request to the server per lookup or attribute read. With `LinuxSimplified`
+ * attributes are never cached, and `attr_timeout_ms` applies again after switching to
+ * another mode. A NullFs device has no host-backed entries and returns `InvalidParam`.
+ */
+KrunResult krun_fs_device_set_cache_timeouts(KrunFsDevice handle, uint32_t entry_timeout_ms, uint32_t attr_timeout_ms, KrunError* err_out);
+typedef KrunResult (*krun_fs_device_set_cache_timeouts_fn)(KrunFsDevice handle, uint32_t entry_timeout_ms, uint32_t attr_timeout_ms, KrunError* err_out);
 void krun_fs_device_destroy(KrunFsDevice handle);
 typedef void (*krun_fs_device_destroy_fn)(KrunFsDevice handle);
 
