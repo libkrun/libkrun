@@ -77,6 +77,12 @@ The caller must ensure its guest kernel supports virtio-rtc before enabling it.
 - `payload(payload)`: The configured boot payload.
 - `devices(device_manager)`: The registered MMIO devices.
 - `split_irqchip(enabled)`: Configures interrupt controller mode on x86_64.
+- `invariant_tsc(enabled)`: Exposes the host's invariant TSC capability to x86_64
+  guests when supported by KVM or WHP. Disabled by default, allowing Linux guests
+  to prefer a paravirtual clock. Opt in with `invariant_tsc(true)?` (C API:
+  `krun_vmm_builder_invariant_tsc()`) to allow the guest to select TSC as its
+  clocksource. This controls CPUID.80000007H:EDX[8]; it does not stop the TSC
+  during a VM pause. Enabling it on other architectures returns `InvalidParam`.
 
 ## 5. Execution & Control
 

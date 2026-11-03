@@ -32,6 +32,7 @@ pub struct VmmBuilder<'a> {
     kernel_console: Option<String>,
     nested_virt: bool,
     reset_exit_code: Option<u8>,
+    invariant_tsc: bool,
     split_irqchip: bool,
     acpi: bool,
     smbios_oem_strings: Vec<String>,
@@ -117,6 +118,19 @@ impl<'a> VmmBuilder<'a> {
     pub fn reset_exit_code(mut self, code: u8) -> Self {
         self.reset_exit_code = Some(code);
         self
+    }
+
+    /// Expose the host's invariant TSC capability to x86_64 guests.
+    ///
+    /// Disabled by default so Linux guests can prefer a paravirtual clock.
+    /// Enabling this preserves backend support for CPUID.80000007H:EDX[8];
+    /// it does not add support when the host lacks it.
+    pub fn invariant_tsc(mut self, enabled: bool) -> Result<Self, VmmError> {
+        if enabled && !cfg!(target_arch = "x86_64") {
+            return Err(VmmError::InvalidParam());
+        }
+        self.invariant_tsc = enabled;
+        Ok(self)
     }
 
     pub fn split_irqchip(mut self, enabled: bool) -> Result<Self, VmmError> {
@@ -428,6 +442,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
 
     vm_resources.nested_enabled = builder_cfg.nested_virt;
     vm_resources.reset_exit_code = builder_cfg.reset_exit_code;
+    vm_resources.invariant_tsc = builder_cfg.invariant_tsc;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
     vm_resources.acpi_enabled = builder_cfg.acpi;
     if !builder_cfg.smbios_oem_strings.is_empty() {

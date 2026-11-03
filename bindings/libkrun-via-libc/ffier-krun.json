@@ -1855,6 +1855,33 @@
           "ffi_name": "krun_vmm_builder_reset_exit_code"
         },
         {
+          "name": "invariant_tsc",
+          "doc": [
+            " Expose the host's invariant TSC capability to x86_64 guests.",
+            "",
+            " Disabled by default so Linux guests can prefer a paravirtual clock.",
+            " Enabling this preserves backend support for CPUID.80000007H:EDX[8];",
+            " it does not add support when the host lacks it."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "enabled",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vmm_builder_invariant_tsc"
+        },
+        {
           "name": "split_irqchip",
           "receiver": "value",
           "params": [
