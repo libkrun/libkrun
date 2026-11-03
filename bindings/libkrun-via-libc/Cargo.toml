@@ -1,0 +1,31 @@
+[package]
+name = "libkrun-via-libc"
+version = "2.0.0-dev"
+edition = "2024"
+description = "Rust client for libkrun (links libkrun.so)"
+license = "Apache-2.0"
+build = "build.rs"
+
+[features]
+# The linking mode has no default: the consuming application has to choose.
+# Enabling neither is a compile error in the generated client.
+ffier-dynlookup = ["dep:libloading"]
+ffier-strong = []
+# Mirror the libkrun build features that gate exported API. They select the
+# generated client's signatures and enable optional symbols in dynamic lookup.
+blk = []
+net = []
+gpu = []
+input = []
+vhost-user = []
+tee = []
+aws-nitro = []
+
+[build-dependencies]
+ffier-gen-rust-client = { git = "https://github.com/mtjhrc/ffier.git", tag = "v0.3.0" }
+pkg-config = "0.3"
+
+[dependencies]
+bitflags = "2"
+ffier = { git = "https://github.com/mtjhrc/ffier.git", tag = "v0.3.0" }
+libloading = { version = "0.8", optional = true }

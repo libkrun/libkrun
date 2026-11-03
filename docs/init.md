@@ -36,15 +36,16 @@ At startup, `init-binary`:
 
 ### 3. Cross-Crate Symbol Resolution
 
-When `krun-init-blob` is consumed as a standalone shared library (`libkrun_init.so`) or built with `feature = "ffi-client"`:
-- It interacts with `libkrun` without compile-time linkage by using foreign handle types (`FsOverlay`, `Payload`) from `krun-via-cdylib-weak`.
-- In `Config::apply`, `init-blob` dynamically resolves required `libkrun` functions (such as `krun_fs_overlay_add_file` and `krun_payload_append_cmdline`) from the process's global symbol table (`RTLD_DEFAULT`) using `krun_via_cdylib_weak::require()`.
-- Callers can also supply an explicit `dlopen` library handle via `Config::apply_in`.
-- When built with `feature = "direct"` (e.g. in-tree static Rust builds), `init-blob` links directly against `krun::FsOverlay` and `krun::Payload` types without dynamic symbol lookups.
+When `krun-init-blob` is consumed as a standalone shared library (`libkrun_init.so`) or built with `feature = "ffi"`:
+- It interacts with `libkrun` without compile-time linkage by using foreign handle types (`FsOverlay`, `Payload`) from `libkrun-via-libc`.
+- In `Config::apply`, `init-blob` dynamically resolves required `libkrun` functions (such as `krun_fs_overlay_add_file` and `krun_payload_append_cmdline`) from the process's global symbol table by default using `libkrun_via_libc::ffi::require()`.
+- When built with `feature = "krun"` (the default, e.g. in-tree static Rust builds), `init-blob` links directly against `krun::FsOverlay` and `krun::Payload` types without dynamic symbol lookups.
 
-### 4. `bindings/init-blob-via-cdylib` (Strongly Linked Rust Client)
+The `krun` and `ffi` backends are mutually exclusive; shared-library builds use `--no-default-features` to disable `krun`.
 
-Provides a Rust client linked against `libkrun_init.so`. The client code is generated at build time from `bindings/init-blob-via-cdylib/ffier-krun_init.json` using `ffier-gen-rust-client`. `libkrun_init.so` must be available at link time and runtime; the weak runtime symbol resolution described above applies to `libkrun` calls made by `init-blob`, not to this client.
+### 4. `bindings/init-blob-via-cdylib` (Rust Client)
+
+Provides a Rust client for `libkrun_init.so`, generated at build time from `bindings/init-blob-via-cdylib/ffier-krun_init.json` using `ffier-gen-rust-client`. With `ffier-strong`, the library must be available at link time and runtime; `ffier-dynlookup` resolves its symbols at runtime.
 
 ### 5. `init/aws-nitro` (AWS Nitro Enclaves Init)
 

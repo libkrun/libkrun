@@ -11,14 +11,19 @@ build = "build.rs"
 amd-sev = []
 tdx = []
 timesync = []
-ffi = ["ffi-client"]
-direct = ["dep:krun"]
-ffi-client = ["dep:krun-via-cdylib-weak"]
+default = ["krun"]
+# `krun` links libkrun and uses its Rust types directly, which is what an
+# in-tree consumer wants. It is implicit from the optional dependency, so
+# building the cdylib passes --no-default-features to leave it out.
+#
+# `ffi` replaces those types with the generated client. The linking mode of
+# that client is the final binary's choice, so nothing is selected here.
+ffi = ["dep:libkrun-via-libc"]
 
 [dependencies]
-ffier = { git = "https://github.com/mtjhrc/ffier.git", tag = "0.2.0rc1" }
+ffier = { workspace = true }
 krun = { path = "../../src/libkrun", package = "libkrun", optional = true }
-krun-via-cdylib-weak = { path = "../../bindings/libkrun-via-cdylib-weak", optional = true }
+libkrun-via-libc = { path = "../../bindings/libkrun-via-libc", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

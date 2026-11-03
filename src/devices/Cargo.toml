@@ -26,7 +26,7 @@ ffi = ["dep:ffier"]
 [dependencies]
 bitflags = "1.2.0"
 crossbeam-channel = ">=0.5.15"
-ffier = { git = "https://github.com/mtjhrc/ffier.git", tag = "0.2.0rc1", optional = true }
+ffier = { workspace = true, optional = true }
 libc = ">=0.2.39"
 libloading = "0.8"
 log = "0.4.0"
