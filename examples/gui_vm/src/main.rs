@@ -15,14 +15,11 @@ use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;
-use std::sync::{LazyLock, OnceLock};
+use std::sync::LazyLock;
 use std::thread;
 
 use anyhow::Context;
 use krun::{DeviceManager, VirglRendererFlags};
-use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
-
-static LIBKRUN: OnceLock<Library> = OnceLock::new();
 
 #[derive(Debug, Copy, Clone)]
 pub enum PhysicalSize {
@@ -116,80 +113,11 @@ struct Args {
     vhost_user_gpu: Option<PathBuf>,
 }
 
-/// Load libkrun and resolve the symbols this example needs from its namespace.
-fn load_krun() -> anyhow::Result<()> {
-    LIBKRUN.get_or_init(|| {
-        let name = if cfg!(target_os = "macos") {
-            "libkrun.dylib"
-        } else {
-            "libkrun.so"
-        };
-        unsafe { Library::open(Some(name), RTLD_NOW | RTLD_GLOBAL) }
-            .expect("failed to dlopen libkrun")
-    });
-
-    use krun::Symbol::*;
-    let mut symbols = vec![
-        KrunInitLog,
-        KrunErrorResult,
-        KrunErrorMessage,
-        KrunErrorDestroy,
-        KrunMmioDeviceManagerNew,
-        KrunMmioDeviceManagerAdd,
-        KrunMmioDeviceManagerDestroy,
-        KrunFsDeviceNew,
-        KrunFsDeviceSetOverlay,
-        KrunFsDeviceDestroy,
-        KrunFsOverlayNew,
-        KrunFsOverlayDestroy,
-        KrunConsoleDeviceBuilder,
-        KrunConsoleBuilderAddDefaultConsole,
-        KrunConsoleBuilderBuild,
-        KrunConsoleBuilderDestroy,
-        KrunConsoleDeviceDestroy,
-        KrunPayloadLoadKrunfw,
-        KrunPayloadDestroy,
-        KrunDisplayBackendNew,
-        KrunDisplayBackendAddDisplay,
-        KrunDisplayBackendDestroy,
-        KrunDisplayInfoBuilderNew,
-        KrunDisplayInfoBuilderDestroy,
-        KrunDisplayInfoBuilderDpi,
-        KrunDisplayInfoBuilderPhysicalSize,
-        KrunDisplayInfoBuilderRefreshRate,
-        KrunGpuDeviceNew,
-        KrunGpuDeviceDestroy,
-        KrunInputDeviceNew,
-        KrunInputDeviceNewFromFd,
-        KrunInputDeviceDestroy,
-        KrunVmmBuilderNew,
-        KrunVmmBuilderVcpus,
-        KrunVmmBuilderRamMib,
-        KrunVmmBuilderPayload,
-        KrunVmmBuilderDevices,
-        KrunVmmBuilderBuild,
-        KrunVmmBuilderDestroy,
-        KrunVmmDestroy,
-        KrunVmmRun,
-    ];
-    #[cfg(target_os = "linux")]
-    symbols.extend([
-        KrunVhostUserDeviceNew,
-        KrunVhostUserDeviceSetDisplayBackend,
-        KrunVhostUserDeviceDestroy,
-    ]);
-    krun::require(None, &symbols).context("failed to load libkrun symbols")?;
-
-    Ok(())
-}
-
 fn krun_thread(
     args: &Args,
     display_backend_handle: DisplayBackendHandle,
     input_device_handles: Vec<InputBackendHandle>,
 ) -> anyhow::Result<()> {
-    load_krun()?;
-
     let (target, level, style) = if let Some(path) = &args.color_log {
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -212,18 +140,19 @@ fn krun_thread(
         .root_dir
         .to_str()
         .context("root_dir must be valid UTF-8")?;
+    // The overlay borrows this config, so it must outlive the FsDevice.
+    let exec = args.executable.as_ref().unwrap().to_str().unwrap();
+    let argv_strs: Vec<&str> = args.argv.iter().map(|a| a.to_str().unwrap()).collect();
+    let mut full_argv: Vec<&str> = vec![exec];
+    full_argv.extend_from_slice(&argv_strs);
+    let init_config = krun_init::Config::builder().args(&full_argv).build();
+
     let mut rootfs = krun::FsDevice::new("/dev/root", root_dir)
         .map_err(|e| anyhow::anyhow!("FsDevice::new: {e}"))?;
 
     let mut payload =
         krun::Payload::load_krunfw().map_err(|e| anyhow::anyhow!("load_krunfw: {e}"))?;
 
-    // Build init configuration.
-    let exec = args.executable.as_ref().unwrap().to_str().unwrap();
-    let argv_strs: Vec<&str> = args.argv.iter().map(|a| a.to_str().unwrap()).collect();
-    let mut full_argv: Vec<&str> = vec![exec];
-    full_argv.extend_from_slice(&argv_strs);
-    let init_config = krun_init::Config::builder().args(&full_argv).build();
     let mut overlay = krun::FsOverlay::new();
     init_config
         .apply(&mut overlay, &mut payload)

@@ -1,11 +1,18 @@
 pub static INIT_BINARY: &[u8] = include_bytes!(env!("KRUN_INIT_BINARY_PATH"));
 
+#[cfg(all(feature = "ffi", feature = "krun"))]
+compile_error!(
+    "`ffi` and `krun` are alternative backends: `ffi` reaches libkrun through the \
+     generated client, `krun` uses its Rust types directly"
+);
+
+#[cfg(not(any(feature = "ffi", feature = "krun")))]
+compile_error!("enable `ffi` or `krun` to choose how this crate reaches libkrun");
+
 pub mod config;
 pub(crate) mod init_schema;
 pub(crate) mod oci_schema;
-#[cfg(any(feature = "direct", feature = "ffi-client"))]
-pub use config::ApplyError;
-pub use config::{Builder, Config, ConfigError, INIT_PATH, KERNEL_INIT_ARG};
+pub use config::{ApplyError, Builder, Config, ConfigError, INIT_PATH, KERNEL_INIT_ARG};
 pub use init_schema::Mount;
 
 #[cfg(feature = "ffi")]

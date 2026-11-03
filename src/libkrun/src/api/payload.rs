@@ -5,8 +5,6 @@ pub use crate::vmm::vmm_config::external_kernel::KernelFormat;
 
 #[cfg(feature = "aws-nitro")]
 use crate::NitroConfig;
-#[cfg(all(feature = "ffi", not(feature = "aws-nitro")))]
-type NitroConfig = (); // placeholder for ffier parsing
 
 pub(crate) enum PayloadKind {
     Kernel {

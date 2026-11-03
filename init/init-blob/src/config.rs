@@ -13,11 +13,11 @@ use crate::oci_schema::OciSchema;
 #[cfg(feature = "ffi")]
 use crate::{FfiBorrow, FfiType};
 
-#[cfg(feature = "direct")]
+#[cfg(feature = "krun")]
 pub type VmmError = krun::VmmError;
 
-#[cfg(all(feature = "ffi-client", not(feature = "direct")))]
-pub type VmmError = krun_via_cdylib_weak::VmmError;
+#[cfg(feature = "ffi")]
+pub type VmmError = libkrun_via_libc::VmmError;
 
 /// Error type for init configuration operations.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -31,7 +31,7 @@ pub enum ConfigError {
 }
 
 /// Error returned by [`Config::apply`].
-#[cfg(any(feature = "direct", feature = "ffi-client"))]
+#[cfg(any(feature = "krun", feature = "ffi"))]
 #[derive(Debug, thiserror::Error)]
 #[cfg_attr(feature = "ffi", derive(ffier::FfiError))]
 #[non_exhaustive]
@@ -53,7 +53,6 @@ pub const INIT_PATH: &str = "/init.krun";
 pub const KERNEL_INIT_ARG: &str = "init=/init.krun";
 
 /// A file that the init process expects to find on the guest root filesystem.
-#[cfg_attr(not(any(feature = "direct", feature = "ffi-client")), allow(dead_code))]
 pub(crate) struct GuestFile {
     pub path: &'static str,
     pub data: Cow<'static, [u8]>,
@@ -66,10 +65,10 @@ pub(crate) struct GuestFile {
 /// Holds the init binary and serialized config JSON as guest files.
 /// The caller **must keep this value alive for the entire lifetime of the VM**.
 pub struct Config {
-    #[cfg_attr(not(any(feature = "direct", feature = "ffi-client")), allow(dead_code))]
     files: Vec<GuestFile>,
 }
 
+#[cfg(feature = "ffi")]
 #[cfg_attr(feature = "ffi", ffier::export)]
 impl Config {
     /// Start building a new init configuration.
@@ -85,43 +84,17 @@ impl Config {
     /// The caller must keep this `Config` (or `KrunInitConfig`) alive for the
     /// entire lifetime of the VM; `apply` borrows data pointers that remain
     /// referenced until the VM exits.
-    ///
-    /// Symbols are loaded from the global namespace (`RTLD_DEFAULT`).
-    #[cfg(feature = "ffi-client")]
     pub fn apply<'a>(
         &'a self,
-        #[cfg_attr(feature = "ffi", ffier(foreign = krun_via_cdylib_weak, c_name = "KrunFsOverlay"))]
-        overlay: &mut krun_via_cdylib_weak::FsOverlay<'a>,
-        #[cfg_attr(feature = "ffi", ffier(foreign = krun_via_cdylib_weak, c_name = "KrunPayload"))]
-        payload: &mut krun_via_cdylib_weak::Payload,
+        #[ffier(foreign = ::libkrun_via_libc, c_name = "KrunFsOverlay")]
+        overlay: &mut libkrun_via_libc::FsOverlay<'a>,
+        #[ffier(foreign = ::libkrun_via_libc, c_name = "KrunPayload")]
+        payload: &mut libkrun_via_libc::Payload,
     ) -> Result<(), ApplyError> {
-        self.apply_in(core::ptr::null_mut(), overlay, payload)
-    }
-
-    /// Like [`apply`](Self::apply), but loads symbols from a specific library
-    /// handle (e.g. from `dlopen`). Pass null for `RTLD_DEFAULT`.
-    ///
-    /// - If `lib_handle` is non-null it must be a valid handle returned by
-    ///   `dlopen` (or equivalent) that remains open for the duration of
-    ///   this call.
-    /// - The caller must keep this `Config` (or `KrunInitConfig`) alive for the
-    ///   entire lifetime of the VM.
-    #[cfg(feature = "ffi-client")]
-    pub fn apply_in<'a>(
-        &'a self,
-        lib_handle: *mut core::ffi::c_void,
-        #[cfg_attr(feature = "ffi", ffier(foreign = krun_via_cdylib_weak, c_name = "KrunFsOverlay"))]
-        overlay: &mut krun_via_cdylib_weak::FsOverlay<'a>,
-        #[cfg_attr(feature = "ffi", ffier(foreign = krun_via_cdylib_weak, c_name = "KrunPayload"))]
-        payload: &mut krun_via_cdylib_weak::Payload,
-    ) -> Result<(), ApplyError> {
-        krun_via_cdylib_weak::require(
-            core::ptr::NonNull::new(lib_handle),
-            &[
-                krun_via_cdylib_weak::Symbol::KrunFsOverlayAddFile,
-                krun_via_cdylib_weak::Symbol::KrunPayloadAppendCmdline,
-            ],
-        )
+        libkrun_via_libc::ffi::require(&[
+            libkrun_via_libc::ffi::Symbol::KrunFsOverlayAddFile,
+            libkrun_via_libc::ffi::Symbol::KrunPayloadAppendCmdline,
+        ])
         .map_err(|e| ApplyError::SymbolNotFound(e.to_string().into()))?;
 
         for file in &self.files {
@@ -134,8 +107,13 @@ impl Config {
     }
 }
 
-#[cfg(feature = "direct")]
+#[cfg(all(not(feature = "ffi"), feature = "krun"))]
 impl Config {
+    /// Start building a new init configuration.
+    pub fn builder() -> Builder {
+        Builder::default()
+    }
+
     /// Apply this init configuration using statically-linked libkrun types.
     ///
     /// The caller must keep this `Config` alive for the entire lifetime of the VM.
