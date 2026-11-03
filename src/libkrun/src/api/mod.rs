@@ -155,7 +155,7 @@ ffier::library_definition!("krun", library_tag = 1,
     enum devices::virtio::fs::PermissionSemantics,
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     enum devices::virtio::fs::CachePolicy,
-    fn crate::api::logging::init_log,
+    fn crate::api::logging::init_log_fn::init_log,
     fn crate::api::vmm_builder::check_nested_virt,
     bitflags crate::api::logging::LogOptions,
     bitflags crate::api::device_builders::TsiFlags,

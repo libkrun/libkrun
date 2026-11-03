@@ -1,14 +1,4 @@
 use std::fmt;
-#[cfg(windows)]
-use std::fs::File;
-use std::io::{self, Write};
-
-#[cfg(not(target_os = "windows"))]
-use std::os::fd::BorrowedFd;
-#[cfg(windows)]
-use std::os::windows::io::BorrowedHandle;
-
-use env_logger::Env;
 
 use super::error::VmmError;
 use super::export_bitflags;
@@ -80,107 +70,114 @@ export_bitflags! {
     }
 }
 
-#[cfg(unix)]
+/// Platform-specific [`init_log`] signatures.
+///
+/// The log target is a Unix file descriptor on Unix and an owned Windows
+/// handle elsewhere, so the two variants cannot share one signature. Exporting
+/// them from one inline module keeps both in the schema: ffier groups the
+/// variants by function name and gates each one with its own `#[cfg]`.
 #[cfg_attr(feature = "ffi", ffier::export)]
-pub fn init_log(
-    target: Option<BorrowedFd<'static>>,
-    level: LogLevel,
-    style: LogStyle,
-    options: LogOptions,
-) -> Result<(), VmmError> {
-    struct FdWriter(BorrowedFd<'static>);
+pub(crate) mod init_log_fn {
+    #[cfg(unix)]
+    pub fn init_log(
+        target: Option<std::os::fd::BorrowedFd<'static>>,
+        level: super::LogLevel,
+        style: super::LogStyle,
+        options: super::LogOptions,
+    ) -> Result<(), super::VmmError> {
+        struct FdWriter(std::os::fd::BorrowedFd<'static>);
 
-    impl Write for FdWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            nix::unistd::write(self.0, buf).map_err(io::Error::from)
+        impl std::io::Write for FdWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                nix::unistd::write(self.0, buf).map_err(std::io::Error::from)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
 
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
+        let target = match target {
+            None => env_logger::Target::default(),
+            Some(fd) => env_logger::Target::Pipe(Box::new(FdWriter(fd))),
+        };
+
+        let filter = level.as_str();
+        let write_style = style.as_str();
+
+        let mut builder = if options.contains(super::LogOptions::NO_ENV) {
+            let mut builder = env_logger::Builder::new();
+            builder.parse_filters(filter).parse_write_style(write_style);
+            builder
+        } else {
+            env_logger::Builder::from_env(
+                env_logger::Env::new()
+                    .default_filter_or(filter)
+                    .default_write_style_or(write_style),
+            )
+        };
+        builder
+            .format_timestamp_micros()
+            .target(target)
+            .try_init()
+            .map_err(|e| super::VmmError::Internal(format!("logger init: {e}")))?;
+
+        Ok(())
     }
 
-    let target = match target {
-        None => env_logger::Target::default(),
-        Some(fd) => env_logger::Target::Pipe(Box::new(FdWriter(fd))),
-    };
+    #[cfg(windows)]
+    pub fn init_log(
+        target: Option<std::os::windows::io::BorrowedHandle<'static>>,
+        level: super::LogLevel,
+        style: super::LogStyle,
+        options: super::LogOptions,
+    ) -> Result<(), super::VmmError> {
+        struct FdWriter(std::fs::File);
 
-    let filter = level.as_str();
-    let write_style = style.as_str();
+        impl std::io::Write for FdWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.write(buf)
+            }
 
-    let mut builder = if options.contains(LogOptions::NO_ENV) {
-        let mut builder = env_logger::Builder::new();
-        builder.parse_filters(filter).parse_write_style(write_style);
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.flush()
+            }
+        }
+
+        let target = match target {
+            None => env_logger::Target::default(),
+            Some(handle) => {
+                // Converts BorrowedHandle into an owned File handle without taking ownership
+                // or closing the underlying OS handle when dropped.
+                let file = std::fs::File::from(handle.try_clone_to_owned().map_err(|e| {
+                    super::VmmError::Internal(format!("failed to clone handle: {e}"))
+                })?);
+                env_logger::Target::Pipe(Box::new(FdWriter(file)))
+            }
+        };
+
+        let filter = level.as_str();
+        let write_style = style.as_str();
+
+        let mut builder = if options.contains(super::LogOptions::NO_ENV) {
+            let mut builder = env_logger::Builder::new();
+            builder.parse_filters(filter).parse_write_style(write_style);
+            builder
+        } else {
+            env_logger::Builder::from_env(
+                env_logger::Env::new()
+                    .default_filter_or(filter)
+                    .default_write_style_or(write_style),
+            )
+        };
         builder
-    } else {
-        env_logger::Builder::from_env(
-            Env::new()
-                .default_filter_or(filter)
-                .default_write_style_or(write_style),
-        )
-    };
-    builder
-        .format_timestamp_micros()
-        .target(target)
-        .try_init()
-        .map_err(|e| VmmError::Internal(format!("logger init: {e}")))?;
+            .format_timestamp_micros()
+            .target(target)
+            .try_init()
+            .map_err(|e| super::VmmError::Internal(format!("logger init: {e}")))?;
 
-    Ok(())
-}
-
-#[cfg(windows)]
-#[cfg_attr(feature = "ffi", ffier::export)]
-pub fn init_log(
-    target: Option<BorrowedHandle<'static>>,
-    level: LogLevel,
-    style: LogStyle,
-    options: LogOptions,
-) -> Result<(), VmmError> {
-    struct FdWriter(File);
-
-    impl Write for FdWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.write(buf)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.0.flush()
-        }
+        Ok(())
     }
-
-    let target = match target {
-        None => env_logger::Target::default(),
-        Some(handle) => {
-            // Converts BorrowedHandle into an owned File handle without taking ownership
-            // or closing the underlying OS handle when dropped.
-            let file = File::from(
-                handle
-                    .try_clone_to_owned()
-                    .map_err(|e| VmmError::Internal(format!("failed to clone handle: {e}")))?,
-            );
-            env_logger::Target::Pipe(Box::new(FdWriter(file)))
-        }
-    };
-
-    let filter = level.as_str();
-    let write_style = style.as_str();
-
-    let mut builder = if options.contains(LogOptions::NO_ENV) {
-        let mut builder = env_logger::Builder::new();
-        builder.parse_filters(filter).parse_write_style(write_style);
-        builder
-    } else {
-        env_logger::Builder::from_env(
-            Env::new()
-                .default_filter_or(filter)
-                .default_write_style_or(write_style),
-        )
-    };
-    builder
-        .format_timestamp_micros()
-        .target(target)
-        .try_init()
-        .map_err(|e| VmmError::Internal(format!("logger init: {e}")))?;
-
-    Ok(())
 }
+
+pub use init_log_fn::init_log;
