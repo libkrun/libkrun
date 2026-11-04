@@ -197,6 +197,22 @@ fn get_xattr_common(buf: &[u8]) -> io::Result<(Option<u32>, Option<u32>, Option<
     Ok((uid, gid, mode))
 }
 
+/// Whether the names `list` returns include `XATTR_KEY`. On APFS, asking for a name a file
+/// doesn't have takes several times longer than listing its names, and most files have no
+/// override, so the owner lookups list the names first. If the list fails or doesn't fit, it
+/// answers yes and the caller asks for the value directly.
+fn has_override_xattr(list: impl FnOnce(*mut libc::c_char, usize) -> isize) -> bool {
+    let mut names = [0u8; 1024];
+    let res = list(names.as_mut_ptr().cast(), names.len());
+    if res < 0 {
+        return true;
+    }
+    let key = &XATTR_KEY[..XATTR_KEY.len() - 1];
+    names[..res as usize]
+        .split(|c| *c == 0)
+        .any(|name| name == key)
+}
+
 fn get_xattr_fstat(
     fd: RawFd,
     st: bindings::stat64,
@@ -207,6 +223,9 @@ fn get_xattr_fstat(
     } else {
         0
     };
+    if !has_override_xattr(|names, len| unsafe { libc::flistxattr(fd, names, len, options) }) {
+        return Ok((None, None, None));
+    }
     let res = unsafe {
         libc::fgetxattr(
             fd,
@@ -237,6 +256,11 @@ fn get_xattr_lstat(
     } else {
         0
     };
+    if !has_override_xattr(|names, len| unsafe {
+        libc::listxattr(path.as_ptr(), names, len, options)
+    }) {
+        return Ok((None, None, None));
+    }
     let res = unsafe {
         libc::getxattr(
             path.as_ptr(),
@@ -2838,5 +2862,74 @@ impl FileSystem for PassthroughFs {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn override_of(path: &CString) -> (Option<u32>, Option<u32>, Option<u32>) {
+        let mut st = MaybeUninit::<bindings::stat64>::zeroed();
+        assert_eq!(unsafe { libc::lstat(path.as_ptr(), st.as_mut_ptr()) }, 0);
+        get_xattr_lstat(path, unsafe { st.assume_init() }).unwrap()
+    }
+
+    #[test]
+    fn test_override_xattr_read_only_when_the_file_has_it() {
+        let path = std::env::temp_dir().join(format!("krun-xattr-{}", std::process::id()));
+        File::create(&path).unwrap();
+        let c_path = CString::new(path.to_str().unwrap()).unwrap();
+        let set = |name: &[u8], value: &[u8]| {
+            let res = unsafe {
+                libc::setxattr(
+                    c_path.as_ptr(),
+                    name.as_ptr().cast(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                )
+            };
+            assert_eq!(res, 0);
+        };
+
+        assert_eq!(override_of(&c_path), (None, None, None));
+        // Other names alone don't count.
+        set(b"user.other\0", b"1");
+        assert_eq!(override_of(&c_path), (None, None, None));
+        set(XATTR_KEY, b"1000:1001:0644");
+        assert_eq!(override_of(&c_path), (Some(1000), Some(1001), Some(0o644)));
+
+        let fd = File::open(&path).unwrap();
+        let mut st = MaybeUninit::<bindings::stat64>::zeroed();
+        assert_eq!(unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) }, 0);
+        let st = unsafe { st.assume_init() };
+        assert_eq!(
+            get_xattr_fstat(fd.as_raw_fd(), st).unwrap(),
+            (Some(1000), Some(1001), Some(0o644))
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_has_override_xattr() {
+        let list = |names: &'static [u8]| {
+            move |buf: *mut libc::c_char, len: usize| {
+                assert!(names.len() <= len);
+                unsafe { std::ptr::copy_nonoverlapping(names.as_ptr(), buf.cast(), names.len()) };
+                names.len() as isize
+            }
+        };
+        assert!(!has_override_xattr(list(b"")));
+        assert!(!has_override_xattr(list(b"com.apple.provenance\0")));
+        assert!(!has_override_xattr(list(
+            b"user.containers.override_stat.x\0"
+        )));
+        assert!(has_override_xattr(list(
+            b"com.apple.provenance\0user.containers.override_stat\0"
+        )));
+        // A list that fails or doesn't fit sends the caller to ask directly.
+        assert!(has_override_xattr(|_, _| -1));
     }
 }
