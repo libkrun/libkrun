@@ -346,6 +346,7 @@ pub enum VcpuExit<'a> {
     MmioRead(u64, &'a mut [u8]),
     MmioWrite(u64, &'a [u8]),
     PsciHandled,
+    Reset,
     SecureMonitorCall,
     Shutdown,
     SystemRegister,
@@ -617,7 +618,7 @@ impl HvfVcpu<'_> {
                 Ok(VcpuExit::Shutdown)
             },
             0x8400_0009 /* QEMU_PSCI_0_2_FN_SYSTEM_RESET */ => {
-                Ok(VcpuExit::Shutdown)
+                Ok(VcpuExit::Reset)
             },
             0xc400_0003 /* QEMU_PSCI_0_2_FN64_CPU_ON */ => {
                 let mpidr = self.read_reg(hv_reg_t_HV_REG_X1)?;

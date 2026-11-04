@@ -182,6 +182,8 @@ pub struct VmResources {
     pub smbios_oem_strings: Option<Vec<String>>,
     /// Whether to enable nested virtualization.
     pub nested_enabled: bool,
+    /// The process exit code when the guest resets instead of powering off.
+    pub reset_exit_code: Option<u8>,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// Do not create an implicit console device in the guest
@@ -445,6 +447,7 @@ mod tests {
             console_output: None,
             smbios_oem_strings: None,
             nested_enabled: false,
+            reset_exit_code: None,
             split_irqchip: false,
             disable_implicit_console: false,
             serial_consoles: Vec::new(),

@@ -201,6 +201,9 @@ pub struct Vmm {
 
     vcpus_handles: Vec<VcpuHandle>,
     exit_evt: EventFd,
+    #[cfg(target_arch = "x86_64")]
+    reset_evt: EventFd,
+    reset_exit_code: Option<u8>,
     vm: Vm,
     exit_observers: Vec<Arc<Mutex<dyn VmmExitObserver>>>,
     exit_code: Arc<AtomicI32>,
@@ -376,6 +379,18 @@ impl Vmm {
         }
     }
 
+    /// Stops with `exit_code` unless the guest's init set one, which takes precedence.
+    fn stop_guest(&mut self, exit_code: u8) {
+        let vmm_exit_code = self.exit_code.load(Ordering::SeqCst);
+        if vmm_exit_code != i32::MAX {
+            debug!("using vmm exit code: {vmm_exit_code}");
+            self.stop(vmm_exit_code);
+        } else {
+            debug!("using vcpu exit code: {exit_code}");
+            self.stop(i32::from(exit_code));
+        }
+    }
+
     /// Returns a reference to the inner KVM Vm object.
     pub fn kvm_vm(&self) -> &Vm {
         &self.vm
@@ -427,41 +442,45 @@ impl Subscriber for Vmm {
         let source = event.fd();
         let event_set = event.event_set();
 
+        #[cfg(target_arch = "x86_64")]
+        if source == self.reset_evt.as_raw_fd() && event_set == EventSet::IN {
+            let _ = self.reset_evt.read();
+            info!("i8042 reset");
+            self.stop_guest(self.reset_exit_code.unwrap_or(FC_EXIT_CODE_OK));
+            return;
+        }
+
         if source == self.exit_evt.as_raw_fd() && event_set == EventSet::IN {
             let _ = self.exit_evt.read();
             // Query each vcpu for the exit_code.
-            // If the exit_code can't be found on any vcpu, it means that the exit signal
-            // has been issued by the i8042 controller in which case we exit with
-            // FC_EXIT_CODE_OK.
-            //
-            // The exit code set up by the guest takes preference over the one reported
-            // by either a vcpu or the i8042 controller.
             let vcpu_exit_code = self
                 .vcpus_handles
                 .iter()
                 .find_map(|handle| match handle.response_receiver().try_recv() {
                     Ok(VcpuResponse::Exited(exit_code)) => Some(exit_code),
+                    Ok(VcpuResponse::Reset) => {
+                        Some(self.reset_exit_code.unwrap_or(FC_EXIT_CODE_OK))
+                    }
                     _ => None,
                 })
                 .unwrap_or(FC_EXIT_CODE_OK);
-            let vmm_exit_code = self.exit_code.load(Ordering::SeqCst);
-            let exit_code = if vmm_exit_code != i32::MAX {
-                debug!("using vmm exit code: {vmm_exit_code}");
-                vmm_exit_code
-            } else {
-                debug!("using vcpu exit code: {vcpu_exit_code}");
-                vcpu_exit_code as i32
-            };
-            self.stop(exit_code);
+            self.stop_guest(vcpu_exit_code);
         } else {
             error!("Spurious EventManager event for handler: Vmm");
         }
     }
 
     fn interest_list(&self) -> Vec<EpollEvent> {
-        vec![EpollEvent::new(
+        #[allow(unused_mut)]
+        let mut list = vec![EpollEvent::new(
             EventSet::IN,
             self.exit_evt.as_raw_fd() as u64,
-        )]
+        )];
+        #[cfg(target_arch = "x86_64")]
+        list.push(EpollEvent::new(
+            EventSet::IN,
+            self.reset_evt.as_raw_fd() as u64,
+        ));
+        list
     }
 }
