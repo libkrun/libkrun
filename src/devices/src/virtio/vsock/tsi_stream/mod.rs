@@ -172,7 +172,7 @@ impl TsiStreamProxy {
                         self.rx_cnt += Wrapping(cnt as u32);
                         self.init_data_pkt(&mut pkt);
                         pkt.set_len(cnt as u32);
-                        pkt.hdr().len() + cnt
+                        pkt.finish_rx().unwrap_or(0) as usize
                     }
                     Ok(RecvPkt::Close) => {
                         self.host_read_closed = true;
@@ -180,7 +180,7 @@ impl TsiStreamProxy {
                         pkt.set_op(uapi::VSOCK_OP_SHUTDOWN)
                             .set_flags(uapi::VSOCK_FLAGS_SHUTDOWN_SEND)
                             .set_len(0);
-                        pkt.hdr().len()
+                        pkt.finish_rx().unwrap_or(0) as usize
                     }
                     Ok(RecvPkt::Error) => 0,
                     Err(e) => {

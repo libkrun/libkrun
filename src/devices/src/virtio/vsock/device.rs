@@ -102,7 +102,7 @@ impl Vsock {
             let used_len = match VsockPacket::from_rx_virtq_head(&head) {
                 Ok(mut pkt) => {
                     if self.muxer.recv_pkt(&mut pkt).is_ok() {
-                        pkt.hdr().len() as u32 + pkt.len()
+                        pkt.finish_rx().unwrap_or(0)
                     } else {
                         // We are using a consuming iterator over the virtio buffers, so, if we can't
                         // fill in this buffer, we'll need to undo the last iterator step.
