@@ -1732,6 +1732,20 @@ export_bitflags! {
         pub struct NetFlags: u32 {
             /// Send the vfkit magic handshake on a unixgram socket.
             const VFKIT = 1;
+            /// Keep the 12-byte virtio-net header (`virtio_net_hdr_v1`) in front of
+            /// each frame on a unixgram socket, instead of stripping it on transmit and
+            /// zero-filling it on receive, so the peer can handle segmentation and
+            /// checksum offload.
+            ///
+            /// Unixgram only: the unixstream constructors reject it. It can't be
+            /// combined with `VFKIT`, because the vfkit protocol (gvproxy
+            /// `-listen-vfkit`) expects raw Ethernet frames. The peer must read and
+            /// write `virtio_net_hdr_v1`.
+            ///
+            /// The flag only changes the framing. The guest negotiates offloads only
+            /// if the caller also passes the matching virtio-net feature bits
+            /// (`VIRTIO_NET_F_HOST_TSO4`, `VIRTIO_NET_F_CSUM`, ...) in `features`.
+            const VNET_HDR = 2;
         }
     }
 }
@@ -1747,6 +1761,8 @@ pub struct NetDevice {
 #[cfg(not(target_os = "windows"))]
 impl NetDevice {
     /// Create a net device backed by a Unix datagram socket path.
+    ///
+    /// Fails with `InvalidParam` if `flags` combines `VNET_HDR` and `VFKIT`.
     pub fn new_unixgram_path(
         id: &str,
         path: &str,
@@ -1755,9 +1771,16 @@ impl NetDevice {
         flags: NetFlags,
     ) -> Result<Self, VmmError> {
         use devices::virtio::net::device::VirtioNetBackend;
+        if flags.contains(NetFlags::VNET_HDR | NetFlags::VFKIT) {
+            return Err(VmmError::InvalidParam());
+        }
         Self::new_inner(
             id,
-            VirtioNetBackend::UnixgramPath(PathBuf::from(path), flags.contains(NetFlags::VFKIT)),
+            VirtioNetBackend::UnixgramPath(
+                PathBuf::from(path),
+                flags.contains(NetFlags::VFKIT),
+                flags.contains(NetFlags::VNET_HDR),
+            ),
             mac,
             features,
         )
@@ -1766,6 +1789,11 @@ impl NetDevice {
     /// Create a net device backed by a Unix datagram socket fd.
     ///
     /// Takes ownership of `fd`; the caller must not close it after this call.
+    ///
+    /// libkrun doesn't change the socket buffer sizes of `fd`. On macOS the
+    /// send buffer of a datagram socket limits the largest datagram, so the
+    /// caller must size both ends for the largest frame: 65550 bytes by default,
+    /// 65562 bytes with `VNET_HDR`, which keeps the 12-byte header in front.
     #[cfg(unix)]
     pub fn new_unixgram_fd(
         id: &str,
@@ -1775,16 +1803,20 @@ impl NetDevice {
         flags: NetFlags,
     ) -> Result<Self, VmmError> {
         use devices::virtio::net::device::VirtioNetBackend;
-        let _ = flags;
         Self::new_inner(
             id,
-            VirtioNetBackend::UnixgramFd(std::os::fd::IntoRawFd::into_raw_fd(fd)),
+            VirtioNetBackend::UnixgramFd(
+                std::os::fd::IntoRawFd::into_raw_fd(fd),
+                flags.contains(NetFlags::VNET_HDR),
+            ),
             mac,
             features,
         )
     }
 
     /// Create a net device backed by a Unix stream socket path.
+    ///
+    /// Fails with `InvalidParam` if `flags` contains `VNET_HDR`.
     pub fn new_unixstream_path(
         id: &str,
         path: &str,
@@ -1793,7 +1825,9 @@ impl NetDevice {
         flags: NetFlags,
     ) -> Result<Self, VmmError> {
         use devices::virtio::net::device::VirtioNetBackend;
-        let _ = flags;
+        if flags.contains(NetFlags::VNET_HDR) {
+            return Err(VmmError::InvalidParam());
+        }
         Self::new_inner(
             id,
             VirtioNetBackend::UnixstreamPath(PathBuf::from(path)),
@@ -1805,6 +1839,8 @@ impl NetDevice {
     /// Create a net device backed by a Unix stream socket fd.
     ///
     /// Takes ownership of `fd`; the caller must not close it after this call.
+    ///
+    /// Fails with `InvalidParam` if `flags` contains `VNET_HDR`.
     #[cfg(unix)]
     pub fn new_unixstream_fd(
         id: &str,
@@ -1814,7 +1850,9 @@ impl NetDevice {
         flags: NetFlags,
     ) -> Result<Self, VmmError> {
         use devices::virtio::net::device::VirtioNetBackend;
-        let _ = flags;
+        if flags.contains(NetFlags::VNET_HDR) {
+            return Err(VmmError::InvalidParam());
+        }
         Self::new_inner(
             id,
             VirtioNetBackend::UnixstreamFd(std::os::fd::IntoRawFd::into_raw_fd(fd)),
@@ -2418,5 +2456,46 @@ mod display_backend_tests {
     #[test]
     fn noop_display_backend_instantiates() {
         DisplayBackend::new_noop().inner.create_instance().unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "net", unix))]
+mod net_flags_tests {
+    use super::{NetDevice, NetFlags};
+    use crate::api::error::VmmError;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::{UnixDatagram, UnixStream};
+
+    const MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
+
+    #[test]
+    fn unixstream_rejects_vnet_hdr() {
+        let (fd, _peer) = UnixStream::pair().unwrap();
+        let res =
+            NetDevice::new_unixstream_fd("net0", OwnedFd::from(fd), &MAC, 0, NetFlags::VNET_HDR);
+        assert!(matches!(res, Err(VmmError::InvalidParam())));
+        let res =
+            NetDevice::new_unixstream_path("net0", "/nonexistent", &MAC, 0, NetFlags::VNET_HDR);
+        assert!(matches!(res, Err(VmmError::InvalidParam())));
+    }
+
+    #[test]
+    fn unixgram_path_rejects_vnet_hdr_with_vfkit() {
+        let res = NetDevice::new_unixgram_path(
+            "net0",
+            "/nonexistent",
+            &MAC,
+            0,
+            NetFlags::VNET_HDR | NetFlags::VFKIT,
+        );
+        assert!(matches!(res, Err(VmmError::InvalidParam())));
+    }
+
+    #[test]
+    fn unixgram_fd_accepts_vnet_hdr() {
+        let (fd, _peer) = UnixDatagram::pair().unwrap();
+        let res =
+            NetDevice::new_unixgram_fd("net0", OwnedFd::from(fd), &MAC, 0, NetFlags::VNET_HDR);
+        assert!(res.is_ok());
     }
 }

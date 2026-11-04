@@ -72,10 +72,13 @@ pub enum VirtioNetBackend {
     #[cfg(windows)]
     UnixstreamFd(RawSocket),
     UnixstreamPath(PathBuf),
+    /// The fd, and whether frames carry the virtio-net header.
     #[cfg(unix)]
-    UnixgramFd(RawFd),
+    UnixgramFd(RawFd, bool),
+    /// The path, whether to send the vfkit magic, and whether frames carry the
+    /// virtio-net header.
     #[cfg(unix)]
-    UnixgramPath(PathBuf, bool),
+    UnixgramPath(PathBuf, bool, bool),
     #[cfg(target_os = "linux")]
     Tap(String),
 }

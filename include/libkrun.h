@@ -242,6 +242,7 @@ typedef struct {
 /* NetFlags ---------------------------------------------------------- */
 
 #define KRUN_NET_FLAGS_VFKIT 1
+#define KRUN_NET_FLAGS_VNET_HDR 2
 
 /* VmmError ---------------------------------------------------------- */
 
@@ -821,7 +822,11 @@ typedef void (*krun_block_device_destroy_fn)(KrunBlockDevice handle);
 
 /* NetDevice --------------------------------------------------------- */
 
-/** Create a net device backed by a Unix datagram socket path. */
+/**
+ * Create a net device backed by a Unix datagram socket path.
+ *
+ * Fails with `InvalidParam` if `flags` combines `VNET_HDR` and `VFKIT`.
+ */
 KrunNetDevice krun_net_device_new_unixgram_path(KrunStr id, KrunStr path, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
 typedef KrunNetDevice (*krun_net_device_new_unixgram_path_fn)(KrunStr id, KrunStr path, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
 #if (defined(__unix__) || defined(__APPLE__))
@@ -829,11 +834,20 @@ typedef KrunNetDevice (*krun_net_device_new_unixgram_path_fn)(KrunStr id, KrunSt
  * Create a net device backed by a Unix datagram socket fd.
  *
  * Takes ownership of `fd`; the caller must not close it after this call.
+ *
+ * libkrun doesn't change the socket buffer sizes of `fd`. On macOS the
+ * send buffer of a datagram socket limits the largest datagram, so the
+ * caller must size both ends for the largest frame: 65550 bytes by default,
+ * 65562 bytes with `VNET_HDR`, which keeps the 12-byte header in front.
  */
 KrunNetDevice krun_net_device_new_unixgram_fd(KrunStr id, int fd, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
 typedef KrunNetDevice (*krun_net_device_new_unixgram_fd_fn)(KrunStr id, int fd, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
 #endif
-/** Create a net device backed by a Unix stream socket path. */
+/**
+ * Create a net device backed by a Unix stream socket path.
+ *
+ * Fails with `InvalidParam` if `flags` contains `VNET_HDR`.
+ */
 KrunNetDevice krun_net_device_new_unixstream_path(KrunStr id, KrunStr path, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
 typedef KrunNetDevice (*krun_net_device_new_unixstream_path_fn)(KrunStr id, KrunStr path, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
 #if (defined(__unix__) || defined(__APPLE__))
@@ -841,6 +855,8 @@ typedef KrunNetDevice (*krun_net_device_new_unixstream_path_fn)(KrunStr id, Krun
  * Create a net device backed by a Unix stream socket fd.
  *
  * Takes ownership of `fd`; the caller must not close it after this call.
+ *
+ * Fails with `InvalidParam` if `flags` contains `VNET_HDR`.
  */
 KrunNetDevice krun_net_device_new_unixstream_fd(KrunStr id, int fd, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
 typedef KrunNetDevice (*krun_net_device_new_unixstream_fd_fn)(KrunStr id, int fd, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
