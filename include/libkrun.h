@@ -465,6 +465,18 @@ KrunResult krun_vmm_builder_add_serial_console(KrunVmmBuilder* handle, int input
 typedef KrunResult (*krun_vmm_builder_add_serial_console_fn)(KrunVmmBuilder* handle, int input_fd, int output_fd, KrunError* err_out);
 void krun_vmm_builder_nested_virt(KrunVmmBuilder* handle, bool enabled);
 typedef void (*krun_vmm_builder_nested_virt_fn)(KrunVmmBuilder* handle, bool enabled);
+/**
+ * Exit the process with `code` when the guest resets instead of
+ * powering off.
+ *
+ * By default both end the VMM with exit code 0. With a reset exit code
+ * the caller can tell a reboot from a shutdown and start the VM again.
+ * A guest reset reaches the VMM through PSCI SYSTEM_RESET on aarch64 and
+ * the i8042 reset line on x86_64; an exit code set by the guest init
+ * takes precedence.
+ */
+void krun_vmm_builder_reset_exit_code(KrunVmmBuilder* handle, uint8_t code);
+typedef void (*krun_vmm_builder_reset_exit_code_fn)(KrunVmmBuilder* handle, uint8_t code);
 KrunResult krun_vmm_builder_split_irqchip(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 typedef KrunResult (*krun_vmm_builder_split_irqchip_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 /**

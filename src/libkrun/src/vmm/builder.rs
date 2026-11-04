@@ -1117,14 +1117,22 @@ pub fn build_microvm(
         .map_err(StartMicrovmError::Internal)?;
 
     #[cfg(target_arch = "x86_64")]
+    let reset_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK)
+        .map_err(Error::EventFd)
+        .map_err(StartMicrovmError::Internal)?;
+
+    #[cfg(target_arch = "x86_64")]
     // Safe to unwrap 'serial_device' as it's always 'Some' on x86_64.
-    // x86_64 uses the i8042 reset event as the Vmm exit event.
     let mut pio_device_manager = PortIODeviceManager::new(
         Arc::new(Mutex::new(Cmos::new(
             arch_memory_info.ram_below_gap,
             arch_memory_info.ram_above_gap,
         ))),
         serial_devices,
+        reset_evt
+            .try_clone()
+            .map_err(Error::EventFd)
+            .map_err(StartMicrovmError::Internal)?,
         exit_evt
             .try_clone()
             .map_err(Error::EventFd)
@@ -1374,6 +1382,9 @@ pub fn build_microvm(
         kernel_cmdline,
         vcpus_handles: Vec::new(),
         exit_evt,
+        #[cfg(target_arch = "x86_64")]
+        reset_evt,
+        reset_exit_code: vm_resources.reset_exit_code,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
         #[cfg(not(target_os = "windows"))]
