@@ -3022,6 +3022,11 @@
           "name": "VFKIT",
           "c_name": "KRUN_NET_FLAGS_VFKIT",
           "value": 1
+        },
+        {
+          "name": "VNET_HDR",
+          "c_name": "KRUN_NET_FLAGS_VNET_HDR",
+          "value": 2
         }
       ],
       "cfg": "feature = \"net\""
