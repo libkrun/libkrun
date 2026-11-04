@@ -14,7 +14,7 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use crossbeam_channel::{Sender, unbounded};
@@ -56,6 +56,9 @@ struct InodeData {
     dev: i32,
     refcount: AtomicU64,
     unlinked_fd: AtomicI64,
+    // Each guest process that maps a file keeps its own handle open, so the read-only handles of
+    // an inode share one host file instead of holding one descriptor each.
+    read_only_file: Mutex<Weak<RwLock<File>>>,
 }
 
 enum InodeHandle {
@@ -153,7 +156,7 @@ impl DirStream {
 
 struct HandleData {
     inode: Inode,
-    file: RwLock<File>,
+    file: Arc<RwLock<File>>,
     dirstream: Mutex<DirStream>,
 }
 
@@ -835,9 +838,10 @@ impl PassthroughFs {
         kill_priv: bool,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        let directory = flags as i32 & libc::O_DIRECTORY != 0;
         let flags = self.parse_open_flags(flags as i32);
 
-        let file = RwLock::new(self.open_inode(inode, flags)?);
+        let file = self.open_file(inode, flags, directory)?;
 
         // If O_TRUNC and kill_priv (OPEN_KILL_SUIDGID), clear security.capability and suid/sgid
         if (flags & libc::O_TRUNC) != 0 && kill_priv {
@@ -887,6 +891,35 @@ impl PassthroughFs {
         };
 
         Ok((Some(handle), opts))
+    }
+
+    fn open_file(
+        &self,
+        inode: Inode,
+        flags: i32,
+        directory: bool,
+    ) -> io::Result<Arc<RwLock<File>>> {
+        // A directory handle reads its entries at the descriptor offset, so it cannot share one.
+        let shareable =
+            !directory && flags & libc::O_ACCMODE == libc::O_RDONLY && flags & libc::O_TRUNC == 0;
+        if !shareable {
+            return Ok(Arc::new(RwLock::new(self.open_inode(inode, flags)?)));
+        }
+
+        let data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+        let mut shared = data.read_only_file.lock().unwrap();
+        if let Some(file) = shared.upgrade() {
+            return Ok(file);
+        }
+        let file = Arc::new(RwLock::new(self.open_inode(inode, flags)?));
+        *shared = Arc::downgrade(&file);
+        Ok(file)
     }
 
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
@@ -1355,6 +1388,7 @@ impl FileSystem for PassthroughFs {
                 dev: st.st_dev,
                 refcount: AtomicU64::new(2),
                 unlinked_fd: AtomicI64::new(-1),
+                read_only_file: Mutex::new(Weak::new()),
             }),
         );
 
@@ -1456,6 +1490,7 @@ impl FileSystem for PassthroughFs {
                     dev: st.st_dev,
                     refcount: AtomicU64::new(1),
                     unlinked_fd: AtomicI64::new(-1),
+                    read_only_file: Mutex::new(Weak::new()),
                 }),
             );
 
@@ -1698,7 +1733,7 @@ impl FileSystem for PassthroughFs {
         }
 
         // Safe because we just opened this fd.
-        let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
+        let file = Arc::new(RwLock::new(unsafe { File::from_raw_fd(fd) }));
 
         let entry = self.lookup(ctx, parent, name)?;
 
@@ -2838,5 +2873,136 @@ impl FileSystem for PassthroughFs {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    const CTX: Context = Context {
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    };
+
+    struct Share {
+        dir: PathBuf,
+        fs: PassthroughFs,
+    }
+
+    impl Share {
+        fn with_file(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("libkrun-passthrough-{}-{name}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(name), b"contents").unwrap();
+            let cfg = Config {
+                root_dir: dir.to_str().unwrap().to_string(),
+                ..Default::default()
+            };
+            let fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
+            fs.init(FsOptions::empty()).unwrap();
+            Share { dir, fs }
+        }
+
+        fn inode(&self, name: &str) -> Inode {
+            let name = CString::new(name).unwrap();
+            self.fs.lookup(CTX, fuse::ROOT_ID, &name).unwrap().inode
+        }
+
+        fn open(&self, inode: Inode, flags: i32) -> Handle {
+            self.fs
+                .open(CTX, inode, false, flags as u32)
+                .unwrap()
+                .0
+                .unwrap()
+        }
+
+        fn fd(&self, handle: Handle) -> RawFd {
+            self.fs.handles.read().unwrap()[&handle]
+                .file
+                .read()
+                .unwrap()
+                .as_raw_fd()
+        }
+    }
+
+    impl Drop for Share {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn read_only_handles_of_one_inode_share_a_host_file() {
+        let share = Share::with_file("shared");
+        let inode = share.inode("shared");
+
+        let first = share.open(inode, libc::O_RDONLY);
+        let second = share.open(inode, libc::O_RDONLY);
+
+        assert_eq!(share.fd(first), share.fd(second));
+    }
+
+    #[test]
+    fn read_only_handles_with_other_flags_share_the_host_file() {
+        let share = Share::with_file("flags");
+        let inode = share.inode("flags");
+
+        let plain = share.open(inode, libc::O_RDONLY);
+        let nonblocking = share.open(inode, libc::O_RDONLY | bindings::LINUX_O_NONBLOCK);
+
+        assert_eq!(share.fd(plain), share.fd(nonblocking));
+    }
+
+    #[test]
+    fn a_writable_handle_gets_its_own_host_file() {
+        let share = Share::with_file("writable");
+        let inode = share.inode("writable");
+
+        let reader = share.open(inode, libc::O_RDONLY);
+        let writer = share.open(inode, libc::O_RDWR);
+
+        assert_ne!(share.fd(reader), share.fd(writer));
+    }
+
+    #[test]
+    fn directory_handles_keep_their_own_host_file() {
+        let share = Share::with_file("dirs");
+
+        let flags = libc::O_RDONLY as u32;
+        let first = share
+            .fs
+            .opendir(CTX, fuse::ROOT_ID, flags)
+            .unwrap()
+            .0
+            .unwrap();
+        let second = share
+            .fs
+            .opendir(CTX, fuse::ROOT_ID, flags)
+            .unwrap()
+            .0
+            .unwrap();
+
+        assert_ne!(share.fd(first), share.fd(second));
+    }
+
+    #[test]
+    fn the_shared_host_file_closes_with_the_last_handle() {
+        let share = Share::with_file("released");
+        let inode = share.inode("released");
+        let first = share.open(inode, libc::O_RDONLY);
+        let second = share.open(inode, libc::O_RDONLY);
+
+        let shared = Arc::downgrade(&share.fs.handles.read().unwrap()[&first].file);
+
+        share.fs.do_release(inode, first).unwrap();
+        assert!(shared.upgrade().is_some());
+        share.fs.do_release(inode, second).unwrap();
+
+        assert!(shared.upgrade().is_none());
     }
 }
