@@ -151,6 +151,17 @@ KrunNetDevice net = krun_net_device_new_unixstream_fd(
 krun_mmio_device_manager_add(devices, net);
 ```
 
+### Datagram sockets and offload
+
+`NetDevice::new_unixgram_fd` and `new_unixgram_path` (C: `krun_net_device_new_unixgram_fd` and `_path`) connect to a proxy over a Unix datagram socket, one Ethernet frame per datagram. Pass `NetFlags::VFKIT` (`KRUN_NET_FLAGS_VFKIT`) to send the vfkit handshake that `gvproxy -listen-vfkit` expects.
+
+By default libkrun strips the virtio-net header from frames the guest sends and writes a zeroed header for frames it receives, so the proxy sees raw Ethernet and the guest gets no offload. With `NetFlags::VNET_HDR` (`KRUN_NET_FLAGS_VNET_HDR`), each datagram starts with the 12-byte `virtio_net_hdr_v1` in both directions, so the proxy can handle segmentation and checksum offload:
+
+- The proxy must read and write `virtio_net_hdr_v1`. Stock `gvproxy` does not, so `VNET_HDR` can't be combined with `VFKIT`.
+- The flag only changes the framing. To make the guest use offload, also pass the matching virtio-net feature bits (for example `VIRTIO_NET_F_CSUM`, `VIRTIO_NET_F_HOST_TSO4`, `VIRTIO_NET_F_HOST_TSO6`) in `features`.
+- On macOS the send buffer of a datagram socket limits the largest datagram. `new_unixgram_path` sizes its own socket; with `new_unixgram_fd`, size both ends yourself for 65562 bytes with `VNET_HDR` (65550 without).
+- The unixstream constructors reject `VNET_HDR`.
+
 ---
 
 ## Security Considerations
