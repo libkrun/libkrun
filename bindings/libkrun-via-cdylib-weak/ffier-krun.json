@@ -1570,6 +1570,32 @@
           "ffi_name": "krun_vmm_builder_nested_virt"
         },
         {
+          "name": "reset_exit_code",
+          "doc": [
+            " Exit the process with `code` when the guest resets instead of",
+            " powering off.",
+            "",
+            " By default both end the VMM with exit code 0. With a reset exit code",
+            " the caller can tell a reboot from a shutdown and start the VM again.",
+            " A guest reset reaches the VMM through PSCI SYSTEM_RESET on aarch64 and",
+            " the i8042 reset line on x86_64; an exit code set by the guest init",
+            " takes precedence."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "code",
+              "param_kind": "regular",
+              "type": "u8"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_vmm_builder_reset_exit_code"
+        },
+        {
           "name": "split_irqchip",
           "receiver": "value",
           "params": [

@@ -87,6 +87,7 @@ impl PortIODeviceManager {
         cmos: Arc<Mutex<devices::legacy::Cmos>>,
         stdio_serial: Vec<Arc<Mutex<devices::legacy::Serial>>>,
         i8042_reset_evfd: EventFd,
+        acpi_exit_evfd: EventFd,
     ) -> Result<Self> {
         let io_bus = devices::Bus::new();
         let mut evts: Vec<EventFd> = Vec::new();
@@ -106,10 +107,10 @@ impl PortIODeviceManager {
         let kbd_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
 
         let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(
-            i8042_reset_evfd.try_clone().map_err(Error::EventFd)?,
+            i8042_reset_evfd,
             kbd_evt.try_clone().map_err(Error::EventFd)?,
         )));
-        let acpi_pm = Arc::new(Mutex::new(devices::legacy::AcpiPm::new(i8042_reset_evfd)));
+        let acpi_pm = Arc::new(Mutex::new(devices::legacy::AcpiPm::new(acpi_exit_evfd)));
 
         #[cfg(windows)]
         let pit = {
@@ -231,6 +232,7 @@ mod tests {
         let ldm = PortIODeviceManager::new(
             Arc::new(Mutex::new(cmos)),
             vec![Arc::new(Mutex::new(serial))],
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
         );
         assert!(ldm.is_ok());

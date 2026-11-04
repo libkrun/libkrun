@@ -114,6 +114,8 @@ pub struct VmResources {
     pub smbios_oem_strings: Option<Vec<String>>,
     /// Whether to enable nested virtualization.
     pub nested_enabled: bool,
+    /// The process exit code when the guest resets instead of powering off.
+    pub reset_exit_code: Option<u8>,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
@@ -267,6 +269,7 @@ mod tests {
             external_kernel: None,
             smbios_oem_strings: None,
             nested_enabled: false,
+            reset_exit_code: None,
             split_irqchip: false,
             acpi_enabled: false,
             serial_consoles: Vec::new(),

@@ -577,6 +577,10 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// The guest asked for a reset. On Windows a reset reaches the VMM
+    /// through the i8042 eventfd, so no vCPU sends this.
+    #[allow(dead_code)]
+    Reset,
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.

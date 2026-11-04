@@ -1596,14 +1596,20 @@ impl Vcpu {
                     error!("Received KVM_EXIT_INTERNAL_ERROR signal");
                     Err(Error::VcpuUnhandledKvmExit)
                 }
-                VcpuExit::SystemEvent(event, _reason) => {
-                    match event {
-                        KVM_SYSTEM_EVENT_SHUTDOWN => info!("Received KVM_SYSTEM_EVENT_SHUTDOWN"),
-                        KVM_SYSTEM_EVENT_RESET => info!("Received KVM_SYSTEM_EVENT_RESET"),
-                        _ => error!("Received an unexpected System Event: {event}"),
+                VcpuExit::SystemEvent(event, _reason) => match event {
+                    KVM_SYSTEM_EVENT_SHUTDOWN => {
+                        info!("Received KVM_SYSTEM_EVENT_SHUTDOWN");
+                        Ok(VcpuEmulation::Stopped)
                     }
-                    Ok(VcpuEmulation::Stopped)
-                }
+                    KVM_SYSTEM_EVENT_RESET => {
+                        info!("Received KVM_SYSTEM_EVENT_RESET");
+                        Ok(VcpuEmulation::Reset)
+                    }
+                    _ => {
+                        error!("Received an unexpected System Event: {event}");
+                        Ok(VcpuEmulation::Stopped)
+                    }
+                },
                 r => {
                     // TODO: Are we sure we want to finish running a vcpu upon
                     // receiving a vm exit that is not necessarily an error?
@@ -1657,9 +1663,12 @@ impl Vcpu {
                 // Moreover if we allow the vCPU0 thread to finish execution, this might generate a
                 // seccomp failure because musl calls `sigprocmask` as part of `pthread_exit`.
                 // So we pause vCPU0 and send a signal to the emulation thread to stop the VMM.
-                Ok(VcpuEmulation::Stopped) => return self.exit(FC_EXIT_CODE_OK),
+                Ok(VcpuEmulation::Stopped) => {
+                    return self.exit(VcpuResponse::Exited(FC_EXIT_CODE_OK));
+                }
+                Ok(VcpuEmulation::Reset) => return self.exit(VcpuResponse::Reset),
                 // Emulation errors lead to vCPU exit.
-                Err(_) => return self.exit(FC_EXIT_CODE_GENERIC_ERROR),
+                Err(_) => return self.exit(VcpuResponse::Exited(FC_EXIT_CODE_GENERIC_ERROR)),
             }
         }
 
@@ -1689,7 +1698,7 @@ impl Vcpu {
             // Unhandled exit of the other end.
             Err(TryRecvError::Disconnected) => {
                 // Move to 'exited' state.
-                state = self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+                state = self.exit(VcpuResponse::Exited(FC_EXIT_CODE_GENERIC_ERROR));
             }
             // All other events or lack thereof have no effect on current 'running' state.
             Err(TryRecvError::Empty) => (),
@@ -1715,17 +1724,17 @@ impl Vcpu {
             // Unhandled exit of the other end.
             Err(_) => {
                 // Move to 'exited' state.
-                self.exit(FC_EXIT_CODE_GENERIC_ERROR)
+                self.exit(VcpuResponse::Exited(FC_EXIT_CODE_GENERIC_ERROR))
             }
         }
     }
 
     #[cfg(not(test))]
     // Transition to the exited state.
-    fn exit(&mut self, exit_code: u8) -> StateMachine<Self> {
+    fn exit(&mut self, response: VcpuResponse) -> StateMachine<Self> {
         self.response_sender
-            .send(VcpuResponse::Exited(exit_code))
-            .expect("failed to send Exited status");
+            .send(response)
+            .expect("failed to send exit status");
 
         if let Err(e) = self.exit_evt.write(1) {
             error!("Failed signaling vcpu exit event: {e}");
@@ -1756,7 +1765,7 @@ impl Vcpu {
     // In tests the main/vmm thread exits without 'exit()'ing the whole process.
     // All channels get closed on the other side while this Vcpu thread is still running.
     // This Vcpu thread should just do a clean finish without reporting back to the main thread.
-    fn exit(&mut self, _: u8) -> StateMachine<Self> {
+    fn exit(&mut self, _: VcpuResponse) -> StateMachine<Self> {
         // State machine reached its end.
         StateMachine::finish()
     }
@@ -1805,6 +1814,8 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// The guest asked for a reset.
+    Reset,
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
@@ -1852,6 +1863,7 @@ impl VcpuHandle {
 enum VcpuEmulation {
     Handled,
     Interrupted,
+    Reset,
     Stopped,
 }
 
