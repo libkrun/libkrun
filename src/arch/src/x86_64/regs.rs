@@ -205,6 +205,7 @@ fn setup_page_tables(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
     use kvm_ioctls::Kvm;
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
@@ -316,6 +317,10 @@ mod tests {
         let vm = kvm.create_vm().unwrap();
         let vcpu = vm.create_vcpu(0).unwrap();
         let gm = create_guest_mem();
+
+        // KVM validates EFER against guest CPUID, so expose long mode first.
+        let cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES).unwrap();
+        vcpu.set_cpuid2(&cpuid).unwrap();
 
         assert!(vcpu.set_sregs(&Default::default()).is_ok());
         setup_sregs(&gm, &vcpu, 1).unwrap();
