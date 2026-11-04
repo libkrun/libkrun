@@ -76,7 +76,7 @@ impl TsiDgramProxy {
                         self.rx_cnt += Wrapping(cnt as u32);
                         sys::init_pkt(self, &mut pkt);
                         pkt.set_len(cnt as u32);
-                        pkt.hdr().len() + cnt
+                        pkt.finish_rx().unwrap_or(0) as usize
                     }
                     RecvPkt::Close => {
                         self.status = ProxyStatus::Closed;

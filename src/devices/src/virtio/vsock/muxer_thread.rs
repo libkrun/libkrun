@@ -77,7 +77,7 @@ impl MuxerThread {
                 if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
                     rx_to_pkt(self.cid, rx, &mut pkt);
                     if let Err(e) =
-                        queue.add_used(&self.mem, head.index, pkt.hdr().len() as u32 + pkt.len())
+                        queue.add_used(&self.mem, head.index, pkt.finish_rx().unwrap_or(0))
                     {
                         error!("failed to add used elements to the queue: {e:?}");
                     }
