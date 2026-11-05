@@ -84,6 +84,7 @@ fn push_connect_rsp(proxy: &super::UnixProxy, result: i32) {
 
     // This response goes to the control port (DGRAM).
     let rx = MuxerRx::ConnResponse {
+        request_id: proxy.connect_request_id,
         local_port: 1025,
         peer_port: proxy.control_port,
         result,

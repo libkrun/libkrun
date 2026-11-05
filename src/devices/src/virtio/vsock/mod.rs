@@ -17,7 +17,9 @@ mod reaper;
 #[cfg(target_os = "macos")]
 mod timesync;
 mod tsi_dgram;
+mod tsi_sockopt;
 mod tsi_stream;
+mod tsi_wire;
 mod unix_proxy;
 
 #[cfg(target_os = "windows")]
@@ -92,6 +94,11 @@ mod defs {
     pub const TSI_LISTEN: u32 = 1029;
     pub const TSI_ACCEPT: u32 = 1030;
     pub const TSI_PROXY_RELEASE: u32 = 1031;
+    pub const TSI_DATAGRAM: u32 = 1032;
+    pub const TSI_DISCONNECT: u32 = 1033;
+    pub const TSI_SETOPT: u32 = 1034;
+    pub const TSI_GETOPT: u32 = 1035;
+    pub const TSI_BIND: u32 = 1036;
 
     // Linux definitions that we need for cross-platform compatibility.
     pub const LINUX_AF_UNIX: u16 = 1;

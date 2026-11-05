@@ -38,6 +38,7 @@ pub struct UnixProxy {
     pub(crate) peer_port: u32,
     pub(crate) local_port: u32,
     pub(crate) control_port: u32,
+    pub(crate) connect_request_id: u64,
     pub(crate) peer_shutdown: u32,
     pub(crate) peer_fwd_cnt: Wrapping<u32>,
     pub(crate) peer_buf_alloc: u32,
@@ -72,6 +73,7 @@ impl UnixProxy {
             peer_port: 0,
             local_port,
             control_port,
+            connect_request_id: 0,
             peer_shutdown: 0,
             peer_fwd_cnt: Wrapping(0),
             peer_buf_alloc: 0,
@@ -100,6 +102,7 @@ impl UnixProxy {
             local_port,
             peer_port,
             control_port: 0,
+            connect_request_id: 0,
             peer_shutdown: 0,
             fd,
             status: ProxyStatus::ReverseInit,
@@ -211,6 +214,7 @@ impl Proxy for UnixProxy {
     }
 
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
+        self.connect_request_id = req.request_id;
         sys::do_connect(self, pkt, req)
     }
 
@@ -218,7 +222,7 @@ impl Proxy for UnixProxy {
         sys::confirm_connect(self, pkt)
     }
 
-    fn getpeername(&mut self, _pkt: &VsockPacket) {
+    fn getname(&mut self, _pkt: &VsockPacket, _peer: bool) {
         todo!();
     }
 
@@ -319,7 +323,7 @@ impl Proxy for UnixAcceptorProxy {
     fn connect(&mut self, _: &VsockPacket, _: TsiConnectReq) -> ProxyUpdate {
         unreachable!()
     }
-    fn getpeername(&mut self, _: &VsockPacket) {
+    fn getname(&mut self, _: &VsockPacket, _: bool) {
         unreachable!()
     }
     fn sendmsg(&mut self, _: &VsockPacket) -> ProxyUpdate {

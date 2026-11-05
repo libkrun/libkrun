@@ -20,6 +20,7 @@ use super::reaper::ReaperThread;
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
+use super::tsi_wire;
 use super::unix_proxy::UnixProxy;
 use crossbeam_channel::{Sender, unbounded};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -27,11 +28,6 @@ use vm_memory::GuestMemoryMmap;
 
 use crate::virtio::InterruptTransport;
 use std::net::{Ipv4Addr, SocketAddrV4};
-
-#[cfg(windows)]
-use defs::{LINUX_AF_INET as AF_INET, LINUX_AF_INET6 as AF_INET6, LINUX_AF_UNIX as AF_UNIX};
-#[cfg(unix)]
-use libc::{AF_INET, AF_INET6, AF_UNIX};
 
 pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
 
@@ -42,12 +38,21 @@ pub enum MuxerRx {
         local_port: u32,
         peer_port: u32,
     },
+    SockoptResponse {
+        request_id: u64,
+        local_port: u32,
+        peer_port: u32,
+        result: i32,
+        value: i32,
+    },
     GetnameResponse {
+        request_id: u64,
         local_port: u32,
         peer_port: u32,
         data: TsiGetnameRsp,
     },
     ConnResponse {
+        request_id: u64,
         local_port: u32,
         peer_port: u32,
         result: i32,
@@ -71,11 +76,13 @@ pub enum MuxerRx {
         fwd_cnt: u32,
     },
     ListenResponse {
+        request_id: u64,
         local_port: u32,
         peer_port: u32,
         result: i32,
     },
     AcceptResponse {
+        request_id: u64,
         local_port: u32,
         peer_port: u32,
         result: i32,
@@ -280,103 +287,96 @@ impl VsockMuxer {
         }
     }
 
-    fn process_proxy_create(&self, pkt: &VsockPacket) {
-        debug!("proxy create request");
-        if let Some(req) = pkt.read_proxy_create() {
-            debug!(
-                "proxy create request: peer_port={}, type={}",
-                req.peer_port, req._type
-            );
-            let mem = match self.mem.as_ref() {
-                Some(m) => m,
-                None => {
-                    error!("proxy creation without mem");
-                    return;
-                }
-            };
-            let queue = match self.queue.as_ref() {
-                Some(q) => q,
-                None => {
-                    error!("stream proxy creation without stream queue");
-                    return;
-                }
-            };
-            match req._type {
-                defs::SOCK_STREAM => {
-                    debug!("proxy create stream");
-                    let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-                    #[allow(clippy::unnecessary_cast)]
-                    if req.family == AF_UNIX as u16
-                        && !self.tsi_flags.contains(TsiFlags::HIJACK_UNIX)
-                    {
-                        warn!("rejecting stream unix proxy because HIJACK_UNIX is disabled");
-                        return;
-                    }
-                    #[allow(clippy::unnecessary_cast)]
-                    if (req.family == AF_INET as u16 || req.family == AF_INET6 as u16)
-                        && !self.tsi_flags.contains(TsiFlags::HIJACK_INET)
-                    {
-                        warn!("rejecting stream inet proxy because HIJACK_INET is disabled");
-                        return;
-                    }
-                    match TsiStreamProxy::new(
-                        id,
-                        self.cid,
-                        req.family,
-                        defs::TSI_PROXY_PORT,
-                        req.peer_port,
-                        pkt.src_port(),
-                        mem.clone(),
-                        queue.clone(),
-                        self.rxq.clone(),
-                    ) {
-                        Ok(proxy) => {
-                            self.proxy_map
-                                .write()
-                                .unwrap()
-                                .insert(id, Mutex::new(Box::new(proxy)));
-                        }
-                        Err(e) => debug!("error creating tcp proxy: {e}"),
-                    }
-                }
-                defs::SOCK_DGRAM => {
-                    debug!("proxy create dgram");
-                    let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-                    #[allow(clippy::unnecessary_cast)]
-                    if req.family == AF_UNIX as u16
-                        && !self.tsi_flags.contains(TsiFlags::HIJACK_UNIX)
-                    {
-                        warn!("rejecting dgram unix proxy because HIJACK_UNIX is disabled");
-                        return;
-                    }
-                    #[allow(clippy::unnecessary_cast)]
-                    if (req.family == AF_INET as u16 || req.family == AF_INET6 as u16)
-                        && !self.tsi_flags.contains(TsiFlags::HIJACK_INET)
-                    {
-                        warn!("rejecting dgram inet proxy because HIJACK_INET is disabled");
-                        return;
-                    }
-                    match TsiDgramProxy::new(
-                        id,
-                        self.cid,
-                        req.family,
-                        req.peer_port,
-                        mem.clone(),
-                        queue.clone(),
-                        self.rxq.clone(),
-                    ) {
-                        Ok(proxy) => {
-                            self.proxy_map
-                                .write()
-                                .unwrap()
-                                .insert(id, Mutex::new(Box::new(proxy)));
-                        }
-                        Err(e) => debug!("error creating udp proxy: {e}"),
-                    }
-                }
-                _ => debug!("unknown type on connection request"),
-            };
+    fn control_error(&self, pkt: &VsockPacket, result: i32) {
+        if pkt.control_request_id() == 0 || matches!(pkt.dst_port(), 1027 | 1031) {
+            return;
         }
+        if pkt.dst_port() == defs::TSI_GETOPT {
+            self.push_packet(MuxerRx::SockoptResponse {
+                request_id: pkt.control_request_id(),
+                local_port: pkt.dst_port(),
+                peer_port: pkt.src_port(),
+                result,
+                value: 0,
+            });
+        } else if pkt.dst_port() == 1026 {
+            self.push_packet(MuxerRx::GetnameResponse {
+                request_id: pkt.control_request_id(),
+                local_port: pkt.dst_port(),
+                peer_port: pkt.src_port(),
+                data: TsiGetnameRsp {
+                    result,
+                    ..Default::default()
+                },
+            });
+        } else {
+            self.push_packet(MuxerRx::ConnResponse {
+                request_id: pkt.control_request_id(),
+                local_port: pkt.dst_port(),
+                peer_port: pkt.src_port(),
+                result,
+            });
+        }
+    }
+
+    fn process_proxy_create(&self, pkt: &VsockPacket) {
+        let result = self.create_proxy(pkt).err().unwrap_or(0);
+        self.push_packet(MuxerRx::ConnResponse {
+            request_id: pkt.control_request_id(),
+            local_port: pkt.dst_port(),
+            peer_port: pkt.src_port(),
+            result,
+        });
+    }
+
+    fn create_proxy(&self, pkt: &VsockPacket) -> Result<(), i32> {
+        let req = pkt.read_proxy_create().ok_or(-tsi_wire::EPROTO)?;
+        tsi_wire::check_protocol(req.family, req._type, req.protocol)?;
+        let flag = match req.family {
+            defs::LINUX_AF_UNIX => TsiFlags::HIJACK_UNIX,
+            defs::LINUX_AF_INET | defs::LINUX_AF_INET6 => TsiFlags::HIJACK_INET,
+            _ => return Err(-tsi_wire::EAFNOSUPPORT),
+        };
+        if !self.tsi_flags.contains(flag) {
+            return Err(-tsi_wire::EPERM);
+        }
+        let mem = self.mem.as_ref().ok_or(-tsi_wire::EIO)?;
+        let queue = self.queue.as_ref().ok_or(-tsi_wire::EIO)?;
+        let id = ((req.peer_port as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+        let proxy: Box<dyn Proxy> = match req._type {
+            defs::SOCK_STREAM => Box::new(
+                TsiStreamProxy::new(
+                    id,
+                    self.cid,
+                    req.family,
+                    defs::TSI_PROXY_PORT,
+                    req.peer_port,
+                    pkt.src_port(),
+                    mem.clone(),
+                    queue.clone(),
+                    self.rxq.clone(),
+                )
+                .map_err(|e| -e.linux_errno())?,
+            ),
+            defs::SOCK_DGRAM => Box::new(
+                TsiDgramProxy::new(
+                    id,
+                    self.cid,
+                    req,
+                    mem.clone(),
+                    queue.clone(),
+                    self.rxq.clone(),
+                )
+                .map_err(|e| -e.linux_errno())?,
+            ),
+            _ => return Err(-tsi_wire::ESOCKTNOSUPPORT),
+        };
+        let mut proxies = self.proxy_map.write().unwrap();
+        if proxies.contains_key(&id) {
+            return Err(-tsi_wire::EADDRINUSE);
+        }
+        proxies.insert(id, Mutex::new(proxy));
+        Ok(())
     }
 
     fn process_connect(&self, pkt: &VsockPacket) {
@@ -386,14 +386,118 @@ impl VsockMuxer {
             debug!("proxy connect request: id={id}");
             match self.proxy_map.read().unwrap().get(&id) {
                 Some(proxy) => {
-                    self.process_proxy_update(id, proxy.lock().unwrap().connect(pkt, req));
+                    let mut proxy = proxy.lock().unwrap();
+                    if proxy.is_tsi() {
+                        self.process_proxy_update(id, proxy.connect(pkt, req));
+                    } else {
+                        self.control_error(pkt, -tsi_wire::EINVAL);
+                    }
                 }
                 None => self.push_packet(MuxerRx::ConnResponse {
+                    request_id: pkt.control_request_id(),
                     local_port: pkt.dst_port(),
                     peer_port: pkt.src_port(),
-                    result: -libc::ECONNREFUSED,
+                    result: -tsi_wire::ECONNREFUSED,
                 }),
             }
+        } else {
+            self.control_error(pkt, -tsi_wire::EPROTO);
+        }
+    }
+
+    fn process_disconnect(&self, pkt: &VsockPacket) {
+        let Ok(body) = pkt.control_payload() else {
+            return;
+        };
+        let port = u32::from_le_bytes(body.try_into().unwrap());
+        let id = ((port as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+        let update = {
+            let proxies = self.proxy_map.read().unwrap();
+            let Some(proxy) = proxies.get(&id) else {
+                self.control_error(pkt, -tsi_wire::EINVAL);
+                return;
+            };
+            proxy.lock().unwrap().disconnect(pkt)
+        };
+        if let Some(update) = update {
+            self.process_proxy_update(id, update);
+        } else {
+            self.control_error(pkt, -tsi_wire::EOPNOTSUPP);
+        }
+    }
+
+    fn process_bind(&self, pkt: &VsockPacket) {
+        let Some(req) = pkt.read_sendto_addr() else {
+            self.control_error(pkt, -tsi_wire::EPROTO);
+            return;
+        };
+        let id = ((req.peer_port as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+        let result = {
+            let proxies = self.proxy_map.read().unwrap();
+            let Some(proxy) = proxies.get(&id) else {
+                self.control_error(pkt, -tsi_wire::EINVAL);
+                return;
+            };
+            let mut proxy = proxy.lock().unwrap();
+            if !proxy.is_tsi() {
+                self.control_error(pkt, -tsi_wire::EINVAL);
+                return;
+            }
+            proxy.bind_datagram(req, &self.host_port_map)
+        };
+        let error = match result {
+            Some(Ok(update)) => {
+                self.process_proxy_update(id, update);
+                0
+            }
+            Some(Err(error)) => error,
+            None => -tsi_wire::EOPNOTSUPP,
+        };
+        self.control_error(pkt, error);
+    }
+
+    fn process_socket_option(&self, pkt: &VsockPacket, set: bool) {
+        let Ok(body) = pkt.control_payload() else {
+            return;
+        };
+        let port = u32::from_le_bytes(body[0..4].try_into().unwrap());
+        let peer = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        let level = u32::from_le_bytes(body[8..12].try_into().unwrap());
+        let name = u32::from_le_bytes(body[12..16].try_into().unwrap());
+        let value = if set {
+            Some(i32::from_le_bytes(body[16..20].try_into().unwrap()))
+        } else {
+            None
+        };
+        let id = ((port as u64) << 32) | peer as u64;
+        let result =
+            self.proxy_map
+                .read()
+                .unwrap()
+                .get(&id)
+                .map_or(Err(-tsi_wire::EINVAL), |proxy| {
+                    let proxy = proxy.lock().unwrap();
+                    if proxy.is_tsi() {
+                        proxy.socket_option(level, name, value)
+                    } else {
+                        Err(-tsi_wire::EINVAL)
+                    }
+                });
+        if set {
+            self.push_packet(MuxerRx::ConnResponse {
+                request_id: pkt.control_request_id(),
+                local_port: pkt.dst_port(),
+                peer_port: pkt.src_port(),
+                result: result.err().unwrap_or(0),
+            });
+        } else {
+            self.push_packet(MuxerRx::SockoptResponse {
+                request_id: pkt.control_request_id(),
+                local_port: pkt.dst_port(),
+                peer_port: pkt.src_port(),
+                result: result.as_ref().err().copied().unwrap_or(0),
+                value: result.unwrap_or(0),
+            });
         }
     }
 
@@ -407,8 +511,16 @@ impl VsockMuxer {
             );
 
             match self.proxy_map.read().unwrap().get(&id) {
-                Some(proxy) => proxy.lock().unwrap().getpeername(pkt),
+                Some(proxy) => {
+                    let mut proxy = proxy.lock().unwrap();
+                    if proxy.is_tsi() {
+                        proxy.getname(pkt, req.peer != 0);
+                    } else {
+                        self.control_error(pkt, -tsi_wire::EINVAL);
+                    }
+                }
                 None => self.push_packet(MuxerRx::GetnameResponse {
+                    request_id: pkt.control_request_id(),
                     local_port: pkt.dst_port(),
                     peer_port: pkt.src_port(),
                     data: TsiGetnameRsp {
@@ -418,6 +530,8 @@ impl VsockMuxer {
                     },
                 }),
             }
+        } else {
+            self.control_error(pkt, -tsi_wire::EPROTO);
         }
     }
 
@@ -426,12 +540,10 @@ impl VsockMuxer {
         if let Some(req) = pkt.read_sendto_addr() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("new DGRAM sendto addr: id={id}");
-            let update = self
-                .proxy_map
-                .read()
-                .unwrap()
-                .get(&id)
-                .map(|proxy| proxy.lock().unwrap().sendto_addr(req));
+            let update = self.proxy_map.read().unwrap().get(&id).and_then(|proxy| {
+                let mut proxy = proxy.lock().unwrap();
+                proxy.is_tsi().then(|| proxy.sendto_addr(req))
+            });
 
             if let Some(update) = update {
                 self.process_proxy_update(id, update);
@@ -453,16 +565,23 @@ impl VsockMuxer {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("DGRAM listen request: id={id}");
             match self.proxy_map.read().unwrap().get(&id) {
-                Some(proxy) => self.process_proxy_update(
-                    id,
-                    proxy.lock().unwrap().listen(pkt, req, &self.host_port_map),
-                ),
+                Some(proxy) => {
+                    let mut proxy = proxy.lock().unwrap();
+                    if proxy.is_tsi() {
+                        self.process_proxy_update(id, proxy.listen(pkt, req, &self.host_port_map));
+                    } else {
+                        self.control_error(pkt, -tsi_wire::EINVAL);
+                    }
+                }
                 None => self.push_packet(MuxerRx::ListenResponse {
+                    request_id: pkt.control_request_id(),
                     local_port: pkt.dst_port(),
                     peer_port: pkt.src_port(),
                     result: -libc::EPERM,
                 }),
             };
+        } else {
+            self.control_error(pkt, -tsi_wire::EPROTO);
         }
     }
 
@@ -472,13 +591,28 @@ impl VsockMuxer {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("DGRAM accept request: id={id}");
             match self.proxy_map.read().unwrap().get(&id) {
-                Some(proxy) => self.process_proxy_update(id, proxy.lock().unwrap().accept(req)),
+                Some(proxy) => {
+                    let mut proxy = proxy.lock().unwrap();
+                    if !proxy.is_tsi()
+                        || !matches!(
+                            proxy.status(),
+                            ProxyStatus::Listening | ProxyStatus::WaitingOnAccept
+                        )
+                    {
+                        self.control_error(pkt, -tsi_wire::EOPNOTSUPP);
+                    } else {
+                        self.process_proxy_update(id, proxy.accept(req));
+                    }
+                }
                 None => self.push_packet(MuxerRx::AcceptResponse {
+                    request_id: pkt.control_request_id(),
                     local_port: pkt.dst_port(),
                     peer_port: pkt.src_port(),
                     result: -libc::EINVAL,
                 }),
             }
+        } else {
+            self.control_error(pkt, -tsi_wire::EPROTO);
         }
     }
 
@@ -491,7 +625,8 @@ impl VsockMuxer {
                 id, req.local_port, req.peer_port
             );
             let update = if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
-                Some(proxy.lock().unwrap().release())
+                let mut proxy = proxy.lock().unwrap();
+                proxy.is_tsi().then(|| proxy.release())
             } else {
                 debug!(
                     "release without proxy: id={}, proxies={}",
@@ -537,14 +672,31 @@ impl VsockMuxer {
             return Ok(());
         }
 
+        if self.tsi_flags.tsi_enabled()
+            && matches!(pkt.dst_port(), 1024..=1027 | 1029..=1031 | 1033..=1036)
+            && let Err(result) = pkt.control_payload()
+        {
+            self.control_error(pkt, result);
+            return Ok(());
+        }
+
         match pkt.dst_port() {
             defs::TSI_PROXY_CREATE if self.tsi_flags.tsi_enabled() => {
                 self.process_proxy_create(pkt)
             }
             defs::TSI_CONNECT if self.tsi_flags.tsi_enabled() => self.process_connect(pkt),
             defs::TSI_GETNAME if self.tsi_flags.tsi_enabled() => self.process_getname(pkt),
+            defs::TSI_SETOPT if self.tsi_flags.tsi_enabled() => {
+                self.process_socket_option(pkt, true)
+            }
+            defs::TSI_GETOPT if self.tsi_flags.tsi_enabled() => {
+                self.process_socket_option(pkt, false)
+            }
+            defs::TSI_BIND if self.tsi_flags.tsi_enabled() => self.process_bind(pkt),
+            defs::TSI_DISCONNECT if self.tsi_flags.tsi_enabled() => self.process_disconnect(pkt),
             defs::TSI_SENDTO_ADDR if self.tsi_flags.tsi_enabled() => self.process_sendto_addr(pkt),
             defs::TSI_SENDTO_DATA if self.tsi_flags.tsi_enabled() => self.process_sendto_data(pkt),
+            defs::TSI_DATAGRAM if self.tsi_flags.tsi_enabled() => self.process_dgram_rw(pkt),
             defs::TSI_LISTEN if self.tsi_flags.tsi_enabled() => self.process_listen_request(pkt),
             defs::TSI_ACCEPT if self.tsi_flags.tsi_enabled() => self.process_accept_request(pkt),
             defs::TSI_PROXY_RELEASE if self.tsi_flags.tsi_enabled() => {
@@ -611,6 +763,7 @@ impl VsockMuxer {
                 }
             };
             let tsi = TsiConnectReq {
+                request_id: 0,
                 peer_port: 0,
                 addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
             };

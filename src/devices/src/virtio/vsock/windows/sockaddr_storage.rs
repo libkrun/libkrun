@@ -46,7 +46,7 @@ impl SockaddrStorage {
             return None;
         }
         let port = byte_order::read_be_u16(&self.buf[2..4]);
-        let flowinfo = byte_order::read_le_u32(&self.buf[4..8]);
+        let flowinfo = byte_order::read_be_u32(&self.buf[4..8]);
         let addr = Ipv6Addr::new(
             byte_order::read_be_u16(&self.buf[8..10]),
             byte_order::read_be_u16(&self.buf[10..12]),
@@ -150,7 +150,7 @@ impl From<SocketAddrV6> for SockaddrStorage {
         };
         byte_order::write_le_u16(&mut storage.buf[0..], defs::LINUX_AF_INET6);
         byte_order::write_be_u16(&mut storage.buf[2..], addr.port());
-        byte_order::write_le_u32(&mut storage.buf[4..], addr.flowinfo());
+        byte_order::write_be_u32(&mut storage.buf[4..], addr.flowinfo());
         let segments = addr.ip().segments();
         for (i, seg) in segments.iter().enumerate() {
             byte_order::write_be_u16(&mut storage.buf[8 + i * 2..], *seg);
@@ -193,7 +193,7 @@ pub fn storage_to_winsock(addr: &SockaddrStorage) -> Option<(Vec<u8>, i32)> {
             let mut sa: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
             sa.sin6_family = AF_INET6;
             sa.sin6_port = v6.port().to_be();
-            sa.sin6_flowinfo = v6.flowinfo();
+            sa.sin6_flowinfo = v6.flowinfo().to_be();
             sa.Anonymous.sin6_scope_id = v6.scope_id();
 
             sa.sin6_addr = IN6_ADDR {
@@ -268,7 +268,7 @@ pub fn winsock_to_storage(buf: &[u8], len: i32) -> Option<SockaddrStorage> {
             let ip = Ipv6Addr::new(
                 segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], segs[7],
             );
-            Some(SocketAddrV6::new(ip, port, sa.sin6_flowinfo, scope_id).into())
+            Some(SocketAddrV6::new(ip, port, u32::from_be(sa.sin6_flowinfo), scope_id).into())
         }
         v if v == AF_UNIX => {
             let path_end = (len as usize).min(110);
