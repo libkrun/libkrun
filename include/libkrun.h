@@ -352,17 +352,15 @@ typedef void (*krun_fs_device_destroy_fn)(KrunFsDevice handle);
 
 /* ConsoleDevice ----------------------------------------------------- */
 
-#if !(defined(_WIN32))
 /** Create a new console builder. */
 KrunConsoleBuilder krun_console_device_builder();
 typedef KrunConsoleBuilder (*krun_console_device_builder_fn)();
-#endif
 void krun_console_device_destroy(KrunConsoleDevice handle);
 typedef void (*krun_console_device_destroy_fn)(KrunConsoleDevice handle);
-#if !(defined(_WIN32))
 
 /* ConsoleBuilder ---------------------------------------------------- */
 
+#if (defined(__unix__) || defined(__APPLE__))
 /**
  * Add a TTY-backed port to the console.
  *
@@ -381,6 +379,8 @@ typedef void (*krun_console_device_destroy_fn)(KrunConsoleDevice handle);
  */
 KrunResult krun_console_builder_add_tty_port(KrunConsoleBuilder handle, KrunStr name, int tty_fd, uint32_t* result, KrunError* err_out);
 typedef KrunResult (*krun_console_builder_add_tty_port_fn)(KrunConsoleBuilder handle, KrunStr name, int tty_fd, uint32_t* result, KrunError* err_out);
+#endif
+#if (defined(__unix__) || defined(__APPLE__))
 /**
  * Add a port with separate borrowed input and output fds (no terminal
  * properties). The caller retains responsibility for the descriptors.
@@ -388,9 +388,11 @@ typedef KrunResult (*krun_console_builder_add_tty_port_fn)(KrunConsoleBuilder ha
  */
 KrunResult krun_console_builder_add_inout_port(KrunConsoleBuilder handle, KrunStr name, int input_fd, int output_fd, uint32_t* result, KrunError* err_out);
 typedef KrunResult (*krun_console_builder_add_inout_port_fn)(KrunConsoleBuilder handle, KrunStr name, int input_fd, int output_fd, uint32_t* result, KrunError* err_out);
+#endif
 /** Build the console device. At least one port must have been added. */
 KrunConsoleDevice krun_console_builder_build(KrunConsoleBuilder handle, KrunError* err_out);
 typedef KrunConsoleDevice (*krun_console_builder_build_fn)(KrunConsoleBuilder handle, KrunError* err_out);
+#if (defined(__unix__) || defined(__APPLE__))
 /**
  * Set up the default console: port 0 (hvc0) plus named redirect ports.
  *
@@ -408,9 +410,21 @@ typedef KrunConsoleDevice (*krun_console_builder_build_fn)(KrunConsoleBuilder ha
  */
 KrunResult krun_console_builder_add_default_console(KrunConsoleBuilder handle, int stdin, int stdout, int stderr, KrunError* err_out);
 typedef KrunResult (*krun_console_builder_add_default_console_fn)(KrunConsoleBuilder handle, int stdin, int stdout, int stderr, KrunError* err_out);
+#endif
+#if defined(_WIN32)
+KrunResult krun_console_builder_add_tty_port(KrunConsoleBuilder handle, KrunStr name, void * tty_fd, uint32_t* result, KrunError* err_out);
+typedef KrunResult (*krun_console_builder_add_tty_port_fn)(KrunConsoleBuilder handle, KrunStr name, void * tty_fd, uint32_t* result, KrunError* err_out);
+#endif
+#if defined(_WIN32)
+KrunResult krun_console_builder_add_inout_port(KrunConsoleBuilder handle, KrunStr name, void * input_fd, void * output_fd, uint32_t* result, KrunError* err_out);
+typedef KrunResult (*krun_console_builder_add_inout_port_fn)(KrunConsoleBuilder handle, KrunStr name, void * input_fd, void * output_fd, uint32_t* result, KrunError* err_out);
+#endif
+#if defined(_WIN32)
+KrunResult krun_console_builder_add_default_console(KrunConsoleBuilder handle, void * stdin, void * stdout, void * stderr, KrunError* err_out);
+typedef KrunResult (*krun_console_builder_add_default_console_fn)(KrunConsoleBuilder handle, void * stdin, void * stdout, void * stderr, KrunError* err_out);
+#endif
 void krun_console_builder_destroy(KrunConsoleBuilder handle);
 typedef void (*krun_console_builder_destroy_fn)(KrunConsoleBuilder handle);
-#endif
 #if !((defined(KRUN_CFG_FEATURE_TEE) || defined(KRUN_CFG_FEATURE_AWS_NITRO)))
 
 /* FsOverlay --------------------------------------------------------- */
