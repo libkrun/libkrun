@@ -106,6 +106,20 @@ impl VcpuList {
             .set_irq_common(irq);
     }
 
+    /// Wakes every vCPU parked waiting for an interrupt. Used by the in-kernel
+    /// GIC, which injects interrupts without going through `pending_irqs`.
+    pub fn wake_waiting(&self) {
+        for vcpu in &self.vcpus {
+            let mut vcpu = vcpu.lock().unwrap();
+            if let VcpuStatus::Waiting = vcpu.status {
+                if let Some(sender) = vcpu.wfe_sender.as_ref() {
+                    let _ = sender.send(vcpu.vcpuid as u32);
+                }
+                vcpu.status = VcpuStatus::Running;
+            }
+        }
+    }
+
     pub fn register(&self, vcpuid: u64, wfe_sender: Sender<u32>) {
         assert!(vcpuid < self.cpu_count);
         self.vcpus[vcpuid as usize].lock().unwrap().wfe_sender = Some(wfe_sender);
