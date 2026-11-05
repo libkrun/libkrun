@@ -43,13 +43,11 @@ impl MuxerRxQ {
 
     /// Push a new RX item to the queue.
     ///
-    /// A push will fail when:
-    /// - trying to push a connection key onto an out-of-sync, or full queue; or
-    /// - trying to push an RST onto a queue already full of RSTs.
-    ///
-    /// RSTs take precedence over connections, because connections can always be queried for
-    /// pending RX data later. Aside from this queue, there is no other storage for RSTs, so
-    /// failing to push one means that we have to drop the packet.
+    /// A push fails when the queue is full or out of sync, and the item is
+    /// then lost: aside from this queue there is no other storage for it.
+    /// Callers for which a lost item is unrecoverable, such as a connection
+    /// announcement the guest cannot otherwise learn about, must check the
+    /// return value.
     ///
     /// Returns:
     /// - `true` if the new item has been successfully queued; or
@@ -92,6 +90,37 @@ impl MuxerRxQ {
 
 pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
     match rx {
+        MuxerRx::SockoptResponse {
+            request_id,
+            operation,
+            peer_port,
+            result,
+            value,
+        } => {
+            pkt.set_op(uapi::VSOCK_OP_RW)
+                .set_src_cid(uapi::VSOCK_HOST_CID)
+                .set_dst_cid(cid)
+                .set_src_port(defs::TSI_CONTROL_PORT)
+                .set_dst_port(peer_port)
+                .set_type(uapi::VSOCK_TYPE_DGRAM);
+            pkt.write_sockopt_rsp(result, value, operation, request_id);
+        }
+        MuxerRx::FeatureResponse {
+            request_id,
+            operation,
+            peer_port,
+            result,
+            services,
+            features,
+        } => {
+            pkt.set_op(uapi::VSOCK_OP_RW)
+                .set_src_cid(uapi::VSOCK_HOST_CID)
+                .set_dst_cid(cid)
+                .set_src_port(defs::TSI_CONTROL_PORT)
+                .set_dst_port(peer_port)
+                .set_type(uapi::VSOCK_TYPE_DGRAM);
+            pkt.write_features_rsp(result, services, features, operation, request_id);
+        }
         MuxerRx::Reset {
             local_port,
             peer_port,
@@ -108,19 +137,19 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_fwd_cnt(0);
         }
         MuxerRx::ConnResponse {
-            local_port,
+            request_id,
+            operation,
             peer_port,
             result,
         } => {
             pkt.set_op(uapi::VSOCK_OP_RW)
                 .set_src_cid(uapi::VSOCK_HOST_CID)
                 .set_dst_cid(cid)
-                .set_src_port(local_port)
+                .set_src_port(defs::TSI_CONTROL_PORT)
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
-            pkt.write_connect_rsp(TsiConnectRsp { result });
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.write_connect_rsp(TsiConnectRsp { result }, operation, request_id);
         }
         MuxerRx::OpRequest {
             local_port,
@@ -151,19 +180,19 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
             pkt.set_len(0);
         }
         MuxerRx::GetnameResponse {
-            local_port,
+            request_id,
+            operation,
             peer_port,
             data,
         } => {
             pkt.set_op(uapi::VSOCK_OP_RW)
                 .set_src_cid(uapi::VSOCK_HOST_CID)
                 .set_dst_cid(cid)
-                .set_src_port(local_port)
+                .set_src_port(defs::TSI_CONTROL_PORT)
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
-            pkt.write_getname_rsp(data);
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.write_getname_rsp(data, operation, request_id);
         }
         MuxerRx::CreditRequest {
             local_port,
@@ -194,34 +223,34 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_fwd_cnt(fwd_cnt);
         }
         MuxerRx::ListenResponse {
-            local_port,
+            request_id,
+            operation,
             peer_port,
             result,
         } => {
             pkt.set_op(uapi::VSOCK_OP_RW)
                 .set_src_cid(uapi::VSOCK_HOST_CID)
                 .set_dst_cid(cid)
-                .set_src_port(local_port)
+                .set_src_port(defs::TSI_CONTROL_PORT)
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
-            pkt.write_listen_rsp(TsiListenRsp { result });
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.write_listen_rsp(TsiListenRsp { result }, operation, request_id);
         }
         MuxerRx::AcceptResponse {
-            local_port,
+            request_id,
+            operation,
             peer_port,
             result,
         } => {
             pkt.set_op(uapi::VSOCK_OP_RW)
                 .set_src_cid(uapi::VSOCK_HOST_CID)
                 .set_dst_cid(cid)
-                .set_src_port(local_port)
+                .set_src_port(defs::TSI_CONTROL_PORT)
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
-            pkt.write_accept_rsp(TsiAcceptRsp { result });
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.write_accept_rsp(TsiAcceptRsp { result }, operation, request_id);
         }
     }
 }

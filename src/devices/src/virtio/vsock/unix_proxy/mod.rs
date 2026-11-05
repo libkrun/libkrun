@@ -8,7 +8,7 @@ use super::defs;
 use super::defs::uapi;
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
-use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
+use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, VsockPacket};
 
 use super::proxy::{AsRawFd, OwnedFd, Proxy, ProxyError, ProxyStatus, ProxyUpdate, RawFd, RecvPkt};
 
@@ -37,7 +37,6 @@ pub struct UnixProxy {
     pub(crate) path: PathBuf,
     pub(crate) peer_port: u32,
     pub(crate) local_port: u32,
-    pub(crate) control_port: u32,
     pub(crate) peer_shutdown: u32,
     pub(crate) peer_fwd_cnt: Wrapping<u32>,
     pub(crate) peer_buf_alloc: u32,
@@ -53,7 +52,6 @@ impl UnixProxy {
         id: u64,
         cid: u64,
         local_port: u32,
-        control_port: u32,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
@@ -71,7 +69,6 @@ impl UnixProxy {
             path,
             peer_port: 0,
             local_port,
-            control_port,
             peer_shutdown: 0,
             peer_fwd_cnt: Wrapping(0),
             peer_buf_alloc: 0,
@@ -99,7 +96,6 @@ impl UnixProxy {
             cid,
             local_port,
             peer_port,
-            control_port: 0,
             peer_shutdown: 0,
             fd,
             status: ProxyStatus::ReverseInit,
@@ -128,6 +124,22 @@ impl UnixProxy {
         };
 
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+    }
+
+    pub(crate) fn push_op_response(&self) {
+        let rx = MuxerRx::OpResponse {
+            local_port: self.local_port,
+            peer_port: self.peer_port,
+        };
+        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+    }
+
+    pub(crate) fn connect_mapped(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
+        self.peer_buf_alloc = pkt.buf_alloc();
+        self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
+        self.local_port = pkt.dst_port();
+        self.peer_port = pkt.src_port();
+        sys::do_connect(self)
     }
 
     pub(crate) fn peer_avail_credit(&self) -> usize {
@@ -210,24 +222,20 @@ impl Proxy for UnixProxy {
         self.status
     }
 
-    fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
-        sys::do_connect(self, pkt, req)
+    fn connect(&mut self, pkt: &VsockPacket, _req: TsiConnectReq) -> ProxyUpdate {
+        self.connect_mapped(pkt)
     }
 
     fn confirm_connect(&mut self, pkt: &VsockPacket) -> Option<ProxyUpdate> {
         sys::confirm_connect(self, pkt)
     }
 
-    fn getpeername(&mut self, _pkt: &VsockPacket) {
+    fn getname(&mut self, _pkt: &VsockPacket, _peer: bool) {
         todo!();
     }
 
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
         sys::sendmsg(self, pkt)
-    }
-
-    fn sendto_addr(&mut self, _req: TsiSendtoAddr) -> ProxyUpdate {
-        todo!();
     }
 
     fn listen(
@@ -247,7 +255,7 @@ impl Proxy for UnixProxy {
         sys::update_peer_credit(self, pkt)
     }
 
-    fn push_op_request(&self) {
+    fn push_op_request(&self) -> bool {
         sys::push_op_request(self)
     }
 
@@ -323,13 +331,10 @@ impl Proxy for UnixAcceptorProxy {
     fn connect(&mut self, _: &VsockPacket, _: TsiConnectReq) -> ProxyUpdate {
         unreachable!()
     }
-    fn getpeername(&mut self, _: &VsockPacket) {
+    fn getname(&mut self, _: &VsockPacket, _: bool) {
         unreachable!()
     }
     fn sendmsg(&mut self, _: &VsockPacket) -> ProxyUpdate {
-        unreachable!()
-    }
-    fn sendto_addr(&mut self, _: TsiSendtoAddr) -> ProxyUpdate {
         unreachable!()
     }
     fn listen(

@@ -3,13 +3,13 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket, RawSocket};
 use std::path::Path;
 use windows_sys::Win32::Networking::WinSock::{
     AF_UNIX, FIONBIO, INVALID_SOCKET, SD_BOTH, SD_RECEIVE, SD_SEND, SOCK_STREAM, SOCKADDR,
-    SOCKADDR_UN, SOCKET, SOCKET_ERROR, WSAECONNREFUSED, WSAEWOULDBLOCK, WSAGetLastError, accept,
-    bind, connect, ioctlsocket, listen, recv, send, shutdown, socket,
+    SOCKADDR_UN, SOCKET, SOCKET_ERROR, WSAEWOULDBLOCK, WSAGetLastError, accept, bind, connect,
+    ioctlsocket, listen, recv, send, shutdown, socket,
 };
 
 use super::super::super::linux_errno::wsa_errno_to_linux;
 use super::super::muxer::{MuxerRx, push_packet};
-use super::super::packet::{TsiConnectReq, VsockPacket};
+use super::super::packet::VsockPacket;
 use super::super::proxy::{
     NewProxyType, OwnedFd, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RawFd, RecvPkt,
 };
@@ -55,15 +55,6 @@ pub(crate) fn switch_to_connected(proxy: &mut super::UnixProxy) {
     // to prevent freezing the event loop thread during `recv_pkt` iterations.
 }
 
-fn push_connect_rsp(proxy: &super::UnixProxy, result: i32) {
-    let rx = MuxerRx::ConnResponse {
-        local_port: 1025,
-        peer_port: proxy.control_port,
-        result,
-    };
-    push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
-}
-
 pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> RecvPkt {
     if let Some(buf) = pkt.buf_mut() {
         let peer_credit = proxy.peer_avail_credit();
@@ -100,11 +91,7 @@ pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> Re
     }
 }
 
-pub(crate) fn do_connect(
-    proxy: &mut super::UnixProxy,
-    _pkt: &VsockPacket,
-    _req: TsiConnectReq,
-) -> ProxyUpdate {
+pub(crate) fn do_connect(proxy: &mut super::UnixProxy) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
 
     let path_str = match proxy.path.to_str() {
@@ -127,7 +114,7 @@ pub(crate) fn do_connect(
     if res == 0 {
         switch_to_connected(proxy);
         update.polling = Some((proxy.id, proxy.fd.as_raw_socket() as RawFd, EventSet::IN));
-        push_connect_rsp(proxy, 0);
+        proxy.push_op_response();
     } else {
         let e = unsafe { WSAGetLastError() };
         if e == WSAEWOULDBLOCK {
@@ -140,7 +127,6 @@ pub(crate) fn do_connect(
             ));
         } else {
             warn!("unix proxy connect error: id={} err={e}", proxy.id);
-            push_connect_rsp(proxy, -wsa_errno_to_linux(e));
         }
     }
 
@@ -205,52 +191,12 @@ pub(crate) fn sendmsg(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyU
     update
 }
 
-pub(crate) fn update_peer_credit(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyUpdate {
-    proxy.peer_buf_alloc = pkt.buf_alloc();
-    proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
-    let mut update = ProxyUpdate::default();
-
-    // If we were deadlocked waiting for credit, and credit is now restored:
-    if proxy.status == ProxyStatus::WaitingCreditUpdate && proxy.peer_avail_credit() > 0 {
-        proxy.status = ProxyStatus::Connected;
-
-        // Proactively pull data to bypass the missed Windows edge-trigger
-        let (signal_queue, wait_credit) = proxy.recv_pkt();
-        update.signal_queue = signal_queue;
-
-        if wait_credit {
-            // We immediately ran out of credit again. Suspend again and ask for more.
-            proxy.status = ProxyStatus::WaitingCreditUpdate;
-            let rx = MuxerRx::CreditRequest {
-                local_port: proxy.local_port,
-                peer_port: proxy.peer_port,
-                fwd_cnt: proxy.tx_cnt.0,
-            };
-            update.push_credit_req = Some(rx);
-            update.polling = Some((
-                proxy.id,
-                proxy.fd.as_raw_socket() as RawFd,
-                EventSet::empty(),
-            ));
-        } else {
-            // Successfully drained, safe to listen for the next edge
-            update.polling = Some((proxy.id, proxy.fd.as_raw_socket() as RawFd, EventSet::IN));
-        }
-    } else {
-        // Normal update (wasn't suspended)
-        proxy.status = ProxyStatus::Connected;
-        update.polling = Some((proxy.id, proxy.fd.as_raw_socket() as RawFd, EventSet::IN));
-    }
-
-    update
-}
-
-pub(crate) fn push_op_request(proxy: &super::UnixProxy) {
+pub(crate) fn push_op_request(proxy: &super::UnixProxy) -> bool {
     let rx = MuxerRx::OpRequest {
         local_port: proxy.local_port,
         peer_port: proxy.peer_port,
     };
-    push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
+    push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem)
 }
 
 pub(crate) fn process_op_response(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyUpdate {
@@ -304,11 +250,7 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
     let mut update = ProxyUpdate::default();
 
     if evset.contains(EventSet::HANG_UP) {
-        if proxy.status == ProxyStatus::Connecting {
-            push_connect_rsp(proxy, -wsa_errno_to_linux(WSAECONNREFUSED));
-        } else {
-            proxy.push_reset();
-        }
+        proxy.push_reset();
         proxy.status = ProxyStatus::Closed;
         update.polling = Some((
             proxy.id,
@@ -379,7 +321,7 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
 
     if evset.contains(EventSet::OUT) && proxy.status == ProxyStatus::Connecting {
         switch_to_connected(proxy);
-        push_connect_rsp(proxy, 0);
+        proxy.push_op_response();
         update.signal_queue = true;
         update.polling = Some((proxy.id, proxy.fd.as_raw_socket() as RawFd, EventSet::IN));
     }
