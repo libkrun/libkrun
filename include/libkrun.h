@@ -480,6 +480,16 @@ typedef void (*krun_vmm_builder_reset_exit_code_fn)(KrunVmmBuilder* handle, uint
 KrunResult krun_vmm_builder_split_irqchip(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 typedef KrunResult (*krun_vmm_builder_split_irqchip_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 /**
+ * Ask for transparent huge pages for guest memory.
+ *
+ * Advises `MADV_HUGEPAGE` on guest memory, so a host with THP set to
+ * `madvise` backs it with huge pages. Building the VM fails if the host
+ * kernel is built without transparent huge page support. Only supported
+ * on Linux.
+ */
+KrunResult krun_vmm_builder_transparent_huge_pages(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
+typedef KrunResult (*krun_vmm_builder_transparent_huge_pages_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
+/**
  * Enable ACPI table generation for x86_64 guests.
  *
  * When disabled (the default), virtio-mmio devices are passed on the kernel
