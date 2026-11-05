@@ -8,7 +8,8 @@ use utils::windows::RawFd;
 use windows_sys::Win32::Networking::WinSock::{
     FIONBIO, INVALID_SOCKET, SD_BOTH, SD_RECEIVE, SD_SEND, SOCK_STREAM, SOCKADDR, SOCKET,
     SOCKET_ERROR, WSAEINTR, WSAESHUTDOWN, WSAEWOULDBLOCK, WSAGetLastError, accept, bind,
-    closesocket, connect, getpeername, ioctlsocket, listen, recv, send, shutdown, socket,
+    closesocket, connect, getpeername, getsockname, ioctlsocket, listen, recv, send, shutdown,
+    socket,
 };
 
 use crate::virtio::vsock::windows::sockaddr_storage::{
@@ -210,16 +211,16 @@ pub(crate) fn do_connect(
     update
 }
 
-pub(crate) fn do_getpeername(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) {
+pub(crate) fn do_getname(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket, peer: bool) {
     let mut sa_buf = [0u8; 128];
     let mut sa_len: i32 = 128;
 
     let res = unsafe {
-        getpeername(
-            sock(proxy),
-            sa_buf.as_mut_ptr() as *mut SOCKADDR,
-            &mut sa_len,
-        )
+        if peer {
+            getpeername(sock(proxy), sa_buf.as_mut_ptr().cast(), &mut sa_len)
+        } else {
+            getsockname(sock(proxy), sa_buf.as_mut_ptr().cast(), &mut sa_len)
+        }
     };
 
     let (result, addr_len, addr) = if res == 0 {
@@ -249,7 +250,8 @@ pub(crate) fn do_getpeername(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacke
         addr,
     };
     let rx = MuxerRx::GetnameResponse {
-        local_port: pkt.dst_port(),
+        request_id: pkt.control_request_id(),
+        operation: pkt.control_operation(),
         peer_port: pkt.src_port(),
         data,
     };
@@ -363,7 +365,8 @@ pub(crate) fn do_listen(
     let result = try_listen(proxy, &req, host_port_map);
 
     let rx = MuxerRx::ListenResponse {
-        local_port: pkt.dst_port(),
+        request_id: pkt.control_request_id(),
+        operation: pkt.control_operation(),
         peer_port: pkt.src_port(),
         result,
     };
@@ -381,13 +384,9 @@ pub(crate) fn do_listen(
 pub(crate) fn do_accept(proxy: &mut super::TsiStreamProxy, req: TsiAcceptReq) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
 
-    const O_NONBLOCK: u32 = 2048;
     if proxy.pending_accepts > 0 {
         proxy.pending_accepts -= 1;
         proxy.push_accept_rsp(0);
-        update.signal_queue = true;
-    } else if (req.flags & O_NONBLOCK) != 0 {
-        proxy.push_accept_rsp(-11); // LINUX_EAGAIN
         update.signal_queue = true;
     } else {
         proxy.status = ProxyStatus::WaitingOnAccept;
@@ -451,11 +450,7 @@ pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) 
         proxy.status = ProxyStatus::Closed;
         update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
         update.signal_queue = true;
-        update.remove_proxy = if proxy.status == ProxyStatus::Listening {
-            ProxyRemoval::Immediate
-        } else {
-            ProxyRemoval::Deferred
-        };
+        // Retain endpoint metadata until the guest releases its descriptor.
         return update;
     }
 
@@ -478,7 +473,7 @@ pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) 
                 proxy.push_reset();
                 update.signal_queue = true;
                 update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-                update.remove_proxy = ProxyRemoval::Deferred;
+                // Keep names available until the guest closes the descriptor.
                 return update;
             } else if proxy.host_read_closed || proxy.status == ProxyStatus::WaitingCreditUpdate {
                 update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));

@@ -15,7 +15,7 @@ use nix::sys::socket::{
 #[cfg(target_os = "macos")]
 use super::super::super::linux_errno::linux_errno_raw;
 use super::super::muxer::{MuxerRx, push_packet};
-use super::super::packet::{TsiConnectReq, VsockPacket};
+use super::super::packet::VsockPacket;
 use super::super::proxy::{
     NewProxyType, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
 };
@@ -78,21 +78,6 @@ pub(crate) fn switch_to_connected(proxy: &mut super::UnixProxy) {
     };
 }
 
-fn push_connect_rsp(proxy: &super::UnixProxy, result: i32) {
-    debug!(
-        "push_connect_rsp: id: {}, control_port: {}, result: {}",
-        proxy.id, proxy.control_port, result
-    );
-
-    // This response goes to the control port (DGRAM).
-    let rx = MuxerRx::ConnResponse {
-        local_port: 1025,
-        peer_port: proxy.control_port,
-        result,
-    };
-    push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
-}
-
 pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> RecvPkt {
     if let Some(buf) = pkt.buf_mut() {
         let peer_credit = proxy.peer_avail_credit();
@@ -137,43 +122,32 @@ pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> Re
     }
 }
 
-pub(crate) fn do_connect(
-    proxy: &mut super::UnixProxy,
-    _pkt: &VsockPacket,
-    _req: TsiConnectReq,
-) -> ProxyUpdate {
+pub(crate) fn do_connect(proxy: &mut super::UnixProxy) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
 
     let addr = UnixAddr::new(&proxy.path).unwrap();
 
-    let result = match connect(proxy.fd.as_raw_fd(), &addr) {
+    match connect(proxy.fd.as_raw_fd(), &addr) {
         Ok(()) => {
             debug!("connect: Connected");
             switch_to_connected(proxy);
-            0
         }
         Err(nix::errno::Errno::EINPROGRESS) => {
             debug!("connect: Connecting");
             proxy.status = ProxyStatus::Connecting;
-            0
         }
         Err(e) => {
             debug!("Error connecting: {e}");
-            #[cfg(target_os = "macos")]
-            let errno = -linux_errno_raw(Errno::last_raw());
-            #[cfg(target_os = "linux")]
-            let errno = -Errno::last_raw();
-            errno
         }
-    };
+    }
 
     if proxy.status == ProxyStatus::Connecting {
         update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::IN | EventSet::OUT));
     } else {
         if proxy.status == ProxyStatus::Connected {
             update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::IN));
+            proxy.push_op_response();
         }
-        push_connect_rsp(proxy, result);
     }
     update
 }
@@ -259,29 +233,7 @@ pub(crate) fn sendmsg(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyU
     update
 }
 
-pub(crate) fn update_peer_credit(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyUpdate {
-    debug!(
-        "update_credit: buf_alloc={} rx_cnt={} fwd_cnt={}",
-        pkt.buf_alloc(),
-        proxy.rx_cnt,
-        pkt.fwd_cnt()
-    );
-    proxy.peer_buf_alloc = pkt.buf_alloc();
-    proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
-
-    if proxy.status != ProxyStatus::WaitingCreditUpdate || proxy.peer_avail_credit() == 0 {
-        return ProxyUpdate::default();
-    }
-
-    proxy.status = ProxyStatus::Connected;
-
-    ProxyUpdate {
-        polling: Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::IN)),
-        ..Default::default()
-    }
-}
-
-pub(crate) fn push_op_request(proxy: &super::UnixProxy) {
+pub(crate) fn push_op_request(proxy: &super::UnixProxy) -> bool {
     debug!(
         "push_op_request: id={}, local_port={} peer_port={}",
         proxy.id, proxy.local_port, proxy.peer_port
@@ -292,7 +244,7 @@ pub(crate) fn push_op_request(proxy: &super::UnixProxy) {
         local_port: proxy.local_port,
         peer_port: proxy.peer_port,
     };
-    push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
+    push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem)
 }
 
 pub(crate) fn process_op_response(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyUpdate {
@@ -365,11 +317,7 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
     {
         debug!("process_event: HANG_UP");
 
-        if proxy.status == ProxyStatus::Connecting {
-            push_connect_rsp(proxy, -libc::ECONNREFUSED);
-        } else {
-            proxy.push_reset();
-        }
+        proxy.push_reset();
 
         proxy.status = ProxyStatus::Closed;
         update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
@@ -419,7 +367,7 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
         debug!("process_event: OUT");
         if proxy.status == ProxyStatus::Connecting {
             switch_to_connected(proxy);
-            push_connect_rsp(proxy, 0);
+            proxy.push_op_response();
             update.signal_queue = true;
             update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::IN));
         } else {

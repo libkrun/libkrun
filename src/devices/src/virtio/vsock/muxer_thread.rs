@@ -181,10 +181,22 @@ impl MuxerThread {
                 .write()
                 .unwrap()
                 .insert(new_id, Mutex::new(new_proxy));
-            if let Some(proxy) = self.proxy_map.read().unwrap().get(&new_id) {
-                proxy.lock().unwrap().push_op_request();
-            };
-            should_signal = true;
+            let announced = self
+                .proxy_map
+                .read()
+                .unwrap()
+                .get(&new_id)
+                .is_some_and(|proxy| proxy.lock().unwrap().push_op_request());
+            if !announced {
+                // Without the request the guest can never learn of the
+                // connection, so nothing would release the proxy or its
+                // descriptor; close the accepted socket instead of holding
+                // it until teardown.
+                self.proxy_map.write().unwrap().remove(&new_id);
+                warn!("dropping accepted connection {new_id}: guest RX queue is full");
+            } else {
+                should_signal = true;
+            }
         }
 
         if should_signal {

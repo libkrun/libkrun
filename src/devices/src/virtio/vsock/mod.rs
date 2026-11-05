@@ -17,7 +17,9 @@ mod reaper;
 #[cfg(target_os = "macos")]
 mod timesync;
 mod tsi_dgram;
+mod tsi_sockopt;
 mod tsi_stream;
+mod tsi_wire;
 mod unix_proxy;
 
 #[cfg(target_os = "windows")]
@@ -82,16 +84,26 @@ mod defs {
     pub const SOCK_STREAM: u16 = 1;
     pub const SOCK_DGRAM: u16 = 2;
 
-    /// Misc
+    // The fixed TSI ports all live below the vsock ephemeral boundary:
+    // the guest reserves ports up to 1023 and reverse proxy ports are
+    // drawn from 1024 upwards, so no dynamically assigned port can alias
+    // them.
     pub const TSI_PROXY_PORT: u32 = 620;
-    pub const TSI_PROXY_CREATE: u32 = 1024;
-    pub const TSI_CONNECT: u32 = 1025;
-    pub const TSI_GETNAME: u32 = 1026;
-    pub const TSI_SENDTO_ADDR: u32 = 1027;
-    pub const TSI_SENDTO_DATA: u32 = 1028;
-    pub const TSI_LISTEN: u32 = 1029;
-    pub const TSI_ACCEPT: u32 = 1030;
-    pub const TSI_PROXY_RELEASE: u32 = 1031;
+    pub const TSI_CONTROL_PORT: u32 = 621;
+    pub const TSI_DATAGRAM: u32 = 622;
+
+    pub const TSI_OP_CREATE: u32 = 1;
+    pub const TSI_OP_CONNECT: u32 = 2;
+    pub const TSI_OP_GETNAME: u32 = 3;
+    pub const TSI_OP_LISTEN: u32 = 4;
+    pub const TSI_OP_ACCEPT: u32 = 5;
+    pub const TSI_OP_RELEASE: u32 = 6;
+    pub const TSI_OP_DISCONNECT: u32 = 7;
+    pub const TSI_OP_SETOPT: u32 = 8;
+    pub const TSI_OP_GETOPT: u32 = 9;
+    pub const TSI_OP_BIND: u32 = 10;
+    pub const TSI_OP_CAPABILITIES: u32 = 11;
+    pub const TSI_OP_ACTIVATE: u32 = 12;
 
     // Linux definitions that we need for cross-platform compatibility.
     pub const LINUX_AF_UNIX: u16 = 1;
