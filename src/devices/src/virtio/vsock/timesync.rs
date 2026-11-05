@@ -48,7 +48,7 @@ impl TimesyncThread {
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
             pkt.write_time_sync(time);
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.set_len(8);
             if let Err(e) = queue.add_used(&self.mem, head.index, pkt.finish_rx().unwrap_or(0)) {
                 error!("failed to add used elements to the queue: {e:?}");
             }

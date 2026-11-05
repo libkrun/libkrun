@@ -41,9 +41,18 @@ krun_vsock_device_add_port_forward(vsock, KRUN_STR("80:8080"), &err);
 krun_mmio_device_manager_add(devices, vsock);
 ```
 
+Linux TSI hosts support ordinary iputils `ping` using ICMP datagram sockets,
+including IPv4, IPv6, connected mode and explicit nonzero echo identifiers.
+Allow the application/VMM groups in `net.ipv4.ping_group_range` in the guest
+and host respectively. `CAP_NET_RAW` is unnecessary. Guest-local destinations
+stay inside the guest; other destinations use the host network. UDP port
+mappings do not apply to echo identifiers. Raw ping (`-e 0`), outgoing TTL/hop-limit
+controls and host error-queue forwarding are unsupported; other host platforms
+do not currently proxy ICMP ping sockets.
+
 ### Known Limitations
 - Requires a kernel with TSI support (bundled in `libkrunfw`).
-- Limited to `SOCK_STREAM` and `SOCK_DGRAM` sockets across `AF_INET`, `AF_INET6`, and `AF_UNIX`. Raw sockets (`SOCK_RAW`), ICMP ping sockets, and netlink are not supported.
+- Limited to `SOCK_STREAM` and `SOCK_DGRAM` sockets across `AF_INET`, `AF_INET6`, and `AF_UNIX`. Linux hosts support ICMP datagram ping sockets for IPv4 and IPv6. Raw sockets (`SOCK_RAW`) and netlink are not supported.
 - For `AF_UNIX` sockets, only absolute filesystem paths are supported.
 - Host-side `AF_UNIX` TSI handling is not implemented on macOS.
 
