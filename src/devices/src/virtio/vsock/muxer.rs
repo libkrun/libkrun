@@ -90,6 +90,15 @@ pub fn push_packet(
     mem: &GuestMemoryMmap,
 ) {
     let mut queue = queue_mutex.lock().unwrap();
+    let mut rxq = rxq_mutex.lock().unwrap();
+    // Packets already waiting in rxq go first: overtaking them reorders credit updates, and the
+    // guest keeps only the last fwd_cnt it receives.
+    if !rxq.is_empty() {
+        if !rxq.push(rx) {
+            error!("rxq full, dropping pkt");
+        }
+        return;
+    }
     if let Some(head) = queue.pop(mem) {
         if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
             rx_to_pkt(cid, rx, &mut pkt);
@@ -99,8 +108,9 @@ pub fn push_packet(
         }
     } else {
         error!("couldn't push pkt to queue, adding it to rxq");
-        drop(queue);
-        rxq_mutex.lock().unwrap().push(rx);
+        if !rxq.push(rx) {
+            error!("rxq full, dropping pkt");
+        }
     }
 }
 
@@ -210,20 +220,7 @@ impl VsockMuxer {
             }
         };
 
-        let mut queue = queue_mutex.lock().unwrap();
-        if let Some(head) = queue.pop(mem) {
-            if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-                rx_to_pkt(self.cid, rx, &mut pkt);
-                if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
-                {
-                    error!("failed to add used elements to the queue: {e:?}");
-                }
-            }
-        } else {
-            error!("couldn't push pkt to queue, adding it to rxq");
-            drop(queue);
-            self.rxq.lock().unwrap().push(rx);
-        }
+        push_packet(self.cid, rx, &self.rxq, queue_mutex, mem);
     }
 
     pub fn update_polling(&self, id: u64, fd: RawFd, evset: EventSet) {

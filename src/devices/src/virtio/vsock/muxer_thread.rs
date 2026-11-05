@@ -84,7 +84,7 @@ impl MuxerThread {
                     drained = true;
                 }
             } else {
-                rxq.push(rx);
+                rxq.push_front(rx);
                 break;
             }
         }
