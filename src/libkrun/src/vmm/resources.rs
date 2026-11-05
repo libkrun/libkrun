@@ -114,6 +114,8 @@ pub struct VmResources {
     pub smbios_oem_strings: Option<Vec<String>>,
     /// Whether to enable nested virtualization.
     pub nested_enabled: bool,
+    /// Whether to expose the host's invariant TSC capability.
+    pub invariant_tsc: bool,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
@@ -141,6 +143,8 @@ impl VmResources {
             cpu_template: self.vm_config().cpu_template,
             #[cfg(target_os = "linux")]
             nested_enabled: self.nested_enabled,
+            #[cfg(target_os = "linux")]
+            invariant_tsc: self.invariant_tsc,
         }
     }
 
@@ -267,6 +271,7 @@ mod tests {
             external_kernel: None,
             smbios_oem_strings: None,
             nested_enabled: false,
+            invariant_tsc: false,
             split_irqchip: false,
             acpi_enabled: false,
             serial_consoles: Vec::new(),
@@ -287,6 +292,8 @@ mod tests {
             cpu_template: vm_resources.vm_config().cpu_template,
             #[cfg(target_os = "linux")]
             nested_enabled: vm_resources.nested_enabled,
+            #[cfg(target_os = "linux")]
+            invariant_tsc: vm_resources.invariant_tsc,
         };
 
         let vcpu_config = vm_resources.vcpu_config();
