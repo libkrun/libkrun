@@ -43,6 +43,8 @@ Create an `MmioDeviceManager` with `MmioDeviceManager::new()` (C API: `krun_mmio
   Call `set_cache_policy()` before attaching it to select `CachePolicy::Auto` (the default),
   `Never` or `Always`. Use `Never` for files modified outside the guest; reserve `Always`
   for directories accessed exclusively through this filesystem.
+  `set_cache_timeouts()` sets how long lookups and attributes are cached (5000 ms by
+  default); use 0 for directories the host modifies while the guest uses them.
 - **Network**:
   - **TSI (Transparent Socket Impersonation)**: Built into `VsockDevice` with `TsiFlags::HIJACK_INET` and port forwarding.
   - **Virtio-net**: `NetDevice` connected via Unix stream or datagram socket (e.g. to `passt` or `gvproxy`).

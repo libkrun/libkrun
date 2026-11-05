@@ -730,6 +730,28 @@ impl<'a> FsDevice<'a> {
         }
         Ok(())
     }
+
+    /// Set how long the guest may cache lookups and attributes, before attaching this device.
+    ///
+    /// Both default to 5000 ms. Files changed outside the guest can look stale until the
+    /// timeouts expire: a file that grew on the host is read with its old size. Use 0 for
+    /// directories the host modifies while the guest uses them, at the cost of one more
+    /// request to the server per lookup or attribute read. With `LinuxSimplified`
+    /// attributes are never cached, and `attr_timeout_ms` applies again after switching to
+    /// another mode. A NullFs device has no host-backed entries and returns `InvalidParam`.
+    pub fn set_cache_timeouts(
+        &mut self,
+        entry_timeout_ms: u32,
+        attr_timeout_ms: u32,
+    ) -> Result<(), VmmError> {
+        if !self.inner.lock().unwrap().set_cache_timeouts(
+            std::time::Duration::from_millis(entry_timeout_ms.into()),
+            std::time::Duration::from_millis(attr_timeout_ms.into()),
+        ) {
+            return Err(VmmError::InvalidParam());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
