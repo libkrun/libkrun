@@ -94,6 +94,14 @@ pub trait PciIntxLine: Send + Sync {
     fn set_level(&self, asserted: bool) -> io::Result<()>;
 }
 
+/// Handles a function's queue notifications outside the transport, e.g. as
+/// KVM ioeventfds.
+pub trait PciQueueNotifications: Send + Sync {
+    /// Moves the notify addresses from BAR0 at `from` to BAR0 at `to`.
+    /// `None` means not registered: notifications go through the transport.
+    fn relocate(&self, from: Option<u64>, to: Option<u64>) -> io::Result<()>;
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum PciRootError {
     DuplicateFunction(PciAddress),
