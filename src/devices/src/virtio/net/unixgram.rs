@@ -35,11 +35,20 @@ const SOCKET_SNDBUF: usize = MAX_BUFFER_SIZE - VNET_HDR_LEN;
 #[cfg(not(target_os = "macos"))]
 const SOCKET_SNDBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
 
+#[cfg(target_os = "macos")]
+const SOCKET_SNDBUF_VNET_HDR: usize = MAX_BUFFER_SIZE;
+
+#[cfg(not(target_os = "macos"))]
+const SOCKET_SNDBUF_VNET_HDR: usize = DEFAULT_SOCKET_BUF_SIZE;
+
 const SOCKET_RCVBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
 
 pub struct Unixgram {
     fd: OwnedFd,
     retries: u64,
+    /// Frames on the socket start with the virtio-net header, so the peer can
+    /// use and produce segmentation and checksum offload.
+    vnet_hdr: bool,
 }
 
 impl Unixgram {
@@ -73,11 +82,26 @@ impl Unixgram {
             };
         }
 
-        Self { fd, retries: 0 }
+        Self {
+            fd,
+            retries: 0,
+            vnet_hdr: false,
+        }
+    }
+
+    /// Keep the virtio-net header on the socket instead of stripping it on
+    /// transmit and zero-filling it on receive.
+    pub fn with_vnet_hdr(mut self, vnet_hdr: bool) -> Self {
+        self.vnet_hdr = vnet_hdr;
+        self
     }
 
     /// Create the backend opening a connection to the userspace network proxy.
-    pub fn open(path: PathBuf, send_vfkit_magic: bool) -> Result<Self, ConnectError> {
+    pub fn open(
+        path: PathBuf,
+        send_vfkit_magic: bool,
+        vnet_hdr: bool,
+    ) -> Result<Self, ConnectError> {
         // We cannot create a non-blocking socket on macOS here. This is done later in new().
         let fd = socket(
             AddressFamily::Unix,
@@ -108,7 +132,13 @@ impl Unixgram {
                 .map_err(ConnectError::SendingMagic)?;
         }
 
-        if let Err(e) = setsockopt(&fd, sockopt::SndBuf, &SOCKET_SNDBUF) {
+        // With the header, a datagram is the whole buffer.
+        let sndbuf = if vnet_hdr {
+            SOCKET_SNDBUF_VNET_HDR
+        } else {
+            SOCKET_SNDBUF
+        };
+        if let Err(e) = setsockopt(&fd, sockopt::SndBuf, &sndbuf) {
             log::warn!("Failed to set SO_SNDBUF: {e}");
         }
         if let Err(e) = setsockopt(&fd, sockopt::RcvBuf, &SOCKET_RCVBUF) {
@@ -121,14 +151,19 @@ impl Unixgram {
             getsockopt(&fd, sockopt::RcvBuf)
         );
 
-        Ok(Self::new(fd))
+        Ok(Self::new(fd).with_vnet_hdr(vnet_hdr))
     }
 }
 
 impl NetBackend for Unixgram {
     /// Try to read a frame the proxy. If no bytes are available reports ReadError::NothingRead
     fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
-        let hdr_len = write_virtio_net_hdr(buf);
+        // With vnet_hdr the peer writes the header itself.
+        let hdr_len = if self.vnet_hdr {
+            0
+        } else {
+            write_virtio_net_hdr(buf)
+        };
         let frame_length = match recv(self.fd.as_raw_fd(), &mut buf[hdr_len..], MsgFlags::empty()) {
             Ok(f) => f,
             #[allow(unreachable_patterns)]
@@ -145,7 +180,8 @@ impl NetBackend for Unixgram {
 
     /// Try to write a frame to the proxy.
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
-        let ret = match send(self.fd.as_raw_fd(), &buf[hdr_len..], MsgFlags::empty()) {
+        let start = if self.vnet_hdr { 0 } else { hdr_len };
+        let ret = match send(self.fd.as_raw_fd(), &buf[start..], MsgFlags::empty()) {
             Ok(ret) => ret,
             // macOS returns ENOBUFS; Linux returns EAGAIN when the socket buffer is full.
             #[allow(unreachable_patterns)]
@@ -185,5 +221,62 @@ impl NetBackend for Unixgram {
     #[cfg(target_os = "macos")]
     fn write_retry_delay_us(&self) -> u64 {
         50
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::socket::socketpair;
+
+    fn pair() -> (OwnedFd, OwnedFd) {
+        socketpair(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            None,
+            SockFlag::empty(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn strips_and_zero_fills_the_header_by_default() {
+        let (ours, peer) = pair();
+        let mut backend = Unixgram::new(ours);
+        let mut frame = [0xaau8; VNET_HDR_LEN + 4];
+        frame[VNET_HDR_LEN..].copy_from_slice(b"eth!");
+        backend.write_frame(VNET_HDR_LEN, &mut frame).unwrap();
+        let mut got = [0u8; 64];
+        let n = recv(peer.as_raw_fd(), &mut got, MsgFlags::empty()).unwrap();
+        assert_eq!(&got[..n], b"eth!");
+
+        send(peer.as_raw_fd(), b"back", MsgFlags::empty()).unwrap();
+        let mut buf = [0xffu8; 64];
+        let n = backend.read_frame(&mut buf).unwrap();
+        assert_eq!(n, VNET_HDR_LEN + 4);
+        assert!(buf[..VNET_HDR_LEN].iter().all(|b| *b == 0));
+        assert_eq!(&buf[VNET_HDR_LEN..n], b"back");
+    }
+
+    #[test]
+    fn keeps_the_header_with_vnet_hdr() {
+        let (ours, peer) = pair();
+        let mut backend = Unixgram::new(ours).with_vnet_hdr(true);
+        let mut frame = [0u8; VNET_HDR_LEN + 4];
+        frame[0] = 1; // VIRTIO_NET_HDR_F_NEEDS_CSUM
+        frame[1] = 1; // VIRTIO_NET_HDR_GSO_TCPV4
+        frame[VNET_HDR_LEN..].copy_from_slice(b"eth!");
+        backend.write_frame(VNET_HDR_LEN, &mut frame).unwrap();
+        let mut got = [0u8; 64];
+        let n = recv(peer.as_raw_fd(), &mut got, MsgFlags::empty()).unwrap();
+        assert_eq!(&got[..n], &frame[..]);
+
+        let mut reply = [0u8; VNET_HDR_LEN + 4];
+        reply[1] = 4; // VIRTIO_NET_HDR_GSO_TCPV6
+        reply[VNET_HDR_LEN..].copy_from_slice(b"back");
+        send(peer.as_raw_fd(), &reply, MsgFlags::empty()).unwrap();
+        let mut buf = [0xffu8; 64];
+        let n = backend.read_frame(&mut buf).unwrap();
+        assert_eq!(&buf[..n], &reply[..]);
     }
 }

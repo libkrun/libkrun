@@ -1658,6 +1658,11 @@ export_bitflags! {
         pub struct NetFlags: u32 {
             /// Send the vfkit magic handshake on a unixgram socket.
             const VFKIT = 1;
+            /// Keep the 12-byte virtio-net header (`virtio_net_hdr_v1`) in front of
+            /// each frame on a unixgram socket, instead of stripping it on transmit and
+            /// zero-filling it on receive, so the peer can handle segmentation and
+            /// checksum offload (`VIRTIO_NET_F_HOST_TSO4` and friends).
+            const VNET_HDR = 2;
         }
     }
 }
@@ -1683,7 +1688,11 @@ impl NetDevice {
         use devices::virtio::net::device::VirtioNetBackend;
         Self::new_inner(
             id,
-            VirtioNetBackend::UnixgramPath(PathBuf::from(path), flags.contains(NetFlags::VFKIT)),
+            VirtioNetBackend::UnixgramPath(
+                PathBuf::from(path),
+                flags.contains(NetFlags::VFKIT),
+                flags.contains(NetFlags::VNET_HDR),
+            ),
             mac,
             features,
         )
@@ -1700,10 +1709,12 @@ impl NetDevice {
         flags: NetFlags,
     ) -> Result<Self, VmmError> {
         use devices::virtio::net::device::VirtioNetBackend;
-        let _ = flags;
         Self::new_inner(
             id,
-            VirtioNetBackend::UnixgramFd(std::os::fd::IntoRawFd::into_raw_fd(fd)),
+            VirtioNetBackend::UnixgramFd(
+                std::os::fd::IntoRawFd::into_raw_fd(fd),
+                flags.contains(NetFlags::VNET_HDR),
+            ),
             mac,
             features,
         )
