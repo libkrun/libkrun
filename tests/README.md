@@ -14,6 +14,117 @@ KRUN_TEST_FFI=1 \
   ./run.sh test
 ```
 
+## TSI application compatibility
+
+Run the stock-application cases against a matching TSIv4 / libkrunfw ABI 6 kernel:
+
+```sh
+make test FFI=0 TEST='tsi-app-*'
+```
+
+Add `KRUN_TEST_TSI_TCP_PUBLICATION_STRICT=1` to run the same batch with
+`FAIL_ON_TCP_PUBLICATION_ERROR` enabled. For example:
+
+```sh
+KRUN_TEST_TSI_TCP_PUBLICATION_STRICT=1 make test FFI=0 TEST='tsi-app-*'
+```
+
+This verifies ordinary application behavior with available host ports in both
+policies. Focused guest tests separately cover occupied-port fallback/failure
+and retry, including TCP port overrides. Use the matching TSIv4 firmware with
+the eight-byte LISTEN reply.
+
+The twenty-eight cases run curl HTTP/HTTPS, two parallel curl scenarios, wget HTTP,
+dig over UDP/TCP, dnsmasq, OpenSSL DTLS, iputils ping, and `python3 -m http.server` over both IPv4
+and IPv6. Existing names select IPv4; their `-ipv6` counterparts select IPv6.
+Use `TEST='tsi-app-*-ipv6'` to run just IPv6. The Python server is reached
+from both the host through a port mapping and a guest-local curl client.
+Applications use their normal socket settings. The guest verifies that automatic INET hijacking is
+active and no `eth0` device exists; no virtual NIC is added.
+
+`tsi-app-ping` and `tsi-app-ping-ipv6` require a Linux host and run the installed
+iputils binary with ICMP datagram sockets, not UDP echo or raw ICMP. Each checks
+ordinary ping, `-C` and an explicit nonzero `-e` identifier against both a
+host-only target and guest loopback. Every invocation must receive all three
+replies with nonzero TTL/hop-limit metadata. The child runs as UID/GID 65534
+with `no_new_privs`, preventing raw-socket privileges from masking a regression.
+The guest enables `ping_group_range`; the host fixture permits its mapped group
+0 and assigns the target IP only inside the runner's private network namespace.
+The normal runner sets `KRUN_TEST_PRIVATE_NETNS=1` after entering that namespace.
+If running a custom namespace wrapper with `KRUN_NO_UNSHARE=1`, set that marker
+inside the private namespace too; the fixture refuses to configure the real
+host namespace. A supplied offline rootfs must include iputils `ping`.
+
+The two parallel curl cases require a Linux host and skip on macOS. A saturated
+host TCP accept queue holds one connection pending while another transfer must
+finish. The delayed case then opens the queue and checks both response bodies;
+the timeout case keeps it closed and verifies curl's one-second connection
+timeout fires within 2.5 seconds. The fast body must arrive before opening the
+slow queue in both cases. Use `TEST='tsi-app-curl-parallel-*'` to select them.
+
+`tsi-app-openssl-dtls` runs the installed `openssl s_server -dtls1_2` as an
+incoming UDP service. An unmodified host `openssl s_client` verifies the test
+certificate and exchanges plaintext through an explicit UDP port mapping;
+a guest-local client repeats the exchange after restarting the server. This
+checks incoming UDP before an application send, replies, guest-local delivery,
+and close/rebind in each address family. Applications use normal socket settings.
+
+`tsi-app-dig-udp-large` checks a UDP reply larger than 3 KB containing 192
+separate A records, with TCP retry disabled. `tsi-app-dig-udp-fallback` checks
+that a truncated UDP response makes stock dig retry automatically over TCP;
+the fixture verifies both transports were used. Both have `-ipv6` counterparts.
+
+`tsi-app-dnsmasq` and `tsi-app-dnsmasq-ipv6` run stock dnsmasq with a fixed
+loopback listener and local DNS data. Sixteen simultaneous host dig processes
+query its mapped UDP port, and a host TCP query and guest-local UDP/TCP queries
+verify the same answer. UDP clients disable TCP retry. This exercises incoming
+UDP before any application send and replies to multiple independent peers.
+The IPv6 case requires guest packet-info support for explicitly bound addresses.
+The wildcard cases below add destination metadata and source selection coverage.
+Interface-only source routing and scoped IPv6 remain outside that coverage.
+
+`tsi-app-dnsmasq-wildcard` and its `-ipv6` counterpart omit `--bind-interfaces`
+and use ordinary wildcard sockets filtered to guest loopback. Sixteen host UDP
+clients query the service, followed by a host TCP query; guest-local UDP/TCP
+clients verify native delivery. Clients bind to the primary loopback address
+so replies from an incorrect default source are detectable. Linux IPv4 uses
+both `127.0.0.1` and `127.0.0.2`; the alternate can be overridden with
+`KRUN_TEST_TSI_IPV4_ALTERNATE`. Other hosts default to one IPv4 address.
+Set `KRUN_TEST_TSI_IPV6_ALTERNATE` to another address already assigned to the
+host to check distinct IPv6 destinations as well. The tests do not configure
+host interfaces. These cases require the coordinated 168-byte TSIv4 datagram
+header and support for source selection on proxy sends.
+
+Local host fixtures use ephemeral ports and fixed test data. HTTPS verifies a
+locally generated certificate through an explicit test CA and verifies the
+selected loopback IP address. IPv6 tests use literal `::1` addresses, including
+URL brackets, so they cannot fall back to IPv4. Tests require no
+public network service at runtime. Application versions, commands and failures
+are recorded in the per-case logs. Host `openssl` and `dig` are needed for the
+TLS/DTLS and incoming DNS fixtures.
+
+By default the existing Podman rootfs provisioner builds a Fedora 43 image with
+curl, wget, Python, bind-utils, OpenSSL and dnsmasq. Check the runner summary for skips
+if image provisioning is unavailable. To use an existing rootfs offline:
+
+```sh
+KRUN_TEST_TSI_APPS_ROOTFS=/path/to/application-rootfs \
+    make test FFI=0 TEST='tsi-app-*'
+```
+
+That rootfs must contain the stock `curl`, `wget`, `dig`, `openssl`, `python3`
+and `dnsmasq` commands in `/usr/bin`, `/usr/sbin`, `/bin` or `/sbin`, plus their
+loader, libraries and Python standard library. dnsmasq uses the root account
+from the rootfs passwd/group files to avoid requiring a service account.
+It is copied into each test's private root before init/fixture files are added;
+the supplied rootfs is not modified. Use `TEST_FLAGS='--base-dir /path/to/results'`
+when you need to choose storage for the copies. Passing these cases establishes
+coverage for the recorded application versions and IPv4/IPv6 paths, including
+parallel progress, connection deadlines, large/truncated DNS replies and
+incoming TCP, DNS and UDP/DTLS. These
+fixtures do not cover arbitrary routed topologies, link-local scope IDs or
+every UDP service; broader service compatibility remains an additional target.
+
 ## Running on macOS
 
 ### Prerequisites

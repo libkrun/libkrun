@@ -153,6 +153,7 @@ fn run_single_test(
         let name = test_case.name;
         let dir = test_dir.display();
         Command::new("buildah")
+            .env("KRUN_TEST_PRIVATE_NETNS", "1")
             .args(["unshare", "--", "unshare", "--net", "--", "sh", "-c"])
             .arg(format!(
                 "echo '=== namespace debug ===' >&2; id >&2; cat /proc/self/uid_map >&2; cat /proc/self/gid_map >&2; ip link >&2; ip addr add 127.0.0.1/8 dev lo && ip link set lo up; echo '=== lo setup exit: '$?' ===' >&2; ip addr >&2; echo '=== end debug ===' >&2; exec {exe} start-vm --test-case {name} --tmp-dir {dir}"
