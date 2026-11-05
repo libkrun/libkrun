@@ -46,6 +46,13 @@
         "fd"
       ]
     },
+    "BuildCapabilityFlags": {
+      "kind": {
+        "bitflags": {
+          "alias_of": "u32"
+        }
+      }
+    },
     "CachePolicy": {
       "kind": {
         "enum": {
@@ -2986,6 +2993,66 @@
   ],
   "bitflags_constants": [
     {
+      "name": "BuildCapabilityFlags",
+      "variants": [
+        {
+          "name": "BLK",
+          "c_name": "KRUN_BUILD_CAPABILITY_FLAGS_BLK",
+          "value": 1
+        },
+        {
+          "name": "NET",
+          "c_name": "KRUN_BUILD_CAPABILITY_FLAGS_NET",
+          "value": 2
+        },
+        {
+          "name": "GPU",
+          "c_name": "KRUN_BUILD_CAPABILITY_FLAGS_GPU",
+          "value": 4
+        },
+        {
+          "name": "INPUT",
+          "c_name": "KRUN_BUILD_CAPABILITY_FLAGS_INPUT",
+          "value": 8
+        },
+        {
+          "name": "VHOST_USER",
+          "c_name": "KRUN_BUILD_CAPABILITY_FLAGS_VHOST_USER",
+          "value": 16
+        },
+        {
+          "name": "VIRGL_RESOURCE_MAP2",
+          "c_name": "KRUN_BUILD_CAPABILITY_FLAGS_VIRGL_RESOURCE_MAP2",
+          "value": 32
+        },
+        {
+          "name": "AWS_NITRO",
+          "c_name": "KRUN_BUILD_CAPABILITY_FLAGS_AWS_NITRO",
+          "value": 64
+        },
+        {
+          "name": "TEE",
+          "c_name": "KRUN_BUILD_CAPABILITY_FLAGS_TEE",
+          "value": 128
+        },
+        {
+          "name": "AMD_SEV",
+          "c_name": "KRUN_BUILD_CAPABILITY_FLAGS_AMD_SEV",
+          "value": 256
+        },
+        {
+          "name": "TDX",
+          "c_name": "KRUN_BUILD_CAPABILITY_FLAGS_TDX",
+          "value": 512
+        },
+        {
+          "name": "TIMESYNC",
+          "c_name": "KRUN_BUILD_CAPABILITY_FLAGS_TIMESYNC",
+          "value": 1024
+        }
+      ]
+    },
+    {
       "name": "LogOptions",
       "variants": [
         {
@@ -3088,6 +3155,18 @@
         "ok": null,
         "err_type": "VmmError",
         "c_convention": "out_param"
+      }
+    },
+    {
+      "name": "build_capability_flags",
+      "ffi_name": "krun_build_capability_flags",
+      "doc": [
+        " Return the build-time capabilities enabled in this libkrun binary."
+      ],
+      "params": [],
+      "ret": {
+        "return_kind": "value",
+        "type": "BuildCapabilityFlags"
       }
     },
     {

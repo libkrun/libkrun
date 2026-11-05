@@ -8,12 +8,13 @@ All builds go through the top-level `Makefile`, which handles feature flag confi
 
 ### Prerequisites
 
-- [libkrunfw](https://github.com/containers/libkrunfw)
+- Installation of [libkrunfw](https://github.com/libkrun/libkrunfw)
 - A working [Rust](https://www.rust-lang.org/) toolchain with the musl cross-target for the guest init binary:
   ```bash
   rustup target add x86_64-unknown-linux-musl   # on x86_64
   rustup target add aarch64-unknown-linux-musl  # on aarch64
   ```
+ - Beyond the rust toolchain install packages such as lld, llvm-config, clang-libs, clang-devel, virglrenderer-devel and glibc-static.
 
 ### Optional Build Features
 
@@ -53,6 +54,46 @@ sudo make BLK=1 NET=1 install
 
 ---
 
+### Build the chroot_vm example
+
+```bash
+cd examples
+make chroot_vm
+```
+
+Optionally you may build outside of make assuming installed locally:
+
+```bash
+cd examples
+gcc -O2 -g -I"$HOME/.local/include" -L"$HOME/.local/lib64" \
+    -o chroot_vm chroot_vm.c -lkrun -lkrun_init
+```
+
+The `-I` and `-L` flags use headers and libraries installed in `$HOME/.local`, without a system-wide libkrun installation.
+
+### Prepare a rootfs
+
+Requires [podman](https://podman.io) installation.
+
+```bash
+make rootfs  # extracts a Fedora root filesystem to a local rootfs_fedora directory
+```
+
+### Run the chroot_vm isolated process example
+
+Running the VM also requires [libkrunfw](https://github.com/containers/libkrunfw) to be installed and discoverable by the dynamic linker. If you have installed libkrun and libkrunfw to the default system-wide install use the following:
+
+```bash
+./chroot_vm ./rootfs_fedora /bin/sh
+```
+
+If libkrun and libkrunfw are installed to your local prefix, use its `lib64` directory for the `LD_LIBRARY_PATH`.
+
+```bash
+LD_LIBRARY_PATH="$HOME/.local/lib64" ./chroot_vm ./rootfs_fedora /bin/sh
+```
+
+
 ## Linux (AMD SEV & Intel TDX Variants)
 
 The confidential computing variants produce standalone libraries (`libkrun-sev.so` and `libkrun-tdx.so`) with distinct sonames.
@@ -85,24 +126,77 @@ sudo make TDX=1 install
 ### Prerequisites
 
 - macOS 14 (Sonoma) or newer.
-- Working Rust toolchain (`aarch64-apple-darwin`).
+- Working Rust toolchain (`aarch64-apple-darwin`) with the musl cross-target for the guest init binary:
+  ```bash
+  rustup target add aarch64-unknown-linux-musl
+  ```
 - Linux guest init target: `rustup target add aarch64-unknown-linux-musl`.
 - `libkrunfw` for running guests (see [the macOS test setup](../tests/README.md#running-on-macos)).
 - Homebrew packages:
   ```bash
-  brew install lld xz
+  brew install llvm lld xz
   ```
 
-### Compiling & Installing
+### Compiling
 
 ```bash
-# Build libkrun on macOS (the Linux guest init is cross-compiled automatically via clang+lld)
+# Minimal build (no optional devices)
 make BLK=1 NET=1
 
-make BLK=1 NET=1 PREFIX="$HOME/.local" install
+# Debug build
+make debug
 ```
 
+### Installing
+
+```bash
+# Install to a user-owned prefix
+make BLK=1 NET=1
+make BLK=1 NET=1 PREFIX="$HOME/.local" install
+
+# System-wide install
+make BLK=1 NET=1
+sudo make BLK=1 NET=1 install
+```
+
+`make install` does not build the libraries. Build with the same feature options before installing.
+
 ---
+
+### Build the chroot_vm example
+
+```bash
+cd examples
+make chroot_vm
+```
+
+### Prepare a rootfs
+
+Requires [podman](https://podman.io) installation.
+
+```bash
+make rootfs  # extracts a Fedora root filesystem to a local rootfs_fedora directory
+```
+
+### Run the chroot_vm isolated process example
+
+Running the VM also requires [libkrunfw](https://github.com/containers/libkrunfw) to be installed and discoverable by the dynamic linker. If you have installed libkrun and libkrunfw to the default system-wide install use the following:
+
+```bash
+./chroot_vm ./rootfs_fedora /bin/sh
+```
+
+If libkrun and libkrunfw are installed to your local prefix, use its `lib64` directory for the `DYLD_LIBRARY_PATH`.
+
+```bash
+DYLD_LIBRARY_PATH="$HOME/.local/lib64" ./chroot_vm ./rootfs_fedora /bin/sh
+```
+
+To use the brew installed libkrunfw while running a different version of libkrun from your local build tree:
+
+```bash
+DYLD_LIBRARY_PATH="/opt/homebrew/opt/libkrunfw/lib" ./chroot_vm ./rootfs_fedora /bin/sh
+```
 
 ## Cross-Compiling FreeBSD Init
 

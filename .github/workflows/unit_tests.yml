@@ -24,6 +24,11 @@ jobs:
       - name: Unit tests
         run: cargo test
 
+      - name: Build capability feature tests
+        run: |
+          cargo test -p libkrun --features blk,net,ffi
+          cargo test -p libkrun --features blk,net,vhost-user,ffi
+
   unit-tests-linux-aarch64:
     name: Unit tests (Linux aarch64)
     runs-on: self-hosted
@@ -38,4 +43,9 @@ jobs:
 
       - name: Unit tests
         run: cargo test
+
+      - name: Build capability feature tests
+        run: |
+          cargo test -p libkrun --features blk,net,ffi
+          cargo test -p libkrun --features blk,net,vhost-user,ffi
 
