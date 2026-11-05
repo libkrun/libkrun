@@ -3,7 +3,11 @@
 TSIv4 requires a matching guest kernel. The paired Linux implementation is
 `net/tsi/af_tsi.{h,c}`; its contract is documented in
 `Documentation/networking/tsi.rst`. There is no TSIv3 negotiation or fallback.
-Firmware loading will require libkrunfw ABI 6 as part of the coordinated release.
+Firmware loading requires libkrunfw ABI 6, verified through
+`krunfw_get_version()` before reading kernel data. Linux/macOS use ABI 6 library
+names; Windows checks the same export in `libkrunfw.dll`. Missing exports and
+older or future ABI values are rejected with a boot error. External kernels
+must supply the matching TSIv4 implementation.
 
 Control messages carry a 24-byte common header before their operation body:
 
@@ -200,7 +204,7 @@ this contract. ICMP proxy creation on other hosts returns `EPROTONOSUPPORT`.
 
 INET datagrams and control messages now use TSIv4 framing. UNIX datagram payloads
 retain the legacy two-message path (their address control message is enveloped).
-Firmware version checks remain in the TSIv4 implementation plan.
+Firmware libraries are checked for ABI 6 before kernel loading.
 
 Application UDP `connect(AF_UNSPEC)` sends an acknowledged DISCONNECT request
 before publishing the disconnected guest state. The host dissolves its socket's
