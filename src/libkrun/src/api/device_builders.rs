@@ -861,7 +861,6 @@ pub struct ConsoleBuilder<'a> {
 #[cfg_attr(feature = "ffi", ffier::export(send, covariant('a)))]
 impl<'a> ConsoleDevice<'a> {
     /// Create a new console builder.
-    #[cfg(not(target_os = "windows"))]
     pub fn builder() -> ConsoleBuilder<'a> {
         ConsoleBuilder {
             ports: Vec::new(),
@@ -873,10 +872,8 @@ impl<'a> ConsoleDevice<'a> {
 
 #[cfg_attr(
     feature = "ffi",
-    ffier::export(covariant('a), cfg = "not(target_os = \"windows\")")
+    ffier::export(covariant('a))
 )]
-#[cfg_attr(not(feature = "ffi"), cfg(not(target_os = "windows")))]
-#[cfg(not(target_os = "windows"))]
 impl<'a> ConsoleBuilder<'a> {
     /// Add a TTY-backed port to the console.
     ///
@@ -892,6 +889,7 @@ impl<'a> ConsoleBuilder<'a> {
     /// # Returns
     ///
     /// The zero-based port index.
+    #[cfg(unix)]
     pub fn add_tty_port(&mut self, name: &str, tty_fd: BorrowedFd<'a>) -> Result<u32, VmmError> {
         let index = self.ports.len() as u32;
         self.add_tty_port_inner(name, tty_fd)?;
@@ -901,6 +899,7 @@ impl<'a> ConsoleBuilder<'a> {
     /// Add a port with separate borrowed input and output fds (no terminal
     /// properties). The caller retains responsibility for the descriptors.
     /// Pass `None` to disable that direction.
+    #[cfg(unix)]
     pub fn add_inout_port(
         &mut self,
         name: &str,
@@ -958,6 +957,7 @@ impl<'a> ConsoleBuilder<'a> {
     /// the VMM exits.
     ///
     /// Pass `None` to skip a stream.
+    #[cfg(unix)]
     pub fn add_default_console(
         &mut self,
         stdin: Option<BorrowedFd<'a>>,
@@ -1045,15 +1045,8 @@ impl<'a> ConsoleBuilder<'a> {
 
         Ok(())
     }
-}
 
-#[cfg(target_os = "windows")]
-#[cfg_attr(
-    feature = "ffi",
-    ffier::export(covariant('a), cfg = "target_os = \"windows\"")
-)]
-#[cfg_attr(not(feature = "ffi"), cfg(target_os = "windows"))]
-impl<'a> ConsoleBuilder<'a> {
+    #[cfg(windows)]
     pub fn add_tty_port(
         &mut self,
         name: &str,
@@ -1064,6 +1057,7 @@ impl<'a> ConsoleBuilder<'a> {
         Ok(index)
     }
 
+    #[cfg(windows)]
     pub fn add_inout_port(
         &mut self,
         name: &str,
@@ -1096,18 +1090,7 @@ impl<'a> ConsoleBuilder<'a> {
         Ok(index)
     }
 
-    /// Build the console device. At least one port must have been added.
-    pub fn build(self) -> Result<ConsoleDevice<'a>, VmmError> {
-        if self.ports.is_empty() {
-            return Err(VmmError::MissingConfig("no ports added to console".into()));
-        }
-        Ok(ConsoleDevice {
-            ports: self.ports,
-            tty_fds: self.tty_fds,
-            _lifetime: PhantomData,
-        })
-    }
-
+    #[cfg(windows)]
     pub fn add_default_console(
         &mut self,
         stdin: Option<BorrowedHandle<'a>>,

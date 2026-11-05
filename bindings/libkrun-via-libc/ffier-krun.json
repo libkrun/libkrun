@@ -897,14 +897,7 @@
               "a"
             ]
           },
-          "ffi_name": "krun_console_device_builder",
-          "cfg": {
-            "kind": "not",
-            "value": {
-              "kind": "target_os",
-              "value": "windows"
-            }
-          }
+          "ffi_name": "krun_console_device_builder"
         }
       ]
     },
@@ -956,7 +949,10 @@
             "err_type": "VmmError",
             "c_convention": "out_param"
           },
-          "ffi_name": "krun_console_builder_add_tty_port"
+          "ffi_name": "krun_console_builder_add_tty_port",
+          "cfg": {
+            "kind": "unix"
+          }
         },
         {
           "name": "add_inout_port",
@@ -1000,7 +996,10 @@
             "err_type": "VmmError",
             "c_convention": "out_param"
           },
-          "ffi_name": "krun_console_builder_add_inout_port"
+          "ffi_name": "krun_console_builder_add_inout_port",
+          "cfg": {
+            "kind": "unix"
+          }
         },
         {
           "name": "build",
@@ -1075,16 +1074,129 @@
             "err_type": "VmmError",
             "c_convention": "out_param"
           },
-          "ffi_name": "krun_console_builder_add_default_console"
+          "ffi_name": "krun_console_builder_add_default_console",
+          "cfg": {
+            "kind": "unix"
+          }
+        },
+        {
+          "name": "add_tty_port",
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "name",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "tty_fd",
+              "param_kind": "regular",
+              "type": "BorrowedHandle",
+              "type_args": [
+                "a"
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "u32"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_console_builder_add_tty_port",
+          "cfg": {
+            "kind": "windows"
+          }
+        },
+        {
+          "name": "add_inout_port",
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "name",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "input_fd",
+              "param_kind": "regular",
+              "type": "BorrowedHandle",
+              "type_args": [
+                "a"
+              ],
+              "optional": true
+            },
+            {
+              "name": "output_fd",
+              "param_kind": "regular",
+              "type": "BorrowedHandle",
+              "type_args": [
+                "a"
+              ],
+              "optional": true
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "u32"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_console_builder_add_inout_port",
+          "cfg": {
+            "kind": "windows"
+          }
+        },
+        {
+          "name": "add_default_console",
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "stdin",
+              "param_kind": "regular",
+              "type": "BorrowedHandle",
+              "type_args": [
+                "a"
+              ],
+              "optional": true
+            },
+            {
+              "name": "stdout",
+              "param_kind": "regular",
+              "type": "BorrowedHandle",
+              "type_args": [
+                "a"
+              ],
+              "optional": true
+            },
+            {
+              "name": "stderr",
+              "param_kind": "regular",
+              "type": "BorrowedHandle",
+              "type_args": [
+                "a"
+              ],
+              "optional": true
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_console_builder_add_default_console",
+          "cfg": {
+            "kind": "windows"
+          }
         }
-      ],
-      "cfg": {
-        "kind": "not",
-        "value": {
-          "kind": "target_os",
-          "value": "windows"
-        }
-      }
+      ]
     },
     {
       "name": "FsOverlay",
