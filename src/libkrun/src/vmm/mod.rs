@@ -28,6 +28,8 @@ use crate::vmm::linux::vstate;
 #[cfg(target_os = "macos")]
 mod macos;
 mod terminal;
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod tests;
 pub mod worker;
 
 #[cfg(target_os = "macos")]
@@ -290,6 +292,10 @@ impl Vmm {
         for h in &self.vcpus_handles {
             match h.response_receiver().recv() {
                 Ok(VcpuResponse::Paused) => {}
+                Ok(VcpuResponse::Reset) => {
+                    self.stop_guest(self.reset_exit_code.unwrap_or(FC_EXIT_CODE_OK));
+                }
+                Ok(VcpuResponse::Exited(code)) => self.stop_guest(code),
                 Ok(other) => return Err(format!("unexpected vcpu response: {other:?}")),
                 Err(e) => return Err(format!("vcpu response: {e:?}")),
             }
@@ -316,6 +322,10 @@ impl Vmm {
         for h in &self.vcpus_handles {
             match h.response_receiver().recv() {
                 Ok(VcpuResponse::Resumed) => {}
+                Ok(VcpuResponse::Reset) => {
+                    self.stop_guest(self.reset_exit_code.unwrap_or(FC_EXIT_CODE_OK));
+                }
+                Ok(VcpuResponse::Exited(code)) => self.stop_guest(code),
                 Ok(other) => return Err(format!("unexpected vcpu response: {other:?}")),
                 Err(e) => return Err(format!("vcpu response: {e:?}")),
             }
@@ -422,7 +432,7 @@ impl Vmm {
     }
 
     /// Waits for all vCPUs to exit and terminates the Firecracker process.
-    pub fn stop(&mut self, exit_code: i32) {
+    pub fn stop(&mut self, exit_code: i32) -> ! {
         info!("Vmm is stopping.");
 
         for observer in &self.exit_observers {
@@ -440,7 +450,7 @@ impl Vmm {
     }
 
     /// Stops with `exit_code` unless the guest's init set one, which takes precedence.
-    fn stop_guest(&mut self, exit_code: u8) {
+    fn stop_guest(&mut self, exit_code: u8) -> ! {
         let vmm_exit_code = self.exit_code.load(Ordering::SeqCst);
         if vmm_exit_code != i32::MAX {
             debug!("using vmm exit code: {vmm_exit_code}");
@@ -522,7 +532,6 @@ impl Subscriber for Vmm {
             let _ = self.reset_evt.read();
             info!("i8042 reset");
             self.stop_guest(self.reset_exit_code.unwrap_or(FC_EXIT_CODE_OK));
-            return;
         }
 
         if source == self.exit_evt.as_raw_fd() && event_set == EventSet::IN {
