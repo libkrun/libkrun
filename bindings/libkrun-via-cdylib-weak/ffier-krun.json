@@ -2953,6 +2953,11 @@
           "name": "Always",
           "c_name": "KRUN_CACHE_POLICY_ALWAYS",
           "value": 2
+        },
+        {
+          "name": "KeepUnchanged",
+          "c_name": "KRUN_CACHE_POLICY_KEEP_UNCHANGED",
+          "value": 3
         }
       ],
       "cfg": "not(any(feature = \"tee\", feature = \"aws-nitro\"))"

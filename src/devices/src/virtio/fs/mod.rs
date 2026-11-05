@@ -56,6 +56,13 @@ pub enum CachePolicy {
     /// Keep cached file data across opens. Use this only when the filesystem has exclusive
     /// access to the shared directory.
     Always = 2,
+    /// Like `Auto`, but keep cached data when the host file's mtime, ctime and size have not
+    /// changed since its previous open, so opening a file does not drop pages other guest
+    /// processes have mapped. A host process writing through a shared mapping may not update the
+    /// mtime until the pages are flushed, and the guest can read stale data until then. Use this
+    /// when host processes don't write to the shared files that way. Hosts other than Linux
+    /// treat it as `Auto`.
+    KeepUnchanged = 3,
 }
 
 impl FromStr for CachePolicy {
@@ -66,6 +73,7 @@ impl FromStr for CachePolicy {
             "never" | "Never" | "NEVER" => Ok(CachePolicy::Never),
             "auto" | "Auto" | "AUTO" => Ok(CachePolicy::Auto),
             "always" | "Always" | "ALWAYS" => Ok(CachePolicy::Always),
+            "keep-unchanged" | "KeepUnchanged" | "KEEP_UNCHANGED" => Ok(CachePolicy::KeepUnchanged),
             _ => Err("invalid cache policy"),
         }
     }
