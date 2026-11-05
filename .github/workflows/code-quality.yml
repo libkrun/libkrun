@@ -21,16 +21,16 @@ jobs:
         run: cargo clippy --locked -- -D warnings
       
       - name: Clippy (amd-sev)
-        run: cargo clippy --locked --features amd-sev -- -D warnings
+        run: cargo clippy --locked -p libkrun --features amd-sev -- -D warnings
       
       - name: Clippy (tdx)
-        run: cargo clippy --locked --features tdx -- -D warnings
+        run: cargo clippy --locked -p libkrun --features tdx -- -D warnings
       
       - name: Clippy (net+blk+gpu+input)
         run: cargo clippy --locked --features net,blk,gpu,input -- -D warnings
       
       - name: Clippy (aws-nitro+net)
-        run: cargo clippy --locked --features aws-nitro,net -- -D warnings
+        run: cargo clippy --locked -p libkrun --features aws-nitro,net -- -D warnings
 
   code-quality-linux-aarch64:
     name: libkrun (Linux aarch64)
