@@ -1,5 +1,7 @@
 mod imp;
 
+#[cfg(target_os = "linux")]
+use crate::display_worker::SharedDmabuf;
 use gtk::{
     cairo::{RectangleInt, Region},
     gdk::{self, MemoryFormat, MemoryTextureBuilder},
@@ -79,6 +81,46 @@ impl ScanoutPaintable {
             && old_texture.height() != height
         {
             self.invalidate_size();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn configure_dmabuf(
+        &self,
+        dmabuf: SharedDmabuf,
+        _src_rect: Option<Rect>,
+        damage_rect: Option<Rect>,
+    ) -> bool {
+        let imp = self.imp();
+
+        // Build texture immediately instead of deferring to snapshot()
+        let new_texture = imp::build_dmabuf_texture(
+            imp::DmabufUpdate {
+                dmabuf,
+                damage_area: damage_rect,
+            },
+            imp.texture.borrow().as_ref(),
+        );
+
+        match new_texture {
+            Some(texture) => {
+                let old_texture = imp.texture.replace(Some(texture.clone()));
+                self.invalidate_contents();
+                if let Some(old_texture) = old_texture {
+                    if old_texture.width() != texture.width()
+                        || old_texture.height() != texture.height()
+                    {
+                        self.invalidate_size();
+                    }
+                } else {
+                    self.invalidate_size();
+                }
+                true
+            }
+            None => {
+                log::error!("Failed to build DMABUF texture");
+                false
+            }
         }
     }
 }
