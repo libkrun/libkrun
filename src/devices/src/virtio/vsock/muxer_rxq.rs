@@ -213,6 +213,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
             local_port,
             peer_port,
             result,
+            flags,
         } => {
             pkt.set_op(uapi::VSOCK_OP_RW)
                 .set_src_cid(uapi::VSOCK_HOST_CID)
@@ -221,7 +222,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
-            pkt.write_listen_rsp(TsiListenRsp { result }, request_id);
+            pkt.write_listen_rsp(TsiListenRsp { result, flags }, request_id);
         }
         MuxerRx::AcceptResponse {
             request_id,

@@ -588,6 +588,7 @@ pub(crate) fn do_listen(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) -> 
         local_port: pkt.dst_port(),
         peer_port: pkt.src_port(),
         result,
+        flags: 0,
     };
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
     ProxyUpdate::default()

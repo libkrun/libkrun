@@ -369,6 +369,7 @@ pub(crate) fn do_listen(
         local_port: pkt.dst_port(),
         peer_port: pkt.src_port(),
         result,
+        flags: req.response_flags(),
     };
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
 

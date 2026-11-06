@@ -80,6 +80,7 @@ pub enum MuxerRx {
         local_port: u32,
         peer_port: u32,
         result: i32,
+        flags: u32,
     },
     AcceptResponse {
         request_id: u64,
@@ -298,6 +299,14 @@ impl VsockMuxer {
                 peer_port: pkt.src_port(),
                 result,
                 value: 0,
+            });
+        } else if pkt.dst_port() == defs::TSI_LISTEN {
+            self.push_packet(MuxerRx::ListenResponse {
+                request_id: pkt.control_request_id(),
+                local_port: pkt.dst_port(),
+                peer_port: pkt.src_port(),
+                result,
+                flags: 0,
             });
         } else if pkt.dst_port() == 1026 {
             self.push_packet(MuxerRx::GetnameResponse {
@@ -561,7 +570,10 @@ impl VsockMuxer {
 
     fn process_listen_request(&self, pkt: &VsockPacket) {
         debug!("DGRAM listen request: src={}", pkt.src_port());
-        if let Some(req) = pkt.read_listen_req() {
+        if let Some(mut req) = pkt.read_listen_req() {
+            req.strict = self
+                .tsi_flags
+                .contains(TsiFlags::FAIL_ON_TCP_PUBLICATION_ERROR);
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("DGRAM listen request: id={id}");
             match self.proxy_map.read().unwrap().get(&id) {
@@ -578,6 +590,7 @@ impl VsockMuxer {
                     local_port: pkt.dst_port(),
                     peer_port: pkt.src_port(),
                     result: -libc::EPERM,
+                    flags: req.response_flags(),
                 }),
             };
         } else {

@@ -44,13 +44,15 @@ mod defs {
             const HIJACK_INET = 1 << 0;
             /// Hijack AF_UNIX sockets
             const HIJACK_UNIX = 1 << 1;
+            /// Return TCP host publication errors rather than falling back locally.
+            const FAIL_ON_TCP_PUBLICATION_ERROR = 1 << 2;
         }
     }
 
     impl TsiFlags {
         /// Returns true if any TSI hijacking is enabled.
         pub fn tsi_enabled(&self) -> bool {
-            !self.is_empty()
+            self.intersects(Self::HIJACK_INET | Self::HIJACK_UNIX)
         }
     }
 
@@ -97,6 +99,7 @@ mod defs {
     pub const TSI_DATAGRAM: u32 = 1032;
     pub const TSI_DISCONNECT: u32 = 1033;
     pub const TSI_SETOPT: u32 = 1034;
+    pub const TSI_LISTEN_STRICT: u32 = 1;
     pub const TSI_GETOPT: u32 = 1035;
     pub const TSI_BIND: u32 = 1036;
 
@@ -187,3 +190,16 @@ pub enum VsockError {
 }
 
 type Result<T> = std::result::Result<T, VsockError>;
+
+#[cfg(test)]
+mod publication_flag_tests {
+    use super::TsiFlags;
+
+    #[test]
+    fn policy_does_not_enable_hijacking_by_itself() {
+        let policy = TsiFlags::FAIL_ON_TCP_PUBLICATION_ERROR;
+        assert!(!policy.tsi_enabled());
+        assert!((policy | TsiFlags::HIJACK_INET).tsi_enabled());
+        assert!((policy | TsiFlags::HIJACK_UNIX).tsi_enabled());
+    }
+}

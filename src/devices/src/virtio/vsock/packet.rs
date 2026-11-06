@@ -153,12 +153,31 @@ pub struct TsiListenReq {
     pub vm_port: u32,
     pub backlog: i32,
     pub addr: SockaddrStorage,
+    pub strict: bool,
+}
+
+impl TsiListenReq {
+    pub fn response_flags(&self) -> u32 {
+        #[cfg(unix)]
+        let inet = self.addr.as_sockaddr_in().is_some() || self.addr.as_sockaddr_in6().is_some();
+        #[cfg(windows)]
+        let inet = matches!(
+            self.addr.family(),
+            defs::LINUX_AF_INET | defs::LINUX_AF_INET6
+        );
+        if self.strict && inet {
+            defs::TSI_LISTEN_STRICT
+        } else {
+            0
+        }
+    }
 }
 
 #[repr(C)]
 #[derive(Debug)]
 pub struct TsiListenRsp {
     pub result: i32,
+    pub flags: u32,
 }
 
 #[repr(C)]
@@ -757,12 +776,14 @@ impl VsockPacket {
             vm_port: byte_order::read_le_u32(&buf[4..]),
             backlog: backlog as i32,
             addr: Self::parse_address(&buf[16..], byte_order::read_le_u32(&buf[12..]))?,
+            strict: false,
         })
     }
 
     pub fn write_listen_rsp(&mut self, rsp: TsiListenRsp, request_id: u64) {
-        if let Some(buf) = self.control_response_buf(request_id, 4) {
+        if let Some(buf) = self.control_response_buf(request_id, 8) {
             byte_order::write_le_u32(buf, rsp.result as u32);
+            byte_order::write_le_u32(&mut buf[4..], rsp.flags);
         }
     }
 
@@ -1055,6 +1076,62 @@ mod descriptor_tests {
         assert_eq!(&data[16..24], &[4, 0, 0, 0, 1, 0, 0, 0]);
         assert_eq!(&data[24..28], &(-111i32).to_le_bytes());
         assert_eq!(data[28], 0xa5);
+    }
+
+    #[test]
+    fn listen_reply_preserves_errno_and_strict_policy() {
+        let layout = [VSOCK_PKT_HDR_SIZE + 5, 64, 128];
+        let mem = memory(&layout, true, 0);
+        let mut pkt = VsockPacket::from_rx_virtq_head(&head(&mem)).unwrap();
+        pkt.set_src_port(defs::TSI_LISTEN);
+        pkt.write_listen_rsp(
+            TsiListenRsp {
+                result: -98,
+                flags: defs::TSI_LISTEN_STRICT,
+            },
+            41,
+        );
+        assert_eq!(pkt.len(), 32);
+        assert_eq!(pkt.finish_rx().unwrap(), VSOCK_PKT_HDR_SIZE as u32 + 32);
+        let data = read_payload(&mem, &layout, 33);
+        assert_eq!(&data[8..16], &41u64.to_le_bytes());
+        assert_eq!(&data[16..24], &[8, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(&data[24..28], &(-98i32).to_le_bytes());
+        assert_eq!(&data[28..32], &defs::TSI_LISTEN_STRICT.to_le_bytes());
+        assert_eq!(data[32], 0xa5);
+    }
+
+    #[test]
+    fn strict_listen_flags_only_apply_to_inet() {
+        for (family, len) in [
+            (defs::LINUX_AF_INET, 16),
+            (defs::LINUX_AF_INET6, 28),
+            (defs::LINUX_AF_UNIX, 11),
+        ] {
+            let mut raw = [0; 128];
+            raw[..2].copy_from_slice(&family.to_le_bytes());
+            if family == defs::LINUX_AF_UNIX {
+                raw[2..11].copy_from_slice(b"/tmp/tsi\0");
+            }
+            let addr = VsockPacket::parse_address(&raw, len).unwrap();
+            let mut request = TsiListenReq {
+                peer_port: 1,
+                vm_port: 2,
+                backlog: 8,
+                addr,
+                strict: false,
+            };
+            assert_eq!(request.response_flags(), 0);
+            request.strict = true;
+            assert_eq!(
+                request.response_flags(),
+                if family == defs::LINUX_AF_UNIX {
+                    0
+                } else {
+                    defs::TSI_LISTEN_STRICT
+                }
+            );
+        }
     }
 
     #[test]

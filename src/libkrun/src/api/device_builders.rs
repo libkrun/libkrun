@@ -1476,6 +1476,9 @@ export_bitflags! {
         pub struct TsiFlags: u32 {
             const HIJACK_INET = 1;
             const HIJACK_UNIX = 2;
+            /// Return INET TCP publication errors instead of guest-only fallback.
+            /// Combine with HIJACK_INET; UNIX and UDP behavior is unchanged.
+            const FAIL_ON_TCP_PUBLICATION_ERROR = 4;
         }
     }
 }

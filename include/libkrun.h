@@ -221,6 +221,7 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 
 #define KRUN_TSI_FLAGS_HIJACK_INET 1
 #define KRUN_TSI_FLAGS_HIJACK_UNIX 2
+#define KRUN_TSI_FLAGS_FAIL_ON_TCP_PUBLICATION_ERROR 4
 
 /* VirglRendererFlags ------------------------------------------------ */
 

@@ -3473,6 +3473,11 @@
           "name": "HIJACK_UNIX",
           "c_name": "KRUN_TSI_FLAGS_HIJACK_UNIX",
           "value": 2
+        },
+        {
+          "name": "FAIL_ON_TCP_PUBLICATION_ERROR",
+          "c_name": "KRUN_TSI_FLAGS_FAIL_ON_TCP_PUBLICATION_ERROR",
+          "value": 4
         }
       ]
     },

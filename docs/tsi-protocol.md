@@ -27,7 +27,7 @@ Async TCP connect and accept replies retain the originating request ID.
 | 1025 | 136 | 4 | Connect: data port, address length, 128-byte address |
 | 1026 | 12 | 136 | Get name: data port, peer port, peer selector |
 | 1027 | 136 | None | Legacy UNIX sendto address, one-way |
-| 1029 | 144 | 4 | Listen: data port, listener port, backlog, address length, address |
+| 1029 | 144 | 8 | Listen: data port, listener port, backlog, address length, address |
 | 1030 | 8 | 4 | Accept accounting: data port, flags = 0 |
 | 1031 | 8 | None | Release: data port, peer port, one-way |
 | 1033 | 4 | 4 | Disconnect INET datagram proxy: data port |
@@ -73,6 +73,12 @@ setters return EAGAIN except local receive/send timeouts. Updating a timeout
 does not extend the active deadline. bind/listen/accept return EINVAL and
 shutdown returns ENOTCONN. UNIX streams retain the existing connect path.
 These rules prioritize event-loop progress over full native equivalence.
+
+LISTEN's reply body contains a signed 32-bit result and a 32-bit policy flags
+word. Bit 0 selects strict host publication; reserved bits are rejected. The
+host sets it from VM configuration, independently of guest request contents.
+UNIX replies leave it zero. The unreleased TSIv4 guest/host must agree on this
+eight-byte reply; there is no compatibility fallback for the former body.
 
 Proxy creation's 12-byte body is:
 
@@ -254,6 +260,30 @@ SO_ERROR reads and clears pending errors. The datagram broker retains the first
 pending error consumed by host I/O or Linux error readiness for one guest read.
 Ordinary UDP sends remain asynchronous. This does not relay host UDP POLLERR to
 the guest; error readiness and platform-specific socket semantics remain gaps.
-The host's existing listener reuse defaults and exposure policy remain in force
-unless explicitly overridden. REUSEPORT forwarding does not isolate ports
-between VMs.
+Unix host INET stream proxies default to SO_REUSEADDR=1 for listener restart;
+SO_REUSEPORT is enabled only by an explicit application request. Cached setters
+replay before host bind/connect, including explicit SO_REUSEADDR=0. Native guest
+endpoints retain native defaults; UDP and UNIX stream reuse policy is unchanged.
+Explicit REUSEPORT permits sharing a host listening address and does not isolate
+ports between VMs. Other host platforms retain their native defaults and options.
+
+TCP host publication defaults to best effort. For EPERM, EADDRINUSE or EADDRNOTAVAIL from
+host listen setup, the guest may keep a guest-only listener and return success.
+Neither listen success nor SO_ACCEPTCONN guarantees external reachability;
+configured port overrides do not make those failures fatal. An existing host
+listener keeps its port while a guest-only replacement can serve local clients.
+That replacement is not automatically published when the owner exits; close and
+recreate it to retry. This is an accepted application-compatibility limitation:
+workloads needing host/external reachability must verify it separately. UNIX
+fallback retains its existing rules.
+
+
+Set `TsiFlags::FAIL_ON_TCP_PUBLICATION_ERROR` alongside `HIJACK_INET` to select
+strict TCP publication for a VM (C: `KRUN_TSI_FLAGS_FAIL_ON_TCP_PUBLICATION_ERROR`).
+Guest `listen()` then returns the original INET TCP host error and does not
+activate a guest-only listener; SO_ACCEPTCONN stays false. Normal host failures
+do not poison the control channel. A bind conflict can be resolved and listen
+retried on the same bound socket; other host states may require close/recreate.
+The policy applies equally to mapped/unmapped ports. UNIX fallback, UDP and
+explicit REUSEPORT semantics are unchanged. The policy flag alone does not
+enable socket hijacking.

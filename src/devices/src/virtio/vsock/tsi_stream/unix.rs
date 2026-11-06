@@ -56,15 +56,8 @@ pub(crate) fn create_socket(
         Err(e) => error!("couldn't obtain fd flags id={id}, err={e}"),
     };
 
-    if family == AddressFamily::Unix {
-        setsockopt(&fd, sockopt::ReuseAddr, &true).map_err(|e| {
-            ProxyError::SettingReuseAddr(std::io::Error::from_raw_os_error(e as i32))
-        })?;
-    } else {
-        setsockopt(&fd, sockopt::ReusePort, &true).map_err(|e| {
-            ProxyError::SettingReusePort(std::io::Error::from_raw_os_error(e as i32))
-        })?;
-    }
+    setsockopt(&fd, sockopt::ReuseAddr, &true)
+        .map_err(|e| ProxyError::SettingReuseAddr(std::io::Error::from_raw_os_error(e as i32)))?;
 
     #[cfg(target_os = "macos")]
     {
@@ -433,6 +426,7 @@ pub(crate) fn do_listen(
         local_port: pkt.dst_port(),
         peer_port: pkt.src_port(),
         result,
+        flags: req.response_flags(),
     };
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
 
@@ -627,4 +621,56 @@ pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) 
     }
 
     update
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::socket::getsockopt;
+    use std::net::Ipv6Addr;
+
+    fn bound_listener(family: u16, sharing: bool) -> (OwnedFd, SockaddrStorage) {
+        let (fd, _) = create_socket(0, family).unwrap();
+        if sharing {
+            setsockopt(&fd, sockopt::ReusePort, &true).unwrap();
+        }
+        let addr: SockaddrStorage = if family == defs::LINUX_AF_INET {
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()
+        } else {
+            SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0).into()
+        };
+        bind(fd.as_raw_fd(), &addr).unwrap();
+        listen(&fd, Backlog::new(8).unwrap()).unwrap();
+        let addr = getsockname(fd.as_raw_fd()).unwrap();
+        (fd, addr)
+    }
+
+    #[test]
+    fn default_tcp_reuse_options() {
+        for family in [defs::LINUX_AF_INET, defs::LINUX_AF_INET6] {
+            let (fd, _) = create_socket(0, family).unwrap();
+            assert!(getsockopt(&fd, sockopt::ReuseAddr).unwrap());
+            assert!(!getsockopt(&fd, sockopt::ReusePort).unwrap());
+        }
+    }
+
+    #[test]
+    fn default_tcp_listener_owns_address() {
+        for family in [defs::LINUX_AF_INET, defs::LINUX_AF_INET6] {
+            let (_first, addr) = bound_listener(family, false);
+            let (second, _) = create_socket(1, family).unwrap();
+            assert_eq!(bind(second.as_raw_fd(), &addr), Err(Errno::EADDRINUSE));
+        }
+    }
+
+    #[test]
+    fn explicit_reuseport_shares_listener() {
+        for family in [defs::LINUX_AF_INET, defs::LINUX_AF_INET6] {
+            let (_first, addr) = bound_listener(family, true);
+            let (second, _) = create_socket(1, family).unwrap();
+            setsockopt(&second, sockopt::ReusePort, &true).unwrap();
+            bind(second.as_raw_fd(), &addr).unwrap();
+            listen(&second, Backlog::new(8).unwrap()).unwrap();
+        }
+    }
 }
