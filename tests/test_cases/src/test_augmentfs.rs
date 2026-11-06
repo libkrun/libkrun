@@ -17,21 +17,11 @@ fn make_test_payload() -> Vec<u8> {
 mod host {
     use super::*;
 
-    use crate::common::{build_and_run, build_init_config, init_krun};
-    use crate::{ShouldRun, Test, TestSetup};
+    use crate::common::{build_and_run, build_init_config};
+    use crate::{Test, TestSetup};
 
     impl Test for TestAugmentFs {
-        fn should_run(&self) -> ShouldRun {
-            #[cfg(feature = "dynamic-linking")]
-            if crate::common::require_vm_symbols().is_err() {
-                return ShouldRun::No("core VM symbols not available");
-            }
-            ShouldRun::Yes
-        }
-
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            init_krun()?;
-
             let guest_agent_path = std::env::var("KRUN_TEST_GUEST_AGENT_PATH")
                 .expect("KRUN_TEST_GUEST_AGENT_PATH not set");
             let guest_agent_bytes: &[u8] =

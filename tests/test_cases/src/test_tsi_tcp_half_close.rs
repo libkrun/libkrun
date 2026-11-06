@@ -28,21 +28,8 @@ mod host {
     use std::thread;
     use std::time::Instant;
 
-    use crate::common::{build_init_config, init_krun, setup_standard_devices};
-    use crate::{ShouldRun, Test, TestSetup};
-
-    #[cfg(feature = "dynamic-linking")]
-    fn require_symbols() -> Result<(), libloading::Error> {
-        crate::common::require_vm_symbols()?;
-        krun::require(
-            None,
-            &[
-                krun::Symbol::KrunVsockDeviceNew,
-                krun::Symbol::KrunVsockDeviceDestroy,
-                krun::Symbol::KrunVsockDeviceAddPortForward,
-            ],
-        )
-    }
+    use crate::common::{build_init_config, setup_standard_devices};
+    use crate::{Test, TestSetup};
 
     fn connect_ready() -> anyhow::Result<TcpStream> {
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, DATA_PORT);
@@ -118,24 +105,12 @@ mod host {
     }
 
     impl Test for TestTsiTcpHalfClose {
-        fn should_run(&self) -> ShouldRun {
-            #[cfg(feature = "dynamic-linking")]
-            if require_symbols().is_err() {
-                return ShouldRun::No("feature not enabled in this libkrun build");
-            }
-            ShouldRun::Yes
-        }
-
         fn timeout_secs(&self) -> u64 {
             20
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             thread::spawn(report_result);
-
-            init_krun()?;
-            #[cfg(feature = "dynamic-linking")]
-            require_symbols().unwrap();
 
             let init_config = build_init_config(&test_setup.test_case, &[]);
             let stdin = std::io::stdin();

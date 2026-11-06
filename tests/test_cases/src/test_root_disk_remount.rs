@@ -13,25 +13,12 @@ pub struct TestRootDiskRemount;
 mod host {
     use super::*;
     #[cfg(feature = "dynamic-linking")]
-    use krun::DeviceManager;
+    use krun::{DeviceManager, ffi::Symbol};
 
     use std::os::fd::AsFd;
     use std::process::Command;
 
-    use crate::common::init_krun;
     use crate::{ShouldRun, Test, TestSetup};
-
-    #[cfg(feature = "dynamic-linking")]
-    fn require_symbols() -> Result<(), libloading::Error> {
-        crate::common::require_vm_symbols()?;
-        krun::require(
-            None,
-            &[
-                krun::Symbol::KrunBlockDeviceNew,
-                krun::Symbol::KrunBlockDeviceDestroy,
-            ],
-        )
-    }
 
     fn create_disk_image(guest_agent_path: &str, output_path: &str) {
         // Populate from a staging directory using mke2fs -d (no root needed).
@@ -62,17 +49,13 @@ mod host {
     impl Test for TestRootDiskRemount {
         fn should_run(&self) -> ShouldRun {
             #[cfg(feature = "dynamic-linking")]
-            if require_symbols().is_err() {
+            if !Symbol::KrunBlockDeviceNew.is_available() {
                 return ShouldRun::No("feature not enabled in this libkrun build");
             }
             ShouldRun::Yes
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            init_krun()?;
-            #[cfg(feature = "dynamic-linking")]
-            require_symbols().unwrap();
-
             let guest_agent_path = std::env::var("KRUN_TEST_GUEST_AGENT_PATH")
                 .expect("KRUN_TEST_GUEST_AGENT_PATH not set");
 

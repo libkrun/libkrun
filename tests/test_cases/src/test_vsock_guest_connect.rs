@@ -42,21 +42,8 @@ mod host {
     use std::os::unix::net::UnixListener;
     use std::thread;
 
-    use crate::common::{build_init_config, init_krun, setup_standard_devices};
-    use crate::{ShouldRun, Test, TestSetup};
-
-    #[cfg(feature = "dynamic-linking")]
-    fn require_symbols() -> Result<(), libloading::Error> {
-        crate::common::require_vm_symbols()?;
-        krun::require(
-            None,
-            &[
-                krun::Symbol::KrunVsockDeviceNew,
-                krun::Symbol::KrunVsockDeviceDestroy,
-                krun::Symbol::KrunVsockDeviceAddUnixPort,
-            ],
-        )
-    }
+    use crate::common::{build_init_config, setup_standard_devices};
+    use crate::{Test, TestSetup};
 
     fn server(listener: UnixListener) {
         let (mut stream, _addr) = listener.accept().unwrap();
@@ -69,19 +56,7 @@ mod host {
     }
 
     impl Test for TestVsockGuestConnect {
-        fn should_run(&self) -> ShouldRun {
-            #[cfg(feature = "dynamic-linking")]
-            if require_symbols().is_err() {
-                return ShouldRun::No("feature not enabled in this libkrun build");
-            }
-            ShouldRun::Yes
-        }
-
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            init_krun()?;
-            #[cfg(feature = "dynamic-linking")]
-            require_symbols().unwrap();
-
             let sock_path = test_setup.tmp_dir.join("test.sock");
             let listener = UnixListener::bind(&sock_path).unwrap();
             thread::spawn(move || server(listener));

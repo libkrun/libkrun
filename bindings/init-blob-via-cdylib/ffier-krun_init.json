@@ -2,13 +2,6 @@
   "prefix": "krun_init",
   "primitives_prefix": "krun",
   "type_registry": {
-    "*mut core::ffi::c_void": {
-      "kind": {
-        "primitive": {
-          "c_type": "void*"
-        }
-      }
-    },
     "ApplyError": {
       "kind": {
         "error": {
@@ -85,18 +78,20 @@
     "FsOverlay": {
       "kind": {
         "foreign_handle": {
-          "foreign_crate": "krun_via_cdylib_weak",
+          "foreign_crate": "::libkrun_via_libc",
           "c_name": "KrunFsOverlay"
         }
       },
       "lifetime_params": [
-        "a"
+        {
+          "name": "a"
+        }
       ]
     },
     "Payload": {
       "kind": {
         "foreign_handle": {
-          "foreign_crate": "krun_via_cdylib_weak",
+          "foreign_crate": "::libkrun_via_libc",
           "c_name": "KrunPayload"
         }
       }
@@ -177,11 +172,10 @@
             "",
             " The caller must keep this `Config` (or `KrunInitConfig`) alive for the",
             " entire lifetime of the VM; `apply` borrows data pointers that remain",
-            " referenced until the VM exits.",
-            "",
-            " Symbols are loaded from the global namespace (`RTLD_DEFAULT`)."
+            " referenced until the VM exits."
           ],
           "receiver": "ref",
+          "receiver_lifetime": "a",
           "method_lifetimes": [
             "a"
           ],
@@ -208,55 +202,7 @@
             "err_type": "ApplyError",
             "c_convention": "out_param"
           },
-          "ffi_name": "krun_init_config_apply",
-          "cfg": "feature = \"ffi-client\""
-        },
-        {
-          "name": "apply_in",
-          "doc": [
-            " Like [`apply`](Self::apply), but loads symbols from a specific library",
-            " handle (e.g. from `dlopen`). Pass null for `RTLD_DEFAULT`.",
-            "",
-            " - If `lib_handle` is non-null it must be a valid handle returned by",
-            "   `dlopen` (or equivalent) that remains open for the duration of",
-            "   this call.",
-            " - The caller must keep this `Config` (or `KrunInitConfig`) alive for the",
-            "   entire lifetime of the VM."
-          ],
-          "receiver": "ref",
-          "method_lifetimes": [
-            "a"
-          ],
-          "params": [
-            {
-              "name": "lib_handle",
-              "param_kind": "regular",
-              "type": "*mut core::ffi::c_void"
-            },
-            {
-              "name": "overlay",
-              "param_kind": "regular",
-              "type": "FsOverlay",
-              "ref_kind": "mut",
-              "type_args": [
-                "a"
-              ]
-            },
-            {
-              "name": "payload",
-              "param_kind": "regular",
-              "type": "Payload",
-              "ref_kind": "mut"
-            }
-          ],
-          "ret": {
-            "return_kind": "result",
-            "ok": null,
-            "err_type": "ApplyError",
-            "c_convention": "out_param"
-          },
-          "ffi_name": "krun_init_config_apply_in",
-          "cfg": "feature = \"ffi-client\""
+          "ffi_name": "krun_init_config_apply"
         }
       ]
     },
@@ -600,13 +546,19 @@
           "name": "InvalidJson",
           "c_name": "KRUN_INIT_ERROR_CONFIG_INVALID_JSON",
           "code": 1,
-          "message": "InvalidJson(...)",
-          "fields": [
-            {
-              "type": "str",
-              "owned": true
-            }
-          ]
+          "message": "InvalidJson",
+          "data": {
+            "kind": "tuple",
+            "fields": [
+              {
+                "kind": "typed",
+                "type_ref": {
+                  "type": "str",
+                  "owned": true
+                }
+              }
+            ]
+          }
         }
       ]
     },
@@ -617,19 +569,33 @@
           "name": "SymbolNotFound",
           "c_name": "KRUN_INIT_ERROR_APPLY_SYMBOL_NOT_FOUND",
           "code": 1,
-          "message": "SymbolNotFound(...)",
-          "fields": [
-            {
-              "type": "str",
-              "owned": true
-            }
-          ]
+          "message": "SymbolNotFound",
+          "data": {
+            "kind": "tuple",
+            "fields": [
+              {
+                "kind": "typed",
+                "type_ref": {
+                  "type": "str",
+                  "owned": true
+                }
+              }
+            ]
+          }
         },
         {
           "name": "OverlayError",
           "c_name": "KRUN_INIT_ERROR_APPLY_OVERLAY_ERROR",
           "code": 2,
-          "message": "OverlayError(...)"
+          "message": "OverlayError",
+          "data": {
+            "kind": "tuple",
+            "fields": [
+              {
+                "kind": "opaque"
+              }
+            ]
+          }
         }
       ]
     }
@@ -667,7 +633,7 @@
         }
       ],
       "own_method_count": 1,
-      "max_vtable_slot": 0
+      "num_slots": 1
     },
     {
       "name": "Error",
@@ -699,7 +665,8 @@
             {
               "name": "writer",
               "param_kind": "impl_trait",
-              "trait_name": "PushStr"
+              "trait_name": "PushStr",
+              "ref_kind": "mut"
             }
           ],
           "ret": {
@@ -727,7 +694,7 @@
         }
       ],
       "own_method_count": 3,
-      "max_vtable_slot": 2
+      "num_slots": 3
     }
   ],
   "trait_impls": [
@@ -752,7 +719,8 @@
             {
               "name": "writer",
               "param_kind": "impl_trait",
-              "trait_name": "PushStr"
+              "trait_name": "PushStr",
+              "ref_kind": "mut"
             }
           ],
           "ret": {
@@ -783,7 +751,8 @@
             {
               "name": "writer",
               "param_kind": "impl_trait",
-              "trait_name": "PushStr"
+              "trait_name": "PushStr",
+              "ref_kind": "mut"
             }
           ],
           "ret": {

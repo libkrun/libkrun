@@ -7,7 +7,7 @@ pub struct TestAcpiSmp {
 #[host]
 mod host {
     use super::*;
-    use crate::common::{init_config_builder, init_krun, setup_standard_devices_from};
+    use crate::common::{init_config_builder, setup_standard_devices_from};
     use crate::{ShouldRun, Test, TestSetup};
 
     impl Test for TestAcpiSmp {
@@ -20,7 +20,6 @@ mod host {
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            init_krun()?;
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();

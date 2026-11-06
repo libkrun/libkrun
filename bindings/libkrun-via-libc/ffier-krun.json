@@ -15,8 +15,12 @@
           "c_name": "KrunAttachDevice"
         }
       },
+      "type_tag": 16777244,
       "lifetime_params": [
-        "a"
+        {
+          "name": "a",
+          "variance": "invariant"
+        }
       ]
     },
     "BalloonDevice": {
@@ -43,7 +47,24 @@
       },
       "bless": "borrowed_fd",
       "lifetime_params": [
-        "fd"
+        {
+          "name": "fd",
+          "variance": "covariant"
+        }
+      ]
+    },
+    "BorrowedHandle": {
+      "kind": {
+        "alias": {
+          "alias_of": "RawHandle"
+        }
+      },
+      "bless": "borrowed_handle",
+      "lifetime_params": [
+        {
+          "name": "handle",
+          "variance": "covariant"
+        }
       ]
     },
     "CachePolicy": {
@@ -61,7 +82,10 @@
       },
       "type_tag": 16777221,
       "lifetime_params": [
-        "a"
+        {
+          "name": "a",
+          "variance": "covariant"
+        }
       ]
     },
     "ConsoleDevice": {
@@ -72,7 +96,10 @@
       },
       "type_tag": 16777220,
       "lifetime_params": [
-        "a"
+        {
+          "name": "a",
+          "variance": "covariant"
+        }
       ]
     },
     "DeviceManager": {
@@ -83,7 +110,10 @@
       },
       "type_tag": 16777242,
       "lifetime_params": [
-        "a"
+        {
+          "name": "a",
+          "variance": "invariant"
+        }
       ]
     },
     "DiskFormat": {
@@ -165,7 +195,10 @@
       },
       "type_tag": 16777219,
       "lifetime_params": [
-        "a"
+        {
+          "name": "a",
+          "variance": "covariant"
+        }
       ]
     },
     "FsOverlay": {
@@ -176,7 +209,10 @@
       },
       "type_tag": 16777222,
       "lifetime_params": [
-        "a"
+        {
+          "name": "a",
+          "variance": "covariant"
+        }
       ]
     },
     "GpuDevice": {
@@ -195,7 +231,10 @@
       },
       "type_tag": 16777240,
       "lifetime_params": [
-        "a"
+        {
+          "name": "a",
+          "variance": "covariant"
+        }
       ]
     },
     "KernelFormat": {
@@ -234,7 +273,10 @@
       },
       "type_tag": 16777218,
       "lifetime_params": [
-        "a"
+        {
+          "name": "a",
+          "variance": "invariant"
+        }
       ]
     },
     "NetDevice": {
@@ -284,7 +326,10 @@
       },
       "type_tag": 16777241,
       "lifetime_params": [
-        "a"
+        {
+          "name": "a",
+          "variance": "invariant"
+        }
       ]
     },
     "PermissionSemantics": {
@@ -310,6 +355,14 @@
         }
       },
       "bless": "raw_fd"
+    },
+    "RawHandle": {
+      "kind": {
+        "primitive": {
+          "c_type": "void *"
+        }
+      },
+      "bless": "raw_handle"
     },
     "RngDevice": {
       "kind": {
@@ -372,7 +425,10 @@
       },
       "type_tag": 16777227,
       "lifetime_params": [
-        "a"
+        {
+          "name": "a",
+          "variance": "covariant"
+        }
       ]
     },
     "VmmBuilder": {
@@ -383,7 +439,10 @@
       },
       "type_tag": 16777226,
       "lifetime_params": [
-        "a"
+        {
+          "name": "a",
+          "variance": "invariant"
+        }
       ]
     },
     "VmmError": {
@@ -481,6 +540,9 @@
       "name": "MmioDeviceManager",
       "destroy_ffi_name": "krun_mmio_device_manager_destroy",
       "is_builder_type": false,
+      "thread_safety": {
+        "send": true
+      },
       "methods": [
         {
           "name": "new",
@@ -504,6 +566,9 @@
       "name": "PciDeviceManager",
       "destroy_ffi_name": "krun_pci_device_manager_destroy",
       "is_builder_type": false,
+      "thread_safety": {
+        "send": true
+      },
       "methods": [
         {
           "name": "new",
@@ -519,12 +584,36 @@
           "ffi_name": "krun_pci_device_manager_new"
         }
       ],
-      "cfg": "all(target_arch = \"x86_64\", any(target_os = \"linux\", target_os = \"windows\"))"
+      "cfg": {
+        "kind": "all",
+        "value": [
+          {
+            "kind": "target_arch",
+            "value": "x86_64"
+          },
+          {
+            "kind": "any",
+            "value": [
+              {
+                "kind": "target_os",
+                "value": "linux"
+              },
+              {
+                "kind": "target_os",
+                "value": "windows"
+              }
+            ]
+          }
+        ]
+      }
     },
     {
       "name": "FsDevice",
       "destroy_ffi_name": "krun_fs_device_destroy",
       "is_builder_type": false,
+      "thread_safety": {
+        "send": true
+      },
       "methods": [
         {
           "name": "new",
@@ -769,12 +858,30 @@
           "ffi_name": "krun_fs_device_set_cache_policy"
         }
       ],
-      "cfg": "not(any(feature = \"tee\", feature = \"aws-nitro\"))"
+      "cfg": {
+        "kind": "not",
+        "value": {
+          "kind": "any",
+          "value": [
+            {
+              "kind": "feature",
+              "value": "tee"
+            },
+            {
+              "kind": "feature",
+              "value": "aws-nitro"
+            }
+          ]
+        }
+      }
     },
     {
       "name": "ConsoleDevice",
       "destroy_ffi_name": "krun_console_device_destroy",
       "is_builder_type": false,
+      "thread_safety": {
+        "send": true
+      },
       "methods": [
         {
           "name": "builder",
@@ -842,7 +949,10 @@
             "err_type": "VmmError",
             "c_convention": "out_param"
           },
-          "ffi_name": "krun_console_builder_add_tty_port"
+          "ffi_name": "krun_console_builder_add_tty_port",
+          "cfg": {
+            "kind": "unix"
+          }
         },
         {
           "name": "add_inout_port",
@@ -886,7 +996,10 @@
             "err_type": "VmmError",
             "c_convention": "out_param"
           },
-          "ffi_name": "krun_console_builder_add_inout_port"
+          "ffi_name": "krun_console_builder_add_inout_port",
+          "cfg": {
+            "kind": "unix"
+          }
         },
         {
           "name": "build",
@@ -961,10 +1074,129 @@
             "err_type": "VmmError",
             "c_convention": "out_param"
           },
-          "ffi_name": "krun_console_builder_add_default_console"
+          "ffi_name": "krun_console_builder_add_default_console",
+          "cfg": {
+            "kind": "unix"
+          }
+        },
+        {
+          "name": "add_tty_port",
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "name",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "tty_fd",
+              "param_kind": "regular",
+              "type": "BorrowedHandle",
+              "type_args": [
+                "a"
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "u32"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_console_builder_add_tty_port",
+          "cfg": {
+            "kind": "windows"
+          }
+        },
+        {
+          "name": "add_inout_port",
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "name",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "input_fd",
+              "param_kind": "regular",
+              "type": "BorrowedHandle",
+              "type_args": [
+                "a"
+              ],
+              "optional": true
+            },
+            {
+              "name": "output_fd",
+              "param_kind": "regular",
+              "type": "BorrowedHandle",
+              "type_args": [
+                "a"
+              ],
+              "optional": true
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "u32"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_console_builder_add_inout_port",
+          "cfg": {
+            "kind": "windows"
+          }
+        },
+        {
+          "name": "add_default_console",
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "stdin",
+              "param_kind": "regular",
+              "type": "BorrowedHandle",
+              "type_args": [
+                "a"
+              ],
+              "optional": true
+            },
+            {
+              "name": "stdout",
+              "param_kind": "regular",
+              "type": "BorrowedHandle",
+              "type_args": [
+                "a"
+              ],
+              "optional": true
+            },
+            {
+              "name": "stderr",
+              "param_kind": "regular",
+              "type": "BorrowedHandle",
+              "type_args": [
+                "a"
+              ],
+              "optional": true
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_console_builder_add_default_console",
+          "cfg": {
+            "kind": "windows"
+          }
         }
-      ],
-      "cfg": "not(target_os = \"windows\")"
+      ]
     },
     {
       "name": "FsOverlay",
@@ -1060,7 +1292,22 @@
           "ffi_name": "krun_fs_overlay_add_file"
         }
       ],
-      "cfg": "not(any(feature = \"tee\", feature = \"aws-nitro\"))"
+      "cfg": {
+        "kind": "not",
+        "value": {
+          "kind": "any",
+          "value": [
+            {
+              "kind": "feature",
+              "value": "tee"
+            },
+            {
+              "kind": "feature",
+              "value": "aws-nitro"
+            }
+          ]
+        }
+      }
     },
     {
       "name": "Payload",
@@ -1221,7 +1468,10 @@
             "c_convention": "handle_or_null"
           },
           "ffi_name": "krun_payload_nitro_enclave",
-          "cfg": "feature = \"aws-nitro\""
+          "cfg": {
+            "kind": "feature",
+            "value": "aws-nitro"
+          }
         }
       ]
     },
@@ -1392,7 +1642,10 @@
           "ffi_name": "krun_nitro_config_debug"
         }
       ],
-      "cfg": "feature = \"aws-nitro\""
+      "cfg": {
+        "kind": "feature",
+        "value": "aws-nitro"
+      }
     },
     {
       "name": "VmmBuilder",
@@ -1551,7 +1804,13 @@
             "c_convention": "out_param"
           },
           "ffi_name": "krun_vmm_builder_add_serial_console",
-          "cfg": "not(target_os = \"windows\")"
+          "cfg": {
+            "kind": "not",
+            "value": {
+              "kind": "target_os",
+              "value": "windows"
+            }
+          }
         },
         {
           "name": "nested_virt",
@@ -1741,6 +2000,9 @@
       "name": "VmmHandle",
       "destroy_ffi_name": "krun_vmm_handle_destroy",
       "is_builder_type": false,
+      "thread_safety": {
+        "send": true
+      },
       "methods": [
         {
           "name": "pause",
@@ -1793,6 +2055,9 @@
       "name": "BalloonDevice",
       "destroy_ffi_name": "krun_balloon_device_destroy",
       "is_builder_type": false,
+      "thread_safety": {
+        "send": true
+      },
       "methods": [
         {
           "name": "new",
@@ -1838,12 +2103,21 @@
           "ffi_name": "krun_balloon_device_set_free_page_reporting_mode"
         }
       ],
-      "cfg": "not(feature = \"tee\")"
+      "cfg": {
+        "kind": "not",
+        "value": {
+          "kind": "feature",
+          "value": "tee"
+        }
+      }
     },
     {
       "name": "RngDevice",
       "destroy_ffi_name": "krun_rng_device_destroy",
       "is_builder_type": false,
+      "thread_safety": {
+        "send": true
+      },
       "methods": [
         {
           "name": "new",
@@ -1860,12 +2134,21 @@
           "ffi_name": "krun_rng_device_new"
         }
       ],
-      "cfg": "not(feature = \"tee\")"
+      "cfg": {
+        "kind": "not",
+        "value": {
+          "kind": "feature",
+          "value": "tee"
+        }
+      }
     },
     {
       "name": "RtcDevice",
       "destroy_ffi_name": "krun_rtc_device_destroy",
       "is_builder_type": false,
+      "thread_safety": {
+        "send": true
+      },
       "methods": [
         {
           "name": "new",
@@ -1882,12 +2165,18 @@
           "ffi_name": "krun_rtc_device_new"
         }
       ],
-      "cfg": "target_os = \"linux\""
+      "cfg": {
+        "kind": "target_os",
+        "value": "linux"
+      }
     },
     {
       "name": "VsockDevice",
       "destroy_ffi_name": "krun_vsock_device_destroy",
       "is_builder_type": false,
+      "thread_safety": {
+        "send": true
+      },
       "methods": [
         {
           "name": "new",
@@ -1976,6 +2265,9 @@
       "name": "BlockDevice",
       "destroy_ffi_name": "krun_block_device_destroy",
       "is_builder_type": false,
+      "thread_safety": {
+        "send": true
+      },
       "methods": [
         {
           "name": "new",
@@ -2116,12 +2408,18 @@
           "ffi_name": "krun_block_device_set_read_pool_size"
         }
       ],
-      "cfg": "feature = \"blk\""
+      "cfg": {
+        "kind": "feature",
+        "value": "blk"
+      }
     },
     {
       "name": "NetDevice",
       "destroy_ffi_name": "krun_net_device_destroy",
       "is_builder_type": false,
+      "thread_safety": {
+        "send": true
+      },
       "methods": [
         {
           "name": "new_unixgram_path",
@@ -2214,7 +2512,10 @@
             "err_type": "VmmError",
             "c_convention": "handle_or_null"
           },
-          "ffi_name": "krun_net_device_new_unixgram_fd"
+          "ffi_name": "krun_net_device_new_unixgram_fd",
+          "cfg": {
+            "kind": "unix"
+          }
         },
         {
           "name": "new_unixstream_path",
@@ -2307,7 +2608,10 @@
             "err_type": "VmmError",
             "c_convention": "handle_or_null"
           },
-          "ffi_name": "krun_net_device_new_unixstream_fd"
+          "ffi_name": "krun_net_device_new_unixstream_fd",
+          "cfg": {
+            "kind": "unix"
+          }
         },
         {
           "name": "new_tap",
@@ -2348,7 +2652,10 @@
           "ffi_name": "krun_net_device_new_tap"
         }
       ],
-      "cfg": "feature = \"net\""
+      "cfg": {
+        "kind": "feature",
+        "value": "net"
+      }
     },
     {
       "name": "DisplayInfoBuilder",
@@ -2447,12 +2754,27 @@
           "ffi_name": "krun_display_info_builder_refresh_rate"
         }
       ],
-      "cfg": "any(feature = \"gpu\", feature = \"vhost-user\")"
+      "cfg": {
+        "kind": "any",
+        "value": [
+          {
+            "kind": "feature",
+            "value": "gpu"
+          },
+          {
+            "kind": "feature",
+            "value": "vhost-user"
+          }
+        ]
+      }
     },
     {
       "name": "VhostUserDevice",
       "destroy_ffi_name": "krun_vhost_user_device_destroy",
       "is_builder_type": false,
+      "thread_safety": {
+        "send": true
+      },
       "methods": [
         {
           "name": "new",
@@ -2539,7 +2861,19 @@
           "ffi_name": "krun_vhost_user_device_set_display_backend"
         }
       ],
-      "cfg": "all(feature = \"vhost-user\", target_os = \"linux\")"
+      "cfg": {
+        "kind": "all",
+        "value": [
+          {
+            "kind": "feature",
+            "value": "vhost-user"
+          },
+          {
+            "kind": "target_os",
+            "value": "linux"
+          }
+        ]
+      }
     },
     {
       "name": "DisplayBackend",
@@ -2596,12 +2930,27 @@
           "ffi_name": "krun_display_backend_add_display"
         }
       ],
-      "cfg": "any(feature = \"gpu\", feature = \"vhost-user\")"
+      "cfg": {
+        "kind": "any",
+        "value": [
+          {
+            "kind": "feature",
+            "value": "gpu"
+          },
+          {
+            "kind": "feature",
+            "value": "vhost-user"
+          }
+        ]
+      }
     },
     {
       "name": "GpuDevice",
       "destroy_ffi_name": "krun_gpu_device_destroy",
       "is_builder_type": true,
+      "thread_safety": {
+        "send": true
+      },
       "methods": [
         {
           "name": "new",
@@ -2641,12 +2990,18 @@
           "ffi_name": "krun_gpu_device_shm_size"
         }
       ],
-      "cfg": "feature = \"gpu\""
+      "cfg": {
+        "kind": "feature",
+        "value": "gpu"
+      }
     },
     {
       "name": "InputDevice",
       "destroy_ffi_name": "krun_input_device_destroy",
       "is_builder_type": false,
+      "thread_safety": {
+        "send": true
+      },
       "methods": [
         {
           "name": "new",
@@ -2728,10 +3083,16 @@
             "c_convention": "handle_or_null"
           },
           "ffi_name": "krun_input_device_new_from_fd",
-          "cfg": "target_os = \"linux\""
+          "cfg": {
+            "kind": "target_os",
+            "value": "linux"
+          }
         }
       ],
-      "cfg": "feature = \"input\""
+      "cfg": {
+        "kind": "feature",
+        "value": "input"
+      }
     }
   ],
   "errors": [
@@ -2742,55 +3103,103 @@
           "name": "InvalidParam",
           "c_name": "KRUN_ERROR_VMM_INVALID_PARAM",
           "code": 1,
-          "message": "InvalidParam"
+          "message": "InvalidParam",
+          "data": {
+            "kind": "tuple",
+            "fields": []
+          }
         },
         {
           "name": "MissingConfig",
           "c_name": "KRUN_ERROR_VMM_MISSING_CONFIG",
           "code": 2,
-          "message": "MissingConfig(...)"
+          "message": "MissingConfig",
+          "data": {
+            "kind": "tuple",
+            "fields": [
+              {
+                "kind": "opaque"
+              }
+            ]
+          }
         },
         {
           "name": "OutOfRange",
           "c_name": "KRUN_ERROR_VMM_OUT_OF_RANGE",
           "code": 3,
-          "message": "OutOfRange"
+          "message": "OutOfRange",
+          "data": {
+            "kind": "tuple",
+            "fields": []
+          }
         },
         {
           "name": "FileNotFound",
           "c_name": "KRUN_ERROR_VMM_FILE_NOT_FOUND",
           "code": 4,
-          "message": "FileNotFound"
+          "message": "FileNotFound",
+          "data": {
+            "kind": "tuple",
+            "fields": []
+          }
         },
         {
           "name": "ResourceAlloc",
           "c_name": "KRUN_ERROR_VMM_RESOURCE_ALLOC",
           "code": 5,
-          "message": "ResourceAlloc"
+          "message": "ResourceAlloc",
+          "data": {
+            "kind": "tuple",
+            "fields": []
+          }
         },
         {
           "name": "BadFd",
           "c_name": "KRUN_ERROR_VMM_BAD_FD",
           "code": 6,
-          "message": "BadFd"
+          "message": "BadFd",
+          "data": {
+            "kind": "tuple",
+            "fields": []
+          }
         },
         {
           "name": "FeatureDisabled",
           "c_name": "KRUN_ERROR_VMM_FEATURE_DISABLED",
           "code": 7,
-          "message": "FeatureDisabled"
+          "message": "FeatureDisabled",
+          "data": {
+            "kind": "tuple",
+            "fields": []
+          }
         },
         {
           "name": "BootError",
           "c_name": "KRUN_ERROR_VMM_BOOT_ERROR",
           "code": 8,
-          "message": "BootError(...)"
+          "message": "BootError",
+          "data": {
+            "kind": "tuple",
+            "fields": [
+              {
+                "kind": "opaque"
+              }
+            ]
+          }
         },
         {
           "name": "Internal",
           "c_name": "KRUN_ERROR_VMM_INTERNAL",
           "code": 9,
-          "message": "Internal(...)"
+          "message": "Internal",
+          "data": {
+            "kind": "tuple",
+            "fields": [
+              {
+                "kind": "opaque"
+              }
+            ]
+          }
         }
       ]
     }
@@ -2960,7 +3369,22 @@
           "value": 2
         }
       ],
-      "cfg": "not(any(feature = \"tee\", feature = \"aws-nitro\"))"
+      "cfg": {
+        "kind": "not",
+        "value": {
+          "kind": "any",
+          "value": [
+            {
+              "kind": "feature",
+              "value": "tee"
+            },
+            {
+              "kind": "feature",
+              "value": "aws-nitro"
+            }
+          ]
+        }
+      }
     },
     {
       "name": "CachePolicy",
@@ -2981,7 +3405,22 @@
           "value": 2
         }
       ],
-      "cfg": "not(any(feature = \"tee\", feature = \"aws-nitro\"))"
+      "cfg": {
+        "kind": "not",
+        "value": {
+          "kind": "any",
+          "value": [
+            {
+              "kind": "feature",
+              "value": "tee"
+            },
+            {
+              "kind": "feature",
+              "value": "aws-nitro"
+            }
+          ]
+        }
+      }
     }
   ],
   "bitflags_constants": [
@@ -3039,7 +3478,10 @@
           "value": 512
         }
       ],
-      "cfg": "feature = \"gpu\""
+      "cfg": {
+        "kind": "feature",
+        "value": "gpu"
+      }
     },
     {
       "name": "NetFlags",
@@ -3050,7 +3492,10 @@
           "value": 1
         }
       ],
-      "cfg": "feature = \"net\""
+      "cfg": {
+        "kind": "feature",
+        "value": "net"
+      }
     }
   ],
   "free_functions": [
@@ -3088,6 +3533,48 @@
         "ok": null,
         "err_type": "VmmError",
         "c_convention": "out_param"
+      },
+      "cfg": {
+        "kind": "unix"
+      }
+    },
+    {
+      "name": "init_log",
+      "ffi_name": "krun_init_log",
+      "params": [
+        {
+          "name": "target",
+          "param_kind": "regular",
+          "type": "BorrowedHandle",
+          "type_args": [
+            "static"
+          ],
+          "optional": true
+        },
+        {
+          "name": "level",
+          "param_kind": "regular",
+          "type": "LogLevel"
+        },
+        {
+          "name": "style",
+          "param_kind": "regular",
+          "type": "LogStyle"
+        },
+        {
+          "name": "options",
+          "param_kind": "regular",
+          "type": "LogOptions"
+        }
+      ],
+      "ret": {
+        "return_kind": "result",
+        "ok": null,
+        "err_type": "VmmError",
+        "c_convention": "out_param"
+      },
+      "cfg": {
+        "kind": "windows"
       }
     },
     {
@@ -3109,6 +3596,9 @@
       "wrapper_c_name": "KrunVtableDeviceManager",
       "vtable_struct_name": "DeviceManagerVtable",
       "wrapper_name": "VtableDeviceManager",
+      "thread_safety": {
+        "send": true
+      },
       "methods": [
         {
           "name": "add",
@@ -3137,7 +3627,23 @@
         }
       ],
       "own_method_count": 1,
-      "max_vtable_slot": 0,
+      "num_slots": 1,
+      "no_vtable": true
+    },
+    {
+      "name": "AttachDevice",
+      "destroy_ffi_name": "krun_attach_device_destroy",
+      "type_tag_constant": "KRUN_ATTACH_DEVICE_TYPE_TAG",
+      "vtable_struct_c_name": "KrunAttachDeviceVtable",
+      "wrapper_c_name": "KrunVtableAttachDevice",
+      "vtable_struct_name": "AttachDeviceVtable",
+      "wrapper_name": "VtableAttachDevice",
+      "thread_safety": {
+        "send": true
+      },
+      "methods": [],
+      "own_method_count": 0,
+      "num_slots": 0,
       "no_vtable": true
     },
     {
@@ -3172,7 +3678,7 @@
         }
       ],
       "own_method_count": 1,
-      "max_vtable_slot": 0
+      "num_slots": 1
     },
     {
       "name": "Error",
@@ -3204,7 +3710,8 @@
             {
               "name": "writer",
               "param_kind": "impl_trait",
-              "trait_name": "PushStr"
+              "trait_name": "PushStr",
+              "ref_kind": "mut"
             }
           ],
           "ret": {
@@ -3232,7 +3739,7 @@
         }
       ],
       "own_method_count": 3,
-      "max_vtable_slot": 2
+      "num_slots": 3
     }
   ],
   "trait_impls": [
@@ -3301,7 +3808,28 @@
           "ffi_name": "krun_pci_device_manager_add"
         }
       ],
-      "cfg": "all(target_arch = \"x86_64\", any(target_os = \"linux\", target_os = \"windows\"))"
+      "cfg": {
+        "kind": "all",
+        "value": [
+          {
+            "kind": "target_arch",
+            "value": "x86_64"
+          },
+          {
+            "kind": "any",
+            "value": [
+              {
+                "kind": "target_os",
+                "value": "linux"
+              },
+              {
+                "kind": "target_os",
+                "value": "windows"
+              }
+            ]
+          }
+        ]
+      }
     },
     {
       "trait_name": "AttachDevice",
@@ -3313,7 +3841,10 @@
         "a"
       ],
       "methods": [],
-      "cfg": "target_os = \"linux\""
+      "cfg": {
+        "kind": "target_os",
+        "value": "linux"
+      }
     },
     {
       "trait_name": "AttachDevice",
@@ -3328,7 +3859,22 @@
         "a"
       ],
       "methods": [],
-      "cfg": "not(any(feature = \"tee\", feature = \"aws-nitro\"))"
+      "cfg": {
+        "kind": "not",
+        "value": {
+          "kind": "any",
+          "value": [
+            {
+              "kind": "feature",
+              "value": "tee"
+            },
+            {
+              "kind": "feature",
+              "value": "aws-nitro"
+            }
+          ]
+        }
+      }
     },
     {
       "trait_name": "AttachDevice",
@@ -3354,7 +3900,10 @@
         "a"
       ],
       "methods": [],
-      "cfg": "feature = \"blk\""
+      "cfg": {
+        "kind": "feature",
+        "value": "blk"
+      }
     },
     {
       "trait_name": "AttachDevice",
@@ -3366,7 +3915,10 @@
         "a"
       ],
       "methods": [],
-      "cfg": "feature = \"net\""
+      "cfg": {
+        "kind": "feature",
+        "value": "net"
+      }
     },
     {
       "trait_name": "AttachDevice",
@@ -3378,7 +3930,10 @@
         "a"
       ],
       "methods": [],
-      "cfg": "feature = \"gpu\""
+      "cfg": {
+        "kind": "feature",
+        "value": "gpu"
+      }
     },
     {
       "trait_name": "AttachDevice",
@@ -3393,7 +3948,10 @@
         "a"
       ],
       "methods": [],
-      "cfg": "feature = \"input\""
+      "cfg": {
+        "kind": "feature",
+        "value": "input"
+      }
     },
     {
       "trait_name": "AttachDevice",
@@ -3405,7 +3963,19 @@
         "a"
       ],
       "methods": [],
-      "cfg": "all(feature = \"vhost-user\", target_os = \"linux\")"
+      "cfg": {
+        "kind": "all",
+        "value": [
+          {
+            "kind": "feature",
+            "value": "vhost-user"
+          },
+          {
+            "kind": "target_os",
+            "value": "linux"
+          }
+        ]
+      }
     },
     {
       "trait_name": "AttachDevice",
@@ -3417,7 +3987,13 @@
         "a"
       ],
       "methods": [],
-      "cfg": "not(feature = \"tee\")"
+      "cfg": {
+        "kind": "not",
+        "value": {
+          "kind": "feature",
+          "value": "tee"
+        }
+      }
     },
     {
       "trait_name": "AttachDevice",
@@ -3429,7 +4005,13 @@
         "a"
       ],
       "methods": [],
-      "cfg": "not(feature = \"tee\")"
+      "cfg": {
+        "kind": "not",
+        "value": {
+          "kind": "feature",
+          "value": "tee"
+        }
+      }
     },
     {
       "trait_name": "AttachDevice",
@@ -3463,7 +4045,8 @@
             {
               "name": "writer",
               "param_kind": "impl_trait",
-              "trait_name": "PushStr"
+              "trait_name": "PushStr",
+              "ref_kind": "mut"
             }
           ],
           "ret": {

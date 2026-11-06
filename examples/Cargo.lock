@@ -265,18 +265,27 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "ffier"
-version = "0.2.0"
-source = "git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1#9616083b528a045fbc6a275e77da0ec03bd28bea"
+version = "0.3.0"
+source = "git+https://github.com/mtjhrc/ffier.git?tag=v0.3.0#51fc8b1abb282e06a81ac9658aff6ca23507004a"
 dependencies = [
+ "ffier-bridge",
  "ffier-builtins",
  "ffier-impl",
  "ffier-rt",
 ]
 
 [[package]]
+name = "ffier-bridge"
+version = "0.3.0"
+source = "git+https://github.com/mtjhrc/ffier.git?tag=v0.3.0#51fc8b1abb282e06a81ac9658aff6ca23507004a"
+dependencies = [
+ "ffier-rt",
+]
+
+[[package]]
 name = "ffier-builtins"
-version = "0.2.0"
-source = "git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1#9616083b528a045fbc6a275e77da0ec03bd28bea"
+version = "0.3.0"
+source = "git+https://github.com/mtjhrc/ffier.git?tag=v0.3.0#51fc8b1abb282e06a81ac9658aff6ca23507004a"
 dependencies = [
  "ffier-impl",
  "ffier-rt",
@@ -284,8 +293,8 @@ dependencies = [
 
 [[package]]
 name = "ffier-gen-rust-client"
-version = "0.2.0"
-source = "git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1#9616083b528a045fbc6a275e77da0ec03bd28bea"
+version = "0.3.0"
+source = "git+https://github.com/mtjhrc/ffier.git?tag=v0.3.0#51fc8b1abb282e06a81ac9658aff6ca23507004a"
 dependencies = [
  "ffier-schema",
  "serde_json",
@@ -293,8 +302,8 @@ dependencies = [
 
 [[package]]
 name = "ffier-impl"
-version = "0.2.0"
-source = "git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1#9616083b528a045fbc6a275e77da0ec03bd28bea"
+version = "0.3.0"
+source = "git+https://github.com/mtjhrc/ffier.git?tag=v0.3.0#51fc8b1abb282e06a81ac9658aff6ca23507004a"
 dependencies = [
  "ffier-schema",
  "proc-macro2",
@@ -305,13 +314,13 @@ dependencies = [
 
 [[package]]
 name = "ffier-rt"
-version = "0.2.0"
-source = "git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1#9616083b528a045fbc6a275e77da0ec03bd28bea"
+version = "0.3.0"
+source = "git+https://github.com/mtjhrc/ffier.git?tag=v0.3.0#51fc8b1abb282e06a81ac9658aff6ca23507004a"
 
 [[package]]
 name = "ffier-schema"
-version = "0.2.0"
-source = "git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1#9616083b528a045fbc6a275e77da0ec03bd28bea"
+version = "0.3.0"
+source = "git+https://github.com/mtjhrc/ffier.git?tag=v0.3.0#51fc8b1abb282e06a81ac9658aff6ca23507004a"
 dependencies = [
  "serde",
  "serde_json",
@@ -668,8 +677,7 @@ dependencies = [
  "gtk_display",
  "krun-init-blob-via-cdylib",
  "krun-input",
- "krun-via-cdylib-weak",
- "libloading",
+ "libkrun-via-libc",
  "log",
  "regex",
 ]
@@ -745,12 +753,12 @@ dependencies = [
 
 [[package]]
 name = "krun-init-blob-via-cdylib"
-version = "0.1.0-1.18.1"
+version = "2.0.0-dev"
 dependencies = [
  "anyhow",
  "ffier",
  "ffier-gen-rust-client",
- "krun-via-cdylib-weak",
+ "libkrun-via-libc",
  "pkg-config",
 ]
 
@@ -781,16 +789,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "krun-via-cdylib-weak"
-version = "2.0.0-dev"
-dependencies = [
- "bitflags 2.13.1",
- "ffier",
- "ffier-gen-rust-client",
- "libloading",
-]
-
-[[package]]
 name = "kvm-bindings"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -806,13 +804,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
-name = "libloading"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+name = "libkrun-via-libc"
+version = "2.0.0-dev"
 dependencies = [
- "cfg-if",
- "windows-link",
+ "bitflags 2.13.1",
+ "ffier",
+ "ffier-gen-rust-client",
+ "pkg-config",
 ]
 
 [[package]]
