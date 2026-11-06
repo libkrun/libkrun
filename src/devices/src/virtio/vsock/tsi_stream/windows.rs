@@ -97,6 +97,41 @@ pub(crate) fn recv_to_pkt(
     }
 }
 
+fn listen_error(family: u16, strict: bool, error: i32) -> i32 {
+    use super::super::defs::{LINUX_AF_INET, LINUX_AF_INET6};
+    use super::super::tsi_wire::{EACCES, EPERM};
+    use windows_sys::Win32::Networking::WinSock::WSAEACCES;
+
+    // Best-effort publication can leave a guest-local listener when the
+    // host denies publication. EPERM is the existing TSI fallback result.
+    if error == WSAEACCES && matches!(family, LINUX_AF_INET | LINUX_AF_INET6) {
+        if strict { -EACCES } else { -EPERM }
+    } else {
+        -wsa_errno_to_linux(error)
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::{listen_error, wsa_errno_to_linux};
+    use crate::virtio::vsock::defs::{LINUX_AF_INET, LINUX_AF_INET6, LINUX_AF_UNIX};
+    use crate::virtio::vsock::tsi_wire::{EACCES, EADDRINUSE, EPERM};
+    use windows_sys::Win32::Networking::WinSock::{WSAEACCES, WSAEADDRINUSE};
+
+    #[test]
+    fn access_denied_is_a_fallback_result_only_for_best_effort_inet() {
+        for family in [LINUX_AF_INET, LINUX_AF_INET6] {
+            assert_eq!(listen_error(family, false, WSAEACCES), -EPERM);
+            assert_eq!(listen_error(family, true, WSAEACCES), -EACCES);
+            assert_eq!(listen_error(family, false, WSAEADDRINUSE), -EADDRINUSE);
+        }
+        assert_eq!(
+            listen_error(LINUX_AF_UNIX, false, WSAEACCES),
+            -wsa_errno_to_linux(WSAEACCES)
+        );
+    }
+}
+
 fn try_listen(
     proxy: &mut super::TsiStreamProxy,
     req: &TsiListenReq,
@@ -143,7 +178,7 @@ fn try_listen(
     if bind_res == SOCKET_ERROR {
         let e = unsafe { WSAGetLastError() };
         warn!("bind failed: id={} err={e}", proxy.id);
-        return -wsa_errno_to_linux(e);
+        return listen_error(req.addr.family(), req.strict, e);
     }
 
     proxy.unixsock_path = unixsock_path;
@@ -154,7 +189,7 @@ fn try_listen(
     if listen_res == SOCKET_ERROR {
         let e = unsafe { WSAGetLastError() };
         warn!("listen failed: id={} err={e}", proxy.id);
-        return -wsa_errno_to_linux(e);
+        return listen_error(req.addr.family(), req.strict, e);
     }
 
     0
@@ -369,6 +404,7 @@ pub(crate) fn do_listen(
         operation: pkt.control_operation(),
         peer_port: pkt.src_port(),
         result,
+        flags: req.response_flags(),
     };
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
 

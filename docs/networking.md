@@ -41,6 +41,33 @@ krun_vsock_device_add_port_forward(vsock, KRUN_STR("80:8080"), &err);
 krun_mmio_device_manager_add(devices, vsock);
 ```
 
+Host TCP proxies on Unix enable `SO_REUSEADDR` for rapid restart. Sharing a
+listening port through `SO_REUSEPORT` requires an explicit application request;
+automatic exposure of application-selected ports remains enabled.
+
+### TCP publication failures
+
+Automatic guest fallback is the default when selected host publication errors
+occur. To return the original host error from guest `listen()` instead, enable
+`FAIL_ON_TCP_PUBLICATION_ERROR` for that VM:
+
+```rust
+let flags = TsiFlags::HIJACK_INET | TsiFlags::FAIL_ON_TCP_PUBLICATION_ERROR;
+let mut vsock = VsockDevice::new(3, flags)?;
+```
+
+```c
+KrunVsockDevice vsock = krun_vsock_device_new(
+    3, KRUN_TSI_FLAGS_HIJACK_INET | KRUN_TSI_FLAGS_FAIL_ON_TCP_PUBLICATION_ERROR,
+    &err);
+```
+
+Strict mode applies to INET TCP listeners, including configured port overrides.
+It leaves the guest socket bound without starting a guest-only listener when
+publication fails. A normal host error keeps the control channel usable, so
+`listen()` can be retried after resolving a bind conflict. UNIX and UDP behavior
+is unchanged. This requires the matching TSIv4 kernel/host pair.
+
 Linux TSI hosts support ordinary iputils `ping` using ICMP datagram sockets,
 including IPv4, IPv6, connected mode and explicit nonzero echo identifiers.
 Allow the application/VMM groups in `net.ipv4.ping_group_range` in the guest
@@ -51,6 +78,7 @@ controls and host error-queue forwarding are unsupported; other host platforms
 do not currently proxy ICMP ping sockets.
 
 ### Known Limitations
+- In the default fallback mode, successful guest TCP `listen()` does not guarantee host reachability. Selected host bind/listen failures (including a busy port) can leave a guest-only listener while returning success. This also applies with configured port overrides. The listener is not automatically exposed when the conflict disappears; close and recreate it to retry publication.
 - Requires a kernel with TSI support (bundled in `libkrunfw`).
 - Limited to `SOCK_STREAM` and `SOCK_DGRAM` sockets across `AF_INET`, `AF_INET6`, and `AF_UNIX`. Linux hosts support ICMP datagram ping sockets for IPv4 and IPv6. Raw sockets (`SOCK_RAW`) and netlink are not supported.
 - For `AF_UNIX` sockets, only absolute filesystem paths are supported.
