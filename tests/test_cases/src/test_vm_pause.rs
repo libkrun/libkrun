@@ -1,4 +1,4 @@
-//! Live pause/resume test. macOS/HVF only (the mechanism is HVF for now).
+//! Live pause/resume test, on macOS/HVF and Linux/KVM.
 //!
 //! Boots a 2-vCPU microVM running a fixed monotonic-clock workload, then from
 //! another thread pauses and resumes it across several cycles while asserting:
@@ -88,8 +88,8 @@ mod host {
 
     impl Test for TestVmPause {
         fn should_run(&self) -> ShouldRun {
-            if !cfg!(target_os = "macos") {
-                return ShouldRun::No("pause/resume is macOS/HVF only");
+            if !cfg!(any(target_os = "macos", target_os = "linux")) {
+                return ShouldRun::No("pause/resume is macOS/HVF and Linux/KVM only");
             }
             #[cfg(feature = "dynamic-linking")]
             if require_symbols().is_err() {
@@ -119,6 +119,8 @@ mod host {
                 .apply(&mut overlay, &mut payload)
                 .map_err(|e| anyhow::anyhow!("Config::apply: {e}"))?;
             rootfs.set_overlay(overlay);
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            payload.append_cmdline("clocksource=kvm-clock");
 
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
