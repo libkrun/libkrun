@@ -1870,6 +1870,7 @@ enum VcpuEmulation {
 #[cfg(test)]
 mod tests {
     use crossbeam_channel::unbounded;
+    use libc::{_SC_PAGESIZE, sysconf};
     use std::sync::{Arc, Barrier};
 
     use super::*;
@@ -1896,8 +1897,13 @@ mod tests {
         }
     }
 
+    fn host_page_size() -> usize {
+        unsafe { sysconf(_SC_PAGESIZE).try_into().unwrap() }
+    }
+
     // Auxiliary function being used throughout the tests.
     fn setup_vcpu(mem_size: usize) -> (Vm, Vcpu, GuestMemoryMmap) {
+        let mem_size = mem_size.next_multiple_of(host_page_size());
         let kvm = KvmContext::new().unwrap();
         let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size)]).unwrap();
         let mut vm = Vm::new(kvm.fd()).expect("Cannot create new vm");
@@ -1955,18 +1961,22 @@ mod tests {
         let mut vm = Vm::new(kvm_context.fd()).expect("Cannot create new vm");
 
         // Create valid memory region and test that the initialization is successful.
-        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let page_size = host_page_size();
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), page_size)]).unwrap();
         assert!(vm.memory_init(&gm, kvm_context.max_memslots()).is_ok());
 
         // Set the maximum number of memory slots to 1 in KvmContext to check the error
         // path of memory_init. Create 2 non-overlapping memory slots.
         kvm_context.max_memslots = 1;
         let gm = GuestMemoryMmap::from_ranges(&[
-            (GuestAddress(0x0), 0x1000),
-            (GuestAddress(0x1001), 0x2000),
+            (GuestAddress(0), page_size),
+            (GuestAddress(page_size as u64), page_size),
         ])
         .unwrap();
-        assert!(vm.memory_init(&gm, kvm_context.max_memslots()).is_err());
+        assert!(matches!(
+            vm.memory_init(&gm, kvm_context.max_memslots()),
+            Err(Error::NotEnoughMemorySlots)
+        ));
     }
 
     #[cfg(target_arch = "x86_64")]
