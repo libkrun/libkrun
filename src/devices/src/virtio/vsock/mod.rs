@@ -16,6 +16,8 @@ mod proxy;
 mod reaper;
 #[cfg(target_os = "macos")]
 mod timesync;
+#[cfg(feature = "tsi-fault-injection")]
+mod tsi_control_faults;
 mod tsi_dgram;
 mod tsi_sockopt;
 mod tsi_stream;

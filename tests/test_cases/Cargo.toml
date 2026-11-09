@@ -17,6 +17,7 @@ dynamic-linking = [
     "krun-init-cdylib/ffier-strong",
 ]
 guest = []
+tsi-fault-injection = ["krun?/tsi-fault-injection"]
 
 [lib]
 name = "test_cases"

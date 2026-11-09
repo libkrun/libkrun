@@ -21,6 +21,7 @@ aws-nitro = ["devices/aws-nitro", "dep:aws-nitro", "aws-nitro/aws-nitro", "dep:n
 vhost-user = ["devices/vhost-user", "krun_display"]
 timesync = ["devices/timesync"]
 ffi = ["serde_json", "dep:ffier", "dep:ffier-builtins", "devices/ffi"]
+tsi-fault-injection = ["devices/tsi-fault-injection"]
 
 [dependencies]
 bitfield = { version = "0.19.4", optional = true }
