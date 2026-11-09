@@ -28,6 +28,8 @@ pub struct MuxerRxQ {
     q: VecDeque<MuxerRx>,
     /// The RX queue sync status.
     synced: bool,
+    #[cfg(feature = "tsi-fault-injection")]
+    pub(super) faults: super::tsi_control_faults::Injector,
 }
 
 impl MuxerRxQ {
@@ -38,6 +40,8 @@ impl MuxerRxQ {
         Self {
             q: VecDeque::with_capacity(Self::SIZE),
             synced: true,
+            #[cfg(feature = "tsi-fault-injection")]
+            faults: super::tsi_control_faults::Injector::default(),
         }
     }
 
@@ -92,6 +96,18 @@ impl MuxerRxQ {
 
 pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
     match rx {
+        #[cfg(feature = "tsi-fault-injection")]
+        MuxerRx::FaultPacket {
+            response,
+            fault,
+            peer_port,
+        } => {
+            super::tsi_control_faults::packet(cid, *response, fault, peer_port, pkt);
+        }
+        #[cfg(feature = "tsi-fault-injection")]
+        MuxerRx::FaultAck { peer_port, words } => {
+            super::tsi_control_faults::ack(cid, peer_port, words, pkt);
+        }
         MuxerRx::SockoptResponse {
             request_id,
             local_port,

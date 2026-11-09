@@ -121,6 +121,7 @@ pub struct TsiGetnameReq {
 
 #[repr(C)]
 #[derive(Debug)]
+#[cfg_attr(feature = "tsi-fault-injection", derive(Clone))]
 pub struct TsiGetnameRsp {
     pub result: i32,
     pub addr_len: u32,

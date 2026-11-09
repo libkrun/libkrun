@@ -50,7 +50,9 @@ EPROTONOSUPPORT. Invalid one-way requests or unidentifiable headers are dropped.
 
 Local control waits have a five-second deadline. Blocking stream connect is
 interruptible and uses the smaller of SO_SNDTIMEO and 120 seconds. GETNAME and
-ordinary GETOPT are also interruptible. Create, datagram connect, listen, accept accounting and
+ordinary GETOPT defer ordinary signals while remaining killable, with the same
+deadline. This avoids spurious EINTR from synchronous metadata queries, such as
+dnsmasq handling SIGCHLD. Create, datagram connect, listen, accept accounting and
 SETOPT finish their bounded wait despite signals. GETOPT of SO_ERROR also waits
 through signals because the read clears the host error. Failed GETNAME/GETOPT
 exchanges do not break the control channel. A failed state-changing exchange leaves host state uncertain:

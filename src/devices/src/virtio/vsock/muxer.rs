@@ -33,7 +33,19 @@ pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
 
 /// A muxer RX queue item.
 #[derive(Debug)]
+#[cfg_attr(feature = "tsi-fault-injection", derive(Clone))]
 pub enum MuxerRx {
+    #[cfg(feature = "tsi-fault-injection")]
+    FaultPacket {
+        response: Box<MuxerRx>,
+        fault: super::tsi_control_faults::Fault,
+        peer_port: Option<u32>,
+    },
+    #[cfg(feature = "tsi-fault-injection")]
+    FaultAck {
+        peer_port: u32,
+        words: [u32; 5],
+    },
     Reset {
         local_port: u32,
         peer_port: u32,
@@ -97,18 +109,24 @@ pub fn push_packet(
     queue_mutex: &Arc<Mutex<VirtQueue>>,
     mem: &GuestMemoryMmap,
 ) {
-    let mut queue = queue_mutex.lock().unwrap();
-    if let Some(head) = queue.pop(mem) {
-        if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-            rx_to_pkt(cid, rx, &mut pkt);
-            if let Err(e) = queue.add_used(mem, head.index, pkt.finish_rx().unwrap_or(0)) {
-                error!("failed to add used elements to the queue: {e:?}");
+    #[cfg(feature = "tsi-fault-injection")]
+    let packets = rxq_mutex.lock().unwrap().faults.filter(rx);
+    #[cfg(not(feature = "tsi-fault-injection"))]
+    let packets = [rx];
+    for rx in packets {
+        let mut queue = queue_mutex.lock().unwrap();
+        if let Some(head) = queue.pop(mem) {
+            if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
+                rx_to_pkt(cid, rx, &mut pkt);
+                if let Err(e) = queue.add_used(mem, head.index, pkt.finish_rx().unwrap_or(0)) {
+                    error!("failed to add used elements to the queue: {e:?}");
+                }
             }
+        } else {
+            error!("couldn't push pkt to queue, adding it to rxq");
+            drop(queue);
+            rxq_mutex.lock().unwrap().push(rx);
         }
-    } else {
-        error!("couldn't push pkt to queue, adding it to rxq");
-        drop(queue);
-        rxq_mutex.lock().unwrap().push(rx);
     }
 }
 
@@ -218,19 +236,7 @@ impl VsockMuxer {
             }
         };
 
-        let mut queue = queue_mutex.lock().unwrap();
-        if let Some(head) = queue.pop(mem) {
-            if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-                rx_to_pkt(self.cid, rx, &mut pkt);
-                if let Err(e) = queue.add_used(mem, head.index, pkt.finish_rx().unwrap_or(0)) {
-                    error!("failed to add used elements to the queue: {e:?}");
-                }
-            }
-        } else {
-            error!("couldn't push pkt to queue, adding it to rxq");
-            drop(queue);
-            self.rxq.lock().unwrap().push(rx);
-        }
+        push_packet(self.cid, rx, &self.rxq, queue_mutex, mem);
     }
 
     pub fn update_polling(&self, id: u64, fd: RawFd, evset: EventSet) {
@@ -682,6 +688,25 @@ impl VsockMuxer {
 
         if pkt.dst_cid() != uapi::VSOCK_HOST_CID {
             debug!("dropping guest packet for unknown CID: {:?}", pkt.hdr());
+            return Ok(());
+        }
+
+        #[cfg(feature = "tsi-fault-injection")]
+        if pkt.dst_port() == super::tsi_control_faults::PORT {
+            let proxies = self.proxy_map.read().unwrap().len() as u32;
+            let (words, released) = self
+                .rxq
+                .lock()
+                .unwrap()
+                .faults
+                .request(pkt.buf().unwrap_or_default(), proxies);
+            if let Some(reply) = released {
+                self.push_packet(reply);
+            }
+            self.push_packet(MuxerRx::FaultAck {
+                peer_port: pkt.src_port(),
+                words,
+            });
             return Ok(());
         }
 

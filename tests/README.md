@@ -14,6 +14,9 @@ KRUN_TEST_FFI=1 \
   ./run.sh test
 ```
 
+The paired Linux control reply fault suite uses an opt-in instrumented host
+build; see [TSI control reply fault tests](../docs/tsi-control-faults.md).
+
 ## TSI application compatibility
 
 Run the stock-application cases against a matching TSIv4 / libkrunfw ABI 6 kernel:
