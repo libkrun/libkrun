@@ -13,6 +13,8 @@
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
 pub(crate) mod device_manager;
+#[cfg(target_arch = "aarch64")]
+mod locked_memory;
 /// Resource store for configured microVM resources.
 pub mod resources;
 /// Signal handling utilities.

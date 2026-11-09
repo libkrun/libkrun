@@ -5,6 +5,8 @@ use std::io::IsTerminal;
 use std::marker::PhantomData;
 #[cfg(feature = "blk")]
 use std::num::NonZeroUsize;
+#[cfg(target_arch = "aarch64")]
+use std::ops::Range;
 #[cfg(all(feature = "net", not(target_os = "windows")))]
 use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
@@ -260,6 +262,13 @@ impl<'a> AttachContext<'a> {
     #[cfg(target_os = "macos")]
     pub fn guest_ram_in_blocks(&self) -> bool {
         self.vmm.ram_in_blocks
+    }
+
+    /// The guest physical addresses of the guest memory that the VMM locks into host memory, if
+    /// there is any.
+    #[cfg(target_arch = "aarch64")]
+    pub fn locked_memory_range(&self) -> Option<Range<u64>> {
+        self.vmm.arch_memory_info.locked_range()
     }
 
     /// Append a string to the kernel command line.
@@ -1387,6 +1396,10 @@ impl<'a> AttachDevice<'a> for BalloonDevice {
 
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        #[cfg(target_arch = "aarch64")]
+        if let Some(locked) = ctx.locked_memory_range() {
+            self.inner.lock().unwrap().set_locked_ranges(vec![locked]);
+        }
         #[cfg(target_os = "macos")]
         {
             let mut balloon = self.inner.lock().unwrap();
