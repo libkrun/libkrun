@@ -32,6 +32,12 @@ pub struct Mount {
     pub source: String,
 }
 
+/// Control server settings (exec and signal delivery for the host).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ControlServerConfig {
+    pub vsock_port: u32,
+}
+
 /// Config envelope (matches what the init binary parses).
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -48,4 +54,6 @@ pub(crate) struct ConfigSchema {
     /// network.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dhcp_renew: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_server: Option<ControlServerConfig>,
 }

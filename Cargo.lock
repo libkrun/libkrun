@@ -101,6 +101,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bincode"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
+dependencies = [
+ "serde",
+ "unty",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -799,6 +809,7 @@ name = "krun-init-blob"
 version = "0.1.0-2.0.0-dev"
 dependencies = [
  "ffier 0.2.0 (git+https://github.com/mtjhrc/ffier.git?tag=0.2.0rc1)",
+ "krun-init-common",
  "krun-via-cdylib-weak",
  "libkrun",
  "serde",
@@ -815,6 +826,15 @@ dependencies = [
  "ffier-gen-rust-client",
  "krun-via-cdylib-weak",
  "pkg-config",
+]
+
+[[package]]
+name = "krun-init-common"
+version = "0.1.0-2.0.0-dev"
+dependencies = [
+ "bincode",
+ "libc",
+ "serde",
 ]
 
 [[package]]
@@ -1717,6 +1737,12 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unty"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 
 [[package]]
 name = "utf8parse"
