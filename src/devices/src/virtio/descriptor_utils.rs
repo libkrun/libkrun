@@ -191,26 +191,36 @@ pub struct Reader<'a> {
 impl<'a> Reader<'a> {
     /// Construct a new Reader wrapper over `desc_chain`.
     pub fn new(mem: &'a GuestMemoryMmap, chain: DescriptorChain<'a>) -> Result<Reader<'a>> {
+        Self::from_guest_buffers(
+            mem,
+            chain
+                .into_iter()
+                .readable()
+                .map(|desc| (desc.addr, desc.len)),
+        )
+    }
+
+    /// Construct a Reader from guest memory buffers previously captured from a descriptor chain.
+    pub(crate) fn from_guest_buffers(
+        mem: &'a GuestMemoryMmap,
+        buffers: impl IntoIterator<Item = (GuestAddress, u32)>,
+    ) -> Result<Reader<'a>> {
         let mut total_len: usize = 0;
-        let buffers = chain
+        let buffers = buffers
             .into_iter()
-            .readable()
-            .map(|desc| {
+            .map(|(addr, len)| {
                 // Verify that summing the descriptor sizes does not overflow.
                 // This can happen if a driver tricks a device into reading more data than
                 // fits in a `usize`.
                 total_len = total_len
-                    .checked_add(desc.len as usize)
+                    .checked_add(len as usize)
                     .ok_or(Error::DescriptorChainOverflow)?;
 
-                let region = mem.find_region(desc.addr).ok_or(Error::FindMemoryRegion)?;
-                let offset = desc
-                    .addr
-                    .checked_sub(region.start_addr().raw_value())
-                    .unwrap();
+                let region = mem.find_region(addr).ok_or(Error::FindMemoryRegion)?;
+                let offset = addr.checked_sub(region.start_addr().raw_value()).unwrap();
                 region
                     .deref()
-                    .get_slice(offset.raw_value() as usize, desc.len as usize)
+                    .get_slice(offset.raw_value() as usize, len as usize)
                     .map_err(Error::VolatileMemoryError)
             })
             .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
