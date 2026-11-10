@@ -41,6 +41,12 @@ krun_vsock_device_add_port_forward(vsock, KRUN_STR("80:8080"), &err);
 krun_mmio_device_manager_add(devices, vsock);
 ```
 
+On macOS, use only `TsiFlags::HIJACK_INET` (C:
+`KRUN_TSI_FLAGS_HIJACK_INET`). Requesting `HIJACK_UNIX` returns
+`VmmError::FeatureDisabled` from `VsockDevice::new` before VM startup because
+host UNIX proxying is unsupported. Guest UNIX sockets, including nscd/NSS
+lookups, retain their native guest behavior when UNIX hijacking is disabled.
+
 Host TCP proxies on Unix enable `SO_REUSEADDR` for rapid restart. Sharing a
 listening port through `SO_REUSEPORT` requires an explicit application request;
 automatic exposure of application-selected ports remains enabled.
