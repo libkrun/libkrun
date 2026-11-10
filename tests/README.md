@@ -89,7 +89,9 @@ after conflict release, and external reachability after close/recreate or retry.
 `tsi-control-wire` sends requests through native guest VSOCK datagrams. It checks
 envelopes, protocol errors, reply IDs/sources, Linux sockaddr/errno translation,
 SO_ERROR retention/clearing, malformed datagram rejection, options and 32 complete
-proxy create/bind/query/release cycles. macOS also verifies AF_UNIX rejection.
+proxy create/bind/query/release cycles. On macOS the VM enables only INET
+hijacking; raw AF_UNIX proxy requests must return `EPERM` because UNIX proxying
+is disabled. The public device constructor rejects `HIJACK_UNIX` on macOS.
 Run the ordinary TSI suite with:
 
 ```sh
