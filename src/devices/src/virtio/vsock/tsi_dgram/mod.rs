@@ -23,6 +23,9 @@ mod unix;
 #[cfg(unix)]
 use unix as sys;
 
+#[cfg(target_os = "macos")]
+mod icmp_macos;
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -42,6 +45,8 @@ pub struct TsiDgramProxy {
     pub(crate) listening: bool,
     pub(crate) family: AddressFamily,
     pub(crate) protocol: u32,
+    #[cfg(target_os = "macos")]
+    icmp: Option<icmp_macos::IcmpSocket>,
     pub(crate) mem: GuestMemoryMmap,
     pub(crate) queue: Arc<Mutex<VirtQueue>>,
     pub(crate) rxq: Arc<Mutex<MuxerRxQ>>,

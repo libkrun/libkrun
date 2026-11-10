@@ -1107,6 +1107,7 @@ mod descriptor_tests {
         for (family, len) in [
             (defs::LINUX_AF_INET, 16),
             (defs::LINUX_AF_INET6, 28),
+            #[cfg(target_os = "linux")]
             (defs::LINUX_AF_UNIX, 11),
         ] {
             let mut raw = [0; 128];

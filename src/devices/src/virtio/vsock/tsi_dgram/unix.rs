@@ -5,6 +5,7 @@ use std::num::Wrapping;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 
+use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::UnixAddr;
@@ -24,6 +25,8 @@ use super::super::packet::{
 };
 use super::super::proxy::{ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt};
 use super::super::tsi_wire::{DGRAM_HEADER_LEN, DGRAM_MAX_SIZE, DatagramInfo, encode_header};
+#[cfg(target_os = "macos")]
+use super::icmp_macos::IcmpSocket;
 use utils::epoll::EventSet;
 use vm_memory::GuestMemoryMmap;
 
@@ -54,12 +57,29 @@ pub(crate) fn create(
         .map_err(|e| ProxyError::CreatingSocket(IoError::from_raw_os_error(e as i32)))?;
 
     let metadata = match family {
-        AddressFamily::Inet => setsockopt(&fd, sockopt::Ipv4PacketInfo, &true),
+        AddressFamily::Inet => {
+            #[cfg(target_os = "macos")]
+            if req.protocol == 1 {
+                setsockopt(&fd, sockopt::Ipv4RecvDstAddr, &true)
+                    .and_then(|()| setsockopt(&fd, sockopt::Ipv4RecvIf, &true))
+            } else {
+                setsockopt(&fd, sockopt::Ipv4PacketInfo, &true)
+            }
+            #[cfg(target_os = "linux")]
+            setsockopt(&fd, sockopt::Ipv4PacketInfo, &true)
+        }
         AddressFamily::Inet6 => setsockopt(&fd, sockopt::Ipv6RecvPacketInfo, &true),
         _ => Ok(()),
     };
     metadata
         .map_err(|error| ProxyError::CreatingSocket(IoError::from_raw_os_error(error as i32)))?;
+
+    #[cfg(target_os = "macos")]
+    let icmp = if matches!(req.protocol, 1 | 58) {
+        Some(IcmpSocket::new(&fd, req.protocol == 58).map_err(ProxyError::CreatingSocket)?)
+    } else {
+        None
+    };
 
     #[cfg(target_os = "linux")]
     match family {
@@ -109,6 +129,8 @@ pub(crate) fn create(
         listening: false,
         family,
         protocol: req.protocol,
+        #[cfg(target_os = "macos")]
+        icmp,
         mem,
         queue,
         rxq,
@@ -146,7 +168,7 @@ pub(crate) fn init_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) {
         .set_fwd_cnt(proxy.tx_cnt.0);
 }
 
-fn record_socket_error(proxy: &super::TsiDgramProxy, error: nix::errno::Errno) {
+fn record_socket_error(proxy: &super::TsiDgramProxy, error: Errno) {
     #[cfg(target_os = "linux")]
     let code = error as i32;
     #[cfg(target_os = "macos")]
@@ -165,16 +187,38 @@ pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -
         return RecvPkt::Error;
     }
     let capacity = buf.len().min(DGRAM_MAX_SIZE) - DGRAM_HEADER_LEN;
+    #[cfg(target_os = "macos")]
+    if let Some(icmp) = &proxy.icmp {
+        return match icmp.receive(
+            proxy.fd.as_raw_fd(),
+            &mut buf[DGRAM_HEADER_LEN..DGRAM_HEADER_LEN + capacity],
+        ) {
+            Ok((count, truncated, address, info)) => {
+                finish_receive(buf, capacity, count, truncated, Some(address), Some(info))
+            }
+            Err(error) => {
+                if !matches!(error, Errno::EAGAIN | Errno::EINTR) {
+                    record_socket_error(proxy, error);
+                }
+                RecvPkt::Error
+            }
+        };
+    }
     let (count, truncated, address, info) = {
         let mut iov = [IoSliceMut::new(
             &mut buf[DGRAM_HEADER_LEN..DGRAM_HEADER_LEN + capacity],
         )];
         let mut control = nix::cmsg_space!(libc::in_pktinfo, libc::in6_pktinfo, libc::c_int);
+        #[cfg(target_os = "linux")]
+        let receive_flags = MsgFlags::MSG_TRUNC;
+        // Darwin echoes an input MSG_TRUNC even when the packet fits.
+        #[cfg(target_os = "macos")]
+        let receive_flags = MsgFlags::empty();
         match recvmsg::<SockaddrStorage>(
             proxy.fd.as_raw_fd(),
             &mut iov,
             Some(&mut control),
-            MsgFlags::MSG_TRUNC,
+            receive_flags,
         ) {
             Ok(msg) => {
                 let Ok(messages) = msg.cmsgs() else {
@@ -190,7 +234,10 @@ pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -
                             address[..4].copy_from_slice(&native.ipi_addr.s_addr.to_ne_bytes());
                             info = Some(DatagramInfo {
                                 address,
+                                #[cfg(target_os = "linux")]
                                 ifindex: native.ipi_ifindex as u32,
+                                #[cfg(target_os = "macos")]
+                                ifindex: native.ipi_ifindex,
                                 hop_limit: None,
                             });
                         }
@@ -220,13 +267,24 @@ pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -
                 )
             }
             Err(error) => {
-                if !matches!(error, nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) {
+                if !matches!(error, Errno::EAGAIN | Errno::EINTR) {
                     record_socket_error(proxy, error);
                 }
                 return RecvPkt::Error;
             }
         }
     };
+    finish_receive(buf, capacity, count, truncated, address, info)
+}
+
+fn finish_receive(
+    buf: &mut [u8],
+    capacity: usize,
+    count: usize,
+    truncated: bool,
+    address: Option<SockaddrStorage>,
+    info: Option<DatagramInfo>,
+) -> RecvPkt {
     let Some(address) = address else {
         return RecvPkt::Error;
     };
@@ -398,14 +456,14 @@ pub(crate) fn do_disconnect(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket)
         if result == 0 {
             0
         } else {
-            let error = nix::errno::Errno::last();
+            let error = Errno::last();
             #[cfg(target_os = "macos")]
             {
                 // Darwin may report EAFNOSUPPORT after dissolving the peer.
-                if error == nix::errno::Errno::EAFNOSUPPORT
+                if error == Errno::EAFNOSUPPORT
                     && matches!(
                         getpeername::<SockaddrStorage>(proxy.fd.as_raw_fd()),
-                        Err(nix::errno::Errno::ENOTCONN)
+                        Err(Errno::ENOTCONN)
                     )
                 {
                     0
@@ -488,9 +546,34 @@ pub(crate) fn sendmsg(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) -> Pr
         #[cfg(target_os = "linux")]
         let flags = MsgFlags::MSG_NOSIGNAL;
         if addr.family() != Some(proxy.family) {
-            proxy.record_error(libc::EAFNOSUPPORT);
+            record_socket_error(proxy, Errno::EAFNOSUPPORT);
             return ProxyUpdate::default();
         }
+        #[cfg(target_os = "macos")]
+        let rewritten;
+        #[cfg(target_os = "macos")]
+        let data = if let Some(icmp) = proxy.icmp.as_mut() {
+            rewritten = match icmp.rewrite_request(data, &addr) {
+                Ok(packet) => packet,
+                Err(error) => {
+                    record_socket_error(proxy, error);
+                    return ProxyUpdate::default();
+                }
+            };
+            rewritten.as_slice()
+        } else {
+            data
+        };
+        #[cfg(target_os = "macos")]
+        let destination = if proxy.status == ProxyStatus::Connected
+            && getpeername::<SockaddrStorage>(proxy.fd.as_raw_fd()).is_ok_and(|peer| peer == addr)
+        {
+            None
+        } else {
+            Some(&addr)
+        };
+        #[cfg(target_os = "linux")]
+        let destination = Some(&addr);
         let result = if let Some(info) = info {
             let iov = [IoSlice::new(data)];
             if proxy.family == AddressFamily::Inet {
@@ -506,7 +589,7 @@ pub(crate) fn sendmsg(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) -> Pr
                     &iov,
                     &[ControlMessage::Ipv4PacketInfo(&control)],
                     flags,
-                    Some(&addr),
+                    destination,
                 )
             } else {
                 let control = libc::in6_pktinfo {
@@ -520,11 +603,22 @@ pub(crate) fn sendmsg(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) -> Pr
                     &iov,
                     &[ControlMessage::Ipv6PacketInfo(&control)],
                     flags,
-                    Some(&addr),
+                    destination,
                 )
             }
         } else {
-            sendto(proxy.fd.as_raw_fd(), data, &addr, flags)
+            #[cfg(target_os = "linux")]
+            {
+                sendto(proxy.fd.as_raw_fd(), data, &addr, flags)
+            }
+            #[cfg(target_os = "macos")]
+            send_message(
+                proxy.fd.as_raw_fd(),
+                &[IoSlice::new(data)],
+                &[],
+                flags,
+                destination,
+            )
         };
         return match result {
             Ok(_) => {

@@ -96,7 +96,7 @@ Proxy creation's 12-byte body is:
 | 8 | 4 | Linux socket protocol |
 
 INET streams support protocol 0 or TCP (6); INET datagrams support 0 or UDP (17).
-Linux hosts also support IPv4 ICMP (1) and IPv6 ICMPv6 (58) datagram ping sockets.
+Linux and macOS hosts also support IPv4 ICMP (1) and IPv6 ICMPv6 (58) datagram ping sockets.
 UNIX sockets support protocol 0, subject to platform support. Other protocols
 return EPROTONOSUPPORT instead of silently becoming TCP/UDP. Creation errors and
 host permission failures are explicit. Duplicate creation returns EADDRINUSE
@@ -173,6 +173,7 @@ when a frame lacks it.
 Linux hosts also capture the reply IPv4 TTL / IPv6 hop-limit. When the guest
 enables `IP_RECVTTL` / `IPV6_RECVHOPLIMIT`, `recvmsg` delivers the corresponding
 `IP_TTL` / `IPV6_HOPLIMIT` control message. This is receive metadata only.
+macOS supplies this metadata for ICMP echo replies too.
 
 Proxy send accepts `IP_PKTINFO.ipi_spec_dst` and `IPV6_PKTINFO.ipi6_addr` as source
 selection. A guest interface index must be zero or match the logical guest
@@ -192,17 +193,36 @@ IPv4 source selection uses an IPv4 control message. See Microsoft's
 [dual-stack documentation](https://learn.microsoft.com/windows/win32/winsock/dual-stack-sockets)
 and [WSASendMsg reference](https://learn.microsoft.com/windows/win32/api/winsock2/nf-winsock2-wsasendmsg).
 
-On Linux, ICMP datagram ping sockets use the same framing and the host's native
-ping socket implementation. The guest keeps echo requests to guest-local IPs
+On Linux and macOS, ICMP datagram ping sockets use the same framing and the host's
+native ICMP datagram implementation. The guest keeps echo requests to guest-local IPs
 native; other destinations use the host proxy. An explicit ICMP bind can use
 the host-selected source from a route probe even if the guest does not own
-that IP; the host still validates the requested bind. Both guest and host must permit
-the socket owner's group in `net.ipv4.ping_group_range`. Echo identifiers are
-managed by the native ping sockets and are not UDP ports; UDP port mappings do
-not apply. This supports ordinary iputils `ping`, including `-C` and nonzero
+that IP; the host still validates the requested bind. The guest and Linux host
+must permit the socket owner's group in `net.ipv4.ping_group_range`. UDP port
+mappings do not apply to echo identifiers. This supports ordinary iputils `ping`, including `-C` and nonzero
 `-e` identifiers, without `CAP_NET_RAW`. Raw ICMP (`-e 0`), other raw protocols,
 host error-queue forwarding and outgoing TTL/hop-limit controls remain outside
 this contract. ICMP proxy creation on other hosts returns `EPROTONOSUPPORT`.
+
+Darwin delivers ICMP replies to multiple sockets and does not allocate echo IDs
+from sockaddr ports. Each macOS proxy therefore reserves a unique host ID with
+a loopback UDP socket, rewrites outgoing echo IDs, and accepts only matching
+replies by host ID, sequence, peer and payload hash. The reservation also
+coordinates independent VMM processes; it carries no traffic. Replies restore
+the guest ID and checksum. IPv4 IP headers are removed; destination, interface
+and TTL/hop-limit metadata are normalized into the existing frame. IPv6 echo
+requests and unrelated replies are discarded. Request matching retains one
+record per 16-bit sequence, replacing its previous record on reuse. This backend
+supports unicast echo requests/replies; other ICMP message types are not relayed.
+
+On Darwin, complete UDP receives must not pass `MSG_TRUNC` as an input flag:
+the native API also returns it on complete packets. The backend requests an
+ordinary receive and forwards the actual truncation status. Original lengths
+of host-truncated datagrams remain subject to the native API's copied-length
+reporting. Sends to a connected peer omit the native destination address;
+Darwin otherwise rejects them with `EISCONN`. Applications changing a connected
+UDP peer should disconnect or reconnect; sending to a different explicit
+destination while retaining a different connected peer is not adapted on macOS.
 
 INET datagrams and control messages now use TSIv4 framing. UNIX datagram payloads
 retain the legacy two-message path (their address control message is enveloped).

@@ -66,11 +66,10 @@ pub(super) fn encode_control_reply(buf: &mut [u8], operation: u32, id: u64, len:
     buf[20..24].copy_from_slice(&CONTROL_REPLY.to_le_bytes());
 }
 
-// Linux additionally supports unprivileged ICMP echo datagram sockets.
 pub(super) fn check_protocol(family: u16, socket_type: u16, protocol: u32) -> Result<(), i32> {
     match (family, socket_type, protocol) {
         (1, 1 | 2, 0) | (2 | 10, 1, 0 | 6) | (2 | 10, 2, 0 | 17) => Ok(()),
-        (2, 2, 1) | (10, 2, 58) if cfg!(target_os = "linux") => Ok(()),
+        (2, 2, 1) | (10, 2, 58) if cfg!(any(target_os = "linux", target_os = "macos")) => Ok(()),
         (1 | 2 | 10, 1 | 2, _) => Err(-EPROTONOSUPPORT),
         (1 | 2 | 10, _, _) => Err(-ESOCKTNOSUPPORT),
         _ => Err(-EAFNOSUPPORT),
@@ -383,7 +382,7 @@ mod tests {
             }
         }
         for (family, protocol) in [(2, 1), (10, 58)] {
-            let expected = if cfg!(target_os = "linux") {
+            let expected = if cfg!(any(target_os = "linux", target_os = "macos")) {
                 Ok(())
             } else {
                 Err(-EPROTONOSUPPORT)
