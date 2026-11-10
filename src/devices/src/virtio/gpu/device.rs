@@ -250,13 +250,14 @@ impl VirtioDevice for Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::display::NoopDisplayBackend;
+    use crate::virtio::gpu::display::NoopDisplayBackend;
     use krun_display::IntoDisplayBackend;
 
     #[test]
     fn blob_alignment_offered() {
         let gpu = Gpu::new(
             0,
+            None,
             Box::new([]),
             NoopDisplayBackend::into_display_backend(None),
             #[cfg(target_os = "macos")]
