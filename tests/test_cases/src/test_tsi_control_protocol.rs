@@ -43,7 +43,10 @@ mod host {
             let (stdin, stdout, stderr) = (io::stdin(), io::stdout(), io::stderr());
             let (mut devices, payload) =
                 setup_standard_devices(&setup, &config, &stdin, &stdout, &stderr)?;
-            let mut flags = krun::TsiFlags::HIJACK_INET | krun::TsiFlags::HIJACK_UNIX;
+            let mut flags = krun::TsiFlags::HIJACK_INET;
+            if cfg!(target_os = "linux") {
+                flags |= krun::TsiFlags::HIJACK_UNIX;
+            }
             if env::var_os("KRUN_TEST_TSI_TCP_PUBLICATION_STRICT").is_some() {
                 flags |= krun::TsiFlags::FAIL_ON_TCP_PUBLICATION_ERROR;
             }
@@ -205,7 +208,7 @@ mod guest {
             for kind in [1, 2] {
                 assert_eq!(
                     word(&control.exchange(1024, &create_body(0xf000_0001, 1, kind, 0))) as i32,
-                    -97
+                    -libc::EPERM
                 );
             }
         }

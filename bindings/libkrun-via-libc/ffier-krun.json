@@ -2210,7 +2210,10 @@
           "doc": [
             " Create a new vsock device.",
             "",
-            " `tsi_features` is a bitmask of TSI flags ([`TsiFlags::empty`] to disable)."
+            " `tsi_features` is a bitmask of TSI flags ([`TsiFlags::empty`] to disable).",
+            " On macOS, requesting [`TsiFlags::HIJACK_UNIX`] returns",
+            " [`VmmError::FeatureDisabled`]. Use [`TsiFlags::HIJACK_INET`] alone to",
+            " preserve native guest UNIX sockets while enabling Internet networking."
           ],
           "receiver": "none",
           "params": [

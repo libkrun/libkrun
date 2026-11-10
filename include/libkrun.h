@@ -668,6 +668,9 @@ typedef void (*krun_rtc_device_destroy_fn)(KrunRtcDevice handle);
  * Create a new vsock device.
  *
  * `tsi_features` is a bitmask of TSI flags ([`TsiFlags::empty`] to disable).
+ * On macOS, requesting [`TsiFlags::HIJACK_UNIX`] returns
+ * [`VmmError::FeatureDisabled`]. Use [`TsiFlags::HIJACK_INET`] alone to
+ * preserve native guest UNIX sockets while enabling Internet networking.
  */
 KrunVsockDevice krun_vsock_device_new(uint64_t cid, uint32_t tsi_features, KrunError* err_out);
 typedef KrunVsockDevice (*krun_vsock_device_new_fn)(uint64_t cid, uint32_t tsi_features, KrunError* err_out);
