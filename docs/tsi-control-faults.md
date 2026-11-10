@@ -38,6 +38,33 @@ stale replies. The signal test first holds a valid reply, delivers SIGUSR1,
 verifies the read is still waiting, then releases the reply. This does not inject
 host process death, transport disconnection, or loss of one-way RELEASE requests.
 
+## Portable HVF/KVM runner
+
+The libkrun integration runner also contains `tsi-control-wire` and
+`tsi-control-faults`. They cross-compile with the guest agent and run against
+the existing matching firmware, without a Linux source checkout or a container
+rootfs. For the instrumented dynamically linked run:
+
+```sh
+make test FFI=1 GPU=0 \
+    FEATURE_FLAGS='--features ffi,devices/tsi-fault-injection' \
+    KRUN_TEST_TSI_FAULTS=1 TEST=tsi-control-faults
+```
+
+On macOS add `EXTRA_LIBPATH_Darwin=/path/to/built/libkrunfw`. Repeat with
+`KRUN_TEST_TSI_TCP_PUBLICATION_STRICT=1`. The explicit opt-in prevents ordinary
+test runs from reporting a missing diagnostic endpoint as a successful check.
+
+The portable fault case exercises GETNAME and SO_ERROR/GETOPT reply validation,
+wrong source/ID filtering, duplicates, five-second dropped-reply deadlines and
+subsequent recovery. Each metadata operation performs 64 malformed-read,
+close/replacement cycles with a poisoned stale reply, ordinary-signal deferral
+and fatal-signal termination. Malformed CREATE, SETOPT and LISTEN replies check
+uncertain state, close-time cleanup and invalid LISTEN policy flags. These are
+separate portable checks of the named behaviors; their results do not reproduce
+the complete Linux kernel selftest matrix above. The instrumented run must
+execute with no skips.
+
 ## Diagnostic protocol (test builds only)
 
 Guest VSOCK datagrams to host CID 2, port `0x54534946`, configure the injector.

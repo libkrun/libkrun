@@ -45,13 +45,6 @@ impl AddressFamily {
         }
     }
 
-    fn ping_target(self) -> &'static str {
-        match self {
-            Self::Ipv4 => "192.0.2.1",
-            Self::Ipv6 => "fd00:7473:7069::1",
-        }
-    }
-
     fn authority(self) -> &'static str {
         match self {
             Self::Ipv4 => "127.0.0.1",
@@ -117,6 +110,8 @@ mod host {
     use std::net::{TcpListener, TcpStream, UdpSocket};
     use std::path::Path;
     use std::process::Stdio;
+    #[cfg(target_os = "macos")]
+    use std::ptr;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -589,6 +584,7 @@ mod host {
         });
     }
 
+    #[cfg(target_os = "linux")]
     fn ping_fixture(family: AddressFamily) -> anyhow::Result<u16> {
         ensure!(
             env::var_os("KRUN_TEST_PRIVATE_NETNS").is_some(),
@@ -596,11 +592,12 @@ mod host {
         );
         fs::write("/proc/sys/net/ipv4/ping_group_range", "0 0")?;
         let mut command = Command::new("ip");
+        let target = ping_target(family)?;
         let address = match family {
-            AddressFamily::Ipv4 => format!("{}/32", family.ping_target()),
+            AddressFamily::Ipv4 => format!("{target}/32"),
             AddressFamily::Ipv6 => {
                 command.arg("-6");
-                format!("{}/128", family.ping_target())
+                format!("{target}/128")
             }
         };
         command.args(["address", "replace", &address, "dev", "lo"]);
@@ -611,10 +608,107 @@ mod host {
         Ok(0)
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn ping_fixture(_family: AddressFamily) -> anyhow::Result<u16> {
+        Ok(0)
+    }
+
+    fn ping_target(family: AddressFamily) -> anyhow::Result<String> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(match family {
+                AddressFamily::Ipv4 => "192.0.2.1",
+                AddressFamily::Ipv6 => "fd00:7473:7069::1",
+            }
+            .to_string())
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use nix::libc;
+            let variable = match family {
+                AddressFamily::Ipv4 => "KRUN_TEST_TSI_PING_IPV4",
+                AddressFamily::Ipv6 => "KRUN_TEST_TSI_PING_IPV6",
+            };
+            let target = if let Ok(target) = env::var(variable) {
+                target.parse::<IpAddr>().context("ping target IP")?
+            } else if matches!(family, AddressFamily::Ipv6) {
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            } else {
+                let mut interfaces = ptr::null_mut();
+                ensure!(
+                    unsafe { libc::getifaddrs(&mut interfaces) } == 0,
+                    "getifaddrs"
+                );
+                let mut current = interfaces;
+                let mut target = None;
+                while !current.is_null() {
+                    let interface = unsafe { &*current };
+                    if !interface.ifa_addr.is_null() {
+                        let native = unsafe { &*interface.ifa_addr };
+                        let address = match (family, i32::from(native.sa_family)) {
+                            (AddressFamily::Ipv4, libc::AF_INET) => {
+                                let native =
+                                    unsafe { &*interface.ifa_addr.cast::<libc::sockaddr_in>() };
+                                Some(IpAddr::V4(Ipv4Addr::from(
+                                    native.sin_addr.s_addr.to_ne_bytes(),
+                                )))
+                            }
+                            (AddressFamily::Ipv6, libc::AF_INET6) => {
+                                let native =
+                                    unsafe { &*interface.ifa_addr.cast::<libc::sockaddr_in6>() };
+                                let ip = Ipv6Addr::from(native.sin6_addr.s6_addr);
+                                (!ip.is_unicast_link_local() && native.sin6_scope_id == 0)
+                                    .then_some(IpAddr::V6(ip))
+                            }
+                            _ => None,
+                        };
+                        if let Some(address) = address.filter(|ip| {
+                            !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
+                        }) {
+                            target = Some(address);
+                            break;
+                        }
+                    }
+                    current = interface.ifa_next;
+                }
+                unsafe { libc::freeifaddrs(interfaces) };
+                target.with_context(|| {
+                    format!("no host ping target; set {variable} to an assigned non-loopback IP")
+                })?
+            };
+            ensure!(
+                (!target.is_loopback() || target == IpAddr::V6(Ipv6Addr::LOCALHOST))
+                    && !target.is_unspecified()
+                    && !target.is_multicast(),
+                "ping target must exercise the host proxy"
+            );
+            ensure!(
+                matches!(
+                    (family, target),
+                    (AddressFamily::Ipv4, IpAddr::V4(_)) | (AddressFamily::Ipv6, IpAddr::V6(_))
+                ),
+                "ping target family"
+            );
+            if let IpAddr::V6(ip) = target {
+                ensure!(
+                    !ip.is_unicast_link_local(),
+                    "scoped IPv6 ping target unsupported"
+                );
+            }
+            let _assigned_address =
+                UdpSocket::bind((target, 0)).context("ping target must be assigned to the host")?;
+            eprintln!("proxied ping target: {target}");
+            Ok(target.to_string())
+        }
+    }
+
     impl Test for TestTsiApplication {
         fn should_run(&self) -> ShouldRun {
-            if !cfg!(target_os = "linux") && matches!(self.application, Application::Ping) {
-                return ShouldRun::No("ICMP datagram proxy requires a Linux host");
+            if !cfg!(any(target_os = "linux", target_os = "macos"))
+                && matches!(self.application, Application::Ping)
+            {
+                return ShouldRun::No("ICMP datagram proxy requires a Linux or macOS host");
             }
             if cfg!(target_os = "macos")
                 && matches!(
@@ -651,16 +745,25 @@ mod host {
                 let source = Path::new(&source)
                     .canonicalize()
                     .context("application rootfs")?;
-                let status = Command::new("cp")
-                    .arg("-a")
-                    .arg(source.join("."))
-                    .arg(&root)
-                    .status()?;
+                let mut copy = Command::new(if cfg!(target_os = "macos") {
+                    "/bin/cp"
+                } else {
+                    "cp"
+                });
+                copy.arg("-a");
+                #[cfg(target_os = "macos")]
+                copy.arg("-c");
+                let status = copy.arg(source.join(".")).arg(&root).status()?;
                 ensure!(status.success(), "copy application rootfs");
             }
             fs::create_dir_all(root.join("srv"))?;
             fs::write(root.join("srv/tsi-app.txt"), BODY)?;
             let family = self.family;
+            let ping_target = if matches!(self.application, Application::Ping) {
+                Some(format!("TSI_APP_PING_TARGET={}", ping_target(family)?))
+            } else {
+                None
+            };
             let mut slow_env = None;
             let port = match self.application {
                 Application::CurlHttp | Application::WgetHttp => http_fixture(family)?,
@@ -707,6 +810,11 @@ mod host {
             ];
             if let Some(slow) = &slow_env {
                 guest_env.push(slow);
+            }
+            if let Some(target) = &ping_target {
+                guest_env.push(target);
+                #[cfg(target_os = "macos")]
+                guest_env.push("TSI_APP_PING_COLLIDING_IDS=1");
             }
             let config = build_init_config(&setup.test_case, &guest_env);
             let (stdin, stdout, stderr) = (io::stdin(), io::stdout(), io::stderr());
@@ -765,6 +873,7 @@ mod guest {
     use std::fs;
     use std::io::{self, Write};
     use std::net::TcpStream;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
     use std::path::Path;
     use std::process::{Child, Output, Stdio};
@@ -797,44 +906,129 @@ mod guest {
 
     fn ping(family: AddressFamily) {
         fs::write("/proc/sys/net/ipv4/ping_group_range", "0 2147483647").unwrap();
-        for target in [family.ping_target(), family.host()] {
+        let proxied = env::var("TSI_APP_PING_TARGET").unwrap();
+        for (index, target) in [proxied.as_str(), family.host()].into_iter().enumerate() {
+            if index == 0 && proxied == "::1" {
+                ipv6_loopback(false);
+            }
             for options in [&[][..], &["-C"][..], &["-e", "4242"][..]] {
-                let mut command = Command::new("ping");
-                command.arg(match family {
-                    AddressFamily::Ipv4 => "-4",
-                    AddressFamily::Ipv6 => "-6",
-                });
-                command.args(["-n", "-c", "3", "-i", "0.1", "-W", "1", "-w", "3"]);
-                command.args(options).arg(target).uid(65534).gid(65534);
-                // Prevent file capabilities from hiding a raw-socket fallback.
-                unsafe {
-                    command.pre_exec(|| {
-                        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                            return Err(io::Error::last_os_error());
-                        }
-                        Ok(())
-                    });
-                }
+                let mut command = ping_command(family, target, options);
                 let result = output(&mut command);
-                let stdout = String::from_utf8(result.stdout).unwrap();
-                eprintln!("{stdout}");
-                assert!(stdout.contains("3 packets transmitted, 3 received, 0% packet loss"));
-                let replies: Vec<_> = stdout
-                    .lines()
-                    .filter(|line| line.contains("icmp_seq="))
+                check_ping(&result.stdout);
+            }
+            if index == 0 {
+                let colliding_ids = env::var_os("TSI_APP_PING_COLLIDING_IDS").is_some();
+                let clients: Vec<_> = ["a5", "5a"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(client, pattern)| {
+                        let identifier = if colliding_ids { 4242 } else { 4242 + client };
+                        let mut command = ping_command(
+                            family,
+                            target,
+                            &["-e", &identifier.to_string(), "-p", pattern],
+                        );
+                        eprintln!("concurrent ping: {command:?}");
+                        command
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn()
+                            .unwrap()
+                    })
                     .collect();
-                assert_eq!(replies.len(), 3);
-                for reply in replies {
-                    let ttl: u8 = reply
-                        .split_whitespace()
-                        .find_map(|word| word.strip_prefix("ttl="))
-                        .unwrap()
-                        .parse()
-                        .unwrap();
-                    assert!(ttl > 0, "missing reply TTL/hop-limit: {reply}");
+                for client in clients {
+                    let result = client.wait_with_output().unwrap();
+                    assert!(
+                        result.status.success(),
+                        "concurrent ping: {}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                    check_ping(&result.stdout);
                 }
             }
+            if index == 0 && proxied == "::1" {
+                ipv6_loopback(true);
+            }
         }
+    }
+
+    fn ping_command(family: AddressFamily, target: &str, options: &[&str]) -> Command {
+        let mut command = Command::new("ping");
+        command.arg(match family {
+            AddressFamily::Ipv4 => "-4",
+            AddressFamily::Ipv6 => "-6",
+        });
+        command.args(["-n", "-c", "3", "-i", "0.1", "-W", "1", "-w", "3"]);
+        command.args(options).arg(target).uid(65534).gid(65534);
+        // Prevent file capabilities from hiding a raw-socket fallback.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+    }
+
+    fn check_ping(stdout: &[u8]) {
+        let stdout = String::from_utf8_lossy(stdout);
+        eprintln!("{stdout}");
+        assert!(stdout.contains("3 packets transmitted, 3 received, 0% packet loss"));
+        assert!(!stdout.contains("wrong data") && !stdout.contains("DUP!"));
+        let replies: Vec<_> = stdout
+            .lines()
+            .filter(|line| line.contains("icmp_seq="))
+            .collect();
+        assert_eq!(replies.len(), 3);
+        for reply in replies {
+            let ttl: u8 = reply
+                .split_whitespace()
+                .find_map(|word| word.strip_prefix("ttl="))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(ttl > 0, "missing reply TTL/hop-limit: {reply}");
+        }
+    }
+
+    fn ipv6_loopback(enabled: bool) {
+        #[repr(C)]
+        struct Address {
+            ip: libc::in6_addr,
+            prefix: u32,
+            interface: i32,
+        }
+        fs::write("/sys/module/kernel/parameters/tsi_hijack", "N").unwrap();
+        let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        fs::write("/sys/module/kernel/parameters/tsi_hijack", "Y").unwrap();
+        assert!(
+            fd >= 0,
+            "native ioctl socket: {}",
+            io::Error::last_os_error()
+        );
+        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+        let address = Address {
+            ip: libc::in6_addr {
+                s6_addr: Ipv6Addr::LOCALHOST.octets(),
+            },
+            prefix: 128,
+            interface: unsafe { libc::if_nametoindex(c"lo".as_ptr()) } as i32,
+        };
+        assert_ne!(address.interface, 0);
+        let operation = if enabled {
+            libc::SIOCSIFADDR
+        } else {
+            libc::SIOCDIFADDR
+        };
+        assert_eq!(
+            unsafe { libc::ioctl(socket.as_raw_fd(), operation as _, &address) },
+            0,
+            "guest IPv6 loopback enabled={enabled}: {}",
+            io::Error::last_os_error()
+        );
+        eprintln!("guest ::1 assigned={enabled}; tsi_hijack=Y");
     }
 
     fn dtls_server(family: AddressFamily) -> Server {

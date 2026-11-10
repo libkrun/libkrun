@@ -1,0 +1,153 @@
+TSIv4 macOS validation — 2026-11-10
+
+The supported macOS TSI paths passed the ordinary four-configuration matrix,
+portable control fault tests, focused socket tests, native ICMP tests and
+cross-VM isolation checks. Four Linux-specific application fixtures remain
+excluded on Darwin. This is macOS validation of the supplied kernel/host pair;
+the original Linux kernel selftest suites were unavailable and were not rerun.
+
+Environment and provenance
+--------------------------
+Host: macOS 27.2 (26B123), arm64; Rust 1.99.1.
+libkrun base: 21c6060b222ba19bdf281c17ea30fde276ec9ae1, wip/tsiv4,
+with the changes described below.
+libkrunfw base: 3dbe7add3136719fb7511790a68153316120098c, wip/tsiv4.
+Firmware: /Users/slopezpa/Projects/libkrunfw/libkrunfw.6.dylib, ABI 6.
+Firmware SHA256:
+  a296a2c285f5668040bb27897b7a478affdb6643770cc08208f798b0389b6f45
+Matching Linux kernel provenance was supplied by the user; no Linux tree used.
+GPU was disabled. DYLD_LIBRARY_PATH contains the test library directory and
+libkrunfw directory; the Homebrew LLVM library directory was not added.
+Podman provisions the Fedora 43 application rootfs. The tests execute directly
+through libkrun/HVF, not inside the Podman VM. No Podman/crun integration claim.
+
+Results
+-------
+Logs below are relative to .tsi-macos-validation/.
+
+Configuration / check                         Result       Log
+Static, default publication                    32/32 +4 skip final-default-static.log
+Static, strict publication                     32/32 +4 skip final-strict-static.log
+FFI, default publication                       32/32 +4 skip final-default-ffi-v2.log
+FFI, strict publication                        32/32 +4 skip final-strict-ffi.log
+Fault injection + contracts, default            5/5          final-faults-progress-default.log
+Fault injection + contracts, strict             5/5          final-faults-progress-strict.log
+Latest binding/publication tests, static       4/4 each      final-binding-static-{default,strict}.log
+Latest binding/publication tests, FFI          4/4 each      final-binding-ffi-{default,strict}.log
+Final contracts + distinct-address DNS          5/5          final-review.log
+Final ICMP receive-error fix + contracts        6/6          final-transient.log
+Two simultaneous VMMs, IPv4/IPv6 ping          2/2 each      cross-vm-sync-{1,2}.log
+Native VSOCK regression cases                   5/5          final-vsock-shortpath.log
+Device unit tests                              148/148      devices-unit-final.log
+Firmware ABI 5, 7, missing getter rejection     3/3          firmware-abi-checks.json
+
+The ordinary matrix totals 128 successful case executions. Each configuration
+includes 24 supported real-application cases plus eight TCP/control/socket
+cases. The fault case is selected separately with an instrumented library.
+The last production edit only prevents transient ICMP EAGAIN/EINTR becoming
+sticky socket errors; its six affected guest cases and all device units passed
+afterward. The Linux-only test-expression and control-length cast cleanups
+were also followed by guest/runner lint and these focused guest runs.
+
+Default workspace, Linux-musl guest-agent, static runner and FFI runner Clippy
+all pass with -D warnings; see clippy-{tsi,guest,runner-static,runner-ffi}-final.log.
+Root and test-workspace cargo fmt --all -- --check and git diff --check pass.
+An optional broader device --all-targets Clippy check fails on eight warnings
+in unmodified test code: five unnecessary mutable arguments in legacy/rtc_pl031.rs
+and three useless conversions in virtio/pci.rs. See clippy-devices-all.log.
+These unrelated test files were not changed.
+
+Coverage and implementation changes
+-----------------------------------
+* Automatic INET hijacking and explicit AF_TSI/AF_TSI6, both IPv4 and IPv6,
+  with no guest eth0. Static Rust and dynamic C API loading both exercised.
+* TCP outgoing/incoming, nonblocking connect, refusal and SO_ERROR clearing,
+  pending-connect errors and close, independent TCP bulk and UDP progress,
+  256 KiB transfers, half-close, local/peer names, NODELAY replay, and lifecycle.
+* Mapped/unmapped host publication conflicts, guest-local default fallback,
+  absence of automatic later publication, close/recreate default retry,
+  strict same-bound-socket retry and externally reachable successful listeners.
+* UDP connected/unconnected/reconnect, AF_UNSPEC disconnect, peer filtering,
+  bound source-port preservation, incoming traffic before guest send, empty
+  and larger packets, peek, full/truncated receive counts, options/names,
+  oversize error and repeated replacement. IPv4/IPv6 destination/interface
+  metadata checked on incoming wildcard traffic, including a second host IPv4.
+* Real curl HTTP/HTTPS, wget, UDP/TCP dig, large DNS and fallback, dnsmasq,
+  Python HTTP server, OpenSSL DTLS, and unprivileged iputils ping in both families.
+* Portable control-wire framing/validation, unsupported protocols/families,
+  duplicate create, options/names, 32 create/bind/query/release cycles,
+  malformed datagram rejection and translated Linux pending-error clearing.
+* Instrumented GETNAME and SO_ERROR/GETOPT: malformed responses, wrong IDs
+  and sources, duplicates, dropped replies and bounded deadlines, recovery,
+  64 stale replacement cycles per operation, deferred ordinary signals,
+  fatal cancellation, and proxy cleanup. Uncertain CREATE/SETOPT/LISTEN
+  poisoning and malformed LISTEN policy flags also exercised under both policies.
+* Darwin connected sends to their existing peer now omit the native destination
+  argument, avoiding EISCONN. Native UDP receive no longer supplies MSG_TRUNC,
+  which Darwin otherwise echoes on complete packets. Wrong-family datagram
+  errors are translated from Darwin EAFNOSUPPORT to Linux errno 97.
+* Darwin ICMP uses native datagram sockets. Each proxy reserves a distinct
+  host echo identifier through an idle loopback UDP port, rewrites/restores
+  IDs/checksums and filters by identifier, sequence, peer and payload hash.
+  IPv4 headers are stripped; destination/interface and TTL/hop-limit metadata
+  are normalized. Foreign replies and IPv6 requests are filtered. Transient
+  receive errors are excluded from pending SO_ERROR, matching UDP handling.
+* Native ICMP units verify colliding guest IDs, distinct host IDs, payloads,
+  odd/even checksums, IPv6 checksum adjustment, metadata and reservation release.
+  Real ping checks normal, -C and -e4242 modes, guest-local routing, plus two
+  simultaneous same-ID clients with different patterns in each guest. Two VMM
+  processes were also launched together: trace timestamps overlap for both
+  families and their reserved host identifiers are disjoint. results.json
+  records timestamps and identifier sets. The earlier unsynchronized
+  cross-vm-{1,2} runs are not used as evidence of concurrent execution.
+* Native C API firmware probes reject ABI 5, ABI 7 and absent version getters
+  before kernel loading, with explicit ABI-6 diagnostics.
+
+Limits and exclusions
+---------------------
+* Four existing curl parallel delayed/timeout fixtures (IPv4/IPv6) require
+  Linux accept-queue behavior and skip on Darwin. Independent pending-connect
+  TCP/UDP progress is covered by the new portable socket contract instead.
+* Host AF_UNIX TSI is unsupported on macOS and its rejection is verified.
+* Connected UDP sendto to a different explicit peer is not adapted; applications
+  must disconnect/reconnect to change peers. Original lengths of native-host
+  truncated UDP receives retain Darwin's copied-length limitation.
+* ICMP covers unicast echo. Raw sockets, other ICMP types, error queues,
+  outgoing TTL/hop-limit controls and scoped IPv6 targets were not implemented.
+  Matching retains one request per 16-bit sequence, replacing it on reuse;
+  each ICMP proxy consumes an extra host loopback UDP descriptor/port.
+* General UDP receive TTL metadata remains Linux-specific; macOS ICMP reply
+  TTL/hop-limit metadata is covered. No universal native-socket parity claim.
+* The existing host ULA did not answer even the native ICMP probe. IPv6 tests
+  use host ::1 while temporarily removing guest ::1, then restore it for
+  guest-local checks. Only disposable guest network configuration is changed.
+* Linux host runtime regressions and the original 668 functional/67 fault
+  selftests were not rerun. FreeBSD, Windows, GPU and non-TSI device integration
+  are outside this validation. Existing Linux sendto behavior was preserved.
+
+Reproduction and retained evidence
+----------------------------------
+Ordinary matrix (repeat with FFI=0/1 and publication env unset/set to 1):
+  make test GPU=0 FFI=1 EXTRA_LIBPATH_Darwin=/Users/slopezpa/Projects/libkrunfw \
+    TEST='tsi-*,!tsi-control-faults'
+  KRUN_TEST_TSI_TCP_PUBLICATION_STRICT=1 selects strict publication.
+Fault commands and prerequisites: docs/tsi-control-faults.md.
+Fixture/coverage details: tests/README.md, docs/tsi-protocol.md.
+
+Reusable application rootfs:
+  .tsi-macos-validation/tsi-default-ffi/tsi-app-curl-http/rootfs
+Set KRUN_TEST_TSI_APPS_ROOTFS to its absolute path for offline fixture reuse.
+macOS copies use /bin/cp -a -c to share APFS file data. Initial duplicate-rootfs
+disk exhaustion was resolved by deleting only approved generated copies while
+preserving this fixture and logs. Empty host-result-file races in the new
+tests were fixed with atomic rename and the affected matrix was rerun.
+Native VSOCK tests use a short /private/tmp base to fit UNIX socket path limits;
+their logs were copied to final-vsock-logs/. Earlier long-path setup failures
+are not used as passing evidence.
+
+Machine-readable results, firmware identity, trace checks and per-source SHA256:
+  .tsi-macos-validation/results.json
+Chronological work journal: tsi-macos-progress.txt.
+Logs and remaining artifacts are ignored by Git. Source, tests, documentation
+and this report form the repository changes; the chronological journal remains
+local. Unrelated existing files were preserved.

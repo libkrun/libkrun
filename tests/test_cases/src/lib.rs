@@ -69,6 +69,16 @@ mod test_tsi_tcp_half_close;
 use test_tsi_tcp_half_close::TestTsiTcpHalfClose;
 
 #[cfg(any(feature = "host", target_os = "linux"))]
+mod test_tsi_socket_contract;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_tsi_socket_contract::TestTsiSocketContract;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_tsi_control_protocol;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_tsi_control_protocol::TestTsiControlProtocol;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
 mod test_tsi_applications;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_tsi_applications::{AddressFamily, Application, TestTsiApplication};
@@ -251,6 +261,48 @@ pub fn test_cases() -> Vec<TestCase> {
             Box::new(TestTsiTcpGuestListen::new()),
         ),
         TestCase::new("tsi-tcp-half-close", Box::new(TestTsiTcpHalfClose)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-control-wire",
+            Box::new(TestTsiControlProtocol { faults: false }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-control-faults",
+            Box::new(TestTsiControlProtocol { faults: true }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-socket-contract",
+            Box::new(TestTsiSocketContract {
+                ipv6: false,
+                hijack: true,
+            }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-socket-contract-ipv6",
+            Box::new(TestTsiSocketContract {
+                ipv6: true,
+                hijack: true,
+            }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-socket-contract-explicit",
+            Box::new(TestTsiSocketContract {
+                ipv6: false,
+                hijack: false,
+            }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-socket-contract-explicit-ipv6",
+            Box::new(TestTsiSocketContract {
+                ipv6: true,
+                hijack: false,
+            }),
+        ),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new(
             "tsi-app-curl-http",
