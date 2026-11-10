@@ -9,7 +9,7 @@ use utils::windows::RawFd;
 
 use super::super::Queue as VirtQueue;
 use super::muxer::{MuxerRx, ProxyMap, push_packet};
-use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
+use super::muxer_rxq::MuxerRxQ;
 use super::packet::VsockPacket;
 use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
 use super::tsi_stream::TsiStreamProxy;
@@ -75,7 +75,7 @@ impl MuxerThread {
         while let Some(rx) = rxq.pop() {
             if let Some(head) = queue.pop(&self.mem) {
                 if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-                    rx_to_pkt(self.cid, rx, &mut pkt);
+                    rxq.deliver(self.cid, rx, &mut pkt);
                     if let Err(e) =
                         queue.add_used(&self.mem, head.index, pkt.hdr().len() as u32 + pkt.len())
                     {

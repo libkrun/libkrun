@@ -198,6 +198,10 @@ impl UnixProxy {
             .set_type(uapi::VSOCK_TYPE_STREAM)
             .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
             .set_fwd_cnt(self.tx_cnt.0);
+        self.rxq
+            .lock()
+            .unwrap()
+            .note_data(self.local_port, self.peer_port, self.tx_cnt.0);
     }
 }
 
