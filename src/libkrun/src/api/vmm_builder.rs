@@ -1,12 +1,15 @@
 use std::marker::PhantomData;
 #[cfg(not(target_os = "windows"))]
 use std::os::fd::{AsRawFd, BorrowedFd};
+#[cfg(target_os = "windows")]
+use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 
 #[cfg(target_os = "macos")]
 use crate::vmm::VmCtl;
 use crate::vmm::Vmm as InnerVmm;
-#[cfg(unix)]
 use crate::vmm::resources::SerialConsoleConfig;
 use crate::vmm::resources::VmResources;
 use crate::vmm::vmm_config::machine_config::VmConfig;
@@ -27,7 +30,6 @@ pub struct VmmBuilder<'a> {
     ram_mib: Option<u32>,
     payload: Option<Payload>,
     device_manager: Option<Box<dyn DeviceManager<'a> + 'a>>,
-    #[cfg(unix)]
     serial_consoles: Vec<SerialConsoleConfig>,
     kernel_console: Option<String>,
     nested_virt: bool,
@@ -97,6 +99,25 @@ impl<'a> VmmBuilder<'a> {
         self.serial_consoles.push(SerialConsoleConfig {
             input_fd: in_fd,
             output_fd: out_fd,
+        });
+        Ok(self)
+    }
+
+    /// Add a legacy serial console device with the given Windows handles.
+    ///
+    /// Can be called multiple times to add multiple serial consoles (ttyS0, ttyS1, …).
+    /// The handles are borrowed, not duplicated. They must remain valid until the VMM exits.
+    #[cfg(target_os = "windows")]
+    pub fn add_serial_console(
+        mut self,
+        input_handle: Option<BorrowedHandle<'a>>,
+        output_handle: Option<BorrowedHandle<'a>>,
+    ) -> Result<Self, VmmError> {
+        self.serial_consoles.push(SerialConsoleConfig {
+            input_handle: input_handle
+                .map_or(INVALID_HANDLE_VALUE, |handle| handle.as_raw_handle()),
+            output_handle: output_handle
+                .map_or(INVALID_HANDLE_VALUE, |handle| handle.as_raw_handle()),
         });
         Ok(self)
     }
@@ -438,10 +459,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         vm_resources.kernel_console = Some(console);
     }
 
-    #[cfg(unix)]
-    {
-        vm_resources.serial_consoles = builder_cfg.serial_consoles;
-    }
+    vm_resources.serial_consoles = builder_cfg.serial_consoles;
 
     let mut event_manager =
         EventManager::new().map_err(|e| VmmError::Internal(format!("{e:?}")))?;
