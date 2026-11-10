@@ -45,18 +45,61 @@ from both the host through a port mapping and a guest-local curl client.
 Applications use their normal socket settings. The guest verifies that automatic INET hijacking is
 active and no `eth0` device exists; no virtual NIC is added.
 
-`tsi-app-ping` and `tsi-app-ping-ipv6` require a Linux host and run the installed
+`tsi-app-ping` and `tsi-app-ping-ipv6` run on Linux and macOS hosts using the installed
 iputils binary with ICMP datagram sockets, not UDP echo or raw ICMP. Each checks
 ordinary ping, `-C` and an explicit nonzero `-e` identifier against both a
 host-only target and guest loopback. Every invocation must receive all three
 replies with nonzero TTL/hop-limit metadata. The child runs as UID/GID 65534
 with `no_new_privs`, preventing raw-socket privileges from masking a regression.
-The guest enables `ping_group_range`; the host fixture permits its mapped group
+Two concurrent proxied clients use different payload patterns, checking
+per-socket isolation and payload integrity. Linux uses distinct echo IDs because
+native Linux ping sockets with the same ID can lose or misdeliver replies.
+macOS deliberately uses the same `-e4242` ID to exercise Darwin's proxy identifier
+reservation and rewriting.
+The guest enables `ping_group_range`; the Linux host fixture permits its mapped group
 0 and assigns the target IP only inside the runner's private network namespace.
 The normal runner sets `KRUN_TEST_PRIVATE_NETNS=1` after entering that namespace.
 If running a custom namespace wrapper with `KRUN_NO_UNSHARE=1`, set that marker
 inside the private namespace too; the fixture refuses to configure the real
 host namespace. A supplied offline rootfs must include iputils `ping`.
+
+On macOS the IPv4 target defaults to an existing non-loopback host address;
+`KRUN_TEST_TSI_PING_IPV4` overrides it. IPv6 defaults to host `::1`: the fixture
+temporarily removes `::1` from the guest loopback interface for the proxied
+checks, then restores it before the guest-local checks. Only the disposable
+test guest's interface changes. `KRUN_TEST_TSI_PING_IPV6` can select another
+assigned, unscoped host IPv6 address. Missing or invalid targets fail the case.
+The native investigation utility is `tests/icmp_macos_probe.c`; compile it with
+`clang -std=c11 -Wall -Wextra -Werror` and run it as a normal user. It records
+socket/name/bind behavior, receive layout, metadata, truncation and colliding IDs.
+
+`tsi-socket-contract*` checks IPv4/IPv6 through both automatic hijacking and
+explicit AF_TSI/AF_TSI6 sockets. It covers zero-length/larger datagrams, peek
+and truncation flags, connected peer filtering, disconnect/reconnect, option
+replay, names, oversize errors and repeated close/recreate. TCP checks include
+nonblocking success/refusal, read-and-clear SO_ERROR, bulk transfer and half-close.
+On macOS a bound, non-listening native TCP socket supplies a pending-connect
+target. Independent TCP/UDP progress, pending-state errors and prompt close are
+checked while that connection remains incomplete.
+Incoming TCP/UDP is exercised before any guest send, with port mappings and
+destination/interface metadata. Occupied mapped and unmapped TCP ports verify
+default guest-local fallback or strict failure, absence of automatic publication
+after conflict release, and external reachability after close/recreate or retry.
+
+`tsi-control-wire` sends requests through native guest VSOCK datagrams. It checks
+envelopes, protocol errors, reply IDs/sources, Linux sockaddr/errno translation,
+SO_ERROR retention/clearing, malformed datagram rejection, options and 32 complete
+proxy create/bind/query/release cycles. macOS also verifies AF_UNIX rejection.
+Run the ordinary TSI suite with:
+
+```sh
+make test FFI=0 TEST='tsi-*,!tsi-control-faults'
+```
+
+Use `FFI=1` for the generated C API client and
+`KRUN_TEST_TSI_TCP_PUBLICATION_STRICT=1` for strict publication.
+`tsi-control-faults` requires an explicitly instrumented library and
+`KRUN_TEST_TSI_FAULTS=1`; see [control fault tests](../docs/tsi-control-faults.md).
 
 The two parallel curl cases require a Linux host and skip on macOS. A saturated
 host TCP accept queue holds one connection pending while another transfer must
