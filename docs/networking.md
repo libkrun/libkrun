@@ -68,10 +68,11 @@ publication fails. A normal host error keeps the control channel usable, so
 `listen()` can be retried after resolving a bind conflict. UNIX and UDP behavior
 is unchanged. This requires the matching TSIv4 kernel/host pair.
 
-Linux TSI hosts support ordinary iputils `ping` using ICMP datagram sockets,
+Linux and macOS TSI hosts support ordinary iputils `ping` using ICMP datagram sockets,
 including IPv4, IPv6, connected mode and explicit nonzero echo identifiers.
 Allow the application/VMM groups in `net.ipv4.ping_group_range` in the guest
-and host respectively. `CAP_NET_RAW` is unnecessary. Guest-local destinations
+and Linux host respectively. macOS uses its unprivileged native ICMP sockets.
+`CAP_NET_RAW` is unnecessary. Guest-local destinations
 stay inside the guest; other destinations use the host network. UDP port
 mappings do not apply to echo identifiers. Raw ping (`-e 0`), outgoing TTL/hop-limit
 controls and host error-queue forwarding are unsupported; other host platforms
@@ -80,9 +81,10 @@ do not currently proxy ICMP ping sockets.
 ### Known Limitations
 - In the default fallback mode, successful guest TCP `listen()` does not guarantee host reachability. Selected host bind/listen failures (including a busy port) can leave a guest-only listener while returning success. This also applies with configured port overrides. The listener is not automatically exposed when the conflict disappears; close and recreate it to retry publication.
 - Requires a kernel with TSI support (bundled in `libkrunfw`).
-- Limited to `SOCK_STREAM` and `SOCK_DGRAM` sockets across `AF_INET`, `AF_INET6`, and `AF_UNIX`. Linux hosts support ICMP datagram ping sockets for IPv4 and IPv6. Raw sockets (`SOCK_RAW`) and netlink are not supported.
+- Limited to `SOCK_STREAM` and `SOCK_DGRAM` sockets across `AF_INET`, `AF_INET6`, and `AF_UNIX`. Linux and macOS hosts support ICMP datagram ping sockets for IPv4 and IPv6. Raw sockets (`SOCK_RAW`) and netlink are not supported.
 - For `AF_UNIX` sockets, only absolute filesystem paths are supported.
 - Host-side `AF_UNIX` TSI handling is not implemented on macOS.
+- On macOS, ICMP support covers unicast echo requests/replies. Connected UDP sends to another explicit destination require disconnect/reconnect; see the [wire contract](tsi-protocol.md) for native datagram limits.
 
 ---
 
