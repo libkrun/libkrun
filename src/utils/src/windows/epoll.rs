@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Networking::WinSock::FD_ACCEPT;
 use windows_sys::Win32::Networking::WinSock::FD_CLOSE;
 use windows_sys::Win32::Networking::WinSock::FD_CONNECT;
+use windows_sys::Win32::Networking::WinSock::FD_CONNECT_BIT;
 use windows_sys::Win32::Networking::WinSock::FD_READ;
 use windows_sys::Win32::Networking::WinSock::FD_WRITE;
 
@@ -78,9 +79,7 @@ pub enum ControlOperation {
 bitflags! {
     /// Bitmask of I/O readiness event types.
     ///
-    /// Bit values are intentionally identical to the macOS implementation so
-    /// that device code using these constants is portable across all three
-    /// supported platforms.
+    /// Shared event types use the same bit values as the macOS implementation.
     pub struct EventSet: u32 {
         /// The handle is ready for reading.
         const IN = 0b00000001;
@@ -93,6 +92,8 @@ bitflags! {
         /// Request edge-triggered notification. The WCP is not re-armed
         /// after delivery; use [`ControlOperation::Modify`] to re-register.
         const EDGE_TRIGGERED = 0b00010000;
+        /// A nonblocking Winsock connection attempt finished.
+        const CONNECT = 0b00100000;
     }
 }
 
@@ -100,6 +101,7 @@ bitflags! {
 #[derive(Clone, Copy, Default)]
 pub struct EpollEvent {
     pub events: u32,
+    connect_error: i32,
     u64: u64,
 }
 
@@ -114,6 +116,7 @@ impl EpollEvent {
     pub fn new(events: EventSet, data: u64) -> Self {
         EpollEvent {
             events: events.bits(),
+            connect_error: 0,
             u64: data,
         }
     }
@@ -136,6 +139,13 @@ impl EpollEvent {
 
     pub fn fd(&self) -> RawFd {
         self.u64 as RawFd
+    }
+
+    /// The Winsock result for a connect notification. Zero means success.
+    pub fn connect_error(&self) -> Option<i32> {
+        self.event_set()
+            .contains(EventSet::CONNECT)
+            .then_some(self.connect_error)
     }
 }
 
@@ -249,26 +259,44 @@ fn calculate_net_events(events: EventSet) -> i32 {
         net_events |= FD_READ | FD_ACCEPT;
     }
     if events.contains(EventSet::OUT) {
-        net_events |= FD_WRITE | FD_CONNECT;
+        net_events |= FD_WRITE;
+    }
+    if events.contains(EventSet::CONNECT) {
+        net_events |= FD_CONNECT;
     }
     if events.intersects(EventSet::HANG_UP | EventSet::READ_HANG_UP) {
         net_events |= FD_CLOSE;
     }
     net_events as i32
 }
-fn parse_net_events(net_ev: &WSANETWORKEVENTS) -> EventSet {
+fn parse_net_events(
+    net_ev: &WSANETWORKEVENTS,
+    interests: EventSet,
+    data: u64,
+) -> Option<EpollEvent> {
     let mut actual = EventSet::empty();
     if net_ev.lNetworkEvents & (FD_READ as i32 | FD_ACCEPT as i32) != 0 {
         actual |= EventSet::IN;
     }
-    if net_ev.lNetworkEvents & (FD_WRITE as i32 | FD_CONNECT as i32) != 0 {
+    if net_ev.lNetworkEvents & FD_WRITE as i32 != 0 {
         actual |= EventSet::OUT;
+    }
+    if net_ev.lNetworkEvents & FD_CONNECT as i32 != 0 {
+        actual |= EventSet::CONNECT;
     }
     if net_ev.lNetworkEvents & FD_CLOSE as i32 != 0 {
         actual |= EventSet::HANG_UP | EventSet::READ_HANG_UP;
     }
 
-    actual
+    let ready = actual & interests;
+    if ready.is_empty() {
+        return None;
+    }
+    let mut event = EpollEvent::new(ready, data);
+    if ready.contains(EventSet::CONNECT) {
+        event.connect_error = net_ev.iErrorCode[FD_CONNECT_BIT as usize];
+    }
+    Some(event)
 }
 
 /// Epoll-compatible polling abstraction backed by an I/O Completion Port.
@@ -340,7 +368,8 @@ impl Epoll {
     /// network events (read/write/close) into the event object, and watches
     /// that event via the IOCP. When [`wait`](Self::wait) returns an event
     /// for this socket, the [`EventSet`] will reflect the actual network
-    /// events (IN / OUT / HANG_UP) obtained via `WSAEnumNetworkEvents`.
+    /// events obtained via `WSAEnumNetworkEvents`. Connect notifications
+    /// carry their completion status in [`EpollEvent::connect_error`].
     ///
     /// * `socket` – the Winsock `SOCKET` handle.
     /// * `event` – carries the desired [`EventSet`] mask and a `u64` data
@@ -556,7 +585,8 @@ impl Epoll {
             let current_events = watch.events.load(Ordering::Acquire);
             let event_set = EventSet::from_bits_truncate(current_events);
 
-            let (bits, should_report) = if let Some(socket) = watch.socket {
+            let data = watch.data.load(Ordering::Acquire);
+            let event = if let Some(socket) = watch.socket {
                 // WSAEnumNetworkEvents atomically retrieves the pending
                 // network events AND resets the WSAEvent object so the
                 // next WSAEventSelect notification can re-signal it.
@@ -568,15 +598,9 @@ impl Epoll {
                         "WSAEnumNetworkEvents failed: {}",
                         io::Error::last_os_error()
                     );
-                    (0, false)
+                    None
                 } else {
-                    let actual = parse_net_events(&net_ev);
-                    let reported = actual & event_set;
-                    if reported.is_empty() {
-                        (0, false)
-                    } else {
-                        (reported.bits(), true)
-                    }
+                    parse_net_events(&net_ev, event_set, data)
                 }
             } else {
                 // The WCP is one-shot: once it fires, re-arming it while the
@@ -588,18 +612,11 @@ impl Epoll {
                 // current state here so we don't report a stale/phantom
                 // notification for an event that was already drained.
                 let signaled = unsafe { WaitForSingleObject(watch.fd, 0) } == WAIT_OBJECT_0;
-                if signaled {
-                    ((event_set & (EventSet::IN | EventSet::OUT)).bits(), true)
-                } else {
-                    (0, false)
-                }
+                signaled.then(|| EpollEvent::new(event_set & (EventSet::IN | EventSet::OUT), data))
             };
 
-            if should_report {
-                events[result_count] = EpollEvent {
-                    events: bits,
-                    u64: watch.data.load(Ordering::Acquire),
-                };
+            if let Some(event) = event {
+                events[result_count] = event;
                 result_count += 1;
             }
 
@@ -648,6 +665,7 @@ impl AsRawFd for Epoll {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Networking::WinSock::WSAETIMEDOUT;
     use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent};
 
     /// Create a manual-reset, initially non-signaled Windows Event object.
@@ -688,6 +706,31 @@ mod tests {
     fn test_events_debug() {
         let event = EpollEvent::new(EventSet::IN, 42);
         assert_eq!(format!("{:?}", event), "{ events: 1, data: 42 }");
+    }
+
+    #[test]
+    fn connect_completion_preserves_its_result_separately_from_write_readiness() {
+        assert_eq!(calculate_net_events(EventSet::CONNECT), FD_CONNECT as i32);
+        assert_eq!(calculate_net_events(EventSet::OUT), FD_WRITE as i32);
+
+        let mut net = WSANETWORKEVENTS {
+            lNetworkEvents: FD_WRITE as i32,
+            ..Default::default()
+        };
+        net.iErrorCode[FD_CONNECT_BIT as usize] = WSAETIMEDOUT;
+        assert!(parse_net_events(&net, EventSet::CONNECT, 42).is_none());
+        let ready = parse_net_events(&net, EventSet::OUT, 42).unwrap();
+        assert_eq!(ready.connect_error(), None);
+
+        net.lNetworkEvents |= FD_CONNECT as i32;
+        let ready = parse_net_events(&net, EventSet::OUT | EventSet::CONNECT, 42).unwrap();
+        assert_eq!(ready.event_set(), EventSet::OUT | EventSet::CONNECT);
+        assert_eq!(ready.connect_error(), Some(WSAETIMEDOUT));
+
+        net.iErrorCode[FD_CONNECT_BIT as usize] = 0;
+        let ready = parse_net_events(&net, EventSet::CONNECT, 42).unwrap();
+        assert_eq!(ready.event_set(), EventSet::CONNECT);
+        assert_eq!(ready.connect_error(), Some(0));
     }
 
     #[test]

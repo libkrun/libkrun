@@ -12,6 +12,8 @@ use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, VsockPacket};
 
 use super::proxy::{AsRawFd, OwnedFd, Proxy, ProxyError, ProxyStatus, ProxyUpdate, RawFd, RecvPkt};
 
+#[cfg(windows)]
+use utils::epoll::Epoll;
 use utils::epoll::EventSet;
 use vm_memory::GuestMemoryMmap;
 
@@ -222,7 +224,12 @@ impl Proxy for UnixProxy {
         self.status
     }
 
-    fn connect(&mut self, pkt: &VsockPacket, _req: TsiConnectReq) -> ProxyUpdate {
+    fn connect(
+        &mut self,
+        pkt: &VsockPacket,
+        _req: TsiConnectReq,
+        #[cfg(windows)] _epoll: &Epoll,
+    ) -> ProxyUpdate {
         self.connect_mapped(pkt)
     }
 
@@ -328,7 +335,12 @@ impl Proxy for UnixAcceptorProxy {
     fn status(&self) -> ProxyStatus {
         ProxyStatus::WaitingOnAccept
     }
-    fn connect(&mut self, _: &VsockPacket, _: TsiConnectReq) -> ProxyUpdate {
+    fn connect(
+        &mut self,
+        _: &VsockPacket,
+        _: TsiConnectReq,
+        #[cfg(windows)] _: &Epoll,
+    ) -> ProxyUpdate {
         unreachable!()
     }
     fn getname(&mut self, _: &VsockPacket, _: bool) {

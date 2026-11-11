@@ -15,6 +15,8 @@ use super::proxy::{
     AddressFamily, AsRawFd, OwnedFd, Proxy, ProxyError, ProxyStatus, ProxyUpdate, RawFd, RecvPkt,
 };
 
+#[cfg(windows)]
+use utils::epoll::Epoll;
 use utils::epoll::EventSet;
 use vm_memory::GuestMemoryMmap;
 
@@ -134,7 +136,12 @@ impl Proxy for TsiDgramProxy {
         self.status
     }
 
-    fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
+    fn connect(
+        &mut self,
+        pkt: &VsockPacket,
+        req: TsiConnectReq,
+        #[cfg(windows)] _epoll: &Epoll,
+    ) -> ProxyUpdate {
         sys::do_connect(self, pkt, req)
     }
 

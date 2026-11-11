@@ -123,7 +123,7 @@ pub(crate) fn do_connect(proxy: &mut super::UnixProxy) -> ProxyUpdate {
             update.polling = Some((
                 proxy.id,
                 proxy.fd.as_raw_socket() as RawFd,
-                EventSet::IN | EventSet::OUT | EventSet::EDGE_TRIGGERED,
+                EventSet::IN | EventSet::OUT | EventSet::CONNECT | EventSet::EDGE_TRIGGERED,
             ));
         } else {
             warn!("unix proxy connect error: id={} err={e}", proxy.id);
@@ -319,7 +319,9 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
         }
     }
 
-    if evset.contains(EventSet::OUT) && proxy.status == ProxyStatus::Connecting {
+    if evset.intersects(EventSet::OUT | EventSet::CONNECT)
+        && proxy.status == ProxyStatus::Connecting
+    {
         switch_to_connected(proxy);
         proxy.push_op_response();
         update.signal_queue = true;
