@@ -290,8 +290,8 @@ host constants, and errors are translated to Linux errno values.
 
 The host allowlist includes SOL_SOCKET REUSEADDR, REUSEPORT, KEEPALIVE,
 BROADCAST, SNDBUF and RCVBUF; read-only SO_ERROR; TCP_NODELAY on INET streams;
-and IPV6_V6ONLY on IPv6 sockets. SO_REUSEPORT is unavailable on UNIX sockets and
-Windows. Host wire requests for unlisted or privileged options return
+and IPV6_V6ONLY on IPv6 sockets. SO_REUSEPORT applies to IPv4 and IPv6 sockets.
+Host wire requests for unlisted or privileged options return
 ENOPROTOOPT, including forced buffer sizes or host device binding.
 
 The guest caches successful native setters before lazy creation and replays
@@ -321,10 +321,13 @@ Unix host INET stream proxies default to SO_REUSEADDR=1 for listener restart;
 SO_REUSEPORT is enabled only by an explicit application request. Cached setters
 replay before host bind/connect, including explicit SO_REUSEADDR=0. Native guest
 endpoints retain native defaults; UDP and UNIX stream reuse policy is unchanged.
-Explicit REUSEPORT permits sharing a host listening address and does not isolate
-ports between VMs. Windows IPv6 sockets clear the Winsock IPV6_V6ONLY default
-to match Linux dual-stack behavior. Other host platforms retain their native
-defaults and options.
+On Unix hosts, explicit REUSEPORT permits sharing a host listening address
+across VMs. Windows hosts keep SO_REUSEADDR and SO_REUSEPORT guest-only and
+report their stored values on readback. Winsock SO_REUSEADDR permits binding
+ports that host processes are actively using, and Winsock has no Linux
+REUSEPORT equivalent. Windows IPv6 sockets clear the Winsock IPV6_V6ONLY
+default to match Linux dual-stack behavior. Other host platforms retain their
+native defaults and options.
 
 TCP host publication defaults to best effort. For EPERM, EADDRINUSE or EADDRNOTAVAIL from
 host listen setup, the guest may keep a guest-only listener and return success.

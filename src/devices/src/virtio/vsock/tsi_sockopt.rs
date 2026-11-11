@@ -5,6 +5,8 @@ use super::tsi_wire;
 #[cfg(unix)]
 use libc as native;
 #[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
 use windows_sys::Win32::Networking::WinSock as native;
 
 fn option(
@@ -37,6 +39,39 @@ fn option(
         _ => return Err(-tsi_wire::ENOPROTOOPT),
     };
     Ok(mapped)
+}
+
+/// Winsock SO_REUSEADDR allows sharing active ports, and Winsock has no Linux
+/// SO_REUSEPORT equivalent. Store both guest values without changing host binds.
+#[cfg(windows)]
+#[derive(Default)]
+pub(super) struct GuestOnlyOptions {
+    reuse_addr: AtomicBool,
+    reuse_port: AtomicBool,
+}
+
+#[cfg(windows)]
+impl GuestOnlyOptions {
+    pub(super) fn apply(
+        &self,
+        family: AddressFamily,
+        level: u32,
+        name: u32,
+        value: Option<i32>,
+    ) -> Option<i32> {
+        let setting = match (level, name) {
+            (1, 2) => &self.reuse_addr,
+            (1, 15) if matches!(family, native::AF_INET | native::AF_INET6) => &self.reuse_port,
+            _ => return None,
+        };
+        Some(match value {
+            Some(value) => {
+                setting.store(value != 0, Ordering::Relaxed);
+                0
+            }
+            None => i32::from(setting.load(Ordering::Relaxed)),
+        })
+    }
 }
 
 fn linux_error(code: i32) -> i32 {
@@ -156,6 +191,36 @@ mod tests {
             option(family, defs::SOCK_STREAM, 1, 4, true),
             Err(-tsi_wire::ENOPROTOOPT)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reuse_addr_stays_guest_only() {
+        let options = GuestOnlyOptions::default();
+        let family = native::AF_INET;
+        assert_eq!(options.apply(family, 1, 2, None), Some(0));
+        assert_eq!(options.apply(family, 1, 2, Some(5)), Some(0));
+        assert_eq!(options.apply(family, 1, 2, None), Some(1));
+        assert_eq!(options.apply(family, 1, 2, Some(0)), Some(0));
+        assert_eq!(options.apply(family, 1, 2, None), Some(0));
+        assert_eq!(options.apply(family, 1, 9, Some(1)), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reuse_port_is_independent_and_guest_only_on_inet() {
+        for family in [native::AF_INET, native::AF_INET6] {
+            let options = GuestOnlyOptions::default();
+            assert_eq!(options.apply(family, 1, 15, None), Some(0));
+            assert_eq!(options.apply(family, 1, 15, Some(5)), Some(0));
+            assert_eq!(options.apply(family, 1, 15, None), Some(1));
+            assert_eq!(options.apply(family, 1, 2, None), Some(0));
+            assert_eq!(options.apply(family, 1, 15, Some(0)), Some(0));
+            assert_eq!(options.apply(family, 1, 15, None), Some(0));
+        }
+        let options = GuestOnlyOptions::default();
+        assert_eq!(options.apply(native::AF_UNIX, 1, 15, Some(1)), None);
+        assert_eq!(options.apply(native::AF_UNIX, 1, 15, None), None);
     }
 
     #[test]
