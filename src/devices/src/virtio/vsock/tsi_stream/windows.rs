@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::mem::size_of;
+use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
 use std::num::Wrapping;
 use std::os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket, RawSocket};
 
 use utils::windows::RawFd;
 use windows_sys::Win32::Networking::WinSock::{
-    FIONBIO, INVALID_SOCKET, SD_BOTH, SD_RECEIVE, SD_SEND, SOCK_STREAM, SOCKADDR, SOCKET,
-    SOCKET_ERROR, WSAEINTR, WSAESHUTDOWN, WSAEWOULDBLOCK, WSAGetLastError, accept, bind,
-    closesocket, connect, getpeername, getsockname, ioctlsocket, listen, recv, send, shutdown,
-    socket,
+    AF_INET6, FIONBIO, INVALID_SOCKET, IPPROTO_IPV6, IPV6_V6ONLY, SD_BOTH, SD_RECEIVE, SD_SEND,
+    SOCK_STREAM, SOCKADDR, SOCKET, SOCKET_ERROR, WSAEINTR, WSAESHUTDOWN, WSAEWOULDBLOCK,
+    WSAGetLastError, accept, bind, closesocket, connect, getpeername, getsockname, ioctlsocket,
+    listen, recv, send, setsockopt, shutdown, socket,
 };
 
 use crate::virtio::vsock::windows::sockaddr_storage::{
@@ -34,6 +35,25 @@ fn create_stream_socket(win_family: i32) -> Result<SOCKET, i32> {
     }
     let mut mode: u32 = 1;
     if unsafe { ioctlsocket(sock, FIONBIO, &mut mode) } == SOCKET_ERROR {
+        let e = unsafe { WSAGetLastError() };
+        unsafe {
+            closesocket(sock);
+        }
+        return Err(e);
+    }
+    // Linux guests expect dual-stack IPv6 sockets (bindv6only=0), but Winsock
+    // defaults to v6-only.
+    if win_family == AF_INET6 as i32
+        && unsafe {
+            setsockopt(
+                sock,
+                IPPROTO_IPV6,
+                IPV6_V6ONLY,
+                (&0u32 as *const u32).cast(),
+                size_of::<u32>() as i32,
+            )
+        } == SOCKET_ERROR
+    {
         let e = unsafe { WSAGetLastError() };
         unsafe {
             closesocket(sock);
@@ -113,6 +133,15 @@ fn try_listen(
             } else {
                 req.addr.clone()
             }
+        } else if let Some(v6) = req.addr.to_std_v6() {
+            // Port overrides apply to IPv6 listeners too; without this a
+            // guest dual-stack listener publishes its IPv6 socket on the
+            // unmapped host port.
+            if let Some(&mapped_port) = port_map.get(&v6.port()) {
+                SocketAddrV6::new(*v6.ip(), mapped_port, v6.flowinfo(), v6.scope_id()).into()
+            } else {
+                req.addr.clone()
+            }
         } else {
             req.addr.clone()
         }
@@ -142,7 +171,10 @@ fn try_listen(
     let bind_res = unsafe { bind(sock(proxy), sa_bytes.as_ptr() as *const SOCKADDR, sa_len) };
     if bind_res == SOCKET_ERROR {
         let e = unsafe { WSAGetLastError() };
-        warn!("bind failed: id={} err={e}", proxy.id);
+        warn!(
+            "bind failed: id={} addr={:?} err={e}",
+            proxy.id, effective_addr
+        );
         return -wsa_errno_to_linux(e);
     }
 
