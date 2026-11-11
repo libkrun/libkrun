@@ -8,9 +8,9 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket, RawSocket};
 use utils::windows::RawFd;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET6, FIONBIO, INVALID_SOCKET, IPPROTO_IPV6, IPV6_V6ONLY, SD_BOTH, SD_RECEIVE, SD_SEND,
-    SOCK_STREAM, SOCKADDR, SOCKET, SOCKET_ERROR, WSAEINTR, WSAESHUTDOWN, WSAEWOULDBLOCK,
-    WSAGetLastError, accept, bind, closesocket, connect, getpeername, getsockname, ioctlsocket,
-    listen, recv, send, setsockopt, shutdown, socket,
+    SO_ERROR, SOCK_STREAM, SOCKADDR, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAEINTR, WSAESHUTDOWN,
+    WSAEWOULDBLOCK, WSAGetLastError, accept, bind, closesocket, connect, getpeername, getsockname,
+    getsockopt, ioctlsocket, listen, recv, send, setsockopt, shutdown, socket,
 };
 
 use crate::virtio::vsock::windows::sockaddr_storage::{
@@ -61,6 +61,25 @@ fn create_stream_socket(win_family: i32) -> Result<SOCKET, i32> {
         return Err(e);
     }
     Ok(sock)
+}
+
+fn pending_socket_error(proxy: &super::TsiStreamProxy) -> i32 {
+    let mut error = 0i32;
+    let mut len = size_of::<i32>() as i32;
+    let result = unsafe {
+        getsockopt(
+            sock(proxy),
+            SOL_SOCKET,
+            SO_ERROR,
+            (&mut error as *mut i32).cast(),
+            &mut len,
+        )
+    };
+    if result == SOCKET_ERROR {
+        unsafe { WSAGetLastError() }
+    } else {
+        error
+    }
 }
 
 pub(crate) fn create_socket(
@@ -532,9 +551,18 @@ pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) 
         }
     }
 
+    // Winsock reports a failed connect as FD_CONNECT without FD_CLOSE, so OUT
+    // alone does not mean the connection was established.
     if evset.contains(EventSet::OUT) && proxy.status == ProxyStatus::Connecting {
-        proxy.status = ProxyStatus::Connected;
-        proxy.push_connect_rsp(0);
+        let error = pending_socket_error(proxy);
+        if error == 0 {
+            proxy.status = ProxyStatus::Connected;
+            proxy.push_connect_rsp(0);
+        } else {
+            debug!("async connect error: id={} err={error}", proxy.id);
+            proxy.status = ProxyStatus::Closed;
+            proxy.push_connect_rsp(-wsa_errno_to_linux(error));
+        }
         update.signal_queue = true;
         update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
     }
