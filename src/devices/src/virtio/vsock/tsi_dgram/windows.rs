@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, CMSGHDR, FIONBIO, IN_PKTINFO, IN6_PKTINFO, INVALID_SOCKET, IP_PKTINFO,
-    IPPROTO_IP, IPPROTO_IPV6, IPV6_PKTINFO, LPFN_WSARECVMSG, MSG_CTRUNC, MSG_TRUNC,
+    IPPROTO_IP, IPPROTO_IPV6, IPV6_PKTINFO, IPV6_V6ONLY, LPFN_WSARECVMSG, MSG_CTRUNC, MSG_TRUNC,
     SIO_GET_EXTENSION_FUNCTION_POINTER, SOCK_DGRAM, SOCKADDR, SOCKET, SOCKET_ERROR, WSABUF,
     WSAEMSGSIZE, WSAEOPNOTSUPP, WSAEWOULDBLOCK, WSAGetLastError, WSAID_WSARECVMSG, WSAIoctl,
     WSAMSG, WSASendMsg, bind, closesocket, connect, getpeername, getsockname, ioctlsocket, sendto,
@@ -189,6 +189,26 @@ pub(crate) fn create(
         )));
     }
     let enabled = 1u32;
+    if win_family == AF_INET6 as i32 {
+        // Winsock IPv6 sockets default to v6-only, where IPPROTO_IP options
+        // such as IP_PKTINFO fail. The dual-stack packet-info setup below
+        // (both IP_PKTINFO and IPV6_PKTINFO, with mapped IPv4 handling in
+        // PacketControl) requires a dual-stack socket: clear V6ONLY first.
+        if unsafe {
+            setsockopt(
+                sock,
+                IPPROTO_IPV6,
+                IPV6_V6ONLY,
+                (&0u32 as *const u32).cast(),
+                size_of::<u32>() as i32,
+            )
+        } == SOCKET_ERROR
+        {
+            return Err(ProxyError::CreatingSocket(IoError::from_raw_os_error(
+                unsafe { WSAGetLastError() },
+            )));
+        }
+    }
     // Winsock needs IP_PKTINFO on IPv6 sockets for mapped IPv4 packets.
     let mut options = vec![(IPPROTO_IP, IP_PKTINFO)];
     if win_family == AF_INET6 as i32 {
