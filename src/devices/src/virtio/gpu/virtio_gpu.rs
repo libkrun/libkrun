@@ -1134,9 +1134,8 @@ mod test {
             RutabagaIovec, Transfer3D, RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D,
         };
 
-        let mut rutabaga = RutabagaBuilder::new(0, RutabagaFenceHandler::new(|_| {}))
-            .set_default_component(RutabagaComponentType::Rutabaga2D)
-            .build()
+        let mut rutabaga = RutabagaBuilder::new(RutabagaComponentType::Rutabaga2D, 0, 0)
+            .build(RutabagaFenceHandler::new(|_| {}), None)
             .unwrap();
         let (width, height) = (4, 2);
         rutabaga
@@ -1167,7 +1166,7 @@ mod test {
             )
             .unwrap();
         rutabaga
-            .transfer_write(0, 1, Transfer3D::new_2d(0, 0, width, height, 0), None)
+            .transfer_write(0, 1, Transfer3D::new_2d(0, 0, width, height))
             .unwrap();
 
         let resource = VirtioGpuResource::new(1, width, height, None, 0);
