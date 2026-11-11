@@ -322,9 +322,11 @@ SO_REUSEPORT is enabled only by an explicit application request. Cached setters
 replay before host bind/connect, including explicit SO_REUSEADDR=0. Native guest
 endpoints retain native defaults; UDP and UNIX stream reuse policy is unchanged.
 Explicit REUSEPORT permits sharing a host listening address and does not isolate
-ports between VMs. Windows IPv6 sockets clear the Winsock IPV6_V6ONLY default
-to match Linux dual-stack behavior. Other host platforms retain their native
-defaults and options.
+ports between VMs. Windows hosts keep SO_REUSEADDR guest-only: the value reads
+back but never reaches the host socket, because Winsock SO_REUSEADDR permits
+binding ports that host processes are actively using. Windows IPv6 sockets clear
+the Winsock IPV6_V6ONLY default to match Linux dual-stack behavior. Other host
+platforms retain their native defaults and options.
 
 TCP host publication defaults to best effort. For EPERM, EADDRINUSE or EADDRNOTAVAIL from
 host listen setup, the guest may keep a guest-only listener and return success.

@@ -5,6 +5,8 @@ use super::tsi_wire;
 #[cfg(unix)]
 use libc as native;
 #[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
 use windows_sys::Win32::Networking::WinSock as native;
 
 fn option(
@@ -37,6 +39,32 @@ fn option(
         _ => return Err(-tsi_wire::ENOPROTOOPT),
     };
     Ok(mapped)
+}
+
+/// Linux SO_REUSEADDR only permits rebinding over TIME_WAIT, which Winsock
+/// already allows by default. Winsock SO_REUSEADDR would instead let the guest
+/// bind ports that host processes are actively using, so the guest value is
+/// kept without touching the host socket.
+#[cfg(windows)]
+#[derive(Default)]
+pub(super) struct GuestOnlyOptions {
+    reuse_addr: AtomicBool,
+}
+
+#[cfg(windows)]
+impl GuestOnlyOptions {
+    pub(super) fn apply(&self, level: u32, name: u32, value: Option<i32>) -> Option<i32> {
+        if (level, name) != (1, 2) {
+            return None;
+        }
+        Some(match value {
+            Some(value) => {
+                self.reuse_addr.store(value != 0, Ordering::Relaxed);
+                0
+            }
+            None => i32::from(self.reuse_addr.load(Ordering::Relaxed)),
+        })
+    }
 }
 
 fn linux_error(code: i32) -> i32 {
@@ -156,6 +184,18 @@ mod tests {
             option(family, defs::SOCK_STREAM, 1, 4, true),
             Err(-tsi_wire::ENOPROTOOPT)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reuse_addr_stays_guest_only() {
+        let options = GuestOnlyOptions::default();
+        assert_eq!(options.apply(1, 2, None), Some(0));
+        assert_eq!(options.apply(1, 2, Some(5)), Some(0));
+        assert_eq!(options.apply(1, 2, None), Some(1));
+        assert_eq!(options.apply(1, 2, Some(0)), Some(0));
+        assert_eq!(options.apply(1, 2, None), Some(0));
+        assert_eq!(options.apply(1, 9, Some(1)), None);
     }
 
     #[test]

@@ -14,6 +14,8 @@ use super::packet::{
 use super::proxy::{
     AddressFamily, AsRawFd, OwnedFd, Proxy, ProxyError, ProxyStatus, ProxyUpdate, RawFd, RecvPkt,
 };
+#[cfg(windows)]
+use super::tsi_sockopt::GuestOnlyOptions;
 
 use utils::epoll::EventSet;
 use vm_memory::GuestMemoryMmap;
@@ -53,6 +55,8 @@ pub struct TsiDgramProxy {
     pub(crate) tx_cnt: Wrapping<u32>,
     pub(crate) peer_buf_alloc: u32,
     pub(crate) peer_fwd_cnt: Wrapping<u32>,
+    #[cfg(windows)]
+    pub(crate) guest_options: GuestOnlyOptions,
 }
 
 impl TsiDgramProxy {
@@ -156,6 +160,10 @@ impl Proxy for TsiDgramProxy {
             if error != 0 {
                 return Ok(error);
             }
+        }
+        #[cfg(windows)]
+        if let Some(result) = self.guest_options.apply(level, name, value) {
+            return Ok(result);
         }
         super::tsi_sockopt::socket_option(
             self.as_raw_fd(),
