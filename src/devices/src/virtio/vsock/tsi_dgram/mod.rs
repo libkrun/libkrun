@@ -43,6 +43,9 @@ pub struct TsiDgramProxy {
     pub(crate) fd: OwnedFd,
     #[cfg(windows)]
     pub(crate) recv_msg: LPFN_WSARECVMSG,
+    // Credit and polling transitions do not change the host UDP peer.
+    #[cfg(windows)]
+    host_connected: bool,
     pub status: ProxyStatus,
     pub(crate) pending_error: AtomicI32,
     pub(crate) listening: bool,
