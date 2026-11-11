@@ -16,6 +16,8 @@ use super::proxy::{
 };
 
 use utils::epoll::EventSet;
+#[cfg(windows)]
+use utils::epoll::{Epoll, EpollEvent};
 use vm_memory::GuestMemoryMmap;
 
 #[cfg(unix)]
@@ -273,7 +275,12 @@ impl Proxy for TsiStreamProxy {
         self.status
     }
 
-    fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
+    fn connect(
+        &mut self,
+        pkt: &VsockPacket,
+        req: TsiConnectReq,
+        #[cfg(windows)] epoll: &Epoll,
+    ) -> ProxyUpdate {
         if self.status == ProxyStatus::Connecting {
             let rx = MuxerRx::ConnResponse {
                 request_id: req.request_id,
@@ -286,7 +293,13 @@ impl Proxy for TsiStreamProxy {
         }
         self.control_port = pkt.src_port();
         self.connect_request_id = req.request_id;
-        sys::do_connect(self, pkt, req)
+        sys::do_connect(
+            self,
+            pkt,
+            req,
+            #[cfg(windows)]
+            epoll,
+        )
     }
 
     fn confirm_connect(&mut self, pkt: &VsockPacket) -> Option<ProxyUpdate> {
@@ -458,6 +471,16 @@ impl Proxy for TsiStreamProxy {
 
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate {
         sys::process_event(self, evset)
+    }
+
+    #[cfg(windows)]
+    fn process_windows_event(&mut self, event: &EpollEvent) -> ProxyUpdate {
+        if self.status == ProxyStatus::Connecting
+            && let Some(error) = event.connect_error()
+        {
+            return sys::finish_connect(self, error);
+        }
+        self.process_event(event.event_set())
     }
 }
 

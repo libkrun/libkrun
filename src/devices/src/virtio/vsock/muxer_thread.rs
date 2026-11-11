@@ -244,12 +244,15 @@ impl MuxerThread {
                 Ok(ev_cnt) => {
                     for ev in &epoll_events[0..ev_cnt] {
                         debug!("Event: ev.data={} ev.fd={:?}", ev.data(), ev.fd());
-                        let evset = EventSet::from_bits(ev.events).unwrap();
                         let id = ev.data();
 
                         let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
                             let mut proxy = proxy_lock.lock().unwrap();
-                            let mut update = proxy.process_event(evset);
+                            #[cfg(unix)]
+                            let mut update =
+                                proxy.process_event(EventSet::from_bits(ev.events).unwrap());
+                            #[cfg(windows)]
+                            let mut update = proxy.process_windows_event(ev);
                             // Credit updates must not rearm polling before this
                             // event's decision to stop polling has been applied.
                             if let Some((id, fd, events)) = update.polling.take() {

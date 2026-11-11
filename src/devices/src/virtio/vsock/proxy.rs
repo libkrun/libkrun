@@ -29,6 +29,8 @@ pub(super) use windows_sys::Win32::Networking::WinSock::{
 };
 
 use utils::epoll::EventSet;
+#[cfg(windows)]
+use utils::epoll::{Epoll, EpollEvent};
 
 #[derive(Debug)]
 pub enum RecvPkt {
@@ -130,7 +132,12 @@ pub trait Proxy: Send + AsRawFd {
     fn id(&self) -> u64;
     #[allow(dead_code)]
     fn status(&self) -> ProxyStatus;
-    fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate;
+    fn connect(
+        &mut self,
+        pkt: &VsockPacket,
+        req: TsiConnectReq,
+        #[cfg(windows)] epoll: &Epoll,
+    ) -> ProxyUpdate;
     fn confirm_connect(&mut self, _pkt: &VsockPacket) -> Option<ProxyUpdate> {
         None
     }
@@ -179,6 +186,10 @@ pub trait Proxy: Send + AsRawFd {
     }
     fn release(&mut self) -> ProxyUpdate;
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate;
+    #[cfg(windows)]
+    fn process_windows_event(&mut self, event: &EpollEvent) -> ProxyUpdate {
+        self.process_event(event.event_set())
+    }
 }
 
 #[cfg(windows)]

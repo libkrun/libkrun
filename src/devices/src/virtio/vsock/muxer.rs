@@ -512,7 +512,12 @@ impl VsockMuxer {
                 if address_family(&req.addr) != Some(family) {
                     return Err(-tsi_wire::EAFNOSUPPORT);
                 }
-                Ok(proxy.connect(pkt, req))
+                Ok(proxy.connect(
+                    pkt,
+                    req,
+                    #[cfg(windows)]
+                    &self.epoll,
+                ))
             });
             match update.unwrap_or(Err(-tsi_wire::ECONNREFUSED)) {
                 Ok(update) => self.process_proxy_update(id, update),

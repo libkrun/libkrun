@@ -26,7 +26,8 @@ use super::super::proxy::{
     AddressFamily, AsRawFd, NewProxyType, OwnedFd, Proxy, ProxyError, ProxyRemoval, ProxyStatus,
     ProxyUpdate, RecvPkt, address_family_from_linux,
 };
-use utils::epoll::EventSet;
+use super::super::tsi_wire::EIO;
+use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 
 fn create_stream_socket(win_family: i32) -> Result<SOCKET, i32> {
     let sock = unsafe { socket(win_family, SOCK_STREAM, 0) };
@@ -231,16 +232,26 @@ pub(crate) fn do_connect(
     proxy: &mut super::TsiStreamProxy,
     _pkt: &VsockPacket,
     req: TsiConnectReq,
+    epoll: &Epoll,
 ) -> ProxyUpdate {
-    let mut update = ProxyUpdate::default();
-
     let (sa_bytes, sa_len) = match storage_to_winsock(&req.addr) {
         Some(v) => v,
         None => {
             proxy.push_connect_rsp(-22); // EINVAL
-            return update;
+            return ProxyUpdate::default();
         }
     };
+
+    // Register first so a fast completion cannot race the FD_CONNECT watch.
+    let event = EpollEvent::new(EventSet::CONNECT | EventSet::EDGE_TRIGGERED, proxy.id);
+    if let Err(error) = epoll.ctl_socket(ControlOperation::Add, sock(proxy), &event) {
+        warn!(
+            "could not watch connect completion: id={} err={error}",
+            proxy.id
+        );
+        proxy.push_connect_rsp(-EIO);
+        return ProxyUpdate::default();
+    }
 
     let res = unsafe { connect(sock(proxy), sa_bytes.as_ptr() as *const SOCKADDR, sa_len) };
 
@@ -251,31 +262,39 @@ pub(crate) fn do_connect(
         let e = unsafe { WSAGetLastError() };
         if e == WSAEWOULDBLOCK {
             proxy.status = ProxyStatus::Connecting;
-            0
-        } else {
-            debug!("connect error: id={} err={e}", proxy.id);
-            -wsa_errno_to_linux(e)
+            return ProxyUpdate::default();
         }
+        debug!("connect error: id={} err={e}", proxy.id);
+        -wsa_errno_to_linux(e)
     };
 
-    if proxy.status == ProxyStatus::Connecting {
-        update.polling = Some((
-            proxy.id,
-            proxy.fd.as_raw_fd(),
-            EventSet::OUT | EventSet::EDGE_TRIGGERED,
-        ));
-    } else if proxy.status == ProxyStatus::Connected {
-        update.polling = Some((
-            proxy.id,
-            proxy.fd.as_raw_fd(),
-            EventSet::IN | EventSet::READ_HANG_UP,
-        ));
-        proxy.push_connect_rsp(result);
+    let interests = if result == 0 {
+        EventSet::IN | EventSet::READ_HANG_UP
     } else {
-        proxy.push_connect_rsp(result);
+        EventSet::empty()
+    };
+    proxy.push_connect_rsp(result);
+    ProxyUpdate {
+        polling: Some((proxy.id, proxy.fd.as_raw_fd(), interests)),
+        ..Default::default()
     }
+}
 
-    update
+pub(super) fn finish_connect(proxy: &mut super::TsiStreamProxy, error: i32) -> ProxyUpdate {
+    debug!("FD_CONNECT completed: id={} err={error}", proxy.id);
+    let result = if error == 0 {
+        proxy.status = ProxyStatus::Connected;
+        0
+    } else {
+        proxy.status = ProxyStatus::Closed;
+        -wsa_errno_to_linux(error)
+    };
+    proxy.push_connect_rsp(result);
+    ProxyUpdate {
+        polling: Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty())),
+        signal_queue: true,
+        ..Default::default()
+    }
 }
 
 pub(crate) fn do_getname(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket, peer: bool) {
@@ -565,13 +584,6 @@ pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) 
             update.signal_queue = true;
             return update;
         }
-    }
-
-    if evset.contains(EventSet::OUT) && proxy.status == ProxyStatus::Connecting {
-        proxy.status = ProxyStatus::Connected;
-        proxy.push_connect_rsp(0);
-        update.signal_queue = true;
-        update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
     }
 
     update
