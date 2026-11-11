@@ -14,6 +14,8 @@ use super::proxy::{
     AddressFamily, AsRawFd, OwnedFd, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate,
     RawFd, RecvPkt,
 };
+#[cfg(windows)]
+use super::tsi_sockopt::GuestOnlyOptions;
 
 use utils::epoll::EventSet;
 #[cfg(windows)]
@@ -60,6 +62,8 @@ pub struct TsiStreamProxy {
     unixsock_path: Option<PathBuf>,
     #[cfg(target_os = "linux")]
     pub(crate) protected_unix_paths: Vec<PathBuf>,
+    #[cfg(windows)]
+    guest_options: GuestOnlyOptions,
 }
 
 impl TsiStreamProxy {
@@ -104,6 +108,8 @@ impl TsiStreamProxy {
             unixsock_path: None,
             #[cfg(target_os = "linux")]
             protected_unix_paths: Vec::new(),
+            #[cfg(windows)]
+            guest_options: GuestOnlyOptions::default(),
         })
     }
 
@@ -148,6 +154,8 @@ impl TsiStreamProxy {
             unixsock_path: None,
             #[cfg(target_os = "linux")]
             protected_unix_paths: Vec::new(),
+            #[cfg(windows)]
+            guest_options: GuestOnlyOptions::default(),
         }
     }
 
@@ -337,6 +345,10 @@ impl Proxy for TsiStreamProxy {
     }
 
     fn socket_option(&self, level: u32, name: u32, value: Option<i32>) -> Result<i32, i32> {
+        #[cfg(windows)]
+        if let Some(result) = self.guest_options.apply(self.family, level, name, value) {
+            return Ok(result);
+        }
         super::tsi_sockopt::socket_option(
             self.as_raw_fd(),
             self.family,

@@ -249,6 +249,7 @@ pub(crate) fn create(
         tx_cnt: Wrapping(0),
         peer_buf_alloc: 0,
         peer_fwd_cnt: Wrapping(0),
+        guest_options: Default::default(),
     })
 }
 
