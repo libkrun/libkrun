@@ -317,6 +317,8 @@ SO_ERROR reads and clears pending errors. The datagram broker retains the first
 pending error consumed by host I/O or Linux error readiness for one guest read.
 Ordinary UDP sends remain asynchronous. This does not relay host UDP POLLERR to
 the guest; error readiness and platform-specific socket semantics remain gaps.
+Windows hosts report ICMP port-unreachable only on connected UDP sockets, as
+ECONNREFUSED, matching Linux.
 Unix host INET stream proxies default to SO_REUSEADDR=1 for listener restart;
 SO_REUSEPORT is enabled only by an explicit application request. Cached setters
 replay before host bind/connect, including explicit SO_REUSEADDR=0. Native guest
