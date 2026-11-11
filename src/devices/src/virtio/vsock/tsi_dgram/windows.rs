@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, CMSGHDR, FIONBIO, IN_PKTINFO, IN6_PKTINFO, INVALID_SOCKET, IP_PKTINFO,
     IPPROTO_IP, IPPROTO_IPV6, IPV6_PKTINFO, IPV6_V6ONLY, LPFN_WSARECVMSG, MSG_CTRUNC, MSG_TRUNC,
-    SIO_GET_EXTENSION_FUNCTION_POINTER, SOCK_DGRAM, SOCKADDR, SOCKET, SOCKET_ERROR, WSABUF,
-    WSAEMSGSIZE, WSAEOPNOTSUPP, WSAEWOULDBLOCK, WSAGetLastError, WSAID_WSARECVMSG, WSAIoctl,
-    WSAMSG, WSASendMsg, bind, closesocket, connect, getpeername, getsockname, ioctlsocket, sendto,
-    setsockopt, socket,
+    SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_UDP_CONNRESET, SOCK_DGRAM, SOCKADDR, SOCKET,
+    SOCKET_ERROR, WSABUF, WSAECONNRESET, WSAEMSGSIZE, WSAEOPNOTSUPP, WSAEWOULDBLOCK,
+    WSAGetLastError, WSAID_WSARECVMSG, WSAIoctl, WSAMSG, WSASendMsg, bind, closesocket, connect,
+    getpeername, getsockname, ioctlsocket, sendto, setsockopt, socket,
 };
 
 use super::super::super::Queue as VirtQueue;
@@ -29,7 +29,9 @@ use super::super::packet::{
 use super::super::proxy::{
     AsRawFd, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt, address_family_from_linux,
 };
-use super::super::tsi_wire::{DGRAM_HEADER_LEN, DGRAM_MAX_SIZE, DatagramInfo, encode_header};
+use super::super::tsi_wire::{
+    DGRAM_HEADER_LEN, DGRAM_MAX_SIZE, DatagramInfo, ECONNREFUSED, encode_header,
+};
 use super::super::windows::sockaddr_storage::{
     SockaddrStorage, storage_to_winsock, winsock_to_storage,
 };
@@ -149,6 +151,31 @@ fn sock(proxy: &super::TsiDgramProxy) -> SOCKET {
     proxy.fd.as_raw_socket() as SOCKET
 }
 
+/// Winsock turns ICMP port-unreachable into WSAECONNRESET on the next receive
+/// even for unconnected sockets, while Linux reports it only on connected ones.
+fn report_port_unreachable(sock: SOCKET, enabled: bool) {
+    let enabled = u32::from(enabled);
+    let mut returned = 0;
+    let result = unsafe {
+        WSAIoctl(
+            sock,
+            SIO_UDP_CONNRESET,
+            from_ref(&enabled).cast(),
+            size_of::<u32>() as u32,
+            null_mut(),
+            0,
+            &mut returned,
+            null_mut(),
+            None,
+        )
+    };
+    if result == SOCKET_ERROR {
+        warn!("SIO_UDP_CONNRESET failed: err={}", unsafe {
+            WSAGetLastError()
+        });
+    }
+}
+
 pub(crate) fn create(
     id: u64,
     cid: u64,
@@ -163,6 +190,7 @@ pub(crate) fn create(
         .map_err(|e| ProxyError::CreatingSocket(IoError::from_raw_os_error(e)))?;
 
     let fd = unsafe { OwnedSocket::from_raw_socket(sock as RawSocket) };
+    report_port_unreachable(sock, false);
     let mut recv_msg: LPFN_WSARECVMSG = None;
     let mut returned = 0;
     let result = unsafe {
@@ -300,7 +328,10 @@ pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -
     } else if unsafe { WSAGetLastError() } == WSAEMSGSIZE {
         (capacity, true)
     } else {
-        let error = wsa_errno_to_linux(unsafe { WSAGetLastError() });
+        let error = match unsafe { WSAGetLastError() } {
+            WSAECONNRESET => ECONNREFUSED,
+            e => wsa_errno_to_linux(e),
+        };
         if error != 11 && error != 4 {
             proxy.record_error(error);
         }
@@ -382,6 +413,7 @@ pub(crate) fn do_connect(
         }
         -wsa_errno_to_linux(e as i32)
     } else {
+        report_port_unreachable(sock(proxy), true);
         proxy.status = ProxyStatus::Connected;
         0
     };
@@ -414,6 +446,7 @@ pub(crate) fn do_disconnect(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket)
     let result = if res == SOCKET_ERROR {
         -wsa_errno_to_linux(unsafe { WSAGetLastError() })
     } else {
+        report_port_unreachable(sock(proxy), false);
         proxy.status = ProxyStatus::Idle;
         0
     };
