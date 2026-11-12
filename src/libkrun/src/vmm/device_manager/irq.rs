@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::vec;
 
 /// No more IRQs are available.
 #[derive(Debug, PartialEq, Eq)]
@@ -16,14 +17,6 @@ impl fmt::Display for IrqsExhausted {
     }
 }
 
-#[derive(Debug)]
-struct IrqRange {
-    /// Next IRQ to hand out, `None` once the range is exhausted.
-    next: Option<u32>,
-    /// Last IRQ (inclusive) that may be handed out.
-    last: u32,
-}
-
 /// Hands out interrupt lines from a fixed range.
 ///
 /// Every device manager that needs an IRQ (MMIO, PCI INTx) must draw it from
@@ -31,26 +24,28 @@ struct IrqRange {
 /// share the same state.
 #[derive(Clone, Debug)]
 pub struct IrqAllocator {
-    range: Arc<Mutex<IrqRange>>,
+    free: Arc<Mutex<vec::IntoIter<u32>>>,
 }
 
 impl IrqAllocator {
-    /// Create an allocator handing out the IRQs `first..=last`.
-    pub fn new(first: u32, last: u32) -> Self {
+    /// Create an allocator handing out the IRQs `first..=last`, skipping
+    /// the `excluded` ones.
+    pub fn new(first: u32, last: u32, excluded: &[u32]) -> Self {
+        let free: Vec<u32> = (first..=last)
+            .filter(|irq| !excluded.contains(irq))
+            .collect();
         Self {
-            range: Arc::new(Mutex::new(IrqRange {
-                next: (first <= last).then_some(first),
-                last,
-            })),
+            free: Arc::new(Mutex::new(free.into_iter())),
         }
     }
 
     /// Allocate the next free IRQ.
     pub fn alloc(&self) -> Result<u32, IrqsExhausted> {
-        let mut range = self.range.lock().expect("Poisoned IRQ allocator lock");
-        let irq = range.next.ok_or(IrqsExhausted)?;
-        range.next = (irq < range.last).then(|| irq + 1);
-        Ok(irq)
+        self.free
+            .lock()
+            .expect("Poisoned IRQ allocator lock")
+            .next()
+            .ok_or(IrqsExhausted)
     }
 }
 
@@ -60,7 +55,7 @@ mod tests {
 
     #[test]
     fn test_alloc_sequential() {
-        let irqs = IrqAllocator::new(5, 7);
+        let irqs = IrqAllocator::new(5, 7, &[]);
         assert_eq!(irqs.alloc(), Ok(5));
         assert_eq!(irqs.alloc(), Ok(6));
         assert_eq!(irqs.alloc(), Ok(7));
@@ -68,7 +63,7 @@ mod tests {
 
     #[test]
     fn test_alloc_exhausted() {
-        let irqs = IrqAllocator::new(5, 6);
+        let irqs = IrqAllocator::new(5, 6, &[]);
         irqs.alloc().unwrap();
         irqs.alloc().unwrap();
         assert_eq!(irqs.alloc(), Err(IrqsExhausted));
@@ -78,20 +73,54 @@ mod tests {
 
     #[test]
     fn test_alloc_single_irq_range() {
-        let irqs = IrqAllocator::new(9, 9);
+        let irqs = IrqAllocator::new(9, 9, &[]);
         assert_eq!(irqs.alloc(), Ok(9));
         assert_eq!(irqs.alloc(), Err(IrqsExhausted));
     }
 
     #[test]
+    fn test_alloc_skips_excluded_irqs() {
+        // x86_64 shape: RTC owns IRQ 8 inside the virtio range.
+        let irqs = IrqAllocator::new(5, 23, &[8]);
+        assert_eq!(irqs.alloc(), Ok(5));
+        assert_eq!(irqs.alloc(), Ok(6));
+        assert_eq!(irqs.alloc(), Ok(7));
+        assert_eq!(irqs.alloc(), Ok(9));
+        assert_eq!(irqs.alloc(), Ok(10));
+    }
+
+    #[test]
+    fn test_alloc_excluded_first_irq() {
+        let irqs = IrqAllocator::new(8, 10, &[8]);
+        assert_eq!(irqs.alloc(), Ok(9));
+        assert_eq!(irqs.alloc(), Ok(10));
+        assert_eq!(irqs.alloc(), Err(IrqsExhausted));
+    }
+
+    #[test]
+    fn test_alloc_all_excluded() {
+        let irqs = IrqAllocator::new(8, 9, &[8, 9]);
+        assert_eq!(irqs.alloc(), Err(IrqsExhausted));
+    }
+
+    #[test]
+    fn test_alloc_ignores_out_of_range_exclusions() {
+        let irqs = IrqAllocator::new(5, 7, &[4, 8, 100]);
+        assert_eq!(irqs.alloc(), Ok(5));
+        assert_eq!(irqs.alloc(), Ok(6));
+        assert_eq!(irqs.alloc(), Ok(7));
+        assert_eq!(irqs.alloc(), Err(IrqsExhausted));
+    }
+
+    #[test]
     fn test_alloc_empty_range() {
-        let irqs = IrqAllocator::new(8, 7);
+        let irqs = IrqAllocator::new(8, 7, &[]);
         assert_eq!(irqs.alloc(), Err(IrqsExhausted));
     }
 
     #[test]
     fn test_alloc_does_not_wrap_at_u32_max() {
-        let irqs = IrqAllocator::new(u32::MAX - 1, u32::MAX);
+        let irqs = IrqAllocator::new(u32::MAX - 1, u32::MAX, &[]);
         assert_eq!(irqs.alloc(), Ok(u32::MAX - 1));
         assert_eq!(irqs.alloc(), Ok(u32::MAX));
         assert_eq!(irqs.alloc(), Err(IrqsExhausted));
@@ -99,7 +128,7 @@ mod tests {
 
     #[test]
     fn test_clones_share_state() {
-        let mmio = IrqAllocator::new(5, 23);
+        let mmio = IrqAllocator::new(5, 23, &[]);
         let pci = mmio.clone();
         assert_eq!(mmio.alloc(), Ok(5));
         assert_eq!(pci.alloc(), Ok(6));

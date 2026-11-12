@@ -288,7 +288,7 @@ mod tests {
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
         let mut device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
 
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
@@ -309,7 +309,7 @@ mod tests {
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
         let mut device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
 
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
@@ -353,7 +353,7 @@ mod tests {
     fn test_error_messages() {
         let device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
         let e = Error::Cmdline(
@@ -409,7 +409,7 @@ mod tests {
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
         let mut device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
@@ -419,11 +419,7 @@ mod tests {
         if let Ok(addr) =
             device_manager.register_virtio_device(guest_mem, dummy, &mut cmdline, type_id, &id)
         {
-            assert!(
-                device_manager
-                    .get_device(DeviceType::Virtio(type_id), &id)
-                    .is_some()
-            );
+            assert!(device_manager.bus.get_device(addr).is_some());
             assert_eq!(
                 addr,
                 device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id.clone())].addr
@@ -433,11 +429,10 @@ mod tests {
                 device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id.clone())].irq
             );
         }
-        let id = "bar";
         assert!(
-            device_manager
-                .get_device(DeviceType::Virtio(type_id), id)
-                .is_none()
+            !device_manager
+                .id_to_dev_info
+                .contains_key(&(DeviceType::Virtio(type_id), String::from("bar")))
         );
     }
 
@@ -445,7 +440,7 @@ mod tests {
     fn test_register_ioapic_none() {
         let mut device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
         assert!(device_manager.register_mmio_ioapic(None).is_ok());
     }

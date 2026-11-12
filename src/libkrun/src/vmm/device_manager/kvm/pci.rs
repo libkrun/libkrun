@@ -225,7 +225,7 @@ mod tests {
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
 
-        let irqs = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX);
+        let irqs = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]);
         let mut mmio = MMIODeviceManager::new(&mut 0xd000_0000, irqs.clone());
         let mut pci = PciHostManager::new(irqs);
 
@@ -258,7 +258,7 @@ mod tests {
         let mut arch_mem_info = arch::ArchMemoryInfo::default();
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
 
-        let irqs = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_BASE);
+        let irqs = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_BASE, &[]);
         // Another manager already took the only IRQ.
         irqs.alloc().unwrap();
         let mut pci = PciHostManager::new(irqs);
