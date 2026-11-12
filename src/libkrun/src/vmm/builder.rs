@@ -1143,7 +1143,7 @@ pub fn build_microvm(
 
     // Every device manager draws its interrupt lines from this one allocator,
     // so that devices on different transports never share a line.
-    let irq_allocator = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX);
+    let irq_allocator = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, arch::IRQ_RESERVED);
 
     #[cfg(all(
         target_arch = "x86_64",

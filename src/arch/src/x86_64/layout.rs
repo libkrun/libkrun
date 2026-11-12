@@ -28,6 +28,13 @@ pub const HIMEM_START: u64 = 0x0010_0000; //1 MB.
 pub const IRQ_BASE: u32 = 5;
 /// Last usable IRQ ID for virtio device interrupts on x86_64.
 pub const IRQ_MAX: u32 = 23;
+/// IRQs inside `IRQ_BASE..=IRQ_MAX` reserved for ISA legacy devices.
+///
+/// The RTC (`rtc_cmos`) owns IRQ 8 and requests it non-shared: a virtio
+/// device handed line 8 fails its probe with -EBUSY ("genirq: Flags
+/// mismatch"), which silently kills the affected device (e.g. the
+/// virtio-vsock transport backing TSI and timesync).
+pub const IRQ_RESERVED: &[u32] = &[8];
 
 /// Address for the TSS setup.
 pub const KVM_TSS_ADDRESS: u64 = 0xfffb_d000;

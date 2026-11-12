@@ -387,7 +387,7 @@ mod tests {
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
         let mut device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
 
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
@@ -408,7 +408,7 @@ mod tests {
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
         let mut device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
 
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
@@ -452,7 +452,7 @@ mod tests {
     fn test_error_messages() {
         let device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
         let e = Error::Cmdline(
@@ -496,7 +496,7 @@ mod tests {
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
         let mut device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
