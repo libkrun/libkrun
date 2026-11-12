@@ -21,7 +21,7 @@ use super::super::{DeviceQueue, GpuError, Queue as VirtQueue};
 use super::protocol::{
     GpuCommand, GpuResponse, VirtioGpuResult, virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
 };
-use super::virtio_gpu::VirtioGpu;
+use super::virtio_gpu::{GpuBackendConfig, VirtioGpu};
 use crate::display::DisplayInfo;
 use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::{VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX};
@@ -36,7 +36,7 @@ pub struct Worker {
     mem: GuestMemoryMmap,
     interrupt: InterruptTransport,
     shm_region: VirtioShmRegion,
-    virgl_flags: u32,
+    backend_config: GpuBackendConfig,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     export_table: Option<ExportTable>,
@@ -51,7 +51,7 @@ impl Worker {
         mem: GuestMemoryMmap,
         interrupt: InterruptTransport,
         shm_region: VirtioShmRegion,
-        virgl_flags: u32,
+        backend_config: GpuBackendConfig,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
@@ -71,7 +71,7 @@ impl Worker {
             mem,
             interrupt,
             shm_region,
-            virgl_flags,
+            backend_config,
             #[cfg(target_os = "macos")]
             map_sender,
             export_table,
@@ -92,7 +92,7 @@ impl Worker {
             self.mem.clone(),
             self.control_queue.clone(),
             self.interrupt.clone(),
-            self.virgl_flags,
+            self.backend_config,
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
             self.export_table.take(),

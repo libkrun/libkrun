@@ -1945,24 +1945,10 @@ impl DisplayBackend {
     }
 }
 
-export_bitflags! {
-    #[cfg(feature = "gpu")]
-    bitflags::bitflags! {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub struct VirglRendererFlags: u32 {
-            const USE_EGL            = 0x001;
-            const THREAD_SYNC        = 0x002;
-            const VENUS              = 0x040;
-            const USE_ASYNC_FENCE_CB = 0x100;
-            const RENDER_SERVER      = 0x200;
-        }
-    }
-}
-
-/// A virtio GPU device with virgl 3D acceleration.
+/// A virtio GPU device.
 #[cfg(feature = "gpu")]
 pub struct GpuDevice {
-    virgl_flags: u32,
+    backend_config: devices::virtio::gpu::GpuBackendConfig,
     backend: DisplayBackend,
     shm_size: usize,
 }
@@ -1972,12 +1958,42 @@ pub struct GpuDevice {
 impl GpuDevice {
     const DEFAULT_SHM_SIZE: usize = 1 << 33;
 
-    pub fn new(virgl_flags: VirglRendererFlags, backend: DisplayBackend) -> Self {
+    /// Creates a GPU device backed by virglrenderer.
+    pub fn virgl(backend: DisplayBackend) -> Self {
         Self {
-            virgl_flags: virgl_flags.bits(),
+            backend_config: devices::virtio::gpu::GpuBackendConfig::virgl(),
             backend,
             shm_size: Self::DEFAULT_SHM_SIZE,
         }
+    }
+
+    /// Creates a GPU device backed by gfxstream.
+    pub fn gfxstream(backend: DisplayBackend) -> Self {
+        Self {
+            backend_config: devices::virtio::gpu::GpuBackendConfig::gfxstream(),
+            backend,
+            shm_size: Self::DEFAULT_SHM_SIZE,
+        }
+    }
+
+    pub fn use_egl(mut self, enable: bool) -> Self {
+        self.backend_config.set_use_egl(enable);
+        self
+    }
+
+    pub fn use_gles(mut self, enable: bool) -> Self {
+        self.backend_config.set_use_gles(enable);
+        self
+    }
+
+    pub fn render_server(mut self, enable: bool) -> Self {
+        self.backend_config.set_render_server(enable);
+        self
+    }
+
+    pub fn venus(mut self, enable: bool) -> Self {
+        self.backend_config.set_venus(enable);
+        self
     }
 
     pub fn shm_size(mut self, size: usize) -> Self {
@@ -2002,7 +2018,7 @@ impl<'a> AttachDevice<'a> for GpuDevice {
         let displays: Box<[DisplayInfo]> = self.backend.displays.into_boxed_slice();
 
         let gpu = devices::virtio::Gpu::new(
-            self.virgl_flags,
+            self.backend_config,
             displays,
             self.backend.inner,
             #[cfg(target_os = "macos")]
