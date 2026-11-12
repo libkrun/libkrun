@@ -178,6 +178,19 @@ static KrunDeviceManager virtio_devices_new(enum transport_mode transport_mode)
     return krun_mmio_device_manager_new();
 }
 
+static bool vhost_user_requested(const struct cmdline *cmdline)
+{
+    return cmdline->vhost_user_rng_socket != NULL ||
+           cmdline->vhost_user_rtc_socket != NULL ||
+           cmdline->vhost_user_input_socket != NULL ||
+           cmdline->vhost_user_gpu_socket != NULL ||
+           cmdline->vhost_user_snd_socket != NULL ||
+           cmdline->vhost_user_vsock_socket != NULL ||
+           cmdline->vhost_user_can_socket != NULL ||
+           cmdline->vhost_user_console_socket != NULL ||
+           cmdline->vhost_user_media_socket != NULL;
+}
+
 bool cmdline_set_log_target(struct cmdline *cmdline, const char *arg) {
     int fd = open(arg, O_WRONLY);
     if (fd < 0) {
@@ -370,6 +383,7 @@ int main(int argc, char *const argv[])
     KrunError krun_err;
     struct cmdline cmdline;
     struct rlimit rlim;
+    bool use_vhost_user;
 
     if (!parse_cmdline(argc, argv, &cmdline)) {
         putchar('\n');
@@ -382,16 +396,9 @@ int main(int argc, char *const argv[])
         return 0;
     }
 
-    if (cmdline.transport_mode == TRANSPORT_MODE_PCI &&
-        (cmdline.vhost_user_rng_socket != NULL ||
-            cmdline.vhost_user_rtc_socket != NULL ||
-            cmdline.vhost_user_input_socket != NULL ||
-            cmdline.vhost_user_gpu_socket != NULL ||
-            cmdline.vhost_user_snd_socket != NULL ||
-            cmdline.vhost_user_vsock_socket != NULL ||
-            cmdline.vhost_user_can_socket != NULL ||
-            cmdline.vhost_user_console_socket != NULL ||
-            cmdline.vhost_user_media_socket != NULL)) {
+    use_vhost_user = vhost_user_requested(&cmdline);
+
+    if (cmdline.transport_mode == TRANSPORT_MODE_PCI && use_vhost_user) {
         fprintf(stderr, "PCI transport does not currently support vhost-user devices\n");
         return -1;
     }
@@ -437,6 +444,7 @@ int main(int argc, char *const argv[])
         krun_device_manager_add(devices, console);
     }
 
+#if (defined(__linux__) && !defined(__ANDROID__))
     // Configure vhost-user RNG if requested
     if (cmdline.vhost_user_rng_socket != NULL) {
         // Auto-detect queue count; use custom queue size of 512
@@ -514,6 +522,8 @@ int main(int argc, char *const argv[])
         krun_device_manager_add(devices, media);
         printf("Using vhost-user media backend at %s\n", cmdline.vhost_user_media_socket);
     }
+#endif // (defined(__linux__) && !defined(__ANDROID__))
+
 
     // Raise RLIMIT_NOFILE to the maximum allowed to create some room for virtio-fs
     getrlimit(RLIMIT_NOFILE, &rlim);
