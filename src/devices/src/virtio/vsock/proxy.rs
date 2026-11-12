@@ -10,8 +10,13 @@ pub(super) use std::os::windows::io::OwnedSocket as OwnedFd;
 #[cfg(windows)]
 pub(super) use utils::windows::{AsRawFd, RawFd};
 
+#[cfg(target_os = "macos")]
+use super::super::linux_errno::linux_errno_raw;
+#[cfg(windows)]
+use super::super::linux_errno::wsa_errno_to_linux;
 use super::muxer::MuxerRx;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
+use super::tsi_wire;
 #[cfg(unix)]
 pub(super) use nix::sys::socket::AddressFamily;
 /// On Windows, reuse the WinSock `ADDRESS_FAMILY` type (a `u16`) directly so
@@ -38,6 +43,28 @@ pub enum ProxyError {
     InvalidFamily,
     SettingReuseAddr(std::io::Error),
     SettingReusePort(std::io::Error),
+}
+
+impl ProxyError {
+    pub fn linux_errno(&self) -> i32 {
+        let error = match self {
+            Self::CreatingSocket(e) | Self::SettingReuseAddr(e) | Self::SettingReusePort(e) => e,
+            Self::InvalidFamily => return tsi_wire::EAFNOSUPPORT,
+        };
+        let code = error.raw_os_error().unwrap_or(tsi_wire::EIO);
+        #[cfg(target_os = "linux")]
+        {
+            code
+        }
+        #[cfg(target_os = "macos")]
+        {
+            linux_errno_raw(code)
+        }
+        #[cfg(windows)]
+        {
+            wsa_errno_to_linux(code)
+        }
+    }
 }
 
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
@@ -84,6 +111,9 @@ impl fmt::Display for ProxyError {
 }
 
 pub trait Proxy: Send + AsRawFd {
+    fn is_tsi(&self) -> bool {
+        false
+    }
     #[allow(dead_code)]
     fn id(&self) -> u64;
     #[allow(dead_code)]
@@ -92,7 +122,20 @@ pub trait Proxy: Send + AsRawFd {
     fn confirm_connect(&mut self, _pkt: &VsockPacket) -> Option<ProxyUpdate> {
         None
     }
-    fn getpeername(&mut self, pkt: &VsockPacket);
+    fn disconnect(&mut self, _pkt: &VsockPacket) -> Option<ProxyUpdate> {
+        None
+    }
+    fn bind_datagram(
+        &mut self,
+        _req: TsiSendtoAddr,
+        _host_port_map: &Option<HashMap<u16, u16>>,
+    ) -> Option<Result<ProxyUpdate, i32>> {
+        None
+    }
+    fn socket_option(&self, _level: u32, _name: u32, _value: Option<i32>) -> Result<i32, i32> {
+        Err(-tsi_wire::ENOPROTOOPT)
+    }
+    fn getname(&mut self, pkt: &VsockPacket, peer: bool);
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
     fn sendto_addr(&mut self, req: TsiSendtoAddr) -> ProxyUpdate;
     fn sendto_data(&mut self, _pkt: &VsockPacket) {}

@@ -37,10 +37,7 @@ pub struct Payload {
 #[cfg_attr(feature = "ffi", ffier::export)]
 impl Payload {
     pub fn load_krunfw() -> Result<Self, VmmError> {
-        let lib = KRUNFW.as_ref().ok_or_else(|| {
-            log::error!("could not load {KRUNFW_NAME}");
-            VmmError::FileNotFound()
-        })?;
+        let lib = krunfw_library()?;
 
         let bundle = load_kernel_bundle(lib)?;
         Ok(Payload {
@@ -55,10 +52,7 @@ impl Payload {
     ) -> Result<Self, VmmError> {
         #[cfg(feature = "tee")]
         {
-            let lib = KRUNFW.as_ref().ok_or_else(|| {
-                log::error!("could not load {KRUNFW_NAME}");
-                VmmError::FileNotFound()
-            })?;
+            let lib = krunfw_library()?;
 
             let bundle = load_kernel_bundle(lib)?;
             #[cfg(feature = "tdx")]
@@ -169,6 +163,20 @@ impl Payload {
 fn load_kernel_bundle(
     lib: &libloading::Library,
 ) -> Result<crate::vmm::vmm_config::kernel_bundle::KernelBundle, VmmError> {
+    let get_version: libloading::Symbol<unsafe extern "C" fn() -> libc::c_int> = unsafe {
+        lib.get(b"krunfw_get_version").map_err(|e| {
+            VmmError::BootError(format!(
+                "cannot verify libkrunfw ABI {KRUNFW_ABI} (TSIv4): krunfw_get_version: {e}"
+            ))
+        })?
+    };
+    let version = unsafe { get_version() };
+    if version != KRUNFW_ABI {
+        return Err(VmmError::BootError(format!(
+            "libkrunfw ABI mismatch: expected {KRUNFW_ABI} (TSIv4), found {version}"
+        )));
+    }
+
     let get_kernel: libloading::Symbol<
         unsafe extern "C" fn(*mut u64, *mut u64, *mut usize) -> *mut libc::c_char,
     > = unsafe {
@@ -268,15 +276,140 @@ fn load_initrd_bundle(
 }
 
 #[cfg(all(target_os = "linux", not(feature = "tee")))]
-const KRUNFW_NAME: &str = "libkrunfw.so.5";
+const KRUNFW_NAME: &str = "libkrunfw.so.6";
 #[cfg(all(target_os = "linux", feature = "amd-sev"))]
-const KRUNFW_NAME: &str = "libkrunfw-sev.so.5";
+const KRUNFW_NAME: &str = "libkrunfw-sev.so.6";
 #[cfg(all(target_os = "linux", feature = "tdx"))]
-const KRUNFW_NAME: &str = "libkrunfw-tdx.so.5";
+const KRUNFW_NAME: &str = "libkrunfw-tdx.so.6";
 #[cfg(target_os = "macos")]
-const KRUNFW_NAME: &str = "libkrunfw.5.dylib";
+const KRUNFW_NAME: &str = "libkrunfw.6.dylib";
 #[cfg(target_os = "windows")]
 const KRUNFW_NAME: &str = "libkrunfw.dll";
 
-static KRUNFW: std::sync::LazyLock<Option<libloading::Library>> =
-    std::sync::LazyLock::new(|| unsafe { libloading::Library::new(KRUNFW_NAME).ok() });
+const KRUNFW_ABI: libc::c_int = 6;
+
+static KRUNFW: std::sync::LazyLock<Result<libloading::Library, libloading::Error>> =
+    std::sync::LazyLock::new(|| unsafe { libloading::Library::new(KRUNFW_NAME) });
+
+fn krunfw_library() -> Result<&'static libloading::Library, VmmError> {
+    KRUNFW.as_ref().map_err(|e| {
+        VmmError::BootError(format!(
+            "could not load {KRUNFW_NAME} (requires libkrunfw ABI {KRUNFW_ABI}, TSIv4): {e}"
+        ))
+    })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use vmm_sys_util::tempfile::TempFile;
+
+    const KERNEL: &str = r#"
+#include <stddef.h>
+#include <stdint.h>
+char *krunfw_get_kernel(uint64_t *load, uint64_t *entry, size_t *size)
+{
+    static char data[] = { 1, 2, 3, 4 };
+    *load = 0x100000;
+    *entry = 0x100100;
+    *size = sizeof(data);
+    return data;
+}
+"#;
+
+    fn fixture(source: &str) -> (libloading::Library, TempFile) {
+        let file = TempFile::new().unwrap();
+        let link_flag = if cfg!(target_os = "macos") {
+            "-dynamiclib"
+        } else {
+            "-shared"
+        };
+        let mut compiler = Command::new("cc")
+            .args([link_flag, "-fPIC", "-x", "c", "-o"])
+            .arg(file.as_path())
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        compiler
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(source.as_bytes())
+            .unwrap();
+        let output = compiler.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let library = unsafe { libloading::Library::new(file.as_path()).unwrap() };
+        (library, file)
+    }
+
+    #[test]
+    fn accepts_abi_6() {
+        let (library, _file) = fixture(&format!(
+            "int krunfw_get_version(void) {{ return 6; }}\n{KERNEL}"
+        ));
+        let bundle = load_kernel_bundle(&library).unwrap();
+        assert_eq!(bundle.guest_addr, 0x100000);
+        assert_eq!(bundle.entry_addr, 0x100100);
+        assert_eq!(bundle.size, 4);
+        assert_eq!(unsafe { *(bundle.host_addr as *const u8) }, 1);
+    }
+
+    #[test]
+    fn rejects_incompatible_abi_before_kernel_lookup() {
+        for version in [-1, 0, 5, 7] {
+            let (library, _file) = fixture(&format!(
+                "int krunfw_get_version(void) {{ return {version}; }}"
+            ));
+            let error = load_kernel_bundle(&library).unwrap_err();
+            assert!(matches!(error, VmmError::BootError(_)));
+            let message = error.to_string();
+            assert!(message.contains("expected 6"), "{message}");
+            assert!(message.contains(&format!("found {version}")), "{message}");
+        }
+    }
+
+    #[test]
+    fn rejects_missing_abi_export() {
+        let (library, _file) = fixture(KERNEL);
+        let error = load_kernel_bundle(&library).unwrap_err();
+        assert!(matches!(error, VmmError::BootError(_)));
+        let message = error.to_string();
+        assert!(message.contains("krunfw_get_version"), "{message}");
+        assert!(message.contains("ABI 6"), "{message}");
+    }
+
+    #[test]
+    fn abi_6_still_requires_kernel_export() {
+        let (library, _file) = fixture("int krunfw_get_version(void) { return 6; }");
+        assert!(matches!(
+            load_kernel_bundle(&library),
+            Err(VmmError::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn abi_6_still_rejects_null_kernel() {
+        let (library, _file) = fixture(
+            r#"
+#include <stddef.h>
+#include <stdint.h>
+int krunfw_get_version(void) { return 6; }
+char *krunfw_get_kernel(uint64_t *load, uint64_t *entry, size_t *size) { return NULL; }
+"#,
+        );
+        let error = load_kernel_bundle(&library).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("krunfw_get_kernel returned null")
+        );
+    }
+}

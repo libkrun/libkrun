@@ -2,19 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-/// `VsockPacket` provides a thin wrapper over the buffers exchanged via virtio queues.
-/// There are two components to a vsock packet, each using its own descriptor in a
-/// virtio queue:
-/// - the packet header; and
-/// - the packet data/buffer.
-///
-/// There is a 1:1 relation between descriptor chains and packets: the first (chain head) holds
-/// the header, and an optional second descriptor holds the data. The second descriptor is only
-/// present for data packets (VSOCK_OP_RW).
-///
-/// `VsockPacket` wraps these two buffers and provides direct access to the data stored
-/// in guest memory. This is done to avoid unnecessarily copying data from guest memory
-/// to temporary buffers, before passing it on to the vsock backend.
+/// VSOCK headers occupy the beginning of a descriptor chain. Payload may be
+/// inline after the header, in subsequent descriptors, or both. Contiguous
+/// payloads use guest memory directly; scattered payloads use bounded staging.
 use std::convert::TryInto;
 use std::ffi::CStr;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -22,6 +12,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::net::{Ipv6Addr, SocketAddrV6};
 use std::os::raw::c_char;
 use std::result;
+use std::{ptr, slice};
 
 #[cfg(windows)]
 use super::windows::sockaddr_storage::SockaddrStorage;
@@ -106,10 +97,12 @@ pub struct TsiProxyCreate {
     pub peer_port: u32,
     pub family: u16,
     pub _type: u16,
+    pub protocol: u32,
 }
 
 #[repr(C)]
 pub struct TsiConnectReq {
+    pub request_id: u64,
     pub peer_port: u32,
     pub addr: SockaddrStorage,
 }
@@ -128,6 +121,7 @@ pub struct TsiGetnameReq {
 
 #[repr(C)]
 #[derive(Debug)]
+#[cfg_attr(feature = "tsi-fault-injection", derive(Clone))]
 pub struct TsiGetnameRsp {
     pub result: i32,
     pub addr_len: u32,
@@ -160,17 +154,37 @@ pub struct TsiListenReq {
     pub vm_port: u32,
     pub backlog: i32,
     pub addr: SockaddrStorage,
+    pub strict: bool,
+}
+
+impl TsiListenReq {
+    pub fn response_flags(&self) -> u32 {
+        #[cfg(unix)]
+        let inet = self.addr.as_sockaddr_in().is_some() || self.addr.as_sockaddr_in6().is_some();
+        #[cfg(windows)]
+        let inet = matches!(
+            self.addr.family(),
+            defs::LINUX_AF_INET | defs::LINUX_AF_INET6
+        );
+        if self.strict && inet {
+            defs::TSI_LISTEN_STRICT
+        } else {
+            0
+        }
+    }
 }
 
 #[repr(C)]
 #[derive(Debug)]
 pub struct TsiListenRsp {
     pub result: i32,
+    pub flags: u32,
 }
 
 #[repr(C)]
 #[derive(Debug)]
 pub struct TsiAcceptReq {
+    pub request_id: u64,
     pub peer_port: u32,
     pub flags: u32,
 }
@@ -187,14 +201,12 @@ pub struct TsiReleaseReq {
     pub local_port: u32,
 }
 
-/// The vsock packet, implemented as a wrapper over a virtq descriptor chain:
-/// - the chain head, holding the packet header; and
-/// - (an optional) data/buffer descriptor, only present for data packets (VSOCK_OP_RW).
 pub struct VsockPacket {
     hdr: *mut u8,
     buf: Option<*mut u8>,
     buf_size: usize,
     owned_buf: Option<Vec<u8>>,
+    rx_regions: Vec<(*mut u8, usize)>,
 }
 
 fn get_host_address<T: GuestMemoryBackend>(
@@ -205,196 +217,191 @@ fn get_host_address<T: GuestMemoryBackend>(
     Ok(mem.get_slice(guest_addr, size)?.ptr_guard_mut().as_ptr())
 }
 
+fn data_regions(
+    head: &DescriptorChain,
+    writable: bool,
+    limit: usize,
+) -> Result<Vec<(*mut u8, usize)>> {
+    let mut remaining = limit;
+    let mut regions = Vec::new();
+    for (i, desc) in head.clone().into_iter().enumerate() {
+        if desc.is_write_only() != writable {
+            return Err(if writable {
+                VsockError::UnwritableDescriptor
+            } else {
+                VsockError::UnreadableDescriptor
+            });
+        }
+        let offset = if i == 0 { VSOCK_PKT_HDR_SIZE } else { 0 };
+        let count = (desc.len as usize - offset).min(remaining);
+        if count > 0 {
+            let addr = desc
+                .addr
+                .checked_add(offset as u64)
+                .ok_or(VsockError::GuestMemoryBounds)?;
+            let ptr =
+                get_host_address(desc.mem, addr, count).map_err(VsockError::GuestMemoryMmap)?;
+            regions.push((ptr, count));
+            remaining -= count;
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    Ok(regions)
+}
+
 impl VsockPacket {
-    /// Create the packet wrapper from a TX virtq chain head.
-    ///
-    /// The chain head is expected to hold valid packet header data. A following packet buffer
-    /// descriptor can optionally end the chain. Bounds and pointer checks are performed when
-    /// creating the wrapper.
     pub fn from_tx_virtq_head(head: &DescriptorChain) -> Result<Self> {
-        // All buffers in the TX queue must be readable.
-        //
         if head.is_write_only() {
             return Err(VsockError::UnreadableDescriptor);
         }
-
-        // The packet header should fit inside the head descriptor.
         if head.len < VSOCK_PKT_HDR_SIZE as u32 {
             return Err(VsockError::HdrDescTooSmall(head.len));
         }
-
         let mut pkt = Self {
             hdr: get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
                 .map_err(VsockError::GuestMemoryMmap)?,
             buf: None,
             buf_size: 0,
             owned_buf: None,
+            rx_regions: Vec::new(),
         };
-        let pkt_len = pkt.len();
-
-        // No point looking for a data/buffer descriptor, if the packet is zero-lengthed.
-        if pkt_len == 0 {
+        let len = pkt.len() as usize;
+        if len > defs::MAX_PKT_BUF_SIZE {
+            return Err(VsockError::InvalidPktLen(len as u32));
+        }
+        if len == 0 {
             return Ok(pkt);
         }
-
-        // Reject weirdly-sized packets.
-        //
-        if pkt_len > defs::MAX_PKT_BUF_SIZE as u32 {
-            return Err(VsockError::InvalidPktLen(pkt_len));
-        }
-
-        let head_data_size = head.len as usize - VSOCK_PKT_HDR_SIZE;
-
-        // Single combined descriptor: header + data with no next descriptor.
-        if !head.has_next() {
-            if head_data_size == 0 {
-                return Err(VsockError::BufDescMissing);
-            }
-            let buf_addr = head
+        let inline = head.len as usize - VSOCK_PKT_HDR_SIZE;
+        if inline >= len {
+            let addr = head
                 .addr
                 .checked_add(VSOCK_PKT_HDR_SIZE as u64)
                 .ok_or(VsockError::GuestMemoryBounds)?;
-            pkt.buf_size = head_data_size;
-            pkt.buf = Some(
-                get_host_address(head.mem, buf_addr, pkt.buf_size)
-                    .map_err(VsockError::GuestMemoryMmap)?,
-            );
-            if pkt.buf_size < pkt_len as usize {
-                return Err(VsockError::BufDescTooSmall);
-            }
+            pkt.buf =
+                Some(get_host_address(head.mem, addr, len).map_err(VsockError::GuestMemoryMmap)?);
+            pkt.buf_size = len;
             return Ok(pkt);
         }
-
-        let buf_desc = head.next_descriptor().ok_or(VsockError::BufDescMissing)?;
-        if buf_desc.is_write_only() {
-            return Err(VsockError::UnreadableDescriptor);
-        }
-
-        // Classic two-descriptor case: header in first, all data in second. Zero-copy.
-        if head_data_size == 0 && !buf_desc.has_next() {
-            if buf_desc.len < pkt_len {
-                return Err(VsockError::BufDescTooSmall);
-            }
-            pkt.buf_size = buf_desc.len as usize;
-            pkt.buf = Some(
-                get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
-                    .map_err(VsockError::GuestMemoryMmap)?,
-            );
-            return Ok(pkt);
-        }
-
-        // Multiple data regions: inline data after header and/or multiple data descriptors.
-        // Copy into a contiguous owned buffer.
-        let mut owned_buf: Vec<u8> = Vec::with_capacity(pkt_len as usize);
-
-        if head_data_size > 0 {
-            let buf_addr = head
-                .addr
-                .checked_add(VSOCK_PKT_HDR_SIZE as u64)
-                .ok_or(VsockError::GuestMemoryBounds)?;
-            let src = get_host_address(head.mem, buf_addr, head_data_size)
-                .map_err(VsockError::GuestMemoryMmap)?;
-            owned_buf.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(src as *const u8, head_data_size)
-            });
-        }
-
-        // First data descriptor (already validated as readable above).
-        if buf_desc.len > 0 {
-            let src = get_host_address(buf_desc.mem, buf_desc.addr, buf_desc.len as usize)
-                .map_err(VsockError::GuestMemoryMmap)?;
-            owned_buf.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(src as *const u8, buf_desc.len as usize)
-            });
-        }
-
-        let mut next = buf_desc.next_descriptor();
-        while let Some(desc) = next {
+        if inline == 0 {
+            let desc = head.next_descriptor().ok_or(VsockError::BufDescMissing)?;
             if desc.is_write_only() {
                 return Err(VsockError::UnreadableDescriptor);
             }
-            if desc.len > 0 {
-                let src = get_host_address(desc.mem, desc.addr, desc.len as usize)
-                    .map_err(VsockError::GuestMemoryMmap)?;
-                owned_buf.extend_from_slice(unsafe {
-                    std::slice::from_raw_parts(src as *const u8, desc.len as usize)
-                });
+            if desc.len as usize >= len {
+                pkt.buf = Some(
+                    get_host_address(desc.mem, desc.addr, len)
+                        .map_err(VsockError::GuestMemoryMmap)?,
+                );
+                pkt.buf_size = len;
+                return Ok(pkt);
             }
-            next = desc.next_descriptor();
         }
-
-        if owned_buf.len() < (pkt_len as usize) {
+        let regions = data_regions(head, false, len)?;
+        if regions.iter().map(|(_, count)| count).sum::<usize>() != len {
             return Err(VsockError::BufDescTooSmall);
         }
-
-        pkt.buf_size = owned_buf.len();
-        pkt.owned_buf = Some(owned_buf);
-
+        let mut data = Vec::with_capacity(len);
+        for (ptr, count) in regions {
+            data.extend_from_slice(unsafe { slice::from_raw_parts(ptr, count) });
+        }
+        pkt.buf_size = len;
+        pkt.owned_buf = Some(data);
         Ok(pkt)
     }
 
-    /// Create the packet wrapper from an RX virtq chain head.
-    ///
-    /// There must be two descriptors in the chain, both writable: a header descriptor and a data
-    /// descriptor. Bounds and pointer checks are performed when creating the wrapper.
     pub fn from_rx_virtq_head(head: &DescriptorChain) -> Result<Self> {
-        // All RX buffers must be writable.
-        //
         if !head.is_write_only() {
             return Err(VsockError::UnwritableDescriptor);
         }
-
-        // The packet header should fit inside the head descriptor.
         if head.len < VSOCK_PKT_HDR_SIZE as u32 {
             return Err(VsockError::HdrDescTooSmall(head.len));
         }
-
         let mut pkt = Self {
             hdr: get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
                 .map_err(VsockError::GuestMemoryMmap)?,
             buf: None,
             buf_size: 0,
             owned_buf: None,
+            rx_regions: Vec::new(),
         };
-
-        // Starting from Linux 6.2 the virtio-vsock driver can use a single descriptor for both
-        // header and data.
-        if !head.has_next() && head.len > VSOCK_PKT_HDR_SIZE as u32 {
-            let buf_addr = head
+        if !head.has_next() && head.len as usize > VSOCK_PKT_HDR_SIZE {
+            let addr = head
                 .addr
                 .checked_add(VSOCK_PKT_HDR_SIZE as u64)
                 .ok_or(VsockError::GuestMemoryBounds)?;
-
-            pkt.buf_size = head.len as usize - VSOCK_PKT_HDR_SIZE;
+            pkt.buf_size = (head.len as usize - VSOCK_PKT_HDR_SIZE).min(defs::MAX_PKT_BUF_SIZE);
             pkt.buf = Some(
-                get_host_address(head.mem, buf_addr, pkt.buf_size)
+                get_host_address(head.mem, addr, pkt.buf_size)
                     .map_err(VsockError::GuestMemoryMmap)?,
             );
-        } else {
-            let buf_desc = head.next_descriptor().ok_or(VsockError::BufDescMissing)?;
-
-            pkt.buf_size = buf_desc.len as usize;
-            pkt.buf = Some(
-                get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
-                    .map_err(VsockError::GuestMemoryMmap)?,
-            );
+            return Ok(pkt);
         }
-
+        if head.len as usize == VSOCK_PKT_HDR_SIZE {
+            let desc = head.next_descriptor().ok_or(VsockError::BufDescMissing)?;
+            if !desc.is_write_only() {
+                return Err(VsockError::UnwritableDescriptor);
+            }
+            if !desc.has_next() && desc.len > 0 {
+                pkt.buf_size = (desc.len as usize).min(defs::MAX_PKT_BUF_SIZE);
+                pkt.buf = Some(
+                    get_host_address(desc.mem, desc.addr, pkt.buf_size)
+                        .map_err(VsockError::GuestMemoryMmap)?,
+                );
+                return Ok(pkt);
+            }
+        }
+        let mut regions = data_regions(head, true, defs::MAX_PKT_BUF_SIZE)?;
+        pkt.buf_size = regions.iter().map(|(_, count)| count).sum();
+        if pkt.buf_size == 0 {
+            return Err(VsockError::BufDescMissing);
+        }
+        if regions.len() == 1 {
+            pkt.buf = Some(regions.pop().unwrap().0);
+        } else {
+            pkt.owned_buf = Some(vec![0; pkt.buf_size]);
+            pkt.rx_regions = regions;
+        }
         Ok(pkt)
+    }
+
+    /// Scatter staged data before the caller publishes the used-ring entry.
+    pub fn finish_rx(self) -> Result<u32> {
+        let len = self.len() as usize;
+        if len > self.buf_size {
+            return Err(VsockError::BufDescTooSmall);
+        }
+        if !self.rx_regions.is_empty() {
+            let data = self.owned_buf.as_ref().unwrap();
+            let mut offset = 0;
+            for (ptr, capacity) in self.rx_regions {
+                let count = capacity.min(len - offset);
+                unsafe {
+                    ptr::copy_nonoverlapping(data.as_ptr().add(offset), ptr, count);
+                }
+                offset += count;
+                if offset == len {
+                    break;
+                }
+            }
+        }
+        Ok((VSOCK_PKT_HDR_SIZE + len) as u32)
     }
 
     /// Provides in-place, byte-slice, access to the vsock packet header.
     pub fn hdr(&self) -> &[u8] {
         // This is safe since bound checks have already been performed when creating the packet
         // from the virtq descriptor.
-        unsafe { std::slice::from_raw_parts(self.hdr as *const u8, VSOCK_PKT_HDR_SIZE) }
+        unsafe { slice::from_raw_parts(self.hdr as *const u8, VSOCK_PKT_HDR_SIZE) }
     }
 
     /// Provides in-place, byte-slice, mutable access to the vsock packet header.
     pub fn hdr_mut(&mut self) -> &mut [u8] {
         // This is safe since bound checks have already been performed when creating the packet
         // from the virtq descriptor.
-        unsafe { std::slice::from_raw_parts_mut(self.hdr, VSOCK_PKT_HDR_SIZE) }
+        unsafe { slice::from_raw_parts_mut(self.hdr, VSOCK_PKT_HDR_SIZE) }
     }
 
     /// Provides in-place, byte-slice access to the vsock packet data buffer.
@@ -411,7 +418,7 @@ impl VsockPacket {
             self.buf.map(|ptr| {
                 // This is safe since bound checks have already been performed when creating the
                 // packet from the virtq descriptor.
-                unsafe { std::slice::from_raw_parts(ptr as *const u8, self.buf_size) }
+                unsafe { slice::from_raw_parts(ptr as *const u8, self.buf_size) }
             })
         }
     }
@@ -430,7 +437,7 @@ impl VsockPacket {
             self.buf.map(|ptr| {
                 // This is safe since bound checks have already been performed when creating the
                 // packet from the virtq descriptor.
-                unsafe { std::slice::from_raw_parts_mut(ptr, self.buf_size) }
+                unsafe { slice::from_raw_parts_mut(ptr, self.buf_size) }
             })
         }
     }
@@ -549,7 +556,7 @@ impl VsockPacket {
     pub fn inet_addr(&self) -> Option<[u8; 4]> {
         if self.buf_size >= 8 {
             let ptr = &self.buf().unwrap()[4];
-            let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, 4) };
+            let slice = unsafe { slice::from_raw_parts(ptr as *const u8, 4) };
             slice[0..4].try_into().ok()
         } else {
             None
@@ -566,8 +573,20 @@ impl VsockPacket {
         }
     }
 
-    #[cfg(target_os = "linux")]
     fn parse_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
+        let len = addr_len as usize;
+        if !(2..=128).contains(&len) || buf.len() < len {
+            return None;
+        }
+        let family = byte_order::read_le_u16(buf);
+        if !matches!((family, len), (2, 16) | (10, 28) | (1, 2..=110)) {
+            return None;
+        }
+        Self::parse_host_address(&buf[..len], addr_len)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_host_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
         let sockaddr: SockaddrStorage = unsafe {
             SockaddrStorage::from_raw(&buf[0] as *const _ as *const sockaddr, Some(addr_len))?
         };
@@ -590,7 +609,7 @@ impl VsockPacket {
     }
 
     #[cfg(target_os = "macos")]
-    fn parse_address(buf: &[u8], _addr_len: u32) -> Option<SockaddrStorage> {
+    fn parse_host_address(buf: &[u8], _addr_len: u32) -> Option<SockaddrStorage> {
         let family: u16 = byte_order::read_le_u16(&buf[0..2]);
 
         match family {
@@ -603,7 +622,7 @@ impl VsockPacket {
             defs::LINUX_AF_INET6 => {
                 debug!("parse_address: AF_INET6");
                 let in_port: u16 = byte_order::read_be_u16(&buf[2..4]);
-                let flowinfo: u32 = byte_order::read_be_u32(&buf[4..8]);
+                let flowinfo: u32 = byte_order::read_be_u32(&buf[4..8]).to_be();
                 let in6_addr = Ipv6Addr::new(
                     byte_order::read_be_u16(&buf[8..10]),
                     byte_order::read_be_u16(&buf[10..12]),
@@ -614,7 +633,7 @@ impl VsockPacket {
                     byte_order::read_be_u16(&buf[20..22]),
                     byte_order::read_be_u16(&buf[22..24]),
                 );
-                let scope_id: u32 = byte_order::read_be_u32(&buf[24..28]);
+                let scope_id: u32 = byte_order::read_le_u32(&buf[24..28]);
                 Some(SocketAddrV6::new(in6_addr, in_port, flowinfo, scope_id).into())
             }
             defs::LINUX_AF_UNIX => {
@@ -628,162 +647,172 @@ impl VsockPacket {
     }
 
     #[cfg(target_os = "windows")]
-    fn parse_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
+    fn parse_host_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
         SockaddrStorage::from_linux_bytes(buf, addr_len)
     }
 
-    pub fn read_proxy_create(&self) -> Option<TsiProxyCreate> {
-        if self.buf_size >= 6 {
-            let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
-            let family: u16 = byte_order::read_le_u16(&self.buf().unwrap()[4..]);
-            let _type: u16 = byte_order::read_le_u16(&self.buf().unwrap()[6..]);
+    pub fn control_request_id(&self) -> u64 {
+        super::tsi_wire::control_id(self.buf().unwrap_or_default()).unwrap_or(0)
+    }
 
-            Some(TsiProxyCreate {
-                peer_port,
-                family,
-                _type,
-            })
-        } else {
-            None
+    pub fn control_payload(&self) -> std::result::Result<&[u8], i32> {
+        super::tsi_wire::decode_control(self.buf().unwrap_or_default(), self.dst_port())
+    }
+
+    fn control_response_buf(&mut self, request_id: u64, len: usize) -> Option<&mut [u8]> {
+        let total = super::tsi_wire::CONTROL_HEADER_LEN + len;
+        if self.buf_size < total {
+            self.set_len(0);
+            return None;
         }
+        let operation = self.src_port();
+        self.set_len(total as u32);
+        let buf = self.buf_mut()?;
+        super::tsi_wire::encode_control_reply(buf, operation, request_id, len);
+        Some(&mut buf[super::tsi_wire::CONTROL_HEADER_LEN..total])
+    }
+
+    pub fn read_proxy_create(&self) -> Option<TsiProxyCreate> {
+        let buf = self.control_payload().ok()?;
+        Some(TsiProxyCreate {
+            peer_port: byte_order::read_le_u32(buf),
+            family: byte_order::read_le_u16(&buf[4..]),
+            _type: byte_order::read_le_u16(&buf[6..]),
+            protocol: byte_order::read_le_u32(&buf[8..]),
+        })
+    }
+
+    pub(super) fn read_datagram(
+        &self,
+    ) -> Option<(
+        SockaddrStorage,
+        Option<super::tsi_wire::DatagramInfo>,
+        &[u8],
+    )> {
+        let buf = self.buf()?.get(..self.len() as usize)?;
+        let frame = super::tsi_wire::decode_datagram_send(buf)?;
+        let addr = Self::parse_address(frame.address, frame.address.len() as u32)?;
+        Some((addr, frame.info, frame.payload))
     }
 
     pub fn read_connect_req(&self) -> Option<TsiConnectReq> {
-        if self.buf_size >= 4 {
-            let buf = self.buf().unwrap();
-            let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
-            let addr_len: u32 = byte_order::read_le_u32(&buf[4..]);
-            let addr = Self::parse_address(&buf[8..], addr_len)?;
+        let buf = self.control_payload().ok()?;
+        let peer_port = byte_order::read_le_u32(buf);
+        let addr_len = byte_order::read_le_u32(&buf[4..]);
+        let addr = Self::parse_address(&buf[8..], addr_len)?;
+        Some(TsiConnectReq {
+            request_id: self.control_request_id(),
+            peer_port,
+            addr,
+        })
+    }
 
-            Some(TsiConnectReq { peer_port, addr })
-        } else {
-            None
+    pub fn write_connect_rsp(&mut self, rsp: TsiConnectRsp, request_id: u64) {
+        if let Some(buf) = self.control_response_buf(request_id, 4) {
+            byte_order::write_le_u32(buf, rsp.result as u32);
         }
     }
 
-    pub fn write_connect_rsp(&mut self, rsp: TsiConnectRsp) {
-        if self.buf_size >= 4
-            && let Some(buf) = self.buf_mut()
-        {
-            byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
+    pub fn write_sockopt_rsp(&mut self, result: i32, value: i32, request_id: u64) {
+        if let Some(buf) = self.control_response_buf(request_id, 8) {
+            byte_order::write_le_u32(buf, result as u32);
+            byte_order::write_le_u32(&mut buf[4..], if result == 0 { value as u32 } else { 0 });
         }
     }
 
     pub fn read_getname_req(&self) -> Option<TsiGetnameReq> {
-        if self.buf_size >= 12 {
-            let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
-            let local_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[4..]);
-            let peer: u32 = byte_order::read_le_u32(&self.buf().unwrap()[8..]);
-            Some(TsiGetnameReq {
-                peer_port,
-                local_port,
-                peer,
-            })
-        } else {
-            None
+        let buf = self.control_payload().ok()?;
+        let peer = byte_order::read_le_u32(&buf[8..]);
+        if peer > 1 {
+            return None;
         }
+        Some(TsiGetnameReq {
+            peer_port: byte_order::read_le_u32(buf),
+            local_port: byte_order::read_le_u32(&buf[4..]),
+            peer,
+        })
     }
 
-    pub fn write_getname_rsp(&mut self, rsp: TsiGetnameRsp) {
-        if self.buf_size >= 132
-            && let Some(buf) = self.buf_mut()
-        {
-            byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
-            byte_order::write_le_u32(&mut buf[4..], rsp.addr_len);
-            let addr_ptr = rsp.addr.as_ptr();
-            #[allow(clippy::unnecessary_cast)]
-            let slice = unsafe {
-                std::slice::from_raw_parts(addr_ptr as *const u8, rsp.addr.len() as usize)
-            };
-            buf[8..(rsp.addr.len() + 8) as usize].copy_from_slice(slice);
-
-            // On macOS, convert BSD sockaddr (u8 sa_len + u8 sa_family) to
-            // Linux wire format (u16 sa_family). Also translate macOS AF_*
-            // values to their Linux equivalents (e.g. AF_INET6: 30 → 10).
-            #[cfg(target_os = "macos")]
-            {
-                let bsd_family = buf[9];
-                let linux_family: u16 = match bsd_family as i32 {
-                    libc::AF_INET => defs::LINUX_AF_INET,
-                    libc::AF_INET6 => defs::LINUX_AF_INET6,
-                    _ => 0, // AF_UNSPEC
-                };
-                byte_order::write_le_u16(&mut buf[8..], linux_family);
+    pub fn write_getname_rsp(&mut self, rsp: TsiGetnameRsp, request_id: u64) {
+        if let Some(buf) = self.control_response_buf(request_id, 136) {
+            byte_order::write_le_u32(buf, rsp.result as u32);
+            if rsp.result == 0 {
+                let len = rsp.addr_len as usize;
+                if !(2..=128).contains(&len) || len > rsp.addr.len() as usize {
+                    byte_order::write_le_u32(buf, (-super::tsi_wire::EPROTO) as u32);
+                    return;
+                }
+                let address = unsafe { slice::from_raw_parts(rsp.addr.as_ptr().cast::<u8>(), len) };
+                byte_order::write_le_u32(&mut buf[4..], len as u32);
+                buf[8..8 + len].copy_from_slice(address);
+                #[cfg(target_os = "macos")]
+                {
+                    let family = match buf[9] as i32 {
+                        libc::AF_INET => defs::LINUX_AF_INET,
+                        libc::AF_INET6 => defs::LINUX_AF_INET6,
+                        _ => 0,
+                    };
+                    buf[8..10].copy_from_slice(&family.to_le_bytes());
+                }
             }
         }
     }
 
     pub fn read_sendto_addr(&self) -> Option<TsiSendtoAddr> {
-        if self.buf_size >= 4 {
-            let buf = self.buf().unwrap();
-            let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
-            let addr_len: u32 = byte_order::read_le_u32(&buf[4..]);
-            let addr = Self::parse_address(&buf[8..], addr_len)?;
-
-            Some(TsiSendtoAddr { peer_port, addr })
-        } else {
-            None
-        }
+        let buf = self.control_payload().ok()?;
+        Some(TsiSendtoAddr {
+            peer_port: byte_order::read_le_u32(buf),
+            addr: Self::parse_address(&buf[8..], byte_order::read_le_u32(&buf[4..]))?,
+        })
     }
 
     pub fn read_listen_req(&self) -> Option<TsiListenReq> {
-        if self.buf_size >= 12 {
-            let buf = self.buf().unwrap();
-            let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
-            let vm_port: u32 = byte_order::read_le_u32(&buf[4..]);
-            let backlog: u32 = byte_order::read_le_u32(&buf[8..]);
-            let addr_len: u32 = byte_order::read_le_u32(&buf[12..]);
-            let addr = Self::parse_address(&buf[16..], addr_len)?;
-
-            Some(TsiListenReq {
-                peer_port,
-                vm_port,
-                backlog: backlog as i32,
-                addr,
-            })
-        } else {
-            None
+        let buf = self.control_payload().ok()?;
+        let backlog = byte_order::read_le_u32(&buf[8..]);
+        if backlog > i32::MAX as u32 {
+            return None;
         }
+        Some(TsiListenReq {
+            peer_port: byte_order::read_le_u32(buf),
+            vm_port: byte_order::read_le_u32(&buf[4..]),
+            backlog: backlog as i32,
+            addr: Self::parse_address(&buf[16..], byte_order::read_le_u32(&buf[12..]))?,
+            strict: false,
+        })
     }
 
-    pub fn write_listen_rsp(&mut self, rsp: TsiListenRsp) {
-        if self.buf_size >= 4
-            && let Some(buf) = self.buf_mut()
-        {
-            byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
+    pub fn write_listen_rsp(&mut self, rsp: TsiListenRsp, request_id: u64) {
+        if let Some(buf) = self.control_response_buf(request_id, 8) {
+            byte_order::write_le_u32(buf, rsp.result as u32);
+            byte_order::write_le_u32(&mut buf[4..], rsp.flags);
         }
     }
 
     pub fn read_accept_req(&self) -> Option<TsiAcceptReq> {
-        if self.buf_size >= 8 {
-            let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
-            let flags: u32 = byte_order::read_le_u32(&self.buf().unwrap()[4..]);
-
-            Some(TsiAcceptReq { peer_port, flags })
-        } else {
-            None
+        let buf = self.control_payload().ok()?;
+        let flags = byte_order::read_le_u32(&buf[4..]);
+        if flags != 0 {
+            return None;
         }
+        Some(TsiAcceptReq {
+            request_id: self.control_request_id(),
+            peer_port: byte_order::read_le_u32(buf),
+            flags,
+        })
     }
 
-    pub fn write_accept_rsp(&mut self, rsp: TsiAcceptRsp) {
-        if self.buf_size >= 4
-            && let Some(buf) = self.buf_mut()
-        {
-            byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
+    pub fn write_accept_rsp(&mut self, rsp: TsiAcceptRsp, request_id: u64) {
+        if let Some(buf) = self.control_response_buf(request_id, 4) {
+            byte_order::write_le_u32(buf, rsp.result as u32);
         }
     }
 
     pub fn read_release_req(&self) -> Option<TsiReleaseReq> {
-        if self.buf_size >= 8 {
-            let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
-            let local_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[4..]);
-            Some(TsiReleaseReq {
-                peer_port,
-                local_port,
-            })
-        } else {
-            None
-        }
+        let buf = self.control_payload().ok()?;
+        Some(TsiReleaseReq {
+            peer_port: byte_order::read_le_u32(buf),
+            local_port: byte_order::read_le_u32(&buf[4..]),
+        })
     }
 
     pub fn write_time_sync(&mut self, time: u64) {
@@ -791,6 +820,354 @@ impl VsockPacket {
             && let Some(buf) = self.buf_mut()
         {
             byte_order::write_le_u64(&mut buf[0..], time);
+        }
+    }
+}
+
+#[cfg(test)]
+mod descriptor_tests {
+    use super::*;
+    use crate::virtio::queue::{Descriptor, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+    use vm_memory::{Bytes, GuestMemoryMmap};
+
+    const TABLE: GuestAddress = GuestAddress(0x1000);
+
+    fn buffer(index: usize) -> GuestAddress {
+        GuestAddress(0x10000 + index as u64 * 0x20000)
+    }
+
+    fn memory(layout: &[usize], writable: bool, data_len: u32) -> GuestMemoryMmap {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x100000)]).unwrap();
+        for (i, &len) in layout.iter().enumerate() {
+            let mut flags = if writable { VIRTQ_DESC_F_WRITE } else { 0 };
+            if i + 1 < layout.len() {
+                flags |= VIRTQ_DESC_F_NEXT;
+            }
+            let desc = Descriptor {
+                addr: buffer(i).raw_value(),
+                len: len as u32,
+                flags,
+                next: (i + 1) as u16,
+            };
+            mem.write_obj(desc, TABLE.checked_add(i as u64 * 16).unwrap())
+                .unwrap();
+            mem.write_slice(&vec![0xa5; len], buffer(i)).unwrap();
+        }
+        mem.write_obj(
+            data_len.to_le(),
+            buffer(0).checked_add(HDROFF_LEN as u64).unwrap(),
+        )
+        .unwrap();
+        mem
+    }
+
+    fn head(mem: &GuestMemoryMmap) -> DescriptorChain<'_> {
+        DescriptorChain::checked_new(mem, TABLE, 16, 0).unwrap()
+    }
+
+    #[test]
+    fn rx_capacity_includes_inline_and_all_descriptors() {
+        let mem = memory(&[VSOCK_PKT_HDR_SIZE + 2, 3, 4], true, 0);
+        let pkt = VsockPacket::from_rx_virtq_head(&head(&mem)).unwrap();
+        assert_eq!(pkt.buf().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn rx_large_packet_spans_descriptors() {
+        let mem = memory(&[32768, 32768, 44], true, 0);
+        let pkt = VsockPacket::from_rx_virtq_head(&head(&mem)).unwrap();
+        assert_eq!(pkt.buf().unwrap().len(), defs::MAX_PKT_BUF_SIZE);
+    }
+
+    #[test]
+    fn rx_rejects_read_only_data() {
+        let mem = memory(&[VSOCK_PKT_HDR_SIZE, 8], true, 0);
+        let mut desc: Descriptor = mem.read_obj(TABLE.checked_add(16).unwrap()).unwrap();
+        desc.flags = 0;
+        mem.write_obj(desc, TABLE.checked_add(16).unwrap()).unwrap();
+        assert!(matches!(
+            VsockPacket::from_rx_virtq_head(&head(&mem)),
+            Err(VsockError::UnwritableDescriptor)
+        ));
+    }
+
+    #[test]
+    fn tx_exposes_declared_payload_only() {
+        let mem = memory(&[VSOCK_PKT_HDR_SIZE, 16], false, 4);
+        mem.write_slice(b"data", buffer(1)).unwrap();
+        let pkt = VsockPacket::from_tx_virtq_head(&head(&mem)).unwrap();
+        assert_eq!(pkt.buf().unwrap(), b"data");
+    }
+    fn write_payload(mem: &GuestMemoryMmap, layout: &[usize], data: &[u8]) {
+        let mut offset = 0;
+        for (i, &len) in layout.iter().enumerate() {
+            let start = if i == 0 { VSOCK_PKT_HDR_SIZE } else { 0 };
+            let count = (len - start).min(data.len() - offset);
+            mem.write_slice(
+                &data[offset..offset + count],
+                buffer(i).checked_add(start as u64).unwrap(),
+            )
+            .unwrap();
+            offset += count;
+            if offset == data.len() {
+                break;
+            }
+        }
+        assert_eq!(offset, data.len());
+    }
+
+    fn read_payload(mem: &GuestMemoryMmap, layout: &[usize], len: usize) -> Vec<u8> {
+        let mut data = vec![0; len];
+        let mut offset = 0;
+        for (i, &size) in layout.iter().enumerate() {
+            let start = if i == 0 { VSOCK_PKT_HDR_SIZE } else { 0 };
+            let count = (size - start).min(len - offset);
+            mem.read_slice(
+                &mut data[offset..offset + count],
+                buffer(i).checked_add(start as u64).unwrap(),
+            )
+            .unwrap();
+            offset += count;
+            if offset == len {
+                break;
+            }
+        }
+        assert_eq!(offset, len);
+        data
+    }
+
+    #[test]
+    fn tx_layouts_preserve_packet_bytes() {
+        for layout in [
+            vec![VSOCK_PKT_HDR_SIZE + 12],
+            vec![VSOCK_PKT_HDR_SIZE, 12],
+            vec![VSOCK_PKT_HDR_SIZE + 2, 3, 7],
+            vec![VSOCK_PKT_HDR_SIZE, 0, 4, 8],
+        ] {
+            let mem = memory(&layout, false, 9);
+            write_payload(&mem, &layout, b"123456789");
+            let pkt = VsockPacket::from_tx_virtq_head(&head(&mem)).unwrap();
+            assert_eq!(pkt.buf().unwrap(), b"123456789");
+        }
+    }
+
+    #[test]
+    fn rx_layouts_write_back_packet_bytes() {
+        for layout in [
+            vec![VSOCK_PKT_HDR_SIZE + 9],
+            vec![VSOCK_PKT_HDR_SIZE, 9],
+            vec![VSOCK_PKT_HDR_SIZE + 2, 3, 4],
+            vec![VSOCK_PKT_HDR_SIZE, 0, 4, 5],
+        ] {
+            let mem = memory(&layout, true, 0);
+            let mut pkt = VsockPacket::from_rx_virtq_head(&head(&mem)).unwrap();
+            pkt.buf_mut().unwrap().copy_from_slice(b"123456789");
+            pkt.set_len(9);
+            assert_eq!(pkt.finish_rx().unwrap(), VSOCK_PKT_HDR_SIZE as u32 + 9);
+            assert_eq!(read_payload(&mem, &layout, 9), b"123456789");
+        }
+    }
+
+    #[test]
+    fn rx_writeback_does_not_overwrite_unused_capacity() {
+        let layout = [VSOCK_PKT_HDR_SIZE + 4, 4];
+        let mem = memory(&layout, true, 0);
+        let mut pkt = VsockPacket::from_rx_virtq_head(&head(&mem)).unwrap();
+        pkt.buf_mut().unwrap()[..5].copy_from_slice(b"hello");
+        pkt.set_len(5);
+        assert_eq!(pkt.finish_rx().unwrap(), VSOCK_PKT_HDR_SIZE as u32 + 5);
+        assert_eq!(read_payload(&mem, &layout, 8), b"hello\xa5\xa5\xa5");
+    }
+
+    #[test]
+    fn rx_large_writeback_is_complete() {
+        let layout = [32768, 32768, 44];
+        let mem = memory(&layout, true, 0);
+        let data: Vec<_> = (0..defs::MAX_PKT_BUF_SIZE).map(|i| i as u8).collect();
+        let mut pkt = VsockPacket::from_rx_virtq_head(&head(&mem)).unwrap();
+        pkt.buf_mut().unwrap().copy_from_slice(&data);
+        pkt.set_len(data.len() as u32);
+        assert_eq!(
+            pkt.finish_rx().unwrap() as usize,
+            VSOCK_PKT_HDR_SIZE + data.len()
+        );
+        assert_eq!(read_payload(&mem, &layout, data.len()), data);
+    }
+
+    #[test]
+    fn rx_capacity_is_bounded() {
+        let mem = memory(&[VSOCK_PKT_HDR_SIZE, defs::MAX_PKT_BUF_SIZE], true, 0);
+        let mut desc: Descriptor = mem.read_obj(TABLE.checked_add(16).unwrap()).unwrap();
+        desc.len = u32::MAX;
+        mem.write_obj(desc, TABLE.checked_add(16).unwrap()).unwrap();
+        let mut pkt = VsockPacket::from_rx_virtq_head(&head(&mem)).unwrap();
+        assert_eq!(pkt.buf_mut().unwrap().len(), defs::MAX_PKT_BUF_SIZE);
+        pkt.set_len(defs::MAX_PKT_BUF_SIZE as u32 + 1);
+        assert!(matches!(pkt.finish_rx(), Err(VsockError::BufDescTooSmall)));
+    }
+
+    #[test]
+    fn tx_short_chain_and_wrong_direction_are_rejected() {
+        let mem = memory(&[VSOCK_PKT_HDR_SIZE + 2, 2], false, 5);
+        assert!(matches!(
+            VsockPacket::from_tx_virtq_head(&head(&mem)),
+            Err(VsockError::BufDescTooSmall)
+        ));
+        let mem = memory(&[VSOCK_PKT_HDR_SIZE + 2, 2, 1], false, 5);
+        let mut desc: Descriptor = mem.read_obj(TABLE.checked_add(32).unwrap()).unwrap();
+        desc.flags = VIRTQ_DESC_F_WRITE;
+        mem.write_obj(desc, TABLE.checked_add(32).unwrap()).unwrap();
+        assert!(matches!(
+            VsockPacket::from_tx_virtq_head(&head(&mem)),
+            Err(VsockError::UnreadableDescriptor)
+        ));
+    }
+
+    #[test]
+    fn rx_unmapped_tail_is_rejected() {
+        let mem = memory(&[VSOCK_PKT_HDR_SIZE + 2, 2, 1], true, 0);
+        let mut desc: Descriptor = mem.read_obj(TABLE.checked_add(32).unwrap()).unwrap();
+        desc.addr = 0x200000;
+        mem.write_obj(desc, TABLE.checked_add(32).unwrap()).unwrap();
+        assert!(matches!(
+            VsockPacket::from_rx_virtq_head(&head(&mem)),
+            Err(VsockError::GuestMemoryMmap(_))
+        ));
+    }
+
+    #[test]
+    fn tx_unused_descriptor_padding_is_not_read() {
+        let mem = memory(&[VSOCK_PKT_HDR_SIZE + 8, 8], false, 4);
+        mem.write_slice(
+            b"data",
+            buffer(0).checked_add(VSOCK_PKT_HDR_SIZE as u64).unwrap(),
+        )
+        .unwrap();
+        let mut desc: Descriptor = mem.read_obj(TABLE.checked_add(16).unwrap()).unwrap();
+        desc.addr = u64::MAX;
+        mem.write_obj(desc, TABLE.checked_add(16).unwrap()).unwrap();
+        let pkt = VsockPacket::from_tx_virtq_head(&head(&mem)).unwrap();
+        assert_eq!(pkt.buf().unwrap(), b"data");
+    }
+
+    #[test]
+    fn truncated_control_requests_are_rejected() {
+        for len in 0..16 {
+            let mem = memory(&[VSOCK_PKT_HDR_SIZE + len], false, len as u32);
+            let pkt = VsockPacket::from_tx_virtq_head(&head(&mem)).unwrap();
+            if len < 8 {
+                assert!(pkt.read_proxy_create().is_none());
+            }
+            assert!(pkt.read_connect_req().is_none());
+            assert!(pkt.read_sendto_addr().is_none());
+            assert!(pkt.read_listen_req().is_none());
+        }
+    }
+    #[test]
+    fn control_reply_uses_exact_length_and_preserves_id() {
+        let layout = [VSOCK_PKT_HDR_SIZE + 5, 64, 128];
+        let mem = memory(&layout, true, 0);
+        let mut pkt = VsockPacket::from_rx_virtq_head(&head(&mem)).unwrap();
+        pkt.set_src_port(1025);
+        pkt.write_connect_rsp(TsiConnectRsp { result: -111 }, 0x123456789abcdef0);
+        assert_eq!(pkt.len(), 28);
+        assert_eq!(pkt.finish_rx().unwrap(), VSOCK_PKT_HDR_SIZE as u32 + 28);
+        let data = read_payload(&mem, &layout, 29);
+        assert_eq!(&data[8..16], &0x123456789abcdef0u64.to_le_bytes());
+        assert_eq!(&data[16..24], &[4, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(&data[24..28], &(-111i32).to_le_bytes());
+        assert_eq!(data[28], 0xa5);
+    }
+
+    #[test]
+    fn listen_reply_preserves_errno_and_strict_policy() {
+        let layout = [VSOCK_PKT_HDR_SIZE + 5, 64, 128];
+        let mem = memory(&layout, true, 0);
+        let mut pkt = VsockPacket::from_rx_virtq_head(&head(&mem)).unwrap();
+        pkt.set_src_port(defs::TSI_LISTEN);
+        pkt.write_listen_rsp(
+            TsiListenRsp {
+                result: -98,
+                flags: defs::TSI_LISTEN_STRICT,
+            },
+            41,
+        );
+        assert_eq!(pkt.len(), 32);
+        assert_eq!(pkt.finish_rx().unwrap(), VSOCK_PKT_HDR_SIZE as u32 + 32);
+        let data = read_payload(&mem, &layout, 33);
+        assert_eq!(&data[8..16], &41u64.to_le_bytes());
+        assert_eq!(&data[16..24], &[8, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(&data[24..28], &(-98i32).to_le_bytes());
+        assert_eq!(&data[28..32], &defs::TSI_LISTEN_STRICT.to_le_bytes());
+        assert_eq!(data[32], 0xa5);
+    }
+
+    #[test]
+    fn strict_listen_flags_only_apply_to_inet() {
+        for (family, len) in [
+            (defs::LINUX_AF_INET, 16),
+            (defs::LINUX_AF_INET6, 28),
+            #[cfg(target_os = "linux")]
+            (defs::LINUX_AF_UNIX, 11),
+        ] {
+            let mut raw = [0; 128];
+            raw[..2].copy_from_slice(&family.to_le_bytes());
+            if family == defs::LINUX_AF_UNIX {
+                raw[2..11].copy_from_slice(b"/tmp/tsi\0");
+            }
+            let addr = VsockPacket::parse_address(&raw, len).unwrap();
+            let mut request = TsiListenReq {
+                peer_port: 1,
+                vm_port: 2,
+                backlog: 8,
+                addr,
+                strict: false,
+            };
+            assert_eq!(request.response_flags(), 0);
+            request.strict = true;
+            assert_eq!(
+                request.response_flags(),
+                if family == defs::LINUX_AF_UNIX {
+                    0
+                } else {
+                    defs::TSI_LISTEN_STRICT
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn short_control_reply_buffer_does_not_announce_partial_body() {
+        let mem = memory(&[VSOCK_PKT_HDR_SIZE + 27], true, 0);
+        let mut pkt = VsockPacket::from_rx_virtq_head(&head(&mem)).unwrap();
+        pkt.set_src_port(1025);
+        pkt.write_connect_rsp(TsiConnectRsp { result: 0 }, 1);
+        assert_eq!(pkt.len(), 0);
+    }
+    #[test]
+    fn getname_uses_typed_address_length() {
+        for (address, len) in [
+            (SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345).into(), 16u32),
+            (
+                std::net::SocketAddrV6::new(std::net::Ipv6Addr::LOCALHOST, 12345, 0, 0).into(),
+                28u32,
+            ),
+        ] {
+            let mem = memory(&[VSOCK_PKT_HDR_SIZE + 256], true, 0);
+            let mut pkt = VsockPacket::from_rx_virtq_head(&head(&mem)).unwrap();
+            pkt.set_src_port(1026);
+            pkt.write_getname_rsp(
+                TsiGetnameRsp {
+                    result: 0,
+                    addr_len: len,
+                    addr: address,
+                },
+                1,
+            );
+            assert_eq!(pkt.len(), 160);
+            let body = &pkt.buf().unwrap()[24..160];
+            assert_eq!(byte_order::read_le_u32(&body[4..]), len);
+            assert!(body[8 + len as usize..].iter().all(|b| *b == 0));
         }
     }
 }

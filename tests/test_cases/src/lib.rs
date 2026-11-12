@@ -11,6 +11,11 @@ extern crate krun_init_cdylib as krun_init;
 mod test_vm_config;
 use test_vm_config::TestVmConfig;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod test_invariant_tsc;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use test_invariant_tsc::TestInvariantTsc;
+
 #[cfg(any(feature = "guest", target_os = "macos"))]
 mod test_vm_pause;
 #[cfg(any(feature = "guest", target_os = "macos"))]
@@ -62,6 +67,21 @@ use test_tsi_tcp_guest_listen::TestTsiTcpGuestListen;
 
 mod test_tsi_tcp_half_close;
 use test_tsi_tcp_half_close::TestTsiTcpHalfClose;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_tsi_socket_contract;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_tsi_socket_contract::TestTsiSocketContract;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_tsi_control_protocol;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_tsi_control_protocol::TestTsiControlProtocol;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_tsi_applications;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_tsi_applications::{AddressFamily, Application, TestTsiApplication};
 
 #[cfg(target_os = "linux")]
 mod test_tsi_unix_host_close;
@@ -179,6 +199,25 @@ pub fn test_cases() -> Vec<TestCase> {
                 ram_mib: 1024,
             }),
         ),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "cpu-invariant-tsc-default",
+            Box::new(TestInvariantTsc { enabled: None }),
+        ),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "cpu-invariant-tsc-disabled",
+            Box::new(TestInvariantTsc {
+                enabled: Some(false),
+            }),
+        ),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "cpu-invariant-tsc-enabled",
+            Box::new(TestInvariantTsc {
+                enabled: Some(true),
+            }),
+        ),
         #[cfg(any(feature = "guest", target_os = "macos"))]
         TestCase::new("vm-pause", Box::new(TestVmPause)),
         TestCase::new("acpi-smp-4cpu", Box::new(TestAcpiSmp { num_cpus: 4 })),
@@ -222,6 +261,272 @@ pub fn test_cases() -> Vec<TestCase> {
             Box::new(TestTsiTcpGuestListen::new()),
         ),
         TestCase::new("tsi-tcp-half-close", Box::new(TestTsiTcpHalfClose)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-control-wire",
+            Box::new(TestTsiControlProtocol { faults: false }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-control-faults",
+            Box::new(TestTsiControlProtocol { faults: true }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-socket-contract",
+            Box::new(TestTsiSocketContract {
+                ipv6: false,
+                hijack: true,
+            }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-socket-contract-ipv6",
+            Box::new(TestTsiSocketContract {
+                ipv6: true,
+                hijack: true,
+            }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-socket-contract-explicit",
+            Box::new(TestTsiSocketContract {
+                ipv6: false,
+                hijack: false,
+            }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-socket-contract-explicit-ipv6",
+            Box::new(TestTsiSocketContract {
+                ipv6: true,
+                hijack: false,
+            }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-curl-http",
+            Box::new(TestTsiApplication::new(
+                Application::CurlHttp,
+                AddressFamily::Ipv4,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-curl-https",
+            Box::new(TestTsiApplication::new(
+                Application::CurlHttps,
+                AddressFamily::Ipv4,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-curl-parallel-delayed",
+            Box::new(TestTsiApplication::new(
+                Application::CurlParallelDelayed,
+                AddressFamily::Ipv4,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-curl-parallel-timeout",
+            Box::new(TestTsiApplication::new(
+                Application::CurlParallelTimeout,
+                AddressFamily::Ipv4,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-wget-http",
+            Box::new(TestTsiApplication::new(
+                Application::WgetHttp,
+                AddressFamily::Ipv4,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-dig-udp",
+            Box::new(TestTsiApplication::new(
+                Application::DigUdp,
+                AddressFamily::Ipv4,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-dig-tcp",
+            Box::new(TestTsiApplication::new(
+                Application::DigTcp,
+                AddressFamily::Ipv4,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-openssl-dtls",
+            Box::new(TestTsiApplication::new(
+                Application::OpenSslDtls,
+                AddressFamily::Ipv4,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-python-http",
+            Box::new(TestTsiApplication::new(
+                Application::PythonHttp,
+                AddressFamily::Ipv4,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-curl-http-ipv6",
+            Box::new(TestTsiApplication::new(
+                Application::CurlHttp,
+                AddressFamily::Ipv6,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-curl-https-ipv6",
+            Box::new(TestTsiApplication::new(
+                Application::CurlHttps,
+                AddressFamily::Ipv6,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-curl-parallel-delayed-ipv6",
+            Box::new(TestTsiApplication::new(
+                Application::CurlParallelDelayed,
+                AddressFamily::Ipv6,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-curl-parallel-timeout-ipv6",
+            Box::new(TestTsiApplication::new(
+                Application::CurlParallelTimeout,
+                AddressFamily::Ipv6,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-wget-http-ipv6",
+            Box::new(TestTsiApplication::new(
+                Application::WgetHttp,
+                AddressFamily::Ipv6,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-dig-udp-ipv6",
+            Box::new(TestTsiApplication::new(
+                Application::DigUdp,
+                AddressFamily::Ipv6,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-dig-tcp-ipv6",
+            Box::new(TestTsiApplication::new(
+                Application::DigTcp,
+                AddressFamily::Ipv6,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-openssl-dtls-ipv6",
+            Box::new(TestTsiApplication::new(
+                Application::OpenSslDtls,
+                AddressFamily::Ipv6,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-python-http-ipv6",
+            Box::new(TestTsiApplication::new(
+                Application::PythonHttp,
+                AddressFamily::Ipv6,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-dig-udp-large",
+            Box::new(TestTsiApplication::new(
+                Application::DigUdpLarge,
+                AddressFamily::Ipv4,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-dig-udp-fallback",
+            Box::new(TestTsiApplication::new(
+                Application::DigUdpFallback,
+                AddressFamily::Ipv4,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-dnsmasq",
+            Box::new(TestTsiApplication::new(
+                Application::Dnsmasq,
+                AddressFamily::Ipv4,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-dig-udp-large-ipv6",
+            Box::new(TestTsiApplication::new(
+                Application::DigUdpLarge,
+                AddressFamily::Ipv6,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-dig-udp-fallback-ipv6",
+            Box::new(TestTsiApplication::new(
+                Application::DigUdpFallback,
+                AddressFamily::Ipv6,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-dnsmasq-ipv6",
+            Box::new(TestTsiApplication::new(
+                Application::Dnsmasq,
+                AddressFamily::Ipv6,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-dnsmasq-wildcard",
+            Box::new(TestTsiApplication::new(
+                Application::DnsmasqWildcard,
+                AddressFamily::Ipv4,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-dnsmasq-wildcard-ipv6",
+            Box::new(TestTsiApplication::new(
+                Application::DnsmasqWildcard,
+                AddressFamily::Ipv6,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-ping",
+            Box::new(TestTsiApplication::new(
+                Application::Ping,
+                AddressFamily::Ipv4,
+            )),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "tsi-app-ping-ipv6",
+            Box::new(TestTsiApplication::new(
+                Application::Ping,
+                AddressFamily::Ipv6,
+            )),
+        ),
         #[cfg(target_os = "linux")]
         TestCase::new("tsi-unix-host-close", Box::new(TestTsiUnixHostClose)),
         TestCase::new("net-passt", Box::new(TestNet::new_passt())),

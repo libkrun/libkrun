@@ -17,7 +17,8 @@ use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::sys::socket::{
     AddressFamily, Backlog, MsgFlags, Shutdown, SockFlag, SockType, SockaddrLike, SockaddrStorage,
-    accept, bind, connect, getpeername, listen, recv, send, setsockopt, shutdown, socket, sockopt,
+    accept, bind, connect, getpeername, getsockname, listen, recv, send, setsockopt, shutdown,
+    socket, sockopt,
 };
 
 #[cfg(target_os = "macos")]
@@ -25,9 +26,7 @@ use super::super::super::linux_errno::linux_errno_raw;
 use super::super::defs;
 use super::super::muxer::{MuxerRx, push_packet};
 use super::super::packet::{TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, VsockPacket};
-use super::super::proxy::{
-    NewProxyType, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
-};
+use super::super::proxy::{NewProxyType, Proxy, ProxyError, ProxyStatus, ProxyUpdate, RecvPkt};
 use utils::epoll::EventSet;
 
 pub(crate) fn create_socket(
@@ -57,15 +56,8 @@ pub(crate) fn create_socket(
         Err(e) => error!("couldn't obtain fd flags id={id}, err={e}"),
     };
 
-    if family == AddressFamily::Unix {
-        setsockopt(&fd, sockopt::ReuseAddr, &true).map_err(|e| {
-            ProxyError::SettingReuseAddr(std::io::Error::from_raw_os_error(e as i32))
-        })?;
-    } else {
-        setsockopt(&fd, sockopt::ReusePort, &true).map_err(|e| {
-            ProxyError::SettingReusePort(std::io::Error::from_raw_os_error(e as i32))
-        })?;
-    }
+    setsockopt(&fd, sockopt::ReuseAddr, &true)
+        .map_err(|e| ProxyError::SettingReuseAddr(std::io::Error::from_raw_os_error(e as i32)))?;
 
     #[cfg(target_os = "macos")]
     {
@@ -313,34 +305,37 @@ pub(crate) fn do_connect(
     update
 }
 
-pub(crate) fn do_getpeername(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) {
+pub(crate) fn do_getname(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket, peer: bool) {
     debug!("getpeername: id={}", proxy.id);
 
-    let (result, addr_len, addr): (i32, u32, SockaddrStorage) =
-        match getpeername(proxy.fd.as_raw_fd()) {
-            Ok(addr) => {
-                if let Some(addr_len) = get_addr_len(proxy, &addr) {
-                    (0, addr_len, addr)
-                } else {
-                    #[cfg(target_os = "macos")]
-                    let errno = -linux_errno_raw(EINVAL);
-                    #[cfg(target_os = "linux")]
-                    let errno = -EINVAL;
-                    (errno, 0, addr)
-                }
-            }
-            Err(e) => {
+    let (result, addr_len, addr): (i32, u32, SockaddrStorage) = match if peer {
+        getpeername(proxy.fd.as_raw_fd())
+    } else {
+        getsockname(proxy.fd.as_raw_fd())
+    } {
+        Ok(addr) => {
+            if let Some(addr_len) = get_addr_len(proxy, &addr) {
+                (0, addr_len, addr)
+            } else {
                 #[cfg(target_os = "macos")]
-                let errno = -linux_errno_raw(e as i32);
+                let errno = -linux_errno_raw(EINVAL);
                 #[cfg(target_os = "linux")]
-                let errno = -(e as i32);
-                (
-                    errno,
-                    0,
-                    SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
-                )
+                let errno = -EINVAL;
+                (errno, 0, addr)
             }
-        };
+        }
+        Err(e) => {
+            #[cfg(target_os = "macos")]
+            let errno = -linux_errno_raw(e as i32);
+            #[cfg(target_os = "linux")]
+            let errno = -(e as i32);
+            (
+                errno,
+                0,
+                SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
+            )
+        }
+    };
 
     let data = TsiGetnameRsp {
         result,
@@ -352,6 +347,7 @@ pub(crate) fn do_getpeername(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacke
 
     // This response goes to the control port (DGRAM).
     let rx = MuxerRx::GetnameResponse {
+        request_id: pkt.control_request_id(),
         local_port: pkt.dst_port(),
         peer_port: pkt.src_port(),
         data,
@@ -426,9 +422,11 @@ pub(crate) fn do_listen(
 
     // This packet goes to the control port (DGRAM).
     let rx = MuxerRx::ListenResponse {
+        request_id: pkt.control_request_id(),
         local_port: pkt.dst_port(),
         peer_port: pkt.src_port(),
         result,
+        flags: req.response_flags(),
     };
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
 
@@ -547,7 +545,7 @@ pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) 
     {
         debug!("process_event: HANG_UP");
         if proxy.status == ProxyStatus::Connecting {
-            proxy.push_connect_rsp(-libc::ECONNREFUSED);
+            proxy.push_connect_rsp(-super::super::tsi_wire::ECONNREFUSED);
         } else {
             proxy.push_reset();
         }
@@ -555,11 +553,7 @@ pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) 
         proxy.status = ProxyStatus::Closed;
         update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
         update.signal_queue = true;
-        update.remove_proxy = if proxy.status == ProxyStatus::Listening {
-            ProxyRemoval::Immediate
-        } else {
-            ProxyRemoval::Deferred
-        };
+        // Retain endpoint metadata until the guest releases its descriptor.
         return update;
     }
 
@@ -587,7 +581,7 @@ pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) 
                 proxy.push_reset();
                 update.signal_queue = true;
                 update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-                update.remove_proxy = ProxyRemoval::Deferred;
+                // Keep names available until the guest closes the descriptor.
                 return update;
             } else if proxy.host_read_closed || proxy.status == ProxyStatus::WaitingCreditUpdate {
                 debug!("process_event: disabling read polling");
@@ -627,4 +621,56 @@ pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) 
     }
 
     update
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::socket::getsockopt;
+    use std::net::Ipv6Addr;
+
+    fn bound_listener(family: u16, sharing: bool) -> (OwnedFd, SockaddrStorage) {
+        let (fd, _) = create_socket(0, family).unwrap();
+        if sharing {
+            setsockopt(&fd, sockopt::ReusePort, &true).unwrap();
+        }
+        let addr: SockaddrStorage = if family == defs::LINUX_AF_INET {
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()
+        } else {
+            SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0).into()
+        };
+        bind(fd.as_raw_fd(), &addr).unwrap();
+        listen(&fd, Backlog::new(8).unwrap()).unwrap();
+        let addr = getsockname(fd.as_raw_fd()).unwrap();
+        (fd, addr)
+    }
+
+    #[test]
+    fn default_tcp_reuse_options() {
+        for family in [defs::LINUX_AF_INET, defs::LINUX_AF_INET6] {
+            let (fd, _) = create_socket(0, family).unwrap();
+            assert!(getsockopt(&fd, sockopt::ReuseAddr).unwrap());
+            assert!(!getsockopt(&fd, sockopt::ReusePort).unwrap());
+        }
+    }
+
+    #[test]
+    fn default_tcp_listener_owns_address() {
+        for family in [defs::LINUX_AF_INET, defs::LINUX_AF_INET6] {
+            let (_first, addr) = bound_listener(family, false);
+            let (second, _) = create_socket(1, family).unwrap();
+            assert_eq!(bind(second.as_raw_fd(), &addr), Err(Errno::EADDRINUSE));
+        }
+    }
+
+    #[test]
+    fn explicit_reuseport_shares_listener() {
+        for family in [defs::LINUX_AF_INET, defs::LINUX_AF_INET6] {
+            let (_first, addr) = bound_listener(family, true);
+            let (second, _) = create_socket(1, family).unwrap();
+            setsockopt(&second, sockopt::ReusePort, &true).unwrap();
+            bind(second.as_raw_fd(), &addr).unwrap();
+            listen(&second, Backlog::new(8).unwrap()).unwrap();
+        }
+    }
 }

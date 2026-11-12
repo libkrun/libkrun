@@ -1475,7 +1475,11 @@ export_bitflags! {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct TsiFlags: u32 {
             const HIJACK_INET = 1;
+            /// Hijack AF_UNIX sockets. Unsupported on macOS hosts.
             const HIJACK_UNIX = 2;
+            /// Return INET TCP publication errors instead of guest-only fallback.
+            /// Combine with HIJACK_INET; UNIX and UDP behavior is unchanged.
+            const FAIL_ON_TCP_PUBLICATION_ERROR = 4;
         }
     }
 }
@@ -1493,7 +1497,14 @@ impl VsockDevice {
     /// Create a new vsock device.
     ///
     /// `tsi_features` is a bitmask of TSI flags ([`TsiFlags::empty`] to disable).
+    /// On macOS, requesting [`TsiFlags::HIJACK_UNIX`] returns
+    /// [`VmmError::FeatureDisabled`]. Use [`TsiFlags::HIJACK_INET`] alone to
+    /// preserve native guest UNIX sockets while enabling Internet networking.
     pub fn new(cid: u64, tsi_features: TsiFlags) -> Result<Self, VmmError> {
+        if cfg!(target_os = "macos") && tsi_features.contains(TsiFlags::HIJACK_UNIX) {
+            return Err(VmmError::FeatureDisabled());
+        }
+
         let tsi_flags = devices::virtio::TsiFlags::from_bits_truncate(tsi_features.bits());
         Ok(Self {
             cid,
@@ -2258,10 +2269,40 @@ fn resolve_parent_dirs<'a, 'b>(
     Ok(current)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_vsock_accepts_inet_and_disabled_tsi() {
+        for flags in [
+            TsiFlags::empty(),
+            TsiFlags::HIJACK_INET,
+            TsiFlags::FAIL_ON_TCP_PUBLICATION_ERROR,
+            TsiFlags::HIJACK_INET | TsiFlags::FAIL_ON_TCP_PUBLICATION_ERROR,
+        ] {
+            assert!(VsockDevice::new(3, flags).is_ok(), "flags={flags:?}");
+        }
+    }
+
+    #[test]
+    fn test_vsock_unix_hijacking_host_support() {
+        for flags in [
+            TsiFlags::HIJACK_UNIX,
+            TsiFlags::HIJACK_UNIX | TsiFlags::HIJACK_INET,
+            TsiFlags::HIJACK_UNIX | TsiFlags::FAIL_ON_TCP_PUBLICATION_ERROR,
+            TsiFlags::all(),
+        ] {
+            let result = VsockDevice::new(3, flags);
+            if cfg!(target_os = "macos") {
+                assert!(matches!(result, Err(VmmError::FeatureDisabled())));
+            } else {
+                assert!(result.is_ok(), "flags={flags:?}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_balloon_replaces_guest_ram_only_in_the_replace_mode() {
         let mut balloon = BalloonDevice::new().unwrap();

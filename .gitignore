@@ -19,5 +19,6 @@ examples/nitro
 examples/consoles
 examples/rootfs_fedora
 test-prefix
+/.tsi-macos-validation/
 /linux-sysroot
 /freebsd-sysroot

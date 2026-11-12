@@ -23,6 +23,8 @@ pub struct VmSpec {
     ht_enabled: bool,
     /// Specifies whether nested virtualization is enabled.
     nested_enabled: bool,
+    /// Specifies whether the host's invariant TSC capability is exposed.
+    invariant_tsc: bool,
     /// The desired brand string for the guest.
     brand_string: BrandString,
 }
@@ -35,6 +37,7 @@ impl VmSpec {
         cpu_count: u8,
         ht_enabled: bool,
         nested_enabled: bool,
+        invariant_tsc: bool,
     ) -> Result<VmSpec, Error> {
         let cpu_vendor_id = get_vendor_id().map_err(Error::InternalError)?;
 
@@ -44,6 +47,7 @@ impl VmSpec {
             cpu_count,
             ht_enabled,
             nested_enabled,
+            invariant_tsc,
             brand_string: BrandString::from_vendor_id(&cpu_vendor_id),
         })
     }
@@ -130,7 +134,7 @@ mod tests {
         let num_entries = 5;
 
         let mut cpuid = CpuId::new(num_entries).unwrap();
-        let vm_spec = VmSpec::new(0, 1, false, false);
+        let vm_spec = VmSpec::new(0, 1, false, false, false);
         cpuid.as_mut_slice()[0].function = PROCESSED_FN;
         assert!(
             MockCpuidTransformer {}

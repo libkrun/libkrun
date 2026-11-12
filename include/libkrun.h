@@ -221,6 +221,7 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 
 #define KRUN_TSI_FLAGS_HIJACK_INET 1
 #define KRUN_TSI_FLAGS_HIJACK_UNIX 2
+#define KRUN_TSI_FLAGS_FAIL_ON_TCP_PUBLICATION_ERROR 4
 
 /* VirglRendererFlags ------------------------------------------------ */
 
@@ -547,6 +548,15 @@ typedef void (*krun_vmm_builder_nested_virt_fn)(KrunVmmBuilder* handle, bool ena
  */
 void krun_vmm_builder_reset_exit_code(KrunVmmBuilder* handle, uint8_t code);
 typedef void (*krun_vmm_builder_reset_exit_code_fn)(KrunVmmBuilder* handle, uint8_t code);
+/**
+ * Expose the host's invariant TSC capability to x86_64 guests.
+ *
+ * Disabled by default so Linux guests can prefer a paravirtual clock.
+ * Enabling this preserves backend support for CPUID.80000007H:EDX[8];
+ * it does not add support when the host lacks it.
+ */
+KrunResult krun_vmm_builder_invariant_tsc(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
+typedef KrunResult (*krun_vmm_builder_invariant_tsc_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 KrunResult krun_vmm_builder_split_irqchip(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 typedef KrunResult (*krun_vmm_builder_split_irqchip_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 /**
@@ -668,6 +678,9 @@ typedef void (*krun_rtc_device_destroy_fn)(KrunRtcDevice handle);
  * Create a new vsock device.
  *
  * `tsi_features` is a bitmask of TSI flags ([`TsiFlags::empty`] to disable).
+ * On macOS, requesting [`TsiFlags::HIJACK_UNIX`] returns
+ * [`VmmError::FeatureDisabled`]. Use [`TsiFlags::HIJACK_INET`] alone to
+ * preserve native guest UNIX sockets while enabling Internet networking.
  */
 KrunVsockDevice krun_vsock_device_new(uint64_t cid, uint32_t tsi_features, KrunError* err_out);
 typedef KrunVsockDevice (*krun_vsock_device_new_fn)(uint64_t cid, uint32_t tsi_features, KrunError* err_out);

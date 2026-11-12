@@ -36,6 +36,8 @@ pub struct TsiStreamProxy {
     pub(crate) local_port: u32,
     pub(crate) peer_port: u32,
     pub(crate) control_port: u32,
+    pub(crate) connect_request_id: u64,
+    pub(crate) accept_request_id: u64,
     pub(crate) fd: OwnedFd,
     pub status: ProxyStatus,
     pub(crate) mem: GuestMemoryMmap,
@@ -76,6 +78,8 @@ impl TsiStreamProxy {
             local_port,
             peer_port,
             control_port,
+            connect_request_id: 0,
+            accept_request_id: 0,
             fd,
             status: ProxyStatus::Idle,
             mem,
@@ -116,6 +120,8 @@ impl TsiStreamProxy {
             local_port,
             peer_port,
             control_port: 0,
+            connect_request_id: 0,
+            accept_request_id: 0,
             fd,
             status: ProxyStatus::ReverseInit,
             mem,
@@ -172,7 +178,7 @@ impl TsiStreamProxy {
                         self.rx_cnt += Wrapping(cnt as u32);
                         self.init_data_pkt(&mut pkt);
                         pkt.set_len(cnt as u32);
-                        pkt.hdr().len() + cnt
+                        pkt.finish_rx().unwrap_or(0) as usize
                     }
                     Ok(RecvPkt::Close) => {
                         self.host_read_closed = true;
@@ -180,7 +186,7 @@ impl TsiStreamProxy {
                         pkt.set_op(uapi::VSOCK_OP_SHUTDOWN)
                             .set_flags(uapi::VSOCK_FLAGS_SHUTDOWN_SEND)
                             .set_len(0);
-                        pkt.hdr().len()
+                        pkt.finish_rx().unwrap_or(0) as usize
                     }
                     Ok(RecvPkt::Error) => 0,
                     Err(e) => {
@@ -223,6 +229,7 @@ impl TsiStreamProxy {
 
         // This response goes to the control port (DGRAM).
         let rx = MuxerRx::ConnResponse {
+            request_id: self.connect_request_id,
             local_port: 1025,
             peer_port: self.control_port,
             result,
@@ -246,6 +253,9 @@ impl TsiStreamProxy {
 }
 
 impl Proxy for TsiStreamProxy {
+    fn is_tsi(&self) -> bool {
+        true
+    }
     fn id(&self) -> u64 {
         self.id
     }
@@ -255,6 +265,18 @@ impl Proxy for TsiStreamProxy {
     }
 
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
+        if self.status == ProxyStatus::Connecting {
+            let rx = MuxerRx::ConnResponse {
+                request_id: req.request_id,
+                local_port: pkt.dst_port(),
+                peer_port: pkt.src_port(),
+                result: -114, // Linux EALREADY
+            };
+            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+            return ProxyUpdate::default();
+        }
+        self.control_port = pkt.src_port();
+        self.connect_request_id = req.request_id;
         sys::do_connect(self, pkt, req)
     }
 
@@ -292,8 +314,19 @@ impl Proxy for TsiStreamProxy {
         })
     }
 
-    fn getpeername(&mut self, pkt: &VsockPacket) {
-        sys::do_getpeername(self, pkt)
+    fn socket_option(&self, level: u32, name: u32, value: Option<i32>) -> Result<i32, i32> {
+        super::tsi_sockopt::socket_option(
+            self.as_raw_fd(),
+            self.family,
+            super::defs::SOCK_STREAM,
+            level,
+            name,
+            value,
+        )
+    }
+
+    fn getname(&mut self, pkt: &VsockPacket, peer: bool) {
+        sys::do_getname(self, pkt, peer)
     }
 
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
@@ -314,6 +347,17 @@ impl Proxy for TsiStreamProxy {
     }
 
     fn accept(&mut self, req: TsiAcceptReq) -> ProxyUpdate {
+        if self.status == ProxyStatus::WaitingOnAccept {
+            let rx = MuxerRx::AcceptResponse {
+                request_id: req.request_id,
+                local_port: 1030,
+                peer_port: self.control_port,
+                result: -16, // Linux EBUSY
+            };
+            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+            return ProxyUpdate::default();
+        }
+        self.accept_request_id = req.request_id;
         sys::do_accept(self, req)
     }
 
@@ -358,6 +402,7 @@ impl Proxy for TsiStreamProxy {
 
         // This packet goes to the control port (DGRAM).
         let rx = MuxerRx::AcceptResponse {
+            request_id: self.accept_request_id,
             local_port: 1030,
             peer_port: self.control_port,
             result,
@@ -381,10 +426,13 @@ impl Proxy for TsiStreamProxy {
         }
 
         self.push_reset();
-        let mut update = self.release();
         self.status = ProxyStatus::Closed;
-        update.signal_queue = true;
-        update
+        // The guest descriptor still owns this socket, including its names.
+        ProxyUpdate {
+            signal_queue: true,
+            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::empty())),
+            ..Default::default()
+        }
     }
 
     fn release(&mut self) -> ProxyUpdate {

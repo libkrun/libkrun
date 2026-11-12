@@ -28,6 +28,8 @@ pub struct MuxerRxQ {
     q: VecDeque<MuxerRx>,
     /// The RX queue sync status.
     synced: bool,
+    #[cfg(feature = "tsi-fault-injection")]
+    pub(super) faults: super::tsi_control_faults::Injector,
 }
 
 impl MuxerRxQ {
@@ -38,6 +40,8 @@ impl MuxerRxQ {
         Self {
             q: VecDeque::with_capacity(Self::SIZE),
             synced: true,
+            #[cfg(feature = "tsi-fault-injection")]
+            faults: super::tsi_control_faults::Injector::default(),
         }
     }
 
@@ -92,6 +96,33 @@ impl MuxerRxQ {
 
 pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
     match rx {
+        #[cfg(feature = "tsi-fault-injection")]
+        MuxerRx::FaultPacket {
+            response,
+            fault,
+            peer_port,
+        } => {
+            super::tsi_control_faults::packet(cid, *response, fault, peer_port, pkt);
+        }
+        #[cfg(feature = "tsi-fault-injection")]
+        MuxerRx::FaultAck { peer_port, words } => {
+            super::tsi_control_faults::ack(cid, peer_port, words, pkt);
+        }
+        MuxerRx::SockoptResponse {
+            request_id,
+            local_port,
+            peer_port,
+            result,
+            value,
+        } => {
+            pkt.set_op(uapi::VSOCK_OP_RW)
+                .set_src_cid(uapi::VSOCK_HOST_CID)
+                .set_dst_cid(cid)
+                .set_src_port(local_port)
+                .set_dst_port(peer_port)
+                .set_type(uapi::VSOCK_TYPE_DGRAM);
+            pkt.write_sockopt_rsp(result, value, request_id);
+        }
         MuxerRx::Reset {
             local_port,
             peer_port,
@@ -108,6 +139,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_fwd_cnt(0);
         }
         MuxerRx::ConnResponse {
+            request_id,
             local_port,
             peer_port,
             result,
@@ -119,8 +151,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
-            pkt.write_connect_rsp(TsiConnectRsp { result });
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.write_connect_rsp(TsiConnectRsp { result }, request_id);
         }
         MuxerRx::OpRequest {
             local_port,
@@ -151,6 +182,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
             pkt.set_len(0);
         }
         MuxerRx::GetnameResponse {
+            request_id,
             local_port,
             peer_port,
             data,
@@ -162,8 +194,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
-            pkt.write_getname_rsp(data);
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.write_getname_rsp(data, request_id);
         }
         MuxerRx::CreditRequest {
             local_port,
@@ -194,9 +225,11 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_fwd_cnt(fwd_cnt);
         }
         MuxerRx::ListenResponse {
+            request_id,
             local_port,
             peer_port,
             result,
+            flags,
         } => {
             pkt.set_op(uapi::VSOCK_OP_RW)
                 .set_src_cid(uapi::VSOCK_HOST_CID)
@@ -205,10 +238,10 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
-            pkt.write_listen_rsp(TsiListenRsp { result });
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.write_listen_rsp(TsiListenRsp { result, flags }, request_id);
         }
         MuxerRx::AcceptResponse {
+            request_id,
             local_port,
             peer_port,
             result,
@@ -220,8 +253,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
-            pkt.write_accept_rsp(TsiAcceptRsp { result });
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.write_accept_rsp(TsiAcceptRsp { result }, request_id);
         }
     }
 }

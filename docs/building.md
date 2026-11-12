@@ -2,6 +2,19 @@
 
 All builds go through the top-level `Makefile`, which handles feature flag configuration, platform detection, and cross-compilation toolchains.
 
+The libkrun 2.0 development branch requires **libkrunfw ABI 6** for bundled
+kernels, including SEV/TDX variants. `Payload::load_krunfw()` checks the exported
+`krunfw_get_version()` before accessing kernel data and rejects any value other
+than 6. Linux loads `libkrunfw.so.6`, `libkrunfw-sev.so.6` or
+`libkrunfw-tdx.so.6`; macOS loads `libkrunfw.6.dylib`. Windows keeps the unversioned
+`libkrunfw.dll` filename and applies the same export check. Missing libraries,
+missing version exports and ABI mismatches return descriptive boot errors.
+There is no fallback to ABI 5 or TSIv3.
+
+External kernels bypass the firmware-library check. When using TSI, supply a
+kernel with the matching TSIv4 implementation; the loader does not infer the
+TSI version from an arbitrary kernel image.
+
 ---
 
 ## Linux
