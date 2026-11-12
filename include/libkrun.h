@@ -213,6 +213,20 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 #define KRUN_CACHE_POLICY_ALWAYS 2
 #endif
 
+/* BuildCapabilityFlags ---------------------------------------------- */
+
+#define KRUN_BUILD_CAPABILITY_FLAGS_BLK 1
+#define KRUN_BUILD_CAPABILITY_FLAGS_NET 2
+#define KRUN_BUILD_CAPABILITY_FLAGS_GPU 4
+#define KRUN_BUILD_CAPABILITY_FLAGS_INPUT 8
+#define KRUN_BUILD_CAPABILITY_FLAGS_VHOST_USER 16
+#define KRUN_BUILD_CAPABILITY_FLAGS_VIRGL_RESOURCE_MAP2 32
+#define KRUN_BUILD_CAPABILITY_FLAGS_AWS_NITRO 64
+#define KRUN_BUILD_CAPABILITY_FLAGS_TEE 128
+#define KRUN_BUILD_CAPABILITY_FLAGS_AMD_SEV 256
+#define KRUN_BUILD_CAPABILITY_FLAGS_TDX 512
+#define KRUN_BUILD_CAPABILITY_FLAGS_TIMESYNC 1024
+
 /* LogOptions -------------------------------------------------------- */
 
 #define KRUN_LOG_OPTIONS_NO_ENV 1
@@ -938,6 +952,9 @@ typedef KrunResult (*krun_init_log_fn)(int target, uint32_t level, uint32_t styl
 KrunResult krun_init_log(void * target, uint32_t level, uint32_t style, uint32_t options, KrunError* err_out);
 typedef KrunResult (*krun_init_log_fn)(void * target, uint32_t level, uint32_t style, uint32_t options, KrunError* err_out);
 #endif
+/** Return the build-time capabilities enabled in this libkrun binary. */
+uint32_t krun_build_capability_flags(void);
+typedef uint32_t (*krun_build_capability_flags_fn)(void);
 bool krun_check_nested_virt(void);
 typedef bool (*krun_check_nested_virt_fn)(void);
 /* Create an owned fieldless error; returns NULL for payload variants or unknown codes.
