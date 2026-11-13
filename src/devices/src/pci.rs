@@ -94,6 +94,10 @@ pub trait PciIntxLine: Send + Sync {
     fn set_level(&self, asserted: bool) -> io::Result<()>;
 }
 
+pub trait PciMsiSender: Send + Sync {
+    fn send(&self, address: u64, data: u32) -> io::Result<()>;
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum PciRootError {
     DuplicateFunction(PciAddress),
