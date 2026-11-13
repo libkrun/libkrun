@@ -185,6 +185,12 @@ pub fn apply_env() {
     }
     if let Ok(term) = env::var("KRUN_TERM") {
         unsafe { env::set_var("TERM", term) };
+    } else if env::var("TERM").is_err() {
+        // The virtio console (hvc0) is a transparent byte pipe that forwards
+        // the host terminal's escape sequences unchanged.  Without a correct
+        // TERM, TUI apps (htop, mc, …) look up the wrong terminfo entries and
+        // misinterpret function/navigation keys (F1-F5, Home, End).
+        unsafe { env::set_var("TERM", "xterm-256color") };
     }
 }
 
@@ -222,6 +228,37 @@ fn parse_rlimit_entry(item: &str) -> Option<(u32, libc::rlim_t, libc::rlim_t)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_env_krun_term_sets_term() {
+        unsafe {
+            env::set_var("KRUN_TERM", "screen-256color");
+            env::remove_var("TERM");
+        }
+        apply_env();
+        assert_eq!(env::var("TERM").unwrap(), "screen-256color");
+        unsafe { env::remove_var("KRUN_TERM") };
+    }
+
+    #[test]
+    fn apply_env_preserves_existing_term() {
+        unsafe {
+            env::remove_var("KRUN_TERM");
+            env::set_var("TERM", "vt100");
+        }
+        apply_env();
+        assert_eq!(env::var("TERM").unwrap(), "vt100");
+    }
+
+    #[test]
+    fn apply_env_defaults_term_when_unset() {
+        unsafe {
+            env::remove_var("KRUN_TERM");
+            env::remove_var("TERM");
+        }
+        apply_env();
+        assert_eq!(env::var("TERM").unwrap(), "xterm-256color");
+    }
 
     #[test]
     fn rlimit_equals_format() {
