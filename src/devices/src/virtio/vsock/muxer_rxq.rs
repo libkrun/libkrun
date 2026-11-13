@@ -15,7 +15,7 @@
 /// connection pool to find it.  This walk is performed here, as part of building an RX queue from
 /// the connection pool. When an out-of-sync is drained, the muxer will discard it, and attempt to
 /// rebuild a synced one.
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use super::defs;
 use super::defs::uapi;
@@ -28,6 +28,8 @@ pub struct MuxerRxQ {
     q: VecDeque<MuxerRx>,
     /// The RX queue sync status.
     synced: bool,
+    /// The newest `fwd_cnt` given to the guest per connection, by any path.
+    delivered: HashMap<(u32, u32), u32>,
 }
 
 impl MuxerRxQ {
@@ -38,6 +40,7 @@ impl MuxerRxQ {
         Self {
             q: VecDeque::with_capacity(Self::SIZE),
             synced: true,
+            delivered: HashMap::new(),
         }
     }
 
@@ -54,7 +57,11 @@ impl MuxerRxQ {
     /// Returns:
     /// - `true` if the new item has been successfully queued; or
     /// - `false` if there was no room left in the queue.
-    pub fn push(&mut self, rx: MuxerRx) -> bool {
+    pub fn push(&mut self, mut rx: MuxerRx) -> bool {
+        if self.coalesce_credit(&mut rx) {
+            return true;
+        }
+
         // Pushing to a non-full, synchronized queue will always succeed.
         if self.is_synced() && !self.is_full() {
             self.q.push_back(rx);
@@ -62,6 +69,84 @@ impl MuxerRxQ {
         }
 
         false
+    }
+
+    /// Put back an item that was just popped but could not be delivered, keeping its place.
+    pub fn push_front(&mut self, rx: MuxerRx) {
+        self.q.push_front(rx);
+    }
+
+    /// The guest keeps only the last `fwd_cnt` it receives for a connection, so a queued
+    /// credit-carrying packet must never deliver an older one than a later packet carries:
+    /// that shrinks the guest's view of our buffer, and with nothing left to correct it the
+    /// connection stalls. Bring every such packet for the connection up to the newest
+    /// `fwd_cnt`, and fold a credit update into one already queued.
+    ///
+    /// Only packets queued since the connection's last reset or handshake packet count: before
+    /// that boundary the ports may belong to an earlier connection, whose `fwd_cnt` means
+    /// nothing to this one.
+    ///
+    /// Returns `true` if `rx` was folded into a queued credit update.
+    fn coalesce_credit(&mut self, rx: &mut MuxerRx) -> bool {
+        let Some((port, peer, new)) = credit_of(rx) else {
+            return false;
+        };
+        let start = self
+            .q
+            .iter()
+            .rposition(|queued| ports_of(queued) == (port, peer) && credit_of(queued).is_none())
+            .map_or(0, |boundary| boundary + 1);
+        let newest = self
+            .q
+            .range(start..)
+            .filter_map(credit_of)
+            .filter(|&(l, p, _)| (l, p) == (port, peer))
+            .map(|(_, _, f)| f)
+            .fold(new, |a, b| if is_after(b, a) { b } else { a });
+
+        set_fwd_cnt(rx, newest);
+        let mut folded = false;
+        for queued in self.q.range_mut(start..) {
+            if credit_of(queued).is_some_and(|(l, p, _)| (l, p) == (port, peer)) {
+                set_fwd_cnt(queued, newest);
+                folded |= matches!(
+                    (&*queued, &*rx),
+                    (MuxerRx::CreditUpdate { .. }, MuxerRx::CreditUpdate { .. })
+                );
+            }
+        }
+        folded
+    }
+
+    /// Record the `fwd_cnt` of a data packet just given to the guest. Data is stamped with the
+    /// current count when it is written, so it is the newest the guest has.
+    pub fn note_data(&mut self, local_port: u32, peer_port: u32, fwd_cnt: u32) {
+        self.delivered.insert((local_port, peer_port), fwd_cnt);
+    }
+
+    /// Build the guest packet for `rx`, which is being given to the guest now.
+    ///
+    /// A credit update or request carries the `fwd_cnt` from when it was made. Data for the
+    /// connection does not wait here, so while it waited the guest may already have been sent a
+    /// newer count; delivering the older one would shrink the guest's view of our buffer just as
+    /// reordering would. Raise it to the newest count the guest has been sent.
+    pub fn deliver(&mut self, cid: u64, mut rx: MuxerRx, pkt: &mut VsockPacket) {
+        self.stamp(&mut rx);
+        rx_to_pkt(cid, rx, pkt);
+    }
+
+    fn stamp(&mut self, rx: &mut MuxerRx) {
+        let ports = ports_of(rx);
+        if let Some((_, _, fwd_cnt)) = credit_of(rx) {
+            let newest = match self.delivered.get(&ports) {
+                Some(&sent) if is_after(sent, fwd_cnt) => sent,
+                _ => fwd_cnt,
+            };
+            set_fwd_cnt(rx, newest);
+            self.delivered.insert(ports, newest);
+        } else if starts_or_ends_connection(rx) {
+            self.delivered.remove(&ports);
+        }
     }
 
     /// Pop an RX item from the front of the queue.
@@ -90,7 +175,93 @@ impl MuxerRxQ {
     }
 }
 
-pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
+fn credit_of(rx: &MuxerRx) -> Option<(u32, u32, u32)> {
+    match *rx {
+        MuxerRx::CreditUpdate {
+            local_port,
+            peer_port,
+            fwd_cnt,
+        }
+        | MuxerRx::CreditRequest {
+            local_port,
+            peer_port,
+            fwd_cnt,
+        } => Some((local_port, peer_port, fwd_cnt)),
+        _ => None,
+    }
+}
+
+fn ports_of(rx: &MuxerRx) -> (u32, u32) {
+    match *rx {
+        MuxerRx::Reset {
+            local_port,
+            peer_port,
+        }
+        | MuxerRx::GetnameResponse {
+            local_port,
+            peer_port,
+            ..
+        }
+        | MuxerRx::ConnResponse {
+            local_port,
+            peer_port,
+            ..
+        }
+        | MuxerRx::OpRequest {
+            local_port,
+            peer_port,
+        }
+        | MuxerRx::OpResponse {
+            local_port,
+            peer_port,
+        }
+        | MuxerRx::CreditRequest {
+            local_port,
+            peer_port,
+            ..
+        }
+        | MuxerRx::CreditUpdate {
+            local_port,
+            peer_port,
+            ..
+        }
+        | MuxerRx::ListenResponse {
+            local_port,
+            peer_port,
+            ..
+        }
+        | MuxerRx::AcceptResponse {
+            local_port,
+            peer_port,
+            ..
+        } => (local_port, peer_port),
+    }
+}
+
+/// After these the ports may name a different connection, whose `fwd_cnt` starts afresh.
+fn starts_or_ends_connection(rx: &MuxerRx) -> bool {
+    matches!(
+        rx,
+        MuxerRx::Reset { .. }
+            | MuxerRx::ConnResponse { .. }
+            | MuxerRx::OpRequest { .. }
+            | MuxerRx::OpResponse { .. }
+            | MuxerRx::AcceptResponse { .. }
+    )
+}
+
+fn set_fwd_cnt(rx: &mut MuxerRx, value: u32) {
+    if let MuxerRx::CreditUpdate { fwd_cnt, .. } | MuxerRx::CreditRequest { fwd_cnt, .. } = rx {
+        *fwd_cnt = value;
+    }
+}
+
+/// Whether wrapping counter `a` is ahead of `b`.
+fn is_after(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
+}
+
+fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
     match rx {
         MuxerRx::Reset {
             local_port,
@@ -223,5 +394,193 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
             pkt.write_accept_rsp(TsiAcceptRsp { result });
             pkt.set_len(pkt.buf().unwrap().len() as u32);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::iter;
+
+    use super::*;
+
+    fn update(fwd_cnt: u32) -> MuxerRx {
+        MuxerRx::CreditUpdate {
+            local_port: 5600,
+            peer_port: 1234,
+            fwd_cnt,
+        }
+    }
+
+    fn request(fwd_cnt: u32) -> MuxerRx {
+        MuxerRx::CreditRequest {
+            local_port: 5600,
+            peer_port: 1234,
+            fwd_cnt,
+        }
+    }
+
+    fn drain(q: &mut MuxerRxQ) -> Vec<Option<(u32, u32, u32)>> {
+        iter::from_fn(|| q.pop()).map(|rx| credit_of(&rx)).collect()
+    }
+
+    #[test]
+    fn credit_update_folds_into_queued_one() {
+        let mut q = MuxerRxQ::new();
+        assert!(q.push(update(100)));
+        assert!(q.push(update(200)));
+        assert_eq!(drain(&mut q), vec![Some((5600, 1234, 200))]);
+    }
+
+    #[test]
+    fn older_credit_never_overtakes_newer() {
+        let mut q = MuxerRxQ::new();
+        assert!(q.push(update(200)));
+        assert!(q.push(request(100)));
+        assert_eq!(
+            drain(&mut q),
+            vec![Some((5600, 1234, 200)), Some((5600, 1234, 200))]
+        );
+    }
+
+    #[test]
+    fn credit_request_is_brought_up_to_date() {
+        let mut q = MuxerRxQ::new();
+        assert!(q.push(request(100)));
+        assert!(q.push(update(300)));
+        assert_eq!(
+            drain(&mut q),
+            vec![Some((5600, 1234, 300)), Some((5600, 1234, 300))]
+        );
+    }
+
+    #[test]
+    fn other_connections_are_left_alone() {
+        let mut q = MuxerRxQ::new();
+        assert!(q.push(update(100)));
+        assert!(q.push(MuxerRx::CreditUpdate {
+            local_port: 5601,
+            peer_port: 1234,
+            fwd_cnt: 900,
+        }));
+        assert_eq!(
+            drain(&mut q),
+            vec![Some((5600, 1234, 100)), Some((5601, 1234, 900))]
+        );
+    }
+
+    #[test]
+    fn newest_wins_across_counter_wrap() {
+        let mut q = MuxerRxQ::new();
+        assert!(q.push(update(u32::MAX - 10)));
+        assert!(q.push(update(5)));
+        assert_eq!(drain(&mut q), vec![Some((5600, 1234, 5))]);
+    }
+
+    #[test]
+    fn push_front_keeps_the_order() {
+        let mut q = MuxerRxQ::new();
+        assert!(q.push(update(100)));
+        assert!(q.push(MuxerRx::Reset {
+            local_port: 5600,
+            peer_port: 1234,
+        }));
+        let first = q.pop().unwrap();
+        q.push_front(first);
+        assert_eq!(drain(&mut q), vec![Some((5600, 1234, 100)), None]);
+    }
+
+    #[test]
+    fn never_coalesces_across_a_reset() {
+        let mut q = MuxerRxQ::new();
+        assert!(q.push(update(300_000_000)));
+        assert!(q.push(MuxerRx::Reset {
+            local_port: 5600,
+            peer_port: 1234,
+        }));
+        assert!(q.push(update(5)));
+        assert_eq!(
+            drain(&mut q),
+            vec![Some((5600, 1234, 300_000_000)), None, Some((5600, 1234, 5))]
+        );
+    }
+
+    #[test]
+    fn coalesces_only_within_the_current_connection() {
+        let mut q = MuxerRxQ::new();
+        assert!(q.push(update(300_000_000)));
+        assert!(q.push(MuxerRx::OpResponse {
+            local_port: 5600,
+            peer_port: 1234,
+        }));
+        assert!(q.push(request(10)));
+        assert!(q.push(update(20)));
+        assert_eq!(
+            drain(&mut q),
+            vec![
+                Some((5600, 1234, 300_000_000)),
+                None,
+                Some((5600, 1234, 20)),
+                Some((5600, 1234, 20)),
+            ]
+        );
+    }
+
+    fn stamped(q: &mut MuxerRxQ, mut rx: MuxerRx) -> Option<(u32, u32, u32)> {
+        q.stamp(&mut rx);
+        credit_of(&rx)
+    }
+
+    #[test]
+    fn queued_update_is_raised_to_data_sent_meanwhile() {
+        let mut q = MuxerRxQ::new();
+        assert!(q.push(update(100)));
+        q.note_data(5600, 1234, 300);
+        let rx = q.pop().unwrap();
+        assert_eq!(stamped(&mut q, rx), Some((5600, 1234, 300)));
+    }
+
+    #[test]
+    fn queued_request_is_raised_to_an_update_sent_before_it() {
+        let mut q = MuxerRxQ::new();
+        assert_eq!(stamped(&mut q, update(300)), Some((5600, 1234, 300)));
+        assert_eq!(stamped(&mut q, request(100)), Some((5600, 1234, 300)));
+    }
+
+    #[test]
+    fn newer_credit_is_delivered_as_it_is() {
+        let mut q = MuxerRxQ::new();
+        q.note_data(5600, 1234, 100);
+        assert_eq!(stamped(&mut q, update(300)), Some((5600, 1234, 300)));
+    }
+
+    #[test]
+    fn raising_works_across_counter_wrap() {
+        let mut q = MuxerRxQ::new();
+        q.note_data(5600, 1234, 5);
+        assert_eq!(
+            stamped(&mut q, update(u32::MAX - 10)),
+            Some((5600, 1234, 5))
+        );
+    }
+
+    #[test]
+    fn a_new_connection_on_the_same_ports_starts_afresh() {
+        let mut q = MuxerRxQ::new();
+        q.note_data(5600, 1234, 500);
+        stamped(
+            &mut q,
+            MuxerRx::Reset {
+                local_port: 5600,
+                peer_port: 1234,
+            },
+        );
+        assert_eq!(stamped(&mut q, update(100)), Some((5600, 1234, 100)));
+    }
+
+    #[test]
+    fn data_on_another_connection_is_not_counted() {
+        let mut q = MuxerRxQ::new();
+        q.note_data(5601, 1234, 500);
+        assert_eq!(stamped(&mut q, update(100)), Some((5600, 1234, 100)));
     }
 }

@@ -11,7 +11,7 @@ use super::TsiFlags;
 use super::VsockError;
 use super::defs;
 use super::defs::uapi;
-use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
+use super::muxer_rxq::MuxerRxQ;
 use super::muxer_thread::MuxerThread;
 use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
 use super::proxy::{Proxy, ProxyRemoval, ProxyStatus, ProxyUpdate};
@@ -90,17 +90,27 @@ pub fn push_packet(
     mem: &GuestMemoryMmap,
 ) {
     let mut queue = queue_mutex.lock().unwrap();
+    let mut rxq = rxq_mutex.lock().unwrap();
+    // Packets already waiting in rxq go first: overtaking them reorders credit updates, and the
+    // guest keeps only the last fwd_cnt it receives.
+    if !rxq.is_empty() {
+        if !rxq.push(rx) {
+            error!("rxq full, dropping pkt");
+        }
+        return;
+    }
     if let Some(head) = queue.pop(mem) {
         if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-            rx_to_pkt(cid, rx, &mut pkt);
+            rxq.deliver(cid, rx, &mut pkt);
             if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len()) {
                 error!("failed to add used elements to the queue: {e:?}");
             }
         }
     } else {
         error!("couldn't push pkt to queue, adding it to rxq");
-        drop(queue);
-        rxq_mutex.lock().unwrap().push(rx);
+        if !rxq.push(rx) {
+            error!("rxq full, dropping pkt");
+        }
     }
 }
 
@@ -183,14 +193,9 @@ impl VsockMuxer {
 
     pub(crate) fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> super::Result<()> {
         debug!("recv_stream_pkt");
-        if self.rxq.lock().unwrap().is_empty() {
-            return Err(VsockError::NoData);
-        }
-
-        if let Some(rx) = self.rxq.lock().unwrap().pop() {
-            rx_to_pkt(self.cid, rx, pkt);
-        }
-
+        let mut rxq = self.rxq.lock().unwrap();
+        let rx = rxq.pop().ok_or(VsockError::NoData)?;
+        rxq.deliver(self.cid, rx, pkt);
         Ok(())
     }
 
@@ -210,20 +215,7 @@ impl VsockMuxer {
             }
         };
 
-        let mut queue = queue_mutex.lock().unwrap();
-        if let Some(head) = queue.pop(mem) {
-            if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-                rx_to_pkt(self.cid, rx, &mut pkt);
-                if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
-                {
-                    error!("failed to add used elements to the queue: {e:?}");
-                }
-            }
-        } else {
-            error!("couldn't push pkt to queue, adding it to rxq");
-            drop(queue);
-            self.rxq.lock().unwrap().push(rx);
-        }
+        push_packet(self.cid, rx, &self.rxq, queue_mutex, mem);
     }
 
     pub fn update_polling(&self, id: u64, fd: RawFd, evset: EventSet) {
