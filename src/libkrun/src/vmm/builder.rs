@@ -1317,7 +1317,7 @@ pub fn build_microvm(
         intc = {
             // If the system supports the in-kernel GIC, use it. Otherwise, fall back to the
             // userspace implementation.
-            let gic = match HvfGicV3::new(vm_resources.vm_config().vcpu_count.unwrap() as u64) {
+            let gic = match HvfGicV3::new(vcpu_list.clone()) {
                 Ok(hvfgic) => IrqChipDevice::new(Box::new(hvfgic)),
                 Err(_) => IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
             };
