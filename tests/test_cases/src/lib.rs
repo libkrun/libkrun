@@ -54,6 +54,11 @@ mod test_vsock_guest_connect_emfile;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_vsock_guest_connect_emfile::TestVsockGuestConnectEmfile;
 
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_virtiofs_host_changes;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_virtiofs_host_changes::TestVirtiofsHostChanges;
+
 mod test_tsi_tcp_guest_connect;
 use test_tsi_tcp_guest_connect::TestTsiTcpGuestConnect;
 
@@ -242,6 +247,8 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("virtiofs-misc", Box::new(TestVirtioFsMisc)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-fixed-owner", Box::new(TestVirtiofsFixedOwner)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("virtiofs-host-changes", Box::new(TestVirtiofsHostChanges)),
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         TestCase::new("virtio-pci", Box::new(TestVirtioPci)),
         #[cfg(target_os = "linux")]
