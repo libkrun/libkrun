@@ -2810,19 +2810,37 @@ pub mod tests {
                     .unwrap();
             let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
             for region in guest_memory.iter() {
-                let start = format!("{:x}-", region.as_ptr() as usize);
-                let flags = smaps
-                    .split_inclusive('\n')
-                    .skip_while(|line| !line.starts_with(&start))
-                    .find_map(|line| line.strip_prefix("VmFlags:"))
-                    .unwrap();
+                let addr = region.as_ptr() as usize;
+                let flags = vma_flags(&smaps, addr).unwrap();
                 assert_eq!(
                     flags.split_whitespace().any(|flag| flag == "hg"),
                     thp,
-                    "{thp}, {start}"
+                    "{thp}, {addr:x}"
                 );
             }
         }
+    }
+
+    // Returns the VmFlags of the mapping that contains addr. The kernel
+    // merges adjacent mappings that have the same flags, so the guest memory
+    // can be part of a larger mapping that starts before it.
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    fn vma_flags(smaps: &str, addr: usize) -> Option<&str> {
+        let mut inside = false;
+        for line in smaps.lines() {
+            let range = line
+                .split_whitespace()
+                .next()
+                .and_then(|r| r.split_once('-'));
+            if let Some((Ok(start), Ok(end))) =
+                range.map(|(s, e)| (usize::from_str_radix(s, 16), usize::from_str_radix(e, 16)))
+            {
+                inside = (start..end).contains(&addr);
+            } else if inside && let Some(flags) = line.strip_prefix("VmFlags:") {
+                return Some(flags);
+            }
+        }
+        None
     }
 
     #[test]
