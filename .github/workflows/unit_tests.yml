@@ -7,7 +7,7 @@ concurrency:
 
 jobs:
   unit-tests-macos:
-    name: Unit tests (macOS utils)
+    name: Unit tests (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +20,12 @@ jobs:
 
       - name: Test macOS filesystem metadata and cached handles
         run: cargo test --locked -p krun-devices --features net,blk --lib virtio::fs::macos
+
+      # Hosted macOS runners do not support nested virtualization. Compile the
+      # hardware regression here; run it explicitly on a physical Mac with:
+      # cargo test --locked -p krun-hvf simd_restore_tests::restored_simd_registers_keep_every_bit -- --ignored --exact
+      - name: Test HVF helpers and compile the hardware restore regression
+        run: cargo test --locked -p krun-hvf
 
   unit-tests-linux-x86_64:
     name: Unit tests (Linux x86_64)
