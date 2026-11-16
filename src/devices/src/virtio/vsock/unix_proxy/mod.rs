@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::Wrapping;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -39,6 +39,18 @@ pub struct UnixProxy {
     pub(crate) local_port: u32,
     pub(crate) control_port: u32,
     pub(crate) peer_shutdown: u32,
+    pub(crate) host_read_closed: bool,
+    /// Guest data the host socket did not take yet. The guest can't send more than
+    /// the credit we return as we write, so this stays below `CONN_TX_BUF_SIZE`;
+    /// the connection is reset if a guest ignoring its credit overflows it.
+    pub(crate) pending_tx: VecDeque<u8>,
+    /// The guest shut down its send side while `pending_tx` still had data.
+    /// Only the unix side buffers writes for the host.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub(crate) shutdown_write_pending: bool,
+    /// The guest shut down both sides while `pending_tx` still had data: the
+    /// connection closes once that data is written.
+    pub(crate) close_after_flush: bool,
     pub(crate) peer_fwd_cnt: Wrapping<u32>,
     pub(crate) peer_buf_alloc: u32,
     pub(crate) tx_cnt: Wrapping<u32>,
@@ -48,6 +60,15 @@ pub struct UnixProxy {
 }
 
 impl UnixProxy {
+    /// Resets the guest side and lets the muxer remove this connection.
+    pub(crate) fn close(&mut self) -> ProxyUpdate {
+        self.push_reset();
+        let mut update = self.release();
+        update.polling = Some((self.id, self.as_raw_fd(), EventSet::empty()));
+        update.signal_queue = true;
+        update
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u64,
@@ -73,6 +94,10 @@ impl UnixProxy {
             local_port,
             control_port,
             peer_shutdown: 0,
+            host_read_closed: false,
+            pending_tx: VecDeque::new(),
+            shutdown_write_pending: false,
+            close_after_flush: false,
             peer_fwd_cnt: Wrapping(0),
             peer_buf_alloc: 0,
             tx_cnt: Wrapping(0),
@@ -101,6 +126,10 @@ impl UnixProxy {
             peer_port,
             control_port: 0,
             peer_shutdown: 0,
+            host_read_closed: false,
+            pending_tx: VecDeque::new(),
+            shutdown_write_pending: false,
+            close_after_flush: false,
             fd,
             status: ProxyStatus::ReverseInit,
             mem,
@@ -139,24 +168,39 @@ impl UnixProxy {
         let mut wait_credit = false;
         let mut queue = self.queue.lock().unwrap();
 
-        while let Some(head) = queue.pop(&self.mem) {
+        while !self.host_read_closed {
+            let Some(head) = queue.pop(&self.mem) else {
+                break;
+            };
             let len = match VsockPacket::from_rx_virtq_head(&head) {
                 Ok(mut pkt) => match sys::recv_to_pkt(self, &mut pkt) {
-                    RecvPkt::WaitForCredit => {
+                    Ok(RecvPkt::WaitForCredit) => {
                         wait_credit = true;
                         0
                     }
-                    RecvPkt::Read(cnt) => {
+                    Ok(RecvPkt::Read(cnt)) => {
                         self.rx_cnt += Wrapping(cnt as u32);
                         self.init_data_pkt(&mut pkt);
                         pkt.set_len(cnt as u32);
                         pkt.hdr().len() + cnt
                     }
-                    RecvPkt::Close => {
+                    // The host side stopped writing, but it may still read the
+                    // guest's reply: send a send-only shutdown, ordered after
+                    // the data already pushed, instead of a reset.
+                    Ok(RecvPkt::Close) => {
+                        self.host_read_closed = true;
+                        self.init_data_pkt(&mut pkt);
+                        pkt.set_op(uapi::VSOCK_OP_SHUTDOWN)
+                            .set_flags(uapi::VSOCK_FLAGS_SHUTDOWN_SEND)
+                            .set_len(0);
+                        pkt.hdr().len()
+                    }
+                    Ok(RecvPkt::Error) => 0,
+                    Err(e) => {
+                        debug!("recv_pkt: socket error: {e}");
                         self.status = ProxyStatus::Closed;
                         0
                     }
-                    RecvPkt::Error => 0,
                 },
                 Err(e) => {
                     debug!("recv_pkt: RX queue error: {e:?}");
@@ -274,12 +318,16 @@ impl Proxy for UnixProxy {
             return ProxyUpdate::default();
         }
 
-        self.push_reset();
-        let mut update = self.release();
         self.status = ProxyStatus::Closed;
-        update.polling = Some((self.id, self.as_raw_fd(), EventSet::empty()));
-        update.signal_queue = true;
-        update
+        if !self.pending_tx.is_empty() {
+            // Data the guest already sent still has to reach the host.
+            self.close_after_flush = true;
+            return ProxyUpdate {
+                polling: Some((self.id, self.as_raw_fd(), EventSet::OUT)),
+                ..Default::default()
+            };
+        }
+        self.close()
     }
 
     fn release(&mut self) -> ProxyUpdate {
