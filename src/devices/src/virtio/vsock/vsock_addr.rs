@@ -56,7 +56,7 @@ impl VsockAddr {
         let family = u16::from_le_bytes([buf[0], buf[1]]);
         match family {
             defs::LINUX_AF_INET => {
-                if buf.len() < LINUX_SOCKADDR_IN_LEN {
+                if len < LINUX_SOCKADDR_IN_LEN {
                     return None;
                 }
                 let port = u16::from_be_bytes([buf[2], buf[3]]);
@@ -64,14 +64,14 @@ impl VsockAddr {
                 Some(VsockAddr::Inet(SocketAddrV4::new(ip, port).into()))
             }
             defs::LINUX_AF_INET6 => {
-                if buf.len() < LINUX_SOCKADDR_IN6_LEN {
+                if len < LINUX_SOCKADDR_IN6_LEN {
                     return None;
                 }
                 let port = u16::from_be_bytes([buf[2], buf[3]]);
                 let flowinfo = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&buf[8..24]);
-                let scope_id = u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]);
+                let scope_id = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
                 Some(VsockAddr::Inet(
                     SocketAddrV6::new(Ipv6Addr::from(octets), port, flowinfo, scope_id).into(),
                 ))
@@ -100,7 +100,7 @@ impl VsockAddr {
                 b[2..4].copy_from_slice(&a.port().to_be_bytes());
                 b[4..8].copy_from_slice(&a.flowinfo().to_be_bytes());
                 b[8..24].copy_from_slice(&a.ip().octets());
-                b[24..28].copy_from_slice(&a.scope_id().to_be_bytes());
+                b[24..28].copy_from_slice(&a.scope_id().to_le_bytes());
                 b
             }
             #[cfg(target_os = "linux")]
@@ -253,6 +253,8 @@ mod tests {
             defs::LINUX_AF_INET6
         );
         assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), 443);
+        // Linux sin6_scope_id is native endian, unlike port and flowinfo.
+        assert_eq!(&bytes[24..28], &[7, 0, 0, 0]);
 
         let parsed = VsockAddr::parse_linux(&bytes, 28).unwrap();
         assert_eq!(parsed, original);
@@ -274,6 +276,11 @@ mod tests {
         buf[0] = 99;
         assert!(VsockAddr::parse_linux(&buf, 16).is_none());
         assert!(VsockAddr::parse_linux(&buf, 0).is_none());
+        buf[0] = defs::LINUX_AF_INET as u8;
+        assert!(VsockAddr::parse_linux(&buf, 2).is_none());
+        let mut v6 = [0; 28];
+        v6[0] = defs::LINUX_AF_INET6 as u8;
+        assert!(VsockAddr::parse_linux(&v6, 16).is_none());
     }
 
     #[test]
