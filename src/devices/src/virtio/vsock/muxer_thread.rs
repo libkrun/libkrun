@@ -6,6 +6,7 @@ use std::thread;
 use super::super::Queue as VirtQueue;
 use super::muxer::{MuxerRx, ProxyMap, push_packet};
 use super::muxer_rxq::MuxerRxQ;
+use super::polling::update_live_polling;
 use super::proxy::{NewProxyType, Proxy, ProxyRawHandle, ProxyRemoval, ProxyUpdate};
 use super::snapshot_gate::SnapshotGate;
 use super::tsi_stream::TsiStreamProxy;
@@ -93,7 +94,13 @@ impl MuxerThread {
 
     fn process_proxy_update(&self, id: u64, update: ProxyUpdate, thread_rng: &mut ThreadRng) {
         if let Some(polling) = update.polling {
-            self.update_polling(polling.0, polling.1, polling.2);
+            update_live_polling(
+                &self.proxy_map,
+                &self.epoll,
+                polling.0,
+                polling.1,
+                polling.2,
+            );
         }
 
         if let Some(credit_rx) = update.push_credit_req {

@@ -13,6 +13,7 @@ mod muxer_rxq;
 mod muxer_thread;
 #[allow(dead_code)]
 mod packet;
+mod polling;
 mod proxy;
 mod reaper;
 mod snapshot_gate;

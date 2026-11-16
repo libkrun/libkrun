@@ -16,6 +16,7 @@ use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::muxer_thread::MuxerThread;
 use super::packet::TsiConnectReq;
 use super::packet::{TsiGetnameRsp, VsockPacket};
+use super::polling::update_live_polling;
 use super::proxy::ProxyRawHandle;
 use super::proxy::{
     ListenerDesc, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, StreamIntercept,
@@ -588,7 +589,13 @@ impl VsockMuxer {
 
     fn process_proxy_update(&self, id: u64, update: ProxyUpdate) {
         if let Some(polling) = update.polling {
-            self.update_polling(polling.0, polling.1, polling.2);
+            update_live_polling(
+                &self.proxy_map,
+                &self.epoll,
+                polling.0,
+                polling.1,
+                polling.2,
+            );
         }
 
         match update.remove_proxy {
