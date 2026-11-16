@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::pci::{
     PCI_CONVENTIONAL_CONFIG_SPACE_SIZE, PCI_UNIMPLEMENTED_READ_BYTE, PciBarAccess, PciFunction,
-    PciIntxLine,
+    PciIntxLine, PciQueueNotifications,
 };
+use utils::eventfd::EventFd;
 use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
 use vm_memory::{Address, GuestAddress, GuestMemoryMmap};
 
@@ -348,6 +349,8 @@ pub struct VirtioPciTransport {
     device_config_len: u32,
     queue_registers: Vec<PciQueueRegisters>,
     bus_master_enabled: Arc<AtomicBool>,
+    queue_notifications: Option<Arc<dyn PciQueueNotifications>>,
+    queue_notifications_base: Option<u64>,
 }
 
 impl VirtioPciTransport {
@@ -422,7 +425,56 @@ impl VirtioPciTransport {
             device_config_len,
             queue_registers,
             bus_master_enabled,
+            queue_notifications: None,
+            queue_notifications_base: None,
         })
+    }
+
+    /// Each queue's eventfd and its notify offset in BAR0.
+    pub fn queue_notify_events(&self) -> Vec<(u64, Arc<EventFd>)> {
+        self.state
+            .queue_evts()
+            .iter()
+            .enumerate()
+            .map(|(i, event)| {
+                (
+                    NOTIFY_CFG_OFFSET + i as u64 * u64::from(NOTIFY_OFF_MULTIPLIER),
+                    event.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Hands queue notifications to `notifications` while BAR0 is mapped and
+    /// memory decoding and bus mastering are on. Otherwise they go through the
+    /// transport, which keeps them pending until bus mastering is on.
+    pub fn set_queue_notifications(&mut self, notifications: Arc<dyn PciQueueNotifications>) {
+        self.queue_notifications = Some(notifications);
+        self.update_queue_notifications();
+    }
+
+    fn update_queue_notifications(&mut self) {
+        let Some(notifications) = &self.queue_notifications else {
+            return;
+        };
+        let command = self
+            .config
+            .read_u16(pci_config::COMMAND)
+            .expect("PCI command register fits in configuration space");
+        let base = (self.bar_base != 0
+            && command & PCI_COMMAND_MEMORY != 0
+            && self.bus_master_enabled.load(Ordering::Acquire))
+        .then_some(u64::from(self.bar_base));
+        if base == self.queue_notifications_base {
+            return;
+        }
+        match notifications.relocate(self.queue_notifications_base, base) {
+            Ok(()) => self.queue_notifications_base = base,
+            Err(err) => warn!(
+                "virtio-pci queue notifications did not move from {:x?} to {base:x?}: {err}",
+                self.queue_notifications_base
+            ),
+        }
     }
 
     pub fn device(&self) -> Arc<Mutex<dyn VirtioDevice>> {
@@ -1088,6 +1140,7 @@ impl PciFunction for VirtioPciTransport {
                 self.activate_if_ready();
             }
         }
+        self.update_queue_notifications();
     }
 
     fn read_bar(&mut self, address: u64, data: &mut [u8]) -> PciBarAccess {
@@ -1631,6 +1684,53 @@ mod tests {
             &mut queue_enable,
         );
         assert_eq!(u16::from_le_bytes(queue_enable), 0);
+    }
+
+    #[derive(Default)]
+    struct RecordingQueueNotifications(Mutex<Vec<(Option<u64>, Option<u64>)>>);
+
+    impl PciQueueNotifications for RecordingQueueNotifications {
+        fn relocate(&self, from: Option<u64>, to: Option<u64>) -> io::Result<()> {
+            self.0.lock().unwrap().push((from, to));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn queue_notifications_follow_bar0_while_bus_mastering_is_on() {
+        let mut transport = transport();
+        let notifications = Arc::new(RecordingQueueNotifications::default());
+        transport.set_queue_notifications(notifications.clone());
+        let bar0 = pci_config::BAR0 as u16;
+        let command = pci_config::COMMAND as u16;
+        let first = u64::from(TEST_BAR_BASE);
+        let second = u64::from(TEST_RELOCATED_BAR_BASE);
+
+        write_config(&mut transport, bar0, &TEST_BAR_BASE.to_le_bytes());
+        write_config(
+            &mut transport,
+            command,
+            &(PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER).to_le_bytes(),
+        );
+        write_config(&mut transport, bar0, &PCI_BAR_PROBE_VALUE.to_le_bytes());
+        write_config(&mut transport, bar0, &TEST_BAR_BASE.to_le_bytes());
+        write_config(&mut transport, bar0, &TEST_RELOCATED_BAR_BASE.to_le_bytes());
+        write_config(&mut transport, command, &PCI_COMMAND_MEMORY.to_le_bytes());
+        write_config(
+            &mut transport,
+            command,
+            &(PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER).to_le_bytes(),
+        );
+
+        assert_eq!(
+            *notifications.0.lock().unwrap(),
+            [
+                (None, Some(first)),
+                (Some(first), Some(second)),
+                (Some(second), None),
+                (None, Some(second)),
+            ]
+        );
     }
 
     #[test]
