@@ -1353,11 +1353,39 @@ pub fn build_microvm(
         capacity_config.vcpu_count = mac_cpu_topology
             .as_ref()
             .map_or(vcpu_config.vcpu_count, |topology| topology.capacity);
+        let board = restore_checkpoint
+            .as_ref()
+            .and_then(|c| c.vm_state.board.as_ref());
         intc = {
             // If the system supports the in-kernel GIC, use it. Otherwise, fall back to the
             // userspace implementation.
-            let gic = match HvfGicV3::new(capacity_config.vcpu_count as u64) {
-                Ok(hvfgic) => IrqChipDevice::new(Box::new(hvfgic)),
+            let slots = board.map_or(u64::from(capacity_config.vcpu_count), |b| {
+                u64::from(b.cpu_slots)
+            });
+            let gic = match HvfGicV3::new(slots) {
+                Ok(hvfgic) => {
+                    if let Some(board) = board {
+                        use devices::legacy::gic::GICDevice;
+                        if hvfgic.device_properties()
+                            != vec![
+                                board.gic_dist_base,
+                                board.gic_dist_size,
+                                board.gic_redist_base,
+                                board.gic_redist_size,
+                            ]
+                        {
+                            return Err(StartMicrovmError::GuestMemoryMmap(
+                                "The saved GIC layout does not match this Mac".into(),
+                            ));
+                        }
+                    }
+                    IrqChipDevice::new(Box::new(hvfgic))
+                }
+                Err(_) if board.is_some() => {
+                    return Err(StartMicrovmError::GuestMemoryMmap(
+                        "This checkpoint requires the native Mac GIC".into(),
+                    ));
+                }
                 Err(_) => IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
             };
             Arc::new(Mutex::new(gic))
@@ -1383,6 +1411,39 @@ pub fn build_microvm(
             event_manager,
             _shutdown_efd,
         )?;
+        if let Some(board) = board {
+            use super::arm_board::{LegacyDevice, LegacyKind};
+            use devices::DeviceType;
+            use devices::fdt::DeviceInfoForFDT;
+            let mut actual = mmio_device_manager
+                .get_device_info()
+                .iter()
+                .filter_map(|((kind, _), info)| {
+                    let kind = match kind {
+                        DeviceType::Serial => LegacyKind::Serial,
+                        DeviceType::RTC => LegacyKind::Rtc,
+                        DeviceType::Gpio => LegacyKind::Gpio,
+                        _ => return None,
+                    };
+                    Some(LegacyDevice {
+                        kind,
+                        addr: info.addr(),
+                        intid: info.irq(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            actual.sort_by_key(|d| d.addr);
+            let mut expected = board.legacy.clone();
+            expected.sort_by_key(|d| d.addr);
+            // Restored RAM contains the original device tree. Do not resume
+            // against a different legacy-device placement.
+            let slot = mmio_device_manager.next_slot();
+            if actual != expected || slot != (board.first_virtio_addr, board.first_virtio_intid) {
+                return Err(StartMicrovmError::GuestMemoryMmap(
+                    "The saved Mac device layout does not match this configuration".into(),
+                ));
+            }
+        }
     }
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     vmm_timing!("vcpus + irq created");

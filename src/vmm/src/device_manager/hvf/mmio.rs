@@ -109,6 +109,11 @@ pub struct MMIODeviceManager {
 }
 
 impl MMIODeviceManager {
+    /// The next MMIO address and interrupt a device would be given.
+    pub fn next_slot(&self) -> (u64, u32) {
+        (self.mmio_base, self.irq)
+    }
+
     /// Create a new DeviceManager handling mmio devices (virtio net, block).
     pub fn new(mmio_base: &mut u64, irq_interval: (u32, u32)) -> MMIODeviceManager {
         if cfg!(target_arch = "aarch64") {

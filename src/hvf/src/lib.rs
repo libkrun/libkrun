@@ -692,6 +692,18 @@ pub fn vcpu_restore_state(vcpuid: u64, state: &HvfVcpuState) -> Result<(), Error
         }
     }
     for &(reg, val) in &state.gic_icc {
+        // Preserve destination read-only capabilities (priority/INTID widths)
+        // when restoring a CPU interface captured by another hypervisor.
+        let val = if reg == 50788 {
+            let mut own = 0;
+            let ret = unsafe { (GIC_REGS.get_icc)(vcpuid, reg as u16, &mut own) };
+            if ret != HV_SUCCESS {
+                return Err(Error::VcpuReadRegister);
+            }
+            (own & !3) | (val & 3)
+        } else {
+            val
+        };
         let ret = unsafe { (GIC_REGS.set_icc)(vcpuid, reg as u16, val) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetSystemRegister(0, val));
@@ -751,7 +763,12 @@ pub fn gic_restore_distributor(regs: &[(u32, u64)]) -> Result<(), Error> {
         }
     }
     if let Some(&(_, ctlr)) = regs.iter().find(|(r, _)| *r == 0) {
-        let ret = unsafe { (GIC_REGS.set_dist)(0, ctlr) };
+        let mut own = 0;
+        let ret = unsafe { (GIC_REGS.get_dist)(0, &mut own) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadRegister);
+        }
+        let ret = unsafe { (GIC_REGS.set_dist)(0, (own & !3) | (ctlr & 3)) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetSystemRegister(0, ctlr));
         }

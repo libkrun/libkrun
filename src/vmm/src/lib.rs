@@ -48,6 +48,8 @@ pub mod vmm_config;
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64", snapshot_supported))]
 mod hvf_import;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", snapshot_supported))]
+mod kvm_import;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -276,6 +278,8 @@ pub struct VmCheckpoint {
 /// leading VM-state section can be.
 #[cfg(snapshot_supported)]
 const HVF_CHECKPOINT_TAG: &[u8; 8] = b"SMVCHVF1";
+#[cfg(snapshot_supported)]
+const KVM_ARM_CHECKPOINT_TAG: &[u8; 8] = b"SMVCKVM1";
 
 /// A checkpoint blob split into its sections, before a hypervisor backend
 /// interprets the VM and vCPU sections.
@@ -303,6 +307,8 @@ impl VmCheckpoint {
         let mut out = Vec::new();
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         out.extend_from_slice(HVF_CHECKPOINT_TAG);
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        out.extend_from_slice(KVM_ARM_CHECKPOINT_TAG);
         put(&mut out, &self.vm_state.serialize());
         out.extend_from_slice(&(self.vcpu_states.len() as u32).to_le_bytes());
         for v in &self.vcpu_states {
@@ -330,6 +336,20 @@ impl VmCheckpoint {
     /// Reconstruct from a blob produced by [`Self::serialize`], on this or (for
     /// a macOS arm64 checkpoint restored on Linux arm64) another backend.
     pub fn deserialize(bytes: &[u8]) -> std::result::Result<VmCheckpoint, String> {
+        if let Some(body) = bytes.strip_prefix(KVM_ARM_CHECKPOINT_TAG) {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            return kvm_import::import(Self::split_sections(body)?);
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+            return Self::from_native_sections(Self::split_sections(body)?);
+            #[cfg(not(all(
+                any(target_os = "linux", target_os = "macos"),
+                target_arch = "aarch64"
+            )))]
+            {
+                let _ = body;
+                return Err("This KVM checkpoint requires an arm64 host".into());
+            }
+        }
         let Some(body) = bytes.strip_prefix(HVF_CHECKPOINT_TAG) else {
             return Self::from_native_sections(Self::split_sections(bytes)?);
         };
@@ -684,10 +704,7 @@ impl Vmm {
         else {
             return None;
         };
-        let cpu_slots = self
-            .mac_cpu_topology
-            .as_ref()
-            .map_or(self.vcpus_handles.len() as u32, |t| u32::from(t.capacity));
+        let cpu_slots = self.intc.lock().unwrap().vcpu_count() as u32;
 
         let mut legacy = Vec::new();
         let mut first_virtio: Option<(u64, u32)> = None;
