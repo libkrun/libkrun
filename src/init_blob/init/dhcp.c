@@ -29,6 +29,46 @@
 #define DHCP_MSG_OFFER 2
 #define DHCP_MSG_ACK 5
 
+/* Extract the first default route's gateway and whether an on-link /32 route
+ * to that gateway is present. Any other route sets *extra. Repeated option 121
+ * instances aren't concatenated (RFC 3396).
+ */
+static int parse_option121(const unsigned char *opt, size_t len,
+                           struct in_addr *gateway, bool *on_link, bool *extra)
+{
+    struct in_addr host = {.s_addr = INADDR_ANY};
+    bool have_gw = false, have_host = false;
+    unsigned int count = 0;
+
+    while (len) {
+        unsigned int plen = *opt;
+        size_t dlen = (plen + 7) / 8;
+        struct in_addr dest = {.s_addr = INADDR_ANY}, gw;
+
+        if (plen > 32 || len < 1 + dlen + sizeof(gw))
+            return -1;
+        memcpy(&dest, opt + 1, dlen);
+        memcpy(&gw, opt + 1 + dlen, sizeof(gw));
+        opt += 1 + dlen + sizeof(gw);
+        len -= 1 + dlen + sizeof(gw);
+        count++;
+
+        if (plen == 0 && gw.s_addr != INADDR_ANY && !have_gw) {
+            *gateway = gw;
+            have_gw = true;
+        } else if (plen == 32 && gw.s_addr == INADDR_ANY && !have_host) {
+            host = dest;
+            have_host = true;
+        }
+    }
+
+    if (!have_gw)
+        return -1;
+    *on_link = have_host && host.s_addr == gateway->s_addr;
+    *extra = count > 1u + *on_link;
+    return 0;
+}
+
 /* Helper function to send netlink message */
 static int nl_send(int sock, struct nlmsghdr *nlh)
 {
@@ -132,14 +172,15 @@ static int set_mtu(int nl_sock, int iface_index, unsigned int mtu)
     return 0;
 }
 
-/* Add or delete IPv4 route */
-static int mod_route4(int nl_sock, int iface_index, int cmd, struct in_addr gw)
+/* Add an IPv4 route. A NULL gateway creates an on-link route. */
+static int mod_route4(int nl_sock, int iface_index, int cmd,
+                      struct in_addr dst, unsigned char prefix_len,
+                      const struct in_addr *gw)
 {
     char buf[4096];
     struct nlmsghdr *nlh;
     struct nlmsgerr *err;
     struct rtmsg *rtm;
-    struct in_addr dst = {.s_addr = INADDR_ANY};
 
     memset(buf, 0, sizeof(buf));
     nlh = (struct nlmsghdr *)buf;
@@ -151,18 +192,20 @@ static int mod_route4(int nl_sock, int iface_index, int cmd, struct in_addr gw)
 
     rtm = (struct rtmsg *)NLMSG_DATA(nlh);
     rtm->rtm_family = AF_INET;
-    rtm->rtm_dst_len = 0;
+    rtm->rtm_dst_len = prefix_len;
     rtm->rtm_src_len = 0;
     rtm->rtm_tos = 0;
     rtm->rtm_table = RT_TABLE_MAIN;
     rtm->rtm_protocol = RTPROT_BOOT;
-    rtm->rtm_scope = RT_SCOPE_UNIVERSE;
+    rtm->rtm_scope = gw ? RT_SCOPE_UNIVERSE : RT_SCOPE_LINK;
     rtm->rtm_type = RTN_UNICAST;
     rtm->rtm_flags = 0;
 
     add_rtattr(nlh, RTA_OIF, &iface_index, sizeof(iface_index));
-    add_rtattr(nlh, RTA_DST, &dst, sizeof(dst));
-    add_rtattr(nlh, RTA_GATEWAY, &gw, sizeof(gw));
+    if (prefix_len)
+        add_rtattr(nlh, RTA_DST, &dst, sizeof(dst));
+    if (gw)
+        add_rtattr(nlh, RTA_GATEWAY, gw, sizeof(*gw));
 
     if (nl_send(nl_sock, nlh) < 0) {
         perror("nl_send failed for mod_route4");
@@ -314,6 +357,10 @@ static int handle_dhcp_ack(int nl_sock, int iface_index,
 
     struct in_addr netmask = {.s_addr = INADDR_ANY};
     struct in_addr router = {.s_addr = INADDR_ANY};
+    /* Option 121 logic */
+    const unsigned char *option121 = NULL;
+    size_t option121_len = 0;
+    bool multiple_option121 = false;
     /* Clamp MTU to passt's limit */
     uint16_t mtu = 65520;
 
@@ -349,6 +396,15 @@ static int handle_dhcp_ack(int nl_sock, int iface_index,
         } else if (opt == 3 && opt_len >= 4) {
             /* Option 3: Router */
             memcpy(&router.s_addr, &response[p], sizeof(router.s_addr));
+        } else if (opt == 121) {
+            /* RFC 3396 requires that we concatenate multiple instances of opt 121;
+             * Instead, for simplicity, if several appear we ignore opt121 later. */
+            if (option121) {
+                multiple_option121 = true;
+            } else {
+                option121 = &response[p];
+                option121_len = opt_len;
+            }
         } else if (opt == 6 && opt_len >= 4) {
             /* Option 6: Domain Name Server */
             if (!resolv && !tried_opening_resolv) {
@@ -385,6 +441,32 @@ static int handle_dhcp_ack(int nl_sock, int iface_index,
         fclose(resolv);
     }
 
+    if (multiple_option121) {
+        fprintf(stderr,
+                "multiple DHCP option 121 instances are unsupported, "
+                "ignoring option 121\n");
+        option121 = NULL;
+    }
+
+    struct in_addr gateway = router;
+    bool on_link = false;
+
+    if (option121) {
+        bool extra;
+
+        if (parse_option121(option121, option121_len, &gateway, &on_link,
+                            &extra) != 0) {
+            fprintf(stderr,
+                    "unsupported DHCP option 121 encoding, "
+                    "falling back to option 3 router\n");
+            /* parse_option121() may have written *gateway before failing */
+            gateway = router;
+            on_link = false;
+        } else if (extra) {
+            fprintf(stderr, "ignoring extra routes in DHCP option 121\n");
+        }
+    }
+
     /* Calculate prefix length from netmask */
     unsigned char prefix_len = count_leading_ones(ntohl(netmask.s_addr));
 
@@ -392,7 +474,14 @@ static int handle_dhcp_ack(int nl_sock, int iface_index,
         printf("couldn't add the address provided by the DHCP server\n");
         return -1;
     }
-    if (mod_route4(nl_sock, iface_index, RTM_NEWROUTE, router) != 0) {
+    /* Host route first so the gateway is reachable, then the default route */
+    if (on_link && mod_route4(nl_sock, iface_index, RTM_NEWROUTE, gateway, 32,
+                              NULL) != 0) {
+        printf("couldn't add the gateway route provided by the DHCP server\n");
+        return -1;
+    }
+    if (mod_route4(nl_sock, iface_index, RTM_NEWROUTE,
+                   (struct in_addr){.s_addr = INADDR_ANY}, 0, &gateway) != 0) {
         printf("couldn't add the default route provided by the DHCP server\n");
         return -1;
     }

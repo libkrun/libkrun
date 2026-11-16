@@ -43,6 +43,18 @@ impl TestNet {
         }
     }
 
+    pub fn new_passt_off_subnet_gateway() -> Self {
+        Self {
+            tcp_tester: TcpTester::new([192, 0, 2, 1].into(), 9005),
+            #[cfg(feature = "host")]
+            should_run: passt::should_run,
+            #[cfg(feature = "host")]
+            setup_backend: passt::setup_backend_off_subnet_gateway,
+            #[cfg(feature = "host")]
+            cleanup: None,
+        }
+    }
+
     pub fn new_tap() -> Self {
         Self {
             tcp_tester: TcpTester::new([10, 0, 0, 1].into(), 9001),
