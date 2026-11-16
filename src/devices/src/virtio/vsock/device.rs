@@ -176,6 +176,8 @@ impl Vsock {
             }
         }
 
+        drop(queue_rx);
+        have_used |= self.muxer.resume_datagram_rx();
         have_used
     }
 

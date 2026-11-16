@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -140,6 +140,7 @@ pub struct VsockMuxer {
     epoll: Epoll,
     interrupt: Option<InterruptTransport>,
     proxy_map: ProxyMap,
+    pending_datagram_rx: Arc<Mutex<HashSet<u64>>>,
     reaper_sender: Option<Sender<u64>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     tsi_flags: TsiFlags,
@@ -245,6 +246,7 @@ impl VsockMuxer {
             epoll: Epoll::new().unwrap(),
             interrupt: None,
             proxy_map: Arc::new(RwLock::new(HashMap::new())),
+            pending_datagram_rx: Arc::new(Mutex::new(HashSet::new())),
             reaper_sender: None,
             unix_ipc_port_map,
             tsi_flags,
@@ -435,6 +437,35 @@ impl VsockMuxer {
 
     pub(crate) fn rx_held_for_transport_reset(&self) -> bool {
         self.snapshot_gate.is_held_for_transport_reset()
+    }
+
+    /// Resume only host datagrams that exhausted the RX descriptors. Called
+    /// after dropping the virtqueue lock: proxies acquire it while delivering.
+    pub(crate) fn resume_datagram_rx(&self) -> bool {
+        if !self.tsi_flags.contains(TsiFlags::HOST_BIND) {
+            return false;
+        }
+        let ids: Vec<_> = self
+            .pending_datagram_rx
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        let mut used = false;
+        for id in ids {
+            let update = self
+                .proxy_map
+                .read()
+                .unwrap()
+                .get(&id)
+                .map(|proxy| proxy.lock().unwrap().process_event(EventSet::IN));
+            if let Some(update) = update {
+                used |= update.signal_queue;
+                self.process_proxy_update(id, update);
+            }
+        }
+        used
     }
 
     pub(crate) fn has_pending_rx(&self) -> bool {
@@ -710,6 +741,8 @@ impl VsockMuxer {
                         self.rxq.clone(),
                         self.dns_sender.clone(),
                         self.snapshot_gate.clone(),
+                        self.pending_datagram_rx.clone(),
+                        self.epoll.clone(),
                     ) {
                         Ok(proxy) => {
                             self.proxy_map

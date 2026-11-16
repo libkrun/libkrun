@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::collections::{HashMap, HashSet};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::Wrapping;
 use std::sync::{Arc, Mutex};
 
@@ -10,6 +10,7 @@ use super::defs;
 use super::defs::uapi;
 use super::dns_filter::{DNS_PORT, DnsRequest, sockaddr_port};
 use super::host_bind::{BindRequest, bind_inet};
+use super::host_datagram::{FRAME_HEADER, HostDatagramRx};
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
@@ -23,7 +24,7 @@ use super::snapshot_gate::SnapshotGate;
 use super::sys;
 use super::vsock_addr::VsockAddr;
 use crossbeam_channel::Sender;
-use utils::epoll::EventSet;
+use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 
 use vm_memory::GuestMemoryMmap;
 
@@ -50,6 +51,10 @@ pub struct TsiDgramProxy {
     /// Set when this socket was `connect()`ed to a resolver (port 53) and is
     /// being intercepted — sends on it are routed to the DNS worker.
     connected_dns: bool,
+    host_rx: Option<HostDatagramRx>,
+    host_peer: Option<SocketAddr>,
+    pending_rx: Arc<Mutex<HashSet<u64>>>,
+    epoll: Epoll,
 }
 
 impl TsiDgramProxy {
@@ -64,6 +69,8 @@ impl TsiDgramProxy {
         rxq: Arc<Mutex<MuxerRxQ>>,
         dns_sender: Option<Sender<DnsRequest>>,
         snapshot_gate: Arc<SnapshotGate>,
+        pending_rx: Arc<Mutex<HashSet<u64>>>,
+        epoll: Epoll,
     ) -> Result<Self, ProxyError> {
         let (family, domain) = match family {
             defs::LINUX_AF_INET => (Family::Inet, Domain::IPV4),
@@ -102,6 +109,10 @@ impl TsiDgramProxy {
             peer_fwd_cnt: Wrapping(0),
             dns_sender,
             connected_dns: false,
+            host_rx: None,
+            host_peer: None,
+            pending_rx,
+            epoll,
         })
     }
 
@@ -127,8 +138,16 @@ impl TsiDgramProxy {
             self.id, self.local_port, self.peer_port
         );
         pkt.set_op(uapi::VSOCK_OP_RW)
-            .set_src_cid(self.cid)
-            .set_dst_cid(uapi::VSOCK_HOST_CID)
+            .set_src_cid(if self.host_rx.is_some() {
+                uapi::VSOCK_HOST_CID
+            } else {
+                self.cid
+            })
+            .set_dst_cid(if self.host_rx.is_some() {
+                self.cid
+            } else {
+                uapi::VSOCK_HOST_CID
+            })
             .set_dst_port(self.peer_port)
             .set_src_port(0)
             .set_type(uapi::VSOCK_TYPE_DGRAM)
@@ -206,6 +225,80 @@ impl TsiDgramProxy {
         (have_used, wait_credit)
     }
 
+    fn recv_host_datagrams(&mut self) -> ProxyUpdate {
+        let mut have_used = false;
+        let mut exhausted = true;
+        let _activity = self.snapshot_gate.enter();
+        let mut queue = self.queue.lock().unwrap();
+        while let Some(head) = queue.pop(&self.mem) {
+            let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) else {
+                let _ = queue.add_used(&self.mem, head.index, 0);
+                have_used = true;
+                continue;
+            };
+            let Some(buf) = pkt.buf_mut().filter(|buf| buf.len() > FRAME_HEADER) else {
+                // Consume a malformed descriptor without consuming a UDP
+                // datagram or permanently wedging the shared receive queue.
+                let _ = queue.add_used(&self.mem, head.index, 0);
+                have_used = true;
+                continue;
+            };
+            match self
+                .host_rx
+                .as_mut()
+                .unwrap()
+                .receive_frame(&self.sock, buf)
+            {
+                Ok(len) => {
+                    self.rx_cnt += Wrapping(len as u32);
+                    self.init_pkt(&mut pkt);
+                    pkt.set_len(len as u32);
+                    if let Err(e) =
+                        queue.add_used(&self.mem, head.index, (pkt.hdr().len() + len) as u32)
+                    {
+                        error!("failed to publish host UDP frame: {e:?}");
+                    }
+                    have_used = true;
+                }
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::WouldBlock {
+                        debug!("host UDP receive: {e}");
+                    }
+                    queue.undo_pop();
+                    exhausted = false;
+                    break;
+                }
+            }
+        }
+        // Set the retry marker while the virtqueue is still locked. A guest
+        // refill must observe it, even if it races this last empty pop.
+        let mut pending = self.pending_rx.lock().unwrap();
+        if exhausted {
+            pending.insert(self.id);
+        } else {
+            pending.remove(&self.id);
+        }
+        drop(pending);
+        drop(queue);
+        // Serialize poll changes under the proxy lock. Applying a deferred
+        // remove after a concurrent refill rearmed IN would lose the wakeup.
+        let fd = raw_handle(&self.sock);
+        let _ = self
+            .epoll
+            .ctl(ControlOperation::Delete, fd, &EpollEvent::default());
+        if !exhausted {
+            let _ = self.epoll.ctl(
+                ControlOperation::Add,
+                fd,
+                &EpollEvent::new(EventSet::IN, self.id),
+            );
+        }
+        ProxyUpdate {
+            signal_queue: have_used,
+            ..Default::default()
+        }
+    }
+
     /// Bind the datagram socket to an unspecified local address so it can
     /// receive replies. Returns the bind result.
     fn bind_unspecified(&self) -> std::io::Result<()> {
@@ -241,12 +334,27 @@ impl TsiDgramProxy {
 
 impl Proxy for TsiDgramProxy {
     fn bind_host(&mut self, req: &BindRequest) -> Result<VsockAddr, i32> {
+        // The legacy DNS worker emits unframed datagrams. A host-mode socket
+        // must use the host resolver directly until that worker speaks the
+        // same sender-preserving protocol; never silently mix wire formats.
+        if self.dns_sender.is_some() {
+            return Err(-95); // EOPNOTSUPP
+        }
         if self.listening || self.status != ProxyStatus::Idle {
             return Err(-libc::EINVAL);
         }
+        // macOS's default UDP send buffer is only 9 KiB. A Linux host-mode
+        // socket must be able to carry a full UDP datagram in either direction.
+        self.sock
+            .set_send_buffer_size(128 * 1024)
+            .map_err(|e| -sys::to_linux_errno(&e))?;
+        self.sock
+            .set_recv_buffer_size(128 * 1024)
+            .map_err(|e| -sys::to_linux_errno(&e))?;
         let addr = bind_inet(&self.sock, self.family, req)?;
         // sendto must keep this source port instead of trying to autobind again.
         self.listening = true;
+        self.host_rx = Some(HostDatagramRx::default());
         Ok(addr.into())
     }
 
@@ -298,6 +406,9 @@ impl Proxy for TsiDgramProxy {
         let (res, poll_host_socket) = match addr.and_then(|a| self.sock.connect(&a)) {
             Ok(()) => {
                 self.status = ProxyStatus::Connected;
+                if self.host_rx.is_some() {
+                    self.host_peer = req.addr.inet();
+                }
                 if intercept {
                     debug!("connect: intercepting DNS socket");
                     self.connected_dns = true;
@@ -341,7 +452,13 @@ impl Proxy for TsiDgramProxy {
     fn getpeername(&mut self, pkt: &VsockPacket) {
         debug!("process_getpeername");
 
-        let (result, addr): (i32, VsockAddr) = match self.sock.peer_addr() {
+        let local = pkt.read_getname_req().is_some_and(|req| req.peer == 0);
+        let name = if local {
+            self.sock.local_addr()
+        } else {
+            self.sock.peer_addr()
+        };
+        let (result, addr): (i32, VsockAddr) = match name {
             Ok(sa) => match sa.as_socket() {
                 Some(socket_addr) => (0, VsockAddr::Inet(socket_addr)),
                 None => (
@@ -383,13 +500,19 @@ impl Proxy for TsiDgramProxy {
         // Connected DNS socket: route the query to the worker; the worker pushes
         // the response and signals the guest asynchronously.
         if self.connected_dns {
-            if let Some(buf) = pkt.data() {
+            if let Some(buf) = pkt
+                .data()
+                .or_else(|| (self.host_rx.is_some() && pkt.len() == 0).then_some(&[]))
+            {
                 self.send_dns_query(buf);
             }
             return ProxyUpdate::default();
         }
 
-        let ret = if let Some(buf) = pkt.data() {
+        let ret = if let Some(buf) = pkt
+            .data()
+            .or_else(|| (self.host_rx.is_some() && pkt.len() == 0).then_some(&[]))
+        {
             #[cfg(target_os = "linux")]
             let send_res = self.sock.send_with_flags(buf, libc::MSG_NOSIGNAL);
             #[cfg(not(target_os = "linux"))]
@@ -445,7 +568,10 @@ impl Proxy for TsiDgramProxy {
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
         if let Some(addr) = self.sendto_addr.clone() {
-            if let Some(buf) = pkt.data() {
+            if let Some(buf) = pkt
+                .data()
+                .or_else(|| (self.host_rx.is_some() && pkt.len() == 0).then_some(&[]))
+            {
                 // Unconnected DNS query (sendto a resolver:53): route to the
                 // worker instead of the host socket.
                 if self.dns_sender.is_some() && sockaddr_port(&addr) == Some(DNS_PORT) {
@@ -464,7 +590,13 @@ impl Proxy for TsiDgramProxy {
                 };
 
                 match dst {
-                    Some(d) => match self.sock.send_to(buf, &d) {
+                    Some(d) => match if self.host_peer.is_some() && self.host_peer == addr.inet() {
+                        // Darwin rejects sendto with an explicit destination
+                        // on a connected UDP socket, even for its own peer.
+                        self.sock.send(buf)
+                    } else {
+                        self.sock.send_to(buf, &d)
+                    } {
                         Ok(sent) => {
                             self.tx_cnt += Wrapping(sent as u32);
                         }
@@ -536,6 +668,10 @@ impl Proxy for TsiDgramProxy {
             return update;
         }
 
+        if evset.contains(EventSet::IN) && self.host_rx.is_some() {
+            return self.recv_host_datagrams();
+        }
+
         if evset.contains(EventSet::IN) {
             let (signal_queue, wait_credit) = self.recv_pkt();
             update.signal_queue = signal_queue || wait_credit;
@@ -561,5 +697,11 @@ impl Proxy for TsiDgramProxy {
         }
 
         update
+    }
+}
+
+impl Drop for TsiDgramProxy {
+    fn drop(&mut self) {
+        self.pending_rx.lock().unwrap().remove(&self.id);
     }
 }

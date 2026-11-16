@@ -4,7 +4,7 @@
 use super::super::packet::VSOCK_PKT_HDR_SIZE;
 use super::*;
 use crate::virtio::queue::tests::VirtQueue as TestQueue;
-use std::net::{Ipv6Addr, SocketAddr, TcpStream};
+use std::net::{Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::time::Duration;
 use vm_memory::{Bytes, GuestAddress};
 
@@ -18,7 +18,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(flags: TsiFlags, map: Option<HashMap<u16, u16>>) -> Self {
-        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
         let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
         let mut muxer = VsockMuxer::new(3, map, None, flags, None, None, None, None, None);
         muxer.mem = Some(mem.clone());
@@ -196,4 +196,162 @@ fn host_bound_stream_listens_on_its_reserved_port() {
     ));
     let _client = TcpStream::connect_timeout(&bound, Duration::from_secs(2)).unwrap();
     f.release();
+}
+
+#[test]
+fn host_udp_preserves_datagrams_across_queue_refills_and_replies_to_each_sender() {
+    use super::super::host_datagram::FRAME_HEADER;
+    let mut f = Fixture::new(granted(), None);
+    // A local host-network launch explicitly permits host loopback; binding
+    // alone must not override the transport's independent egress policy.
+    f.muxer.floor = FloorMode::MetadataOnly;
+    f.create(defs::SOCK_DGRAM, defs::LINUX_AF_INET);
+    let bound = f.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let mem = f.mem.clone();
+    let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+    let clients: Vec<_> = (0..2)
+        .map(|_| {
+            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            socket
+        })
+        .collect();
+    let id = ((GUEST as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+    let mut available = 0u16;
+    for (index, len) in [0, 4096, 65_507, 1].into_iter().enumerate() {
+        let client = &clients[index % 2];
+        socket2::SockRef::from(client)
+            .set_send_buffer_size(128 * 1024)
+            .unwrap();
+        let data: Vec<_> = (0..len).map(|i| (i % 251) as u8).collect();
+        client.send_to(&data, bound).unwrap();
+        let fd = f
+            .muxer
+            .proxy_map
+            .read()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .poll_handle();
+        super::super::host_datagram::wait_readable(fd);
+        // The socket becomes readable while the guest has no RX buffers.
+        let proxy = f.muxer.proxy_map.read().unwrap();
+        proxy
+            .get(&id)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .process_event(EventSet::IN);
+        drop(proxy);
+        assert!(f.muxer.pending_datagram_rx.lock().unwrap().contains(&id));
+        let mut recovered = Vec::new();
+        let mut sequence = None;
+        loop {
+            let buffer = 0x30000;
+            rx.dtable[0].set(buffer, (VSOCK_PKT_HDR_SIZE + 512) as u32, 2, 0);
+            rx.avail.ring[available as usize % 8].set(0);
+            available += 1;
+            rx.avail.idx.set(available);
+            // A guest refill alone must resume a partially delivered message,
+            // even after the host socket has been drained and is no longer readable.
+            assert!(f.muxer.resume_datagram_rx());
+            assert_eq!(rx.used.idx.get(), available);
+            let used = rx.used.ring[(available as usize - 1) % 8].get();
+            let bytes = used.len as usize - VSOCK_PKT_HDR_SIZE;
+            let mut frame = vec![0; bytes];
+            mem.read_slice(&mut frame, GuestAddress(buffer + VSOCK_PKT_HDR_SIZE as u64))
+                .unwrap();
+            assert_eq!(
+                mem.read_obj::<u64>(GuestAddress(buffer)).unwrap(),
+                uapi::VSOCK_HOST_CID
+            );
+            assert_eq!(mem.read_obj::<u64>(GuestAddress(buffer + 8)).unwrap(), 3);
+            let word = |at| u32::from_le_bytes(frame[at..at + 4].try_into().unwrap());
+            assert_eq!(word(4) as usize, len);
+            assert_eq!(word(8) as usize, recovered.len());
+            if let Some(sequence) = sequence {
+                assert_eq!(word(0), sequence);
+            } else {
+                sequence = Some(word(0));
+            }
+            let sender = VsockAddr::parse_linux(&frame[16..FRAME_HEADER], word(12)).unwrap();
+            assert_eq!(sender.inet(), Some(client.local_addr().unwrap()));
+            recovered.extend_from_slice(&frame[FRAME_HEADER..]);
+            if recovered.len() == len {
+                break;
+            }
+        }
+        assert_eq!(recovered, data);
+        // Reply through the existing guest sendto path; the client must see the
+        // exact bound port, not an independently autobound ephemeral socket.
+        let sender = VsockAddr::from(client.local_addr().unwrap());
+        f.send(
+            defs::TSI_SENDTO_ADDR,
+            &[
+                &GUEST.to_le_bytes()[..],
+                &sender.linux_len().to_le_bytes(),
+                &sender.to_linux_bytes(),
+            ]
+            .concat(),
+        );
+        let response = if index == 0 { &b""[..] } else { &b"reply"[..] };
+        let mut pkt = f.packet(defs::TSI_SENDTO_DATA, response);
+        pkt.set_src_port(GUEST);
+        f.muxer.send_dgram_pkt(&pkt).unwrap();
+        let mut reply = [0; 16];
+        let (len, sender) = client.recv_from(&mut reply).unwrap();
+        assert_eq!(&reply[..len], response);
+        assert_eq!(sender, bound);
+    }
+    f.release();
+    assert!(f.muxer.pending_datagram_rx.lock().unwrap().is_empty());
+}
+
+#[test]
+fn host_udp_connected_sends_preserve_empty_payloads_and_bound_port() {
+    for ip in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        let mut f = Fixture::new(granted(), None);
+        f.muxer.floor = FloorMode::MetadataOnly;
+        let family = if ip.is_ipv4() {
+            defs::LINUX_AF_INET
+        } else {
+            defs::LINUX_AF_INET6
+        };
+        f.create(defs::SOCK_DGRAM, family);
+        let bound = f.bind(SocketAddr::new(ip, 0)).unwrap();
+        let receiver = UdpSocket::bind(SocketAddr::new(ip, 0)).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let destination = VsockAddr::from(receiver.local_addr().unwrap());
+        let request = [
+            &GUEST.to_le_bytes()[..],
+            &destination.linux_len().to_le_bytes(),
+            &destination.to_linux_bytes(),
+        ]
+        .concat();
+        f.send(defs::TSI_CONNECT, &request);
+        assert!(matches!(
+            f.muxer.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::ConnResponse { result: 0, .. })
+        ));
+        for payload in [&b""[..], &b"connected"[..]] {
+            f.send(defs::TSI_SENDTO_ADDR, &request);
+            let mut packet = f.packet(defs::TSI_SENDTO_DATA, payload);
+            packet.set_src_port(GUEST);
+            f.muxer.send_dgram_pkt(&packet).unwrap();
+            let mut data = [0; 32];
+            let (len, sender) = receiver.recv_from(&mut data).unwrap();
+            assert_eq!(&data[..len], payload);
+            assert_eq!(sender, bound);
+        }
+        f.release();
+    }
 }

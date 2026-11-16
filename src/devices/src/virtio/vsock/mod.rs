@@ -9,6 +9,7 @@ mod device;
 mod dns_filter;
 mod event_handler;
 mod host_bind;
+mod host_datagram;
 mod muxer;
 mod muxer_rxq;
 mod muxer_thread;

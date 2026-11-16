@@ -893,9 +893,14 @@ impl Proxy for TsiStreamProxy {
     fn getpeername(&mut self, pkt: &VsockPacket) {
         debug!("getpeername: id={}", self.id);
 
-        let peer = match self.intercept_peer {
-            Some(destination) => Ok(socket2::SockAddr::from(destination)),
-            None => self.sock.peer_addr(),
+        let local = pkt.read_getname_req().is_some_and(|req| req.peer == 0);
+        let peer = if local {
+            self.sock.local_addr()
+        } else {
+            match self.intercept_peer {
+                Some(destination) => Ok(socket2::SockAddr::from(destination)),
+                None => self.sock.peer_addr(),
+            }
         };
         let (result, addr_len, addr): (i32, u32, VsockAddr) = match peer {
             Ok(sa) => match sa.as_socket() {
