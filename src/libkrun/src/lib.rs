@@ -5334,6 +5334,10 @@ pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
         None => return -libc::EINVAL,
     };
 
+    if tsi_flags.contains(TsiFlags::HOST_BIND) && !tsi_flags.contains(TsiFlags::HIJACK_INET) {
+        return -libc::EINVAL;
+    }
+
     // AF_UNIX hijacking needs host AF_UNIX sockets, which exist only on Unix
     // (and aren't yet wired on macOS).
     if !cfg!(target_os = "linux") && tsi_flags.contains(TsiFlags::HIJACK_UNIX) {

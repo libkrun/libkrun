@@ -9,6 +9,7 @@ use super::super::Queue as VirtQueue;
 use super::defs;
 use super::defs::uapi;
 use super::dns_filter::{DNS_PORT, DnsRequest, sockaddr_port};
+use super::host_bind::{BindRequest, bind_inet};
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
@@ -239,6 +240,16 @@ impl TsiDgramProxy {
 }
 
 impl Proxy for TsiDgramProxy {
+    fn bind_host(&mut self, req: &BindRequest) -> Result<VsockAddr, i32> {
+        if self.listening || self.status != ProxyStatus::Idle {
+            return Err(-libc::EINVAL);
+        }
+        let addr = bind_inet(&self.sock, self.family, req)?;
+        // sendto must keep this source port instead of trying to autobind again.
+        self.listening = true;
+        Ok(addr.into())
+    }
+
     fn poll_handle(&self) -> ProxyRawHandle {
         raw_handle(&self.sock)
     }

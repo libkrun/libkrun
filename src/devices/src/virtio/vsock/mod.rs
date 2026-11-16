@@ -8,6 +8,7 @@
 mod device;
 mod dns_filter;
 mod event_handler;
+mod host_bind;
 mod muxer;
 mod muxer_rxq;
 mod muxer_thread;
@@ -46,6 +47,8 @@ mod defs {
             const HIJACK_INET = 1 << 0;
             /// Hijack AF_UNIX sockets
             const HIJACK_UNIX = 1 << 1;
+            /// Permit synchronous INET binds on host sockets (no port mapping).
+            const HOST_BIND = 1 << 2;
         }
     }
 
@@ -96,6 +99,7 @@ mod defs {
     pub const TSI_LISTEN: u32 = 1029;
     pub const TSI_ACCEPT: u32 = 1030;
     pub const TSI_PROXY_RELEASE: u32 = 1031;
+    pub const TSI_BIND: u32 = 1032;
 
     // Linux definitions that we need for cross-platform compatibility.
     // AF_UNIX over TSI is Linux-only; the constant is unused on macOS/Windows.

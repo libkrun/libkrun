@@ -12,6 +12,7 @@ use super::dns_filter::{
     DnsRequest, DnsWorker, EgressPolicy, FloorMode, floor_mode, is_addr_floored,
     is_addr_host_loopback, sockaddr_port,
 };
+use super::host_bind::{BindRequest, BindResponse};
 use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::muxer_thread::MuxerThread;
 use super::packet::TsiConnectReq;
@@ -35,11 +36,20 @@ use vm_memory::GuestMemoryMmap;
 
 use crate::virtio::InterruptTransport;
 
+#[cfg(test)]
+#[path = "host_bind_tests.rs"]
+mod host_bind_tests;
+
 pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
 
 /// A muxer RX queue item.
 #[derive(Debug)]
 pub enum MuxerRx {
+    BindResponse {
+        local_port: u32,
+        peer_port: u32,
+        data: BindResponse,
+    },
     Reset {
         local_port: u32,
         peer_port: u32,
@@ -828,6 +838,52 @@ impl VsockMuxer {
         }
     }
 
+    fn process_bind_request(&self, pkt: &VsockPacket) {
+        // This is a new capability, not a way around the legacy publishing
+        // allow-list. Even an empty map deliberately forbids direct host binds.
+        let allowed = self
+            .tsi_flags
+            .contains(TsiFlags::HIJACK_INET | TsiFlags::HOST_BIND)
+            && self.host_port_map.is_none();
+        let mut update = None;
+        let result = if !allowed {
+            Err(-libc::EPERM)
+        } else if let Some(req) = pkt.data().and_then(BindRequest::parse) {
+            let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+            let map = self.proxy_map.read().unwrap();
+            match map.get(&id) {
+                Some(proxy) => {
+                    let mut proxy = proxy.lock().unwrap();
+                    let result = proxy.bind_host(&req);
+                    if result.is_ok() && proxy.is_dgram() {
+                        update = Some((
+                            id,
+                            ProxyUpdate {
+                                polling: Some((id, proxy.poll_handle(), EventSet::IN)),
+                                ..Default::default()
+                            },
+                        ));
+                    }
+                    result
+                }
+                None => Err(-libc::EBADF),
+            }
+        } else {
+            Err(-libc::EINVAL)
+        };
+        // Register UDP reads with no proxy-map lock held. The host socket is
+        // already bound when success is sent; conflicts cannot be hidden by
+        // later best-effort publication.
+        if let Some((id, update)) = update {
+            self.process_proxy_update(id, update);
+        }
+        self.push_packet(MuxerRx::BindResponse {
+            local_port: pkt.dst_port(),
+            peer_port: pkt.src_port(),
+            data: BindResponse::from(result),
+        });
+    }
+
     fn process_listen_request(&self, pkt: &VsockPacket) {
         debug!("DGRAM listen request: src={}", pkt.src_port());
         if let Some(req) = pkt.read_listen_req() {
@@ -937,6 +993,7 @@ impl VsockMuxer {
             defs::TSI_GETNAME if self.tsi_flags.tsi_enabled() => self.process_getname(pkt),
             defs::TSI_SENDTO_ADDR if self.tsi_flags.tsi_enabled() => self.process_sendto_addr(pkt),
             defs::TSI_SENDTO_DATA if self.tsi_flags.tsi_enabled() => self.process_sendto_data(pkt),
+            defs::TSI_BIND => self.process_bind_request(pkt),
             defs::TSI_LISTEN if self.tsi_flags.tsi_enabled() => self.process_listen_request(pkt),
             defs::TSI_ACCEPT if self.tsi_flags.tsi_enabled() => self.process_accept_request(pkt),
             defs::TSI_PROXY_RELEASE if self.tsi_flags.tsi_enabled() => {

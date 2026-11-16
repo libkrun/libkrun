@@ -404,6 +404,11 @@ int32_t krun_add_virtiofs4(uint32_t ctx_id,
 /* TSI (Transparent Socket Impersonation) feature flags for vsock */
 #define KRUN_TSI_HIJACK_INET  (1 << 0)
 #define KRUN_TSI_HIJACK_UNIX  (1 << 1)
+/* Allow TSI_BIND to reserve host TCP/UDP addresses synchronously; requires
+ * HIJACK_INET and no port map. This is a transport capability for cooperating
+ * guest firmware, not a switch that makes existing guests use host networking.
+ */
+#define KRUN_TSI_HOST_BIND    (1 << 2)
 
 /* Taken from uapi/linux/virtio_net.h */
 #define NET_FEATURE_CSUM 1 << 0
@@ -1003,7 +1008,8 @@ int32_t krun_add_vsock_port2(uint32_t ctx_id,
  *
  * Arguments:
  *  "ctx_id"       - the configuration context ID.
- *  "tsi_features" - bitmask of TSI features (KRUN_TSI_HIJACK_INET, KRUN_TSI_HIJACK_UNIX)
+ *  "tsi_features" - bitmask of TSI features (KRUN_TSI_HIJACK_INET, KRUN_TSI_HIJACK_UNIX,
+ *                   KRUN_TSI_HOST_BIND)
  *                   Use 0 to add vsock without any TSI hijacking.
  *
  * Returns:

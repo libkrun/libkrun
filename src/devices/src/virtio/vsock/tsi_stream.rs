@@ -13,6 +13,7 @@ use super::super::Queue as VirtQueue;
 use super::super::linux_errno::{LINUX_EADDRINUSE, LINUX_EAGAIN, LINUX_ECONNREFUSED};
 use super::defs;
 use super::defs::uapi;
+use super::host_bind::{BindRequest, bind_inet};
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
@@ -56,6 +57,7 @@ pub struct TsiStreamProxy {
     /// `try_listen`/`relisten`). Captured into a [`ListenerDesc`] so a fork clone
     /// can re-establish the host-side listener. 0 = not a listener.
     listen_guest_port: u16,
+    host_bound: Option<SocketAddr>,
     /// Listen backlog requested by the guest, for the same reason.
     listen_backlog: i32,
     /// Set once the remote peer half-closed its send side (our recv hit EOF) and
@@ -171,6 +173,7 @@ impl TsiStreamProxy {
             #[cfg(target_os = "linux")]
             unixsock_path: None,
             listen_guest_port: 0,
+            host_bound: None,
             listen_backlog: 0,
             local_read_shutdown: false,
         })
@@ -220,6 +223,7 @@ impl TsiStreamProxy {
             #[cfg(target_os = "linux")]
             unixsock_path: None,
             listen_guest_port: 0,
+            host_bound: None,
             listen_backlog: 0,
             local_read_shutdown: false,
         }
@@ -282,6 +286,10 @@ impl TsiStreamProxy {
         let guest_listen_port = req.addr.inet().map(|s| s.port()).unwrap_or(0);
 
         let bind_res: std::io::Result<()> = match mapped {
+            Some(addr) if self.host_bound == Some(addr) => Ok(()),
+            Some(_) if self.host_bound.is_some() => {
+                return -libc::EINVAL;
+            }
             Some(addr) => self.sock.bind(&addr.into()),
             #[cfg(target_os = "linux")]
             None => self.bind_unix(req),
@@ -740,6 +748,15 @@ impl TsiStreamProxy {
 }
 
 impl Proxy for TsiStreamProxy {
+    fn bind_host(&mut self, req: &BindRequest) -> Result<VsockAddr, i32> {
+        if self.host_bound.is_some() || self.status != ProxyStatus::Idle {
+            return Err(-libc::EINVAL);
+        }
+        let addr = bind_inet(&self.sock, self.family, req)?;
+        self.host_bound = Some(addr);
+        Ok(addr.into())
+    }
+
     fn poll_handle(&self) -> ProxyRawHandle {
         raw_handle(&self.sock)
     }

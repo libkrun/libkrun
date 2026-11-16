@@ -7,8 +7,10 @@ use std::os::unix::io::RawFd;
 
 use socket2::Socket;
 
+use super::host_bind::BindRequest;
 use super::muxer::MuxerRx;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
+use super::vsock_addr::VsockAddr;
 use serde::{Deserialize, Serialize};
 use utils::epoll::EventSet;
 
@@ -198,6 +200,11 @@ pub trait Proxy: Send {
     /// DNS interception to datagram sockets only.
     fn is_dgram(&self) -> bool {
         false
+    }
+    /// Reserve a host address before listen/send, returning the actual address
+    /// chosen for port zero. Host IPC and other proxies cannot use this path.
+    fn bind_host(&mut self, _req: &BindRequest) -> Result<VsockAddr, i32> {
+        Err(-95) // Linux EOPNOTSUPP, including on non-Linux hosts.
     }
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate;
     /// Connect through a [`StreamIntercept`] instead of to `req.addr` directly.
