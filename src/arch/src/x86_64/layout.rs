@@ -22,12 +22,19 @@ pub const INITRD_SEV_START: u64 = 0xa00000;
 /// Start of the high memory.
 pub const HIMEM_START: u64 = 0x0010_0000; //1 MB.
 
-// The I/O APIC has 24 pins (0-23). ISA IRQs 0-4 are reserved for
-// legacy devices, leaving GSIs 5-23 for virtio-mmio devices.
+// Virtio MMIO and PCI INTx share I/O APIC GSIs 5-23, except for GSI 8,
+// which is reserved for the CMOS RTC.
 /// First usable IRQ ID for virtio device interrupts on x86_64.
 pub const IRQ_BASE: u32 = 5;
 /// Last usable IRQ ID for virtio device interrupts on x86_64.
 pub const IRQ_MAX: u32 = 23;
+/// ISA interrupt line owned by the RTC, which the `rtc_cmos` guest
+/// driver requests non-shared: a virtio device handed this line fails
+/// its probe with -EBUSY ("genirq: Flags mismatch") and silently
+/// disappears from the guest.
+pub const IRQ_RTC_CMOS: u32 = 8;
+/// IRQs inside `IRQ_BASE..=IRQ_MAX` reserved for ISA legacy devices.
+pub const IRQ_RESERVED: &[u32] = &[IRQ_RTC_CMOS];
 
 /// Address for the TSS setup.
 pub const KVM_TSS_ADDRESS: u64 = 0xfffb_d000;
