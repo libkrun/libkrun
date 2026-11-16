@@ -420,7 +420,7 @@ mod tests {
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
         let mut device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
         #[cfg(target_arch = "x86_64")]
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
@@ -447,7 +447,7 @@ mod tests {
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
         let mut device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
         #[cfg(target_arch = "x86_64")]
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
@@ -497,7 +497,7 @@ mod tests {
     fn test_error_messages() {
         let device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
         let e = Error::Cmdline(
@@ -551,7 +551,7 @@ mod tests {
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
         let mut device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
@@ -586,7 +586,7 @@ mod tests {
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
         let mut device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
         #[cfg(target_arch = "x86_64")]
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();

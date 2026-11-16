@@ -77,6 +77,10 @@ pub const IRQ_BASE: u32 = 32;
 /// Last usable interrupt on aarch64.
 pub const IRQ_MAX: u32 = 159;
 
+/// IRQs inside `IRQ_BASE..=IRQ_MAX` reserved for legacy devices: none on
+/// aarch64, where the interrupt space is not shared with ISA devices.
+pub const IRQ_RESERVED: &[u32] = &[];
+
 /// Timer interrupts
 pub const GTIMER_SEC: u32 = 13;
 pub const GTIMER_HYP: u32 = 14;
