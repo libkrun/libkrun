@@ -79,13 +79,12 @@ impl GenerationGuardian {
     /// boundary.
     pub fn start(memory: &GuestMemoryMmap, socket_path: &Path) -> io::Result<Self> {
         validate_private_memory_mappings(memory)?;
-        if socket_path.as_os_str().len() > 100 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "RAM guardian socket path is too long",
-            ));
-        }
-        let listener = UnixListener::bind(socket_path)?;
+        // Only original paths enter the manifest; clients resolve those paths
+        // independently, so no private alias needs to survive a raw fork.
+        let listener = {
+            let address = utils::SocketPath::new(socket_path)?;
+            UnixListener::bind(address.path())?
+        };
         fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
         let mut token = [0_u8; TOKEN_BYTES];
         fill_random(&mut token)?;
@@ -586,7 +585,8 @@ pub struct GuardianPageSource {
 
 impl GuardianPageSource {
     pub fn connect(desc: &GuardianGenerationDesc) -> io::Result<Self> {
-        let stream = UnixStream::connect(&desc.socket_path)?;
+        let address = utils::SocketPath::new(&desc.socket_path)?;
+        let stream = UnixStream::connect(address.path())?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
         stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
         let mut source = Self {

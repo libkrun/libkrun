@@ -116,8 +116,6 @@ use utils::worker_message::WorkerMessage;
 #[cfg(any(target_os = "linux", not(any(feature = "tee", feature = "aws-nitro"))))]
 use vm_memory::Address;
 use vm_memory::Bytes;
-#[cfg(all(feature = "vhost-user", target_os = "linux"))]
-use vm_memory::FileOffset;
 #[cfg(not(feature = "aws-nitro"))]
 use vm_memory::GuestMemory;
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]

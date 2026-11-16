@@ -8,6 +8,7 @@ license = "Apache-2.0"
 repository = "https://github.com/containers/libkrun"
 
 [dependencies]
+krun-socket = { path = "../socket" }
 bitflags = "1.2.0"
 log = "0.4.0"
 

@@ -93,7 +93,8 @@ impl VhostUserDevice {
         );
 
         // Connect to the vhost-user backend
-        let stream = UnixStream::connect(socket_path)?;
+        let address = utils::SocketPath::new(socket_path)?;
+        let stream = UnixStream::connect(address.path())?;
         // NOTE: `num_queues` could be 0 here, but this is actually fine
         // because if `VhostUserProtocolFeatures::MQ` is supported the negotiated
         // value will be used automatically by Frontend

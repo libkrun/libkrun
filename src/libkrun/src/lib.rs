@@ -2505,7 +2505,8 @@ mod control_command_tests {
 #[cfg(not(target_os = "windows"))]
 fn start_control_socket(path: PathBuf, vmm: Arc<Mutex<vmm::Vmm>>) -> std::io::Result<()> {
     let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)?;
+    let address = utils::SocketPath::new(&path)?;
+    let listener = UnixListener::bind(address.path())?;
 
     std::thread::Builder::new()
         .name("krun control".into())

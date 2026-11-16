@@ -60,7 +60,8 @@ pub fn send(sock: &Socket, buf: &[u8]) -> io::Result<usize> {
 /// Create a nonblocking AF_UNIX stream socket connected to the proxy at `path`.
 pub fn connect_unix_stream(path: &Path) -> io::Result<Socket> {
     let sock = Socket::new(Domain::UNIX, Type::STREAM, None)?;
-    sock.connect(&SockAddr::unix(path)?)?;
+    let address = utils::SocketPath::new(path)?;
+    sock.connect(&SockAddr::unix(address.path())?)?;
     sock.set_nonblocking(true)?;
     Ok(sock)
 }
@@ -68,11 +69,13 @@ pub fn connect_unix_stream(path: &Path) -> io::Result<Socket> {
 /// Create a nonblocking AF_UNIX datagram socket bound to `local` and connected
 /// to the proxy at `peer`. Unix-only: Windows AF_UNIX is stream-only.
 #[cfg(unix)]
-pub fn connect_unix_dgram(local: &Path, peer: &Path) -> io::Result<Socket> {
+pub fn connect_unix_dgram(local: &Path, peer: &Path) -> io::Result<(Socket, utils::SocketPath)> {
     let sock = Socket::new(Domain::UNIX, Type::DGRAM, None)?;
     let _ = std::fs::remove_file(local);
-    sock.bind(&SockAddr::unix(local)?)?;
-    sock.connect(&SockAddr::unix(peer)?)?;
+    let local_address = utils::SocketPath::new(local)?;
+    let peer_address = utils::SocketPath::new(peer)?;
+    sock.bind(&SockAddr::unix(local_address.path())?)?;
+    sock.connect(&SockAddr::unix(peer_address.path())?)?;
     sock.set_nonblocking(true)?;
-    Ok(sock)
+    Ok((sock, local_address))
 }
