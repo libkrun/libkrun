@@ -1373,7 +1373,13 @@ fn read_guardian_manifest(
     }
     let socket_len = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap()) as usize;
     let region_count = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap()) as usize;
-    if socket_len == 0 || socket_len > 100 || region_count == 0 || region_count > 256 {
+    // The manifest stores the original filesystem path, not the short alias
+    // used to fit sockaddr_un when connecting to a deep socket directory.
+    if socket_len == 0
+        || socket_len >= libc::PATH_MAX as usize
+        || region_count == 0
+        || region_count > 256
+    {
         return Err(invalid("guardian manifest has invalid dimensions"));
     }
     let mut token = [0_u8; 32];
@@ -2442,7 +2448,7 @@ mod control_command_tests {
     fn guardian_manifest_builds_an_exact_demand_paged_restore() {
         use vm_memory::{Bytes, GuestAddress};
 
-        let dir = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "libkrun-guardian-restore-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -2450,7 +2456,8 @@ mod control_command_tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = root.join("a".repeat(80)).join("b".repeat(80));
+        std::fs::create_dir_all(&dir).unwrap();
         let size = 256 * 1024;
         let memory = vmm::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), size)]).unwrap();
         memory
@@ -2463,6 +2470,10 @@ mod control_command_tests {
         .unwrap();
         atomic_write_file(&dir.join("checkpoint.bin"), b"checkpoint").unwrap();
         write_guardian_manifest(&dir.join("manifest.bin"), guardian.description()).unwrap();
+        assert_eq!(
+            read_guardian_manifest(&dir.join("manifest.bin")).unwrap(),
+            *guardian.description()
+        );
         memory
             .write_slice(&vec![0xe2_u8; size], GuestAddress(0))
             .unwrap();
@@ -2498,7 +2509,7 @@ mod control_command_tests {
         assert!(restore.demand_pager.as_ref().unwrap().failure().is_none());
         drop(restore);
         drop(guardian);
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 
