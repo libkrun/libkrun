@@ -822,6 +822,31 @@ fn ads_xattr_path(base: &Path, name: &CStr) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Refuse an xattr name that does not name a stream of its own.
+///
+/// An xattr is a stream appended to the entry's path after a `:`, so a name holding one more
+/// reaches a stream the request did not name — `:$DATA` is the entry's own contents — and a name
+/// holding a separator reaches the streams of another entry. Windows drops the dots and spaces
+/// that end a path before NTFS sees it, so a name ending in either reaches the stream named
+/// without them.
+fn check_xattr_name(name: &CStr) -> io::Result<()> {
+    let bytes = name.to_bytes();
+    if bytes.is_empty()
+        || bytes.iter().any(|b| matches!(b, b'\\' | b'/' | b':'))
+        || matches!(bytes.last(), Some(b'.' | b' '))
+    {
+        return Err(einval());
+    }
+    Ok(())
+}
+
+/// Whether a name reaches a stream this backend keeps for itself. NTFS matches a stream name
+/// without regard to case, so this comparison cannot either.
+fn is_reserved_xattr(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"user.containers.override_stat")
+        || name.eq_ignore_ascii_case(b"security.capability")
+}
+
 fn ads_list_streams(path: &Path) -> io::Result<Vec<String>> {
     use windows_sys::Win32::Storage::FileSystem::*;
 
@@ -2853,10 +2878,11 @@ impl FileSystem for PassthroughFs {
             return Err(enosys());
         }
 
+        check_xattr_name(name)?;
+
         // Prevent the guest from directly modifying these attributes
         // If the guest could directly modify this xattr, it could bypass security boundaries or corrupt the emulation.
-        let attr_name = name.to_bytes();
-        if attr_name == b"user.containers.override_stat" || attr_name == b"security.capability" {
+        if is_reserved_xattr(name.to_bytes()) {
             return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES)));
         }
 
@@ -2884,10 +2910,11 @@ impl FileSystem for PassthroughFs {
             return Err(enosys());
         }
 
+        check_xattr_name(name)?;
+
         // Prevent the guest from reading them directly.
         // The guest should only see these values through standard stat calls, not raw getxattr queries
-        let attr_name = name.to_bytes();
-        if attr_name == b"user.containers.override_stat" || attr_name == b"security.capability" {
+        if is_reserved_xattr(name.to_bytes()) {
             return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES)));
         }
 
@@ -2926,7 +2953,7 @@ impl FileSystem for PassthroughFs {
 
         let mut buf = Vec::new();
         for s in &streams {
-            if s == "user.containers.override_stat" || s == "security.capability" {
+            if is_reserved_xattr(s.as_bytes()) {
                 continue;
             }
             buf.extend_from_slice(s.as_bytes());
@@ -2947,8 +2974,9 @@ impl FileSystem for PassthroughFs {
             return Err(enosys());
         }
 
-        let attr_name = name.to_bytes();
-        if attr_name == b"user.containers.override_stat" || attr_name == b"security.capability" {
+        check_xattr_name(name)?;
+
+        if is_reserved_xattr(name.to_bytes()) {
             return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES)));
         }
 
@@ -3206,10 +3234,20 @@ mod tests {
         CString::new(path.to_str().unwrap()).unwrap()
     }
 
-    fn refused(result: io::Result<impl Sized>, what: &str) {
+    /// The inode of the one file the shared directory holds.
+    fn inside(fs: &PassthroughFs) -> Inode {
+        let dir = fs.lookup(CTX, fuse::ROOT_ID, c"sub").unwrap().inode;
+        fs.lookup(CTX, dir, c"inside.txt").unwrap().inode
+    }
+
+    fn eacces() -> io::Error {
+        io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES))
+    }
+
+    fn refused(result: io::Result<impl Sized>, expected: io::Error, what: &str) {
         match result {
             Ok(_) => panic!("{what}"),
-            Err(e) => assert_eq!(e.raw_os_error(), einval().raw_os_error(), "{what}: {e:?}"),
+            Err(e) => assert_eq!(e.raw_os_error(), expected.raw_os_error(), "{what}: {e:?}"),
         }
     }
 
@@ -3260,10 +3298,12 @@ mod tests {
 
         refused(
             fs.lookup(CTX, fuse::ROOT_ID, c"sub\\inside.txt"),
+            einval(),
             "a separator in a name reached an entry of another directory",
         );
         refused(
             fs.lookup(CTX, fuse::ROOT_ID, &name_of(&share.outside)),
+            einval(),
             "a name spelling a host path reached a file outside the share",
         );
     }
@@ -3275,6 +3315,7 @@ mod tests {
 
         refused(
             fs.unlink(CTX, fuse::ROOT_ID, c"sub\\inside.txt"),
+            einval(),
             "a separator in a name removed an entry of another directory",
         );
         assert_eq!(
@@ -3300,6 +3341,7 @@ mod tests {
                 0,
                 Extensions::default(),
             ),
+            einval(),
             "a name spelling a host path created a file outside the share",
         );
         assert!(!made.exists());
@@ -3318,10 +3360,134 @@ mod tests {
         ] {
             refused(
                 fs.symlink(CTX, &target, fuse::ROOT_ID, name, Extensions::default()),
+                einval(),
                 "a symlink target reached an entry outside the share",
             );
             let made = share.root.join(name.to_str().unwrap());
             assert!(fs::symlink_metadata(&made).is_err(), "{made:?}");
         }
+    }
+
+    #[test]
+    fn an_xattr_name_that_is_not_one_stream_is_refused() {
+        for name in [
+            c":$DATA",
+            c"user.x:$DATA",
+            c"a\\b",
+            c"a/b",
+            c"user.x.",
+            c"user.x ",
+            c"",
+        ] {
+            assert!(check_xattr_name(name).is_err(), "{name:?}");
+        }
+        assert!(check_xattr_name(c"user.x").is_ok());
+        assert!(check_xattr_name(c"user. x.y").is_ok());
+    }
+
+    #[test]
+    fn an_xattr_stays_out_of_the_entrys_own_data() {
+        let share = Share::new("xattr-data");
+        let fs = share.served();
+        let file = inside(&fs);
+        let path = share.root.join("sub").join("inside.txt");
+
+        refused(
+            fs.setxattr(CTX, file, c":$DATA", b"written as an xattr", 0),
+            einval(),
+            "an xattr name reached the entry's own contents",
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"shared");
+        refused(
+            fs.getxattr(CTX, file, c":$DATA", 64),
+            einval(),
+            "an xattr name read the entry's own contents",
+        );
+        refused(
+            fs.removexattr(CTX, file, c":$DATA"),
+            einval(),
+            "an xattr name removed the entry itself",
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"shared");
+    }
+
+    #[test]
+    fn a_reserved_xattr_is_refused_whatever_its_case() {
+        let share = Share::new("xattr-case");
+        let fs = share.served();
+        let file = inside(&fs);
+
+        for name in [
+            c"USER.CONTAINERS.OVERRIDE_STAT",
+            c"Security.Capability",
+            c"user.containers.override_stat",
+        ] {
+            refused(
+                fs.setxattr(CTX, file, name, b"0:0:04755", 0),
+                eacces(),
+                "a reserved xattr was written by the guest",
+            );
+        }
+
+        let (attr, _) = fs.getattr(CTX, file, None).unwrap();
+        assert_eq!(attr.st_mode & S_ISUID, 0);
+
+        let path = share.root.join("sub").join("inside.txt");
+        fs::write(
+            ads_stream_path(&path, ":USER.CONTAINERS.OVERRIDE_STAT"),
+            b"0:0:0644",
+        )
+        .unwrap();
+        refused(
+            fs.getxattr(CTX, file, c"User.Containers.Override_Stat", 64),
+            eacces(),
+            "the reserved xattr was read by the guest",
+        );
+        let listed = match fs.listxattr(CTX, file, 4096).unwrap() {
+            ListxattrReply::Names(names) => names,
+            ListxattrReply::Count(n) => panic!("asked for the names, got a count of {n}"),
+        };
+        assert!(listed.is_empty(), "{}", String::from_utf8_lossy(&listed));
+    }
+
+    #[test]
+    fn a_reserved_xattr_is_refused_whatever_ends_its_name() {
+        let share = Share::new("xattr-end");
+        let fs = share.served();
+        let file = inside(&fs);
+        let names = [
+            c"user.containers.override_stat.",
+            c"user.containers.override_stat ",
+            c"security.capability . .",
+        ];
+
+        for name in names {
+            refused(
+                fs.setxattr(CTX, file, name, b"0:0:04755", 0),
+                einval(),
+                "a reserved xattr was written under a name ending in a dot or a space",
+            );
+        }
+        let (attr, _) = fs.getattr(CTX, file, None).unwrap();
+        assert_eq!(attr.st_mode & S_ISUID, 0);
+
+        let stream = ads_stream_path(
+            &share.root.join("sub").join("inside.txt"),
+            OVERRIDE_STAT_STREAM,
+        );
+        fs::write(&stream, b"0:0:0644").unwrap();
+        for name in names {
+            refused(
+                fs.getxattr(CTX, file, name, 64),
+                einval(),
+                "a reserved xattr was read under a name ending in a dot or a space",
+            );
+            refused(
+                fs.removexattr(CTX, file, name),
+                einval(),
+                "a reserved xattr was removed under a name ending in a dot or a space",
+            );
+        }
+        assert_eq!(fs::read(&stream).unwrap(), b"0:0:0644");
     }
 }
