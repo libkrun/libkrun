@@ -39,3 +39,16 @@ jobs:
       - name: Unit tests
         run: cargo test
 
+  unit-tests-windows-x86_64:
+    name: Unit tests (Windows x86_64)
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add musl target for krun-init
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Unit tests
+        run: cargo test --locked
