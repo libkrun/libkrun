@@ -3,7 +3,8 @@
 
 use std::io;
 use std::ops::Deref;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 
 use bitflags::bitflags;
 use libc::{
@@ -133,13 +134,15 @@ impl EpollEvent {
 /// Wrapper over epoll functionality.
 #[derive(Clone, Debug)]
 pub struct Epoll {
-    epoll_fd: RawFd,
+    epoll_fd: Arc<OwnedFd>,
 }
 
 impl Epoll {
     /// Create a new epoll file descriptor.
     pub fn new() -> io::Result<Self> {
         let epoll_fd = SyscallReturnCode(unsafe { epoll_create1(EPOLL_CLOEXEC) }).into_result()?;
+        // SAFETY: epoll_create1 returned a new, exclusively owned descriptor.
+        let epoll_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(epoll_fd) });
         Ok(Epoll { epoll_fd })
     }
 
@@ -163,7 +166,7 @@ impl Epoll {
         // as well as a valid epoll_event structure. We also check the return value.
         SyscallReturnCode(unsafe {
             epoll_ctl(
-                self.epoll_fd,
+                self.epoll_fd.as_raw_fd(),
                 operation as i32,
                 fd,
                 event as *const EpollEvent as *mut epoll_event,
@@ -195,7 +198,7 @@ impl Epoll {
         // descriptors in the interest list. We also check the return value.
         let events_count = SyscallReturnCode(unsafe {
             epoll_wait(
-                self.epoll_fd,
+                self.epoll_fd.as_raw_fd(),
                 events.as_mut_ptr() as *mut epoll_event,
                 max_events as i32,
                 timeout,
@@ -209,17 +212,7 @@ impl Epoll {
 
 impl AsRawFd for Epoll {
     fn as_raw_fd(&self) -> RawFd {
-        self.epoll_fd
-    }
-}
-
-impl std::ops::Drop for Epoll {
-    fn drop(&mut self) {
-        // Safe because this fd is opened with `epoll_create` and we trust
-        // the kernel to give us a valid fd.
-        unsafe {
-            libc::close(self.epoll_fd);
-        }
+        self.epoll_fd.as_raw_fd()
     }
 }
 
@@ -250,7 +243,7 @@ mod tests {
         const MAX_EVENTS: usize = 10;
 
         let mut epoll = Epoll::new().unwrap();
-        assert_eq!(epoll.epoll_fd, epoll.as_raw_fd());
+        assert_eq!(epoll.epoll_fd.as_raw_fd(), epoll.as_raw_fd());
 
         // Let's test different scenarios for `epoll_ctl()` and `epoll_wait()` functionality.
 
@@ -410,5 +403,41 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use std::net::UdpSocket;
+
+    #[test]
+    fn dropping_either_poll_owner_preserves_registered_socket_delivery() {
+        for drop_original in [false, true] {
+            let original = Epoll::new().unwrap();
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            original
+                .ctl(
+                    ControlOperation::Add,
+                    socket.as_raw_fd(),
+                    &EpollEvent::new(EventSet::IN, 37),
+                )
+                .unwrap();
+            let cloned = original.clone();
+            let mut remaining = if drop_original {
+                drop(original);
+                cloned
+            } else {
+                drop(cloned);
+                original
+            };
+            let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+            sender
+                .send_to(b"alive", socket.local_addr().unwrap())
+                .unwrap();
+            let mut events = [EpollEvent::default(); 1];
+            assert_eq!(remaining.wait(1, 2000, &mut events).unwrap(), 1);
+            assert_eq!(events[0].data(), 37);
+        }
     }
 }
