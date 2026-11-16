@@ -1,10 +1,12 @@
 use std::io::Read;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use utils::eventfd::EventFd;
+
+const FENCE_POLL_INTERVAL_US: i64 = 100;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
@@ -101,6 +103,15 @@ impl Worker {
         );
 
         loop {
+            // Without eventfd (macOS) virglrenderer has no sync thread, so pending fences only
+            // retire when we poll the renderer; keep polling until they have all signaled.
+            if virtio_gpu.has_pending_fences() {
+                let ready = wait_readable(self.control_evt.as_raw_fd(), FENCE_POLL_INTERVAL_US);
+                virtio_gpu.event_poll();
+                if !ready {
+                    continue;
+                }
+            }
             if let Err(e) = self.control_evt.read() {
                 error!("Failed to read control_evt: {e:?}");
                 continue;
@@ -458,5 +469,57 @@ impl Worker {
 
         debug!("gpu: process_queue exit");
         used_any
+    }
+}
+
+/// Waits until `fd` is readable or `timeout_us` has passed; returns whether it became readable.
+fn wait_readable(fd: RawFd, timeout_us: i64) -> bool {
+    // SAFETY: fd_set is plain data; FD_ZERO/FD_SET initialise it for a valid fd below FD_SETSIZE.
+    let mut readfds: libc::fd_set = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::FD_ZERO(&mut readfds);
+        libc::FD_SET(fd, &mut readfds);
+    }
+    let mut timeout = libc::timeval {
+        tv_sec: (timeout_us / 1_000_000) as libc::time_t,
+        tv_usec: (timeout_us % 1_000_000) as libc::suseconds_t,
+    };
+    // SAFETY: readfds and timeout are valid for the duration of the call.
+    let ret = unsafe {
+        libc::select(
+            fd + 1,
+            &mut readfds,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut timeout,
+        )
+    };
+    ret > 0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    use utils::eventfd::{EFD_NONBLOCK, EventFd};
+
+    use super::wait_readable;
+
+    #[test]
+    fn wait_readable_times_out_without_event() {
+        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let start = Instant::now();
+        assert!(!wait_readable(evt.as_raw_fd(), 20_000));
+        assert!(start.elapsed() >= Duration::from_millis(15));
+    }
+
+    #[test]
+    fn wait_readable_returns_when_event_is_pending() {
+        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        evt.write(1).unwrap();
+        assert!(wait_readable(evt.as_raw_fd(), 1_000_000));
+        // The wait must not consume the event; the worker reads it afterwards.
+        assert_eq!(evt.read().unwrap(), 1);
     }
 }

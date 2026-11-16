@@ -739,6 +739,16 @@ impl VirtioGpu {
         Ok(OkNoData)
     }
 
+    pub fn has_pending_fences(&self) -> bool {
+        !self.fence_state.lock().unwrap().descs.is_empty()
+    }
+
+    /// Lets virglrenderer retire fences whose GPU work has finished; must run on the thread that
+    /// owns the renderer's GL contexts.
+    pub fn event_poll(&self) {
+        self.rutabaga.event_poll();
+    }
+
     /// Creates a fence with the RutabagaFence that can be used to determine when the previous
     /// command completed.
     pub fn create_fence(&mut self, rutabaga_fence: RutabagaFence) -> VirtioGpuResult {
