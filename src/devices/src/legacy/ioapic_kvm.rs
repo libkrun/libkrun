@@ -146,8 +146,8 @@ impl IoApicKvmBackend {
     }
 
     fn update_routes(&mut self, regs: &IoApicRegs) {
-        for i in 0..IOAPIC_NUM_PINS {
-            let info = self.parse_entry(&regs.ioredtbl[i]);
+        for (index, entry) in regs.ioredtbl.iter().enumerate() {
+            let info = self.parse_entry(entry);
 
             if info.masked == 0 {
                 let msg = MsiMessage {
@@ -155,7 +155,7 @@ impl IoApicKvmBackend {
                     data: info.data as u64,
                 };
 
-                self.update_msi_route(i, &msg);
+                self.update_msi_route(index, &msg);
             }
         }
 
