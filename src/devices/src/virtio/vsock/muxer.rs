@@ -13,6 +13,7 @@ use super::dns_filter::{
     is_addr_host_loopback, sockaddr_port,
 };
 use super::host_bind::{BindRequest, BindResponse};
+use super::host_send::{HostSendRequest, PendingHostSend};
 use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::muxer_thread::MuxerThread;
 use super::packet::TsiConnectReq;
@@ -45,6 +46,11 @@ pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
 /// A muxer RX queue item.
 #[derive(Debug)]
 pub enum MuxerRx {
+    HostSendResponse {
+        peer_port: u32,
+        sequence: u64,
+        result: i32,
+    },
     BindResponse {
         local_port: u32,
         peer_port: u32,
@@ -845,6 +851,11 @@ impl VsockMuxer {
             // intercepted; any other destination must pass the egress policy.
             if !self.is_dns_dest(&req.addr) && !self.is_ip_allowed(&req.addr) {
                 warn!("egress policy denied sendto {}", req.addr);
+                // Never let the following payload reuse a prior destination.
+                let id = ((req.peer_port as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+                if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
+                    proxy.lock().unwrap().clear_sendto_addr();
+                }
                 return;
             }
 
@@ -860,6 +871,51 @@ impl VsockMuxer {
             if let Some(update) = update {
                 self.process_proxy_update(id, update);
             }
+        }
+    }
+
+    fn process_host_sendto_addr(&self, pkt: &VsockPacket) {
+        let Some(mut req) = pkt.data().and_then(HostSendRequest::parse) else {
+            self.push_packet(MuxerRx::HostSendResponse {
+                peer_port: pkt.src_port(),
+                sequence: 0,
+                result: -22,
+            });
+            return;
+        };
+        if !self
+            .tsi_flags
+            .contains(TsiFlags::HIJACK_INET | TsiFlags::HOST_BIND)
+            || self.host_port_map.is_some()
+        {
+            req.destination = Err(-1);
+        } else if req
+            .destination
+            .as_ref()
+            .is_ok_and(|addr| !self.is_ip_allowed(addr))
+        {
+            req.destination = Err(-13);
+        }
+        let id = ((req.peer_port as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+        let result = self
+            .proxy_map
+            .read()
+            .unwrap()
+            .get(&id)
+            .ok_or(-9)
+            .and_then(|proxy| {
+                proxy.lock().unwrap().prepare_host_send(PendingHostSend {
+                    control_port: pkt.src_port(),
+                    sequence: req.sequence,
+                    destination: req.destination,
+                })
+            });
+        if let Err(result) = result {
+            self.push_packet(MuxerRx::HostSendResponse {
+                peer_port: pkt.src_port(),
+                sequence: req.sequence,
+                result,
+            });
         }
     }
 
@@ -1027,6 +1083,7 @@ impl VsockMuxer {
             defs::TSI_SENDTO_ADDR if self.tsi_flags.tsi_enabled() => self.process_sendto_addr(pkt),
             defs::TSI_SENDTO_DATA if self.tsi_flags.tsi_enabled() => self.process_sendto_data(pkt),
             defs::TSI_BIND => self.process_bind_request(pkt),
+            defs::TSI_HOST_SENDTO_ADDR => self.process_host_sendto_addr(pkt),
             defs::TSI_LISTEN if self.tsi_flags.tsi_enabled() => self.process_listen_request(pkt),
             defs::TSI_ACCEPT if self.tsi_flags.tsi_enabled() => self.process_accept_request(pkt),
             defs::TSI_PROXY_RELEASE if self.tsi_flags.tsi_enabled() => {

@@ -355,3 +355,107 @@ fn host_udp_connected_sends_preserve_empty_payloads_and_bound_port() {
         f.release();
     }
 }
+
+impl Fixture {
+    fn acknowledged_send(&mut self, sequence: u64, destination: SocketAddr, payload: &[u8]) -> i32 {
+        let addr = VsockAddr::from(destination);
+        self.send(
+            defs::TSI_HOST_SENDTO_ADDR,
+            &[
+                &GUEST.to_le_bytes()[..],
+                &addr.linux_len().to_le_bytes(),
+                &sequence.to_le_bytes(),
+                &addr.to_linux_bytes(),
+            ]
+            .concat(),
+        );
+        let mut packet = self.packet(defs::TSI_SENDTO_DATA, payload);
+        packet.set_src_port(GUEST);
+        self.muxer.send_dgram_pkt(&packet).unwrap();
+        match self.muxer.rxq.lock().unwrap().pop().unwrap() {
+            MuxerRx::HostSendResponse {
+                peer_port,
+                sequence: actual,
+                result,
+            } => {
+                assert_eq!(peer_port, CONTROL);
+                assert_eq!(actual, sequence);
+                result
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn host_udp_acknowledges_actual_send_errors_and_denied_destinations() {
+    let mut f = Fixture::new(granted(), None);
+    f.muxer.floor = FloorMode::MetadataOnly;
+    f.create(defs::SOCK_DGRAM, defs::LINUX_AF_INET);
+    let bound = f.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let destination = receiver.local_addr().unwrap();
+    let mut buf = [0; 32];
+    for (seq, payload) in [(1, &b""[..]), (2, &b"sent"[..])] {
+        assert_eq!(
+            f.acknowledged_send(seq, destination, payload),
+            payload.len() as i32
+        );
+        let (len, sender) = receiver.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..len], payload);
+        assert_eq!(sender, bound);
+    }
+    // The host rejects a real oversized IPv4 datagram; report its Linux errno.
+    assert_eq!(f.acknowledged_send(3, destination, &vec![0; 65_508]), -90);
+    f.muxer.floor = FloorMode::Strict;
+    assert_eq!(f.acknowledged_send(4, destination, b"denied"), -13);
+    receiver.set_nonblocking(true).unwrap();
+    assert_eq!(
+        receiver.recv_from(&mut buf).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    f.muxer.floor = FloorMode::MetadataOnly;
+    assert_eq!(f.acknowledged_send(5, destination, b"recovered"), 9);
+    receiver.set_nonblocking(false).unwrap();
+    let (len, _) = receiver.recv_from(&mut buf).unwrap();
+    assert_eq!(&buf[..len], b"recovered");
+    f.release();
+}
+
+#[test]
+fn a_denied_legacy_udp_destination_cannot_reuse_the_last_allowed_one() {
+    let mut f = Fixture::new(TsiFlags::HIJACK_INET, None);
+    f.muxer.floor = FloorMode::MetadataOnly;
+    f.create(defs::SOCK_DGRAM, defs::LINUX_AF_INET);
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let destination = VsockAddr::from(receiver.local_addr().unwrap());
+    let request = [
+        &GUEST.to_le_bytes()[..],
+        &destination.linux_len().to_le_bytes(),
+        &destination.to_linux_bytes(),
+    ]
+    .concat();
+    f.send(defs::TSI_SENDTO_ADDR, &request);
+    let mut pkt = f.packet(defs::TSI_SENDTO_DATA, b"allowed");
+    pkt.set_src_port(GUEST);
+    f.muxer.send_dgram_pkt(&pkt).unwrap();
+    let mut buf = [0; 32];
+    assert_eq!(receiver.recv_from(&mut buf).unwrap().0, 7);
+    f.muxer.floor = FloorMode::Strict;
+    f.send(defs::TSI_SENDTO_ADDR, &request);
+    let mut pkt = f.packet(defs::TSI_SENDTO_DATA, b"must not be sent");
+    pkt.set_src_port(GUEST);
+    f.muxer.send_dgram_pkt(&pkt).unwrap();
+    receiver.set_nonblocking(true).unwrap();
+    assert_eq!(
+        receiver.recv_from(&mut buf).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    f.release();
+}

@@ -11,6 +11,7 @@ use super::defs::uapi;
 use super::dns_filter::{DNS_PORT, DnsRequest, sockaddr_port};
 use super::host_bind::{BindRequest, bind_inet};
 use super::host_datagram::{FRAME_HEADER, HostDatagramRx};
+use super::host_send::PendingHostSend;
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
@@ -53,6 +54,7 @@ pub struct TsiDgramProxy {
     connected_dns: bool,
     host_rx: Option<HostDatagramRx>,
     host_peer: Option<SocketAddr>,
+    host_send: Option<PendingHostSend>,
     pending_rx: Arc<Mutex<HashSet<u64>>>,
     epoll: Epoll,
 }
@@ -111,6 +113,7 @@ impl TsiDgramProxy {
             connected_dns: false,
             host_rx: None,
             host_peer: None,
+            host_send: None,
             pending_rx,
             epoll,
         })
@@ -358,6 +361,19 @@ impl Proxy for TsiDgramProxy {
         Ok(addr.into())
     }
 
+    fn prepare_host_send(&mut self, send: PendingHostSend) -> Result<(), i32> {
+        if self.host_rx.is_none() {
+            return Err(-95);
+        }
+        self.sendto_addr = None;
+        self.host_send = Some(send);
+        Ok(())
+    }
+
+    fn clear_sendto_addr(&mut self) {
+        self.sendto_addr = None;
+    }
+
     fn poll_handle(&self) -> ProxyRawHandle {
         raw_handle(&self.sock)
     }
@@ -566,6 +582,42 @@ impl Proxy for TsiDgramProxy {
 
         self.peer_buf_alloc = pkt.buf_alloc();
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
+        if let Some(send) = self.host_send.take() {
+            let result = send
+                .destination
+                .and_then(|addr| {
+                    let destination = addr
+                        .inet()
+                        .filter(|_| addr.suits_family(self.family))
+                        .ok_or(-22)?;
+                    let buf = pkt
+                        .data()
+                        .or_else(|| (pkt.len() == 0).then_some(&[]))
+                        .ok_or(-22)?;
+                    let sent = if self.host_peer == Some(destination) {
+                        self.sock.send(buf)
+                    } else {
+                        self.sock.send_to(buf, &destination.into())
+                    }
+                    .map_err(|err| -sys::to_linux_errno(&err))?;
+                    self.tx_cnt += Wrapping(sent as u32);
+                    Ok(sent as i32)
+                })
+                .unwrap_or_else(|err| err);
+            push_packet(
+                self.cid,
+                MuxerRx::HostSendResponse {
+                    peer_port: send.control_port,
+                    sequence: send.sequence,
+                    result,
+                },
+                &self.rxq,
+                &self.queue,
+                &self.mem,
+                &self.snapshot_gate,
+            );
+            return;
+        }
 
         if let Some(addr) = self.sendto_addr.clone() {
             if let Some(buf) = pkt

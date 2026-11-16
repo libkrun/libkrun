@@ -10,6 +10,7 @@ mod dns_filter;
 mod event_handler;
 mod host_bind;
 mod host_datagram;
+mod host_send;
 mod muxer;
 mod muxer_rxq;
 mod muxer_thread;
@@ -101,6 +102,7 @@ mod defs {
     pub const TSI_ACCEPT: u32 = 1030;
     pub const TSI_PROXY_RELEASE: u32 = 1031;
     pub const TSI_BIND: u32 = 1032;
+    pub const TSI_HOST_SENDTO_ADDR: u32 = 1033;
 
     // Linux definitions that we need for cross-platform compatibility.
     // AF_UNIX over TSI is Linux-only; the constant is unused on macOS/Windows.

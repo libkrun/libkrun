@@ -8,6 +8,7 @@ use std::os::unix::io::RawFd;
 use socket2::Socket;
 
 use super::host_bind::BindRequest;
+use super::host_send::PendingHostSend;
 use super::muxer::MuxerRx;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
 use super::vsock_addr::VsockAddr;
@@ -206,6 +207,10 @@ pub trait Proxy: Send {
     fn bind_host(&mut self, _req: &BindRequest) -> Result<VsockAddr, i32> {
         Err(-95) // Linux EOPNOTSUPP, including on non-Linux hosts.
     }
+    fn prepare_host_send(&mut self, _send: PendingHostSend) -> Result<(), i32> {
+        Err(-95)
+    }
+    fn clear_sendto_addr(&mut self) {}
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate;
     /// Connect through a [`StreamIntercept`] instead of to `req.addr` directly.
     /// Proxies without a redirected path fall back to a plain connect.
