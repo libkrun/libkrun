@@ -2260,11 +2260,11 @@ mod control_command_tests {
     #[cfg(all(snapshot_supported, fork_continue_supported))]
     #[test]
     fn disconnected_prepared_reply_recovers_source_once() {
-        use std::net::Shutdown;
         use std::os::unix::net::UnixStream;
 
         let (mut server, client) = UnixStream::pair().unwrap();
-        client.shutdown(Shutdown::Read).unwrap();
+        // A read shutdown alone still accepts peer writes on macOS.
+        drop(client);
         let mut recoveries = 0;
         let result = write_prepared_save_reply(&mut server, "OK prepared (paused)\n", || {
             recoveries += 1;
@@ -2276,7 +2276,6 @@ mod control_command_tests {
     #[cfg(all(snapshot_supported, fork_continue_supported))]
     #[test]
     fn prepared_reply_preserves_success_and_failed_prepare_ownership() {
-        use std::net::Shutdown;
         use std::os::unix::net::UnixStream;
 
         let mut output = Vec::new();
@@ -2287,7 +2286,7 @@ mod control_command_tests {
         assert_eq!(output, b"OK prepared (paused)\n");
 
         let (mut server, client) = UnixStream::pair().unwrap();
-        client.shutdown(Shutdown::Read).unwrap();
+        drop(client);
         assert!(
             write_prepared_save_reply(&mut server, "ERR EBUSY another save is pending\n", || {
                 panic!("failed preparation must not cancel another save");
