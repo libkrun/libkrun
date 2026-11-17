@@ -6,6 +6,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  socket-paths:
+    name: Socket paths (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked -p krun-socket
+      - run: cargo clippy --locked -p krun-socket --all-targets -- -D warnings
+
   check-windows:
     name: libkrun (Windows cross)
     runs-on: ubuntu-22.04
