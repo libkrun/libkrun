@@ -61,6 +61,7 @@ pub struct TsiDgramProxy {
     dns_identity: Option<Arc<()>>,
     host_peer: Option<SocketAddr>,
     host_send: Option<PendingHostSend>,
+    host_error: Option<i32>,
     pending_rx: Arc<Mutex<HashSet<u64>>>,
     epoll: Epoll,
 }
@@ -123,6 +124,7 @@ impl TsiDgramProxy {
             dns_identity: None,
             host_peer: None,
             host_send: None,
+            host_error: None,
             pending_rx,
             epoll,
         })
@@ -259,6 +261,20 @@ impl TsiDgramProxy {
                 have_used = true;
                 continue;
             };
+            if let Some(errno) = self.host_error.take() {
+                // ABI 3 uses a header-only datagram reset to report an async
+                // socket error without consuming or corrupting queued data.
+                self.init_pkt(&mut pkt);
+                pkt.set_op(uapi::VSOCK_OP_RST)
+                    .set_src_port(defs::TSI_PROXY_PORT)
+                    .set_flags(errno as u32)
+                    .set_len(0);
+                if let Err(error) = queue.add_used(&self.mem, head.index, pkt.hdr().len() as u32) {
+                    error!("failed to publish host UDP error: {error:?}");
+                }
+                have_used = true;
+                continue;
+            }
             let Some(buf) = pkt.buf_mut().filter(|buf| buf.len() > FRAME_HEADER) else {
                 // Consume a malformed descriptor without consuming a UDP
                 // datagram or permanently wedging the shared receive queue.
@@ -301,10 +317,11 @@ impl TsiDgramProxy {
                     have_used = true;
                 }
                 Err(e) => {
-                    if e.kind() != std::io::ErrorKind::WouldBlock {
-                        debug!("host UDP receive: {e}");
-                    }
                     queue.undo_pop();
+                    if e.kind() != std::io::ErrorKind::WouldBlock {
+                        self.host_error = Some(sys::to_linux_errno(&e));
+                        continue;
+                    }
                     exhausted = false;
                     break;
                 }
@@ -551,6 +568,23 @@ impl Proxy for TsiDgramProxy {
             return false;
         }
         self.drain_host_datagrams(activity).signal_queue
+    }
+
+    #[cfg(target_os = "macos")]
+    fn receive_host_error(
+        &mut self,
+        error: &super::macos_icmp::DatagramError,
+    ) -> Option<ProxyUpdate> {
+        if self.connected_dns
+            || !self
+                .macos_datagram
+                .as_ref()
+                .is_some_and(|socket| socket.matches_error(error.source, error.destination))
+        {
+            return None;
+        }
+        self.host_error = Some(error.errno);
+        Some(self.recv_host_datagrams())
     }
 
     fn clear_sendto_addr(&mut self) {
@@ -924,7 +958,16 @@ impl Proxy for TsiDgramProxy {
             return update;
         }
 
-        if evset.contains(EventSet::IN) && self.host_rx.is_some() {
+        let readable = evset.contains(EventSet::IN);
+        #[cfg(target_os = "linux")]
+        let readable = readable || evset.contains(EventSet::ERROR);
+        if self.host_rx.is_some() && readable {
+            // EPOLLERR is level-triggered even when only IN was requested.
+            // Consume SO_ERROR once, retain it through RX backpressure, and
+            // deliver it to the guest instead of spinning on the same error.
+            if let Ok(Some(error)) = self.sock.take_error() {
+                self.host_error = Some(sys::to_linux_errno(&error));
+            }
             return self.recv_host_datagrams();
         }
 

@@ -30,6 +30,8 @@ pub struct MuxerThread {
     /// AF_UNIX host-IPC listeners; consumed by `create_lisening_ipc_sockets`.
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
     snapshot_gate: Arc<SnapshotGate>,
+    #[cfg(target_os = "macos")]
+    host_icmp: Option<Arc<super::macos_icmp::MacIcmp>>,
 }
 
 impl MuxerThread {
@@ -45,6 +47,7 @@ impl MuxerThread {
         reaper_sender: Sender<u64>,
         unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
         snapshot_gate: Arc<SnapshotGate>,
+        #[cfg(target_os = "macos")] host_icmp: Option<Arc<super::macos_icmp::MacIcmp>>,
     ) -> Self {
         MuxerThread {
             cid,
@@ -57,6 +60,8 @@ impl MuxerThread {
             reaper_sender,
             unix_ipc_port_map,
             snapshot_gate,
+            #[cfg(target_os = "macos")]
+            host_icmp,
         }
     }
 
@@ -261,6 +266,26 @@ impl MuxerThread {
                             );
                         }
 
+                        #[cfg(target_os = "macos")]
+                        if super::macos_icmp::MacIcmp::owns_event(id) {
+                            if let Some(collector) = &self.host_icmp {
+                                for error in collector.receive(id) {
+                                    let update = self.proxy_map.read().unwrap().iter().find_map(
+                                        |(id, proxy)| {
+                                            proxy
+                                                .lock()
+                                                .unwrap()
+                                                .receive_host_error(&error)
+                                                .map(|update| (*id, update))
+                                        },
+                                    );
+                                    if let Some((id, update)) = update {
+                                        self.process_proxy_update(id, update, &mut thread_rng);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
                             let mut proxy = proxy_lock.lock().unwrap();
                             proxy.process_event(evset)

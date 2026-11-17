@@ -171,6 +171,8 @@ pub struct VsockMuxer {
     /// so the guest's connect fails with the reason (say, the host process
     /// is out of file descriptors) instead of a refusal from nowhere.
     failed_creates: Mutex<FailedCreates>,
+    #[cfg(target_os = "macos")]
+    host_icmp: Option<Result<Arc<super::macos_icmp::MacIcmp>, i32>>,
 }
 
 /// Bound on [`FailedCreates`]: guest sockets that fail to get a host socket
@@ -244,13 +246,22 @@ impl VsockMuxer {
         }
         let egress_policy = EgressPolicy::new(egress_cidrs, egress_hosts, egress_resolvers)
             .map(|policy| Arc::new(RwLock::new(policy)));
+        let epoll = Epoll::new().unwrap();
+        #[cfg(target_os = "macos")]
+        let host_icmp = tsi_flags.contains(TsiFlags::HOST_BIND).then(|| {
+            super::macos_icmp::MacIcmp::new(&epoll)
+                .map(Arc::new)
+                .map_err(|error| -sys::to_linux_errno(&error))
+        });
         VsockMuxer {
+            #[cfg(target_os = "macos")]
+            host_icmp,
             cid,
             host_port_map,
             queue: None,
             mem: None,
             rxq: Arc::new(Mutex::new(MuxerRxQ::new())),
-            epoll: Epoll::new().unwrap(),
+            epoll,
             interrupt: None,
             proxy_map: Arc::new(RwLock::new(HashMap::new())),
             pending_datagram_rx: Arc::new(Mutex::new(HashSet::new())),
@@ -386,6 +397,11 @@ impl VsockMuxer {
             sender.clone(),
             self.unix_ipc_port_map.clone().unwrap_or_default(),
             self.snapshot_gate.clone(),
+            #[cfg(target_os = "macos")]
+            self.host_icmp
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .cloned(),
         );
         thread.run();
         debug!("[VSOCK_TIMING] MuxerThread spawned");
@@ -970,6 +986,17 @@ impl VsockMuxer {
             match map.get(&id) {
                 Some(proxy) => {
                     let mut proxy = proxy.lock().unwrap();
+                    #[cfg(target_os = "macos")]
+                    let result = if proxy.is_dgram() {
+                        match &self.host_icmp {
+                            Some(Ok(_)) => proxy.bind_host(&req),
+                            Some(Err(error)) => Err(*error),
+                            None => Err(-95),
+                        }
+                    } else {
+                        proxy.bind_host(&req)
+                    };
+                    #[cfg(not(target_os = "macos"))]
                     let result = proxy.bind_host(&req);
                     if result.is_ok() && proxy.is_dgram() {
                         update = Some((

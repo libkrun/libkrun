@@ -914,3 +914,164 @@ fn host_udp_queued_replies_survive_peer_changes_and_rx_backpressure() {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn host_udp_errors_clear_native_readiness_and_survive_rx_backpressure() {
+    use super::super::host_datagram::wait_readable;
+    let mut f = Fixture::new(granted(), None);
+    f.muxer.floor = FloorMode::MetadataOnly;
+    f.create(defs::SOCK_DGRAM, defs::LINUX_AF_INET);
+    f.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let reserved = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let destination = VsockAddr::from(reserved.local_addr().unwrap());
+    drop(reserved);
+    f.send(
+        defs::TSI_CONNECT,
+        &[
+            &GUEST.to_le_bytes()[..],
+            &destination.linux_len().to_le_bytes(),
+            &destination.to_linux_bytes(),
+        ]
+        .concat(),
+    );
+    assert!(matches!(
+        f.muxer.rxq.lock().unwrap().pop(),
+        Some(MuxerRx::ConnResponse { result: 0, .. })
+    ));
+    let mut packet = f.packet(defs::TSI_PROXY_PORT, b"closed port");
+    packet.set_src_port(GUEST);
+    f.muxer.send_dgram_pkt(&packet).unwrap();
+    let id = ((GUEST as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+    let fd;
+    {
+        let proxies = f.muxer.proxy_map.read().unwrap();
+        let mut proxy = proxies.get(&id).unwrap().lock().unwrap();
+        fd = proxy.poll_handle();
+        wait_readable(fd);
+        assert!(!proxy.process_event(EventSet::ERROR).signal_queue);
+    }
+    assert!(f.muxer.pending_datagram_rx.lock().unwrap().contains(&id));
+    let mut poll = Epoll::new().unwrap();
+    poll.ctl(ControlOperation::Add, fd, &EpollEvent::new(EventSet::IN, 1))
+        .unwrap();
+    let mut events = [EpollEvent::default(); 1];
+    assert_eq!(
+        poll.wait(1, 0, &mut events).unwrap(),
+        0,
+        "unconsumed native error would spin the muxer"
+    );
+    let mem = f.mem.clone();
+    let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+    rx.dtable[0].set(0x30000, (VSOCK_PKT_HDR_SIZE + 512) as u32, 2, 0);
+    rx.avail.ring[0].set(0);
+    rx.avail.idx.set(1);
+    assert!(f.muxer.resume_datagram_rx());
+    assert_eq!(rx.used.ring[0].get().len, VSOCK_PKT_HDR_SIZE as u32);
+    assert_eq!(
+        mem.read_obj::<u32>(GuestAddress(0x30000 + 16)).unwrap(),
+        defs::TSI_PROXY_PORT
+    );
+    assert_eq!(
+        mem.read_obj::<u16>(GuestAddress(0x30000 + 30)).unwrap(),
+        uapi::VSOCK_OP_RST
+    );
+    assert_eq!(
+        mem.read_obj::<u32>(GuestAddress(0x30000 + 32)).unwrap(),
+        111
+    );
+    rx.avail.ring[1].set(0);
+    rx.avail.idx.set(2);
+    assert!(
+        !f.muxer.resume_datagram_rx(),
+        "an error must be delivered only once"
+    );
+    assert_eq!(rx.used.idx.get(), 1);
+    f.release();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn host_udp_error_routing_rejects_other_flows_and_preserves_backpressure() {
+    use super::super::macos_icmp::DatagramError;
+
+    let mut f = Fixture::new(granted(), None);
+    f.muxer.floor = FloorMode::MetadataOnly;
+    f.create(defs::SOCK_DGRAM, defs::LINUX_AF_INET);
+    let source = f.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let first = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let second = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let id = ((GUEST as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+    for peer in [&first, &second] {
+        let destination = VsockAddr::from(peer.local_addr().unwrap());
+        f.send(
+            defs::TSI_CONNECT,
+            &[
+                &GUEST.to_le_bytes()[..],
+                &destination.linux_len().to_le_bytes(),
+                &destination.to_linux_bytes(),
+            ]
+            .concat(),
+        );
+        assert!(matches!(
+            f.muxer.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::ConnResponse { result: 0, .. })
+        ));
+        let proxies = f.muxer.proxy_map.read().unwrap();
+        let mut proxy = proxies.get(&id).unwrap().lock().unwrap();
+        let mut error = DatagramError {
+            source,
+            destination: peer.local_addr().unwrap(),
+            errno: 111,
+        };
+        error.source.set_port(0);
+        assert!(proxy.receive_host_error(&error).is_none());
+        error.source = source;
+        error.destination = if std::ptr::eq(peer, &first) {
+            second.local_addr().unwrap()
+        } else {
+            first.local_addr().unwrap()
+        };
+        assert!(
+            proxy.receive_host_error(&error).is_none(),
+            "a different or previously connected peer must not receive the error"
+        );
+    }
+    {
+        let proxies = f.muxer.proxy_map.read().unwrap();
+        let mut proxy = proxies.get(&id).unwrap().lock().unwrap();
+        let update = proxy
+            .receive_host_error(&DatagramError {
+                source,
+                destination: second.local_addr().unwrap(),
+                errno: 111,
+            })
+            .unwrap();
+        assert!(!update.signal_queue);
+    }
+    assert!(f.muxer.pending_datagram_rx.lock().unwrap().contains(&id));
+    let mem = f.mem.clone();
+    let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+    rx.dtable[0].set(0x30000, (VSOCK_PKT_HDR_SIZE + 512) as u32, 2, 0);
+    rx.avail.ring[0].set(0);
+    rx.avail.idx.set(1);
+    assert!(f.muxer.resume_datagram_rx());
+    assert_eq!(rx.used.ring[0].get().len, VSOCK_PKT_HDR_SIZE as u32);
+    assert_eq!(
+        mem.read_obj::<u32>(GuestAddress(0x30000 + 16)).unwrap(),
+        defs::TSI_PROXY_PORT
+    );
+    assert_eq!(
+        mem.read_obj::<u16>(GuestAddress(0x30000 + 30)).unwrap(),
+        uapi::VSOCK_OP_RST
+    );
+    assert_eq!(
+        mem.read_obj::<u32>(GuestAddress(0x30000 + 32)).unwrap(),
+        111
+    );
+    rx.avail.ring[1].set(0);
+    rx.avail.idx.set(2);
+    assert!(!f.muxer.resume_datagram_rx());
+    assert_eq!(rx.used.idx.get(), 1);
+    f.release();
+}

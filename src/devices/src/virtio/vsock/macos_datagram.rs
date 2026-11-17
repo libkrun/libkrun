@@ -235,6 +235,14 @@ impl MacDatagram {
         }
     }
 
+    pub fn matches_error(&self, source: SocketAddr, destination: SocketAddr) -> bool {
+        self.peer
+            .is_some_and(|peer| canonical_peer(peer) == canonical_peer(destination))
+            && self
+                .selected
+                .is_some_and(|local| canonical_peer(local) == canonical_peer(source))
+    }
+
     pub fn has_saved(&self) -> bool {
         !self.saved.is_empty()
     }

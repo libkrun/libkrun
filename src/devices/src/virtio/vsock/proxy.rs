@@ -210,6 +210,13 @@ pub trait Proxy: Send {
     fn prepare_host_send(&mut self, _send: PendingHostSend) -> Result<(), i32> {
         Err(-95)
     }
+    #[cfg(target_os = "macos")]
+    fn receive_host_error(
+        &mut self,
+        _error: &super::macos_icmp::DatagramError,
+    ) -> Option<ProxyUpdate> {
+        None
+    }
     fn clear_sendto_addr(&mut self) {}
     fn disconnect_host_datagram(&mut self) -> (Result<(), i32>, ProxyUpdate) {
         (Err(-95), ProxyUpdate::default())
