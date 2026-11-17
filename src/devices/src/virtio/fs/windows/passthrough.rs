@@ -286,6 +286,29 @@ fn child_path(parent: &Path, name: &CStr) -> io::Result<PathBuf> {
     Ok(parent.join(cstr_to_path(name)))
 }
 
+/// Refuse a symlink target that resolves outside the shared directory from a link made `depth`
+/// directories below the shared root.
+///
+/// A host program that opens the link follows it, reading the target as a Windows path: `\` is
+/// a separator, `:` names a drive or a stream, a target starting with `/` starts at the root of
+/// a drive, and Win32 drops the trailing dots and spaces of a component, so a component made
+/// only of them does not name what it spells.
+fn check_symlink_target(target: &CStr, mut depth: usize) -> io::Result<()> {
+    let bytes = target.to_bytes();
+    if bytes.first() == Some(&b'/') || bytes.iter().any(|b| matches!(b, b'\\' | b':')) {
+        return Err(einval());
+    }
+    for component in bytes.split(|b| *b == b'/') {
+        match component {
+            b"" | b"." => {}
+            b".." => depth = depth.checked_sub(1).ok_or_else(einval)?,
+            _ if component.iter().all(|b| matches!(b, b'.' | b' ')) => return Err(einval()),
+            _ => depth += 1,
+        }
+    }
+    Ok(())
+}
+
 const FILETIME_UNIX_EPOCH_DIFF: i64 = 116_444_736_000_000_000;
 const FILETIME_TICKS_PER_SEC: i64 = 10_000_000;
 const FILETIME_NSEC_PER_TICK: i64 = 100;
@@ -2331,7 +2354,7 @@ impl FileSystem for PassthroughFs {
      * which enforce host-side path validation.
      *
      * The Limitation is that absolute paths from the guest (e.g., "/etc/passwd") are treated as drive-relative
-     * on Windows, causing `symlink_file` to fail with EINVAL.
+     * on Windows, so they are refused with EINVAL.
      *
      * TODO:
      * To support true absolute guest symlinks, we need to bypass the Win32 API
@@ -2349,6 +2372,10 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<Entry> {
         let parent_path = self.inode_path(parent)?;
         let link_path = child_path(parent_path.as_path(), name)?;
+        let depth = parent_path
+            .strip_prefix(&self.cfg.root_dir)
+            .map_or(0, |below| below.components().count());
+        check_symlink_target(linkname, depth)?;
         let target = cstr_to_path(linkname);
 
         // Windows requires knowing if a symlink target is a file or a directory.
@@ -3195,6 +3222,38 @@ mod tests {
     }
 
     #[test]
+    fn a_symlink_target_outside_the_share_is_refused() {
+        for (target, depth) in [
+            (c"/etc/passwd", 2),
+            (c"..", 0),
+            (c"../x", 0),
+            (c"a/../../x", 0),
+            (c"../../x", 1),
+            (c"a\\b", 0),
+            (c"C:x", 0),
+            (c".../../x", 1),
+            (c"a/.. /x", 1),
+        ] {
+            assert!(
+                check_symlink_target(target, depth).is_err(),
+                "{target:?} at depth {depth}"
+            );
+        }
+        for (target, depth) in [
+            (c"x", 0),
+            (c"./a//b/", 0),
+            (c"a/../x", 0),
+            (c"..", 1),
+            (c"../../x", 2),
+        ] {
+            assert!(
+                check_symlink_target(target, depth).is_ok(),
+                "{target:?} at depth {depth}"
+            );
+        }
+    }
+
+    #[test]
     fn a_lookup_stays_within_the_shared_directory() {
         let share = Share::new("lookup");
         let fs = share.served();
@@ -3245,5 +3304,24 @@ mod tests {
         );
         assert!(!made.exists());
         assert_eq!(fs::read(&share.outside).unwrap(), b"host");
+    }
+
+    #[test]
+    fn a_symlink_stays_within_the_shared_directory() {
+        let share = Share::new("symlink");
+        let fs = share.served();
+
+        for (target, name) in [
+            (c"..".to_owned(), c"up"),
+            (c"..\\outside.txt".to_owned(), c"beside"),
+            (name_of(&share.outside), c"host"),
+        ] {
+            refused(
+                fs.symlink(CTX, &target, fuse::ROOT_ID, name, Extensions::default()),
+                "a symlink target reached an entry outside the share",
+            );
+            let made = share.root.join(name.to_str().unwrap());
+            assert!(fs::symlink_metadata(&made).is_err(), "{made:?}");
+        }
     }
 }
