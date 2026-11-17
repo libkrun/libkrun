@@ -1,0 +1,10 @@
+[package]
+name = "krun-socket"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Short-lived private addresses for filesystem Unix sockets"
+
+[target.'cfg(unix)'.dependencies]
+tempfile = "3"
+

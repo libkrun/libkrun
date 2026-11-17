@@ -412,25 +412,24 @@ impl Proxy for UnixProxy {
     fn connect(&mut self, _pkt: &VsockPacket, _req: TsiConnectReq) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
-        let result = match SockAddr::unix(&self.path) {
-            Ok(addr) => match self.sock.connect(&addr) {
-                Ok(()) => {
-                    debug!("connect: Connected");
-                    self.switch_to_connected();
-                    0
-                }
-                Err(e) if sys::connect_in_progress(&e) => {
-                    debug!("connect: Connecting");
-                    self.status = ProxyStatus::Connecting;
-                    0
-                }
-                Err(e) => {
-                    debug!("Error connecting: {e}");
-                    -sys::to_linux_errno(&e)
-                }
-            },
+        let connected = (|| {
+            let address = utils::SocketPath::new(&self.path)?;
+            let addr = SockAddr::unix(address.path())?;
+            self.sock.connect(&addr)
+        })();
+        let result = match connected {
+            Ok(()) => {
+                debug!("connect: Connected");
+                self.switch_to_connected();
+                0
+            }
+            Err(e) if sys::connect_in_progress(&e) => {
+                debug!("connect: Connecting");
+                self.status = ProxyStatus::Connecting;
+                0
+            }
             Err(e) => {
-                debug!("Error building unix address: {e}");
+                debug!("Error connecting: {e}");
                 -sys::to_linux_errno(&e)
             }
         };
@@ -819,7 +818,8 @@ impl UnixAcceptorProxy {
             start.elapsed()
         );
 
-        let addr = SockAddr::unix(path).map_err(ProxyError::CreatingSocket)?;
+        let address = utils::SocketPath::new(path).map_err(ProxyError::CreatingSocket)?;
+        let addr = SockAddr::unix(address.path()).map_err(ProxyError::CreatingSocket)?;
         sock.bind(&addr).map_err(ProxyError::CreatingSocket)?;
         debug!(
             "[VSOCK_TIMING] UnixAcceptorProxy bound to {:?} in {:?}",

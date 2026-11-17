@@ -37,6 +37,7 @@ const SOCKET_RCVBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
 pub struct Unixgram {
     sock: Socket,
     retries: u64,
+    _local_address: Option<utils::SocketPath>,
 }
 
 impl Unixgram {
@@ -68,7 +69,11 @@ impl Unixgram {
             log::warn!("Failed to set SO_RCVBUF: {e}");
         }
 
-        Self { sock, retries: 0 }
+        Self {
+            sock,
+            retries: 0,
+            _local_address: None,
+        }
     }
 
     /// Create the backend opening a connection to the userspace network proxy.
@@ -79,13 +84,16 @@ impl Unixgram {
             NET_SOCK_COUNTER.fetch_add(1, Ordering::Relaxed),
         );
         let local_path = std::env::temp_dir().join(&socket_name);
-        let sock = sys::connect_unix_dgram(&local_path, &path).map_err(ConnectError::Binding)?;
+        let (sock, address) =
+            sys::connect_unix_dgram(&local_path, &path).map_err(ConnectError::Binding)?;
 
         if send_vfkit_magic {
             sys::send(&sock, &VFKIT_MAGIC).map_err(ConnectError::SendingMagic)?;
         }
 
-        Ok(Self::new(sock))
+        let mut backend = Self::new(sock);
+        backend._local_address = Some(address);
+        Ok(backend)
     }
 }
 

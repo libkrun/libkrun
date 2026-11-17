@@ -632,6 +632,21 @@ pub fn vcpu_save_state(vcpuid: u64) -> Result<HvfVcpuState, Error> {
     })
 }
 
+// Apple's hv_simd_fp_uchar16_t is uint8_t __attribute__((ext_vector_type(16))).
+// A Rust u128 has the same storage but a different by-value ABI: it would go
+// in integer registers while Hypervisor.framework reads q0. Take a pointer
+// using the ordinary C ABI, then tail-call with the vector in the right place.
+// x0/x1 (vCPU and register) and the caller's link register remain unchanged.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C" fn set_simd_fp_reg(
+    _vcpu: hv_vcpu_t,
+    _reg: hv_simd_fp_reg_t,
+    _value: *const u128,
+) -> hv_return_t {
+    core::arch::naked_asm!("ldr q0, [x2]", "b _hv_vcpu_set_simd_fp_reg");
+}
+
 /// Restore previously-captured register state onto a (paused) HVF vCPU by its
 /// id. The macOS adapter mirroring KVM's `Vcpu::restore_state`.
 #[cfg(target_arch = "aarch64")]
@@ -660,7 +675,9 @@ pub fn vcpu_restore_state(vcpuid: u64, state: &HvfVcpuState) -> Result<(), Error
     write_reg(hv_reg_t_HV_REG_FPSR, state.fpsr)?;
     for (i, &v) in state.simd.iter().enumerate() {
         let ret = unsafe {
-            hv_vcpu_set_simd_fp_reg(vcpuid, hv_simd_fp_reg_t_HV_SIMD_FP_REG_Q0 + i as u32, v)
+            // SAFETY: v lives through the synchronous call; the adapter reads
+            // exactly its 16 bytes and supplies Apple's vector calling convention.
+            set_simd_fp_reg(vcpuid, hv_simd_fp_reg_t_HV_SIMD_FP_REG_Q0 + i as u32, &v)
         };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetRegister);
@@ -675,6 +692,18 @@ pub fn vcpu_restore_state(vcpuid: u64, state: &HvfVcpuState) -> Result<(), Error
         }
     }
     for &(reg, val) in &state.gic_icc {
+        // Preserve destination read-only capabilities (priority/INTID widths)
+        // when restoring a CPU interface captured by another hypervisor.
+        let val = if reg == 50788 {
+            let mut own = 0;
+            let ret = unsafe { (GIC_REGS.get_icc)(vcpuid, reg as u16, &mut own) };
+            if ret != HV_SUCCESS {
+                return Err(Error::VcpuReadRegister);
+            }
+            (own & !3) | (val & 3)
+        } else {
+            val
+        };
         let ret = unsafe { (GIC_REGS.set_icc)(vcpuid, reg as u16, val) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetSystemRegister(0, val));
@@ -734,7 +763,12 @@ pub fn gic_restore_distributor(regs: &[(u32, u64)]) -> Result<(), Error> {
         }
     }
     if let Some(&(_, ctlr)) = regs.iter().find(|(r, _)| *r == 0) {
-        let ret = unsafe { (GIC_REGS.set_dist)(0, ctlr) };
+        let mut own = 0;
+        let ret = unsafe { (GIC_REGS.get_dist)(0, &mut own) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadRegister);
+        }
+        let ret = unsafe { (GIC_REGS.set_dist)(0, (own & !3) | (ctlr & 3)) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetSystemRegister(0, ctlr));
         }
@@ -1596,5 +1630,59 @@ mod balloon_reclaim_tests {
             "the range must be mapped again even though the purge failed"
         );
         assert_eq!(*order.lock().unwrap(), ["unmap", "purge", "remap"]);
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod simd_restore_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an Apple Silicon host with Hypervisor.framework available; run explicitly with --ignored"]
+    fn restored_simd_registers_keep_every_bit() {
+        // Hypervisor state belongs to this test's process and owning thread.
+        // No guest code is run, and the test runner supplies HVF entitlements.
+        let _vm = HvfVm::new(false).unwrap();
+        let cpu = HvfVcpu::new(0, false).unwrap();
+        struct Cleanup(u64);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    hv_vcpu_destroy(self.0);
+                    hv_vm_destroy();
+                }
+            }
+        }
+        let _cleanup = Cleanup(cpu.id());
+        let mut state = HvfVcpuState {
+            gp: [0; 31],
+            pc: 0x8000_0000,
+            cpsr: 0x3c5,
+            fpcr: 0,
+            fpsr: 0,
+            simd: [0; 32],
+            sys: vec![],
+            gic_redist: vec![],
+            gic_icc: vec![],
+            vtimer_offset: 0,
+            guest_counter: 0,
+        };
+        // Check all registers, both 64-bit halves, and a second restore that
+        // must replace existing values rather than just initialize reset state.
+        for pattern in [
+            0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128,
+            0xfedc_ba98_7654_3210_0123_4567_89ab_cdefu128,
+        ] {
+            for (i, value) in state.simd.iter_mut().enumerate() {
+                *value = pattern ^ ((i as u128) << 96) ^ ((i as u128) << 32);
+            }
+            vcpu_restore_state(cpu.id(), &state).unwrap();
+            for (i, expected) in state.simd.iter().enumerate() {
+                let mut value = 0;
+                let ret = unsafe { hv_vcpu_get_simd_fp_reg(cpu.id(), i as u32, &mut value) };
+                assert_eq!(ret, HV_SUCCESS);
+                assert_eq!(value, *expected, "restored Q{i} differs");
+            }
+        }
     }
 }

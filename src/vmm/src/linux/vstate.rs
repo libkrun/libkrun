@@ -2614,7 +2614,7 @@ impl Vcpu {
 
     #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
-    fn restore_state(&mut self, state: VcpuState) -> Result<()> {
+    fn restore_state(&mut self, mut state: VcpuState) -> Result<()> {
         /*
          * Ordering requirements:
          *
@@ -2637,6 +2637,7 @@ impl Vcpu {
          * SET_LAPIC must come before SET_MSRS, because the TSC deadline MSR
          * only restores successfully, when the LAPIC is correctly configured.
          */
+        state.omit_inactive_optional_msrs(&self.msr_list);
         // Guest clock conversion state was initialized against the source
         // virtual TSC rate. Program that same rate before restoring TSC/MSRs;
         // otherwise a cross-host resume can make guest timers stall or jump.
@@ -3357,6 +3358,43 @@ fn nested_guest_mode_is_read_from_the_state_header() {
 
 #[cfg(target_arch = "x86_64")]
 impl VcpuState {
+    /// KVM may save XSS/CET registers even when the guest was not offered
+    /// those facilities, while another host rejects the registers entirely.
+    /// Omit only zero, unexposed, inactive state absent from the destination's
+    /// MSR list. Never silently downgrade active state or other MSRs.
+    fn omit_inactive_optional_msrs(&mut self, supported: &MsrList) {
+        const IA32_XSS: u32 = 0xda0;
+        let is_cet = |index| matches!(index, 0x6a0 | 0x6a2 | 0x6a4..=0x6a8);
+        let guest_uses_xss = self.cpuid.as_slice().iter().any(|entry| {
+            entry.function == 0xd
+                && entry.index == 1
+                && (entry.eax & (1 << 3) != 0 || entry.ecx != 0 || entry.edx != 0)
+        });
+        let guest_uses_cet =
+            guest_uses_xss
+                || self.cpuid.as_slice().iter().any(|entry| {
+                    entry.function == 7
+                        && entry.index == 0
+                        && (entry.ecx & (1 << 7) != 0 || entry.edx & (1 << 20) != 0)
+                })
+                || self.sregs.cr4 & (1 << 23) != 0
+                || self.msrs.as_slice().iter().any(|entry| {
+                    (is_cet(entry.index) || entry.index == IA32_XSS) && entry.data != 0
+                });
+        self.msrs.retain(|entry| {
+            if entry.data != 0 || supported.as_slice().contains(&entry.index) {
+                return true;
+            }
+            if entry.index == IA32_XSS {
+                guest_uses_xss
+            } else if is_cet(entry.index) {
+                guest_uses_cet
+            } else {
+                true
+            }
+        });
+    }
+
     /// The CPUID the guest on this vCPU was given.
     pub fn cpuid(&self) -> &CpuId {
         &self.cpuid
@@ -4266,6 +4304,60 @@ mod tests {
         assert!(added.portable_cpu, "still captured as a portable vCPU");
     }
 
+    // Cloud KVM can save an inactive XSS even when the portable guest was
+    // never offered XSAVES; another KVM may reject that register entirely.
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    #[test]
+    fn restore_portable_guest_with_inactive_foreign_msrs() {
+        let (_vm, mut vcpu, mem) = setup_vcpu(0x10000);
+        vcpu.configure_x86_64(&mem, GuestAddress(0), &portable_vcpu_config(), true, false)
+            .unwrap();
+        let mut state = vcpu.save_state().unwrap();
+        assert_eq!(leaf(&state.cpuid, 0xd, 1).eax & (1 << 3), 0);
+        state.msrs.retain(|entry| entry.index != 0xda0);
+        state
+            .msrs
+            .push(kvm_bindings::kvm_msr_entry {
+                index: 0xda0,
+                data: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        for index in [0x6a0, 0x6a2, 0x6a4, 0x6a5, 0x6a6, 0x6a7, 0x6a8] {
+            state.msrs.retain(|entry| entry.index != index);
+            state
+                .msrs
+                .push(kvm_bindings::kvm_msr_entry {
+                    index,
+                    data: 0,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        // A following register proves the rest of the batch is still applied.
+        const SYSENTER_CS: u32 = 0x174;
+        state.msrs.retain(|entry| entry.index != SYSENTER_CS);
+        state
+            .msrs
+            .push(kvm_bindings::kvm_msr_entry {
+                index: SYSENTER_CS,
+                data: 0x10,
+                ..Default::default()
+            })
+            .unwrap();
+        let supports_xss = vcpu.msr_list.as_slice().contains(&0xda0);
+        eprintln!("destination KVM lists XSS: {supports_xss}");
+        vcpu.restore_state(VcpuState::deserialize(&state.serialize()).unwrap())
+            .unwrap();
+        let mut observed = Msrs::from_entries(&[kvm_bindings::kvm_msr_entry {
+            index: SYSENTER_CS,
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(vcpu.fd.get_msrs(&mut observed).unwrap(), 1);
+        assert_eq!(observed.as_slice()[0].data, 0x10);
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_vcpu_save_restore_state_roundtrip() {
@@ -4323,6 +4415,104 @@ mod tests {
                 tsc_migration: None,
                 nested_state,
             }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn inactive_xss_filter_preserves_active_and_unrelated_state() {
+        for (xss, eax, ecx, edx, supported, omitted) in [
+            (0, 1, 0, 0, false, true),
+            (0, 1, 0, 0, true, false),
+            (1 << 11, 1, 0, 0, false, false),
+            (0, 1 << 3, 0, 0, false, false),
+            (0, 1, 1 << 11, 0, false, false),
+            (0, 1, 0, 1, false, false),
+        ] {
+            let mut state = blank_vcpu_state(None);
+            state.cpuid = CpuId::from_entries(&[kvm_bindings::kvm_cpuid_entry2 {
+                function: 0xd,
+                index: 1,
+                eax,
+                ecx,
+                edx,
+                ..Default::default()
+            }])
+            .unwrap();
+            let entries = [
+                kvm_bindings::kvm_msr_entry {
+                    index: 0xda0,
+                    data: xss,
+                    ..Default::default()
+                },
+                kvm_bindings::kvm_msr_entry {
+                    index: 0xdead,
+                    data: 0,
+                    ..Default::default()
+                },
+                kvm_bindings::kvm_msr_entry {
+                    index: 0x174,
+                    data: 0x10,
+                    ..Default::default()
+                },
+            ];
+            state.msrs = Msrs::from_entries(&entries).unwrap();
+            let supported = MsrList::from_entries(if supported { &[0xda0] } else { &[] }).unwrap();
+            state.omit_inactive_optional_msrs(&supported);
+            assert_eq!(state.msrs.as_slice(), &entries[usize::from(omitted)..]);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn inactive_cet_filter_preserves_exposed_or_active_state() {
+        for (ss, ibt, cr4, xss, cet_data, supported, omit) in [
+            (false, false, 0, 0, 0, false, true),
+            (false, false, 0, 0, 0, true, false),
+            (true, false, 0, 0, 0, false, false),
+            (false, true, 0, 0, 0, false, false),
+            (false, false, 1 << 23, 0, 0, false, false),
+            (false, false, 0, 1 << 11, 0, false, false),
+            (false, false, 0, 0, 1, false, false),
+        ] {
+            let mut state = blank_vcpu_state(None);
+            state.sregs.cr4 = cr4;
+            state.cpuid = CpuId::from_entries(&[kvm_bindings::kvm_cpuid_entry2 {
+                function: 7,
+                ecx: u32::from(ss) << 7,
+                edx: u32::from(ibt) << 20,
+                ..Default::default()
+            }])
+            .unwrap();
+            let indices = [0x6a0, 0x6a2, 0x6a4, 0x6a5, 0x6a6, 0x6a7, 0x6a8];
+            for index in indices {
+                state
+                    .msrs
+                    .push(kvm_bindings::kvm_msr_entry {
+                        index,
+                        data: if index == 0x6a0 { cet_data } else { 0 },
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+            state
+                .msrs
+                .push(kvm_bindings::kvm_msr_entry {
+                    index: 0xda0,
+                    data: xss,
+                    ..Default::default()
+                })
+                .unwrap();
+            let supported = MsrList::from_entries(if supported { &indices } else { &[] }).unwrap();
+            state.omit_inactive_optional_msrs(&supported);
+            let remaining: Vec<_> = state
+                .msrs
+                .as_slice()
+                .iter()
+                .filter(|e| indices.contains(&e.index))
+                .map(|e| e.index)
+                .collect();
+            assert_eq!(remaining.as_slice(), if omit { &[][..] } else { &indices });
         }
     }
 

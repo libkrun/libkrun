@@ -6,6 +6,7 @@ members = [
     "src/input",
     "src/display",
     "src/utils",
+    "src/socket",
     "src/arch_gen",
     "src/cpuid",
     "src/smbios",

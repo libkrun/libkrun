@@ -4392,13 +4392,8 @@ unsafe extern "C" {
         value: *mut hv_simd_fp_uchar16_t,
     ) -> hv_return_t;
 }
-unsafe extern "C" {
-    pub fn hv_vcpu_set_simd_fp_reg(
-        vcpu: hv_vcpu_t,
-        reg: hv_simd_fp_reg_t,
-        value: hv_simd_fp_uchar16_t,
-    ) -> hv_return_t;
-}
+// hv_vcpu_set_simd_fp_reg takes a C vector by value, not an integer u128.
+// The ABI adapter in lib.rs supplies that argument in q0 on arm64.
 unsafe extern "C" {
     pub fn hv_vcpu_get_sys_reg(vcpu: hv_vcpu_t, reg: hv_sys_reg_t, value: *mut u64) -> hv_return_t;
 }

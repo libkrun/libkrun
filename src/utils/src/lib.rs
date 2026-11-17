@@ -1,6 +1,8 @@
 // Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+pub use krun_socket::SocketPath;
+
 #[cfg(unix)]
 pub use vmm_sys_util::{errno, tempdir, tempfile, terminal};
 // vmm-sys-util is Unix-only; provide a compatible `errno` shim on Windows.
