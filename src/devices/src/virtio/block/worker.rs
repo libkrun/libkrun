@@ -1,6 +1,4 @@
 use crate::virtio::descriptor_utils::{Reader, Writer};
-#[cfg(target_os = "windows")]
-use std::fs::File;
 
 use super::super::DeviceQueue;
 use super::BlockIoEngine;
@@ -187,7 +185,7 @@ struct AsyncCompletion {
     head_index: u16,
     bytes: usize,
     result: io::Result<usize>,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     owned_data: Option<Vec<u8>>,
 }
 

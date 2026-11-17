@@ -20,7 +20,9 @@ use std::os::fd::{BorrowedFd, FromRawFd};
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle};
 #[cfg(windows)]
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
+use std::sync::atomic::AtomicI32;
+#[cfg(unix)]
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use utils::windows::SendHandle;
