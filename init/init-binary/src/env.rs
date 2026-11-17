@@ -185,6 +185,12 @@ pub fn apply_env() {
     }
     if let Ok(term) = env::var("KRUN_TERM") {
         unsafe { env::set_var("TERM", term) };
+    } else if env::var("TERM").is_err() {
+        // The virtio console (hvc0) is a transparent byte pipe that forwards
+        // the host terminal's escape sequences unchanged.  Without a correct
+        // TERM, TUI apps (htop, mc, …) look up the wrong terminfo entries and
+        // misinterpret function/navigation keys (F1-F5, Home, End).
+        unsafe { env::set_var("TERM", "xterm-256color") };
     }
 }
 
