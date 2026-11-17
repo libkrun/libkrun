@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 #[cfg(target_os = "linux")]
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::num::Wrapping;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -62,6 +62,9 @@ pub struct TsiStreamProxy {
     /// can re-establish the host-side listener. 0 = not a listener.
     listen_guest_port: u16,
     host_bound: Option<SocketAddr>,
+    /// A cross-family interceptor uses a separate transport socket. Retain
+    /// the guest's explicitly bound socket so its address remains reserved.
+    intercept_reservation: Option<Socket>,
     /// Listen backlog requested by the guest, for the same reason.
     listen_backlog: i32,
     /// Set once the remote peer half-closed its send side (our recv hit EOF) and
@@ -178,6 +181,7 @@ impl TsiStreamProxy {
             unixsock_path: None,
             listen_guest_port: 0,
             host_bound: None,
+            intercept_reservation: None,
             listen_backlog: 0,
             local_read_shutdown: false,
         })
@@ -228,6 +232,7 @@ impl TsiStreamProxy {
             unixsock_path: None,
             listen_guest_port: 0,
             host_bound: None,
+            intercept_reservation: None,
             listen_backlog: 0,
             local_read_shutdown: false,
         }
@@ -569,6 +574,49 @@ impl TsiStreamProxy {
         }
     }
 
+    fn guest_local_addr(&self) -> std::io::Result<socket2::SockAddr> {
+        let local = self.sock.local_addr()?;
+        if self.intercept_peer.is_none() {
+            return Ok(local);
+        }
+        let Some(local) = local.as_socket() else {
+            return Ok(local);
+        };
+        // Interceptors are loopback endpoints. Translate their transport's
+        // local address into the original guest family, just as getpeername
+        // exposes the original destination rather than the interceptor.
+        let mut local: SocketAddr = match (self.family, local) {
+            (Family::Inet6, SocketAddr::V4(addr)) => {
+                let ip = if addr.ip().is_unspecified() {
+                    Ipv6Addr::UNSPECIFIED
+                } else {
+                    addr.ip().to_ipv6_mapped()
+                };
+                SocketAddrV6::new(ip, addr.port(), 0, 0).into()
+            }
+            (Family::Inet, SocketAddr::V6(addr)) => {
+                let ip = if addr.ip().is_loopback() {
+                    Ipv4Addr::LOCALHOST
+                } else if addr.ip().is_unspecified() {
+                    Ipv4Addr::UNSPECIFIED
+                } else {
+                    addr.ip()
+                        .to_ipv4_mapped()
+                        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EAFNOSUPPORT))?
+                };
+                SocketAddrV4::new(ip, addr.port()).into()
+            }
+            (_, addr) => addr,
+        };
+        if let Some(bound) = self.host_bound {
+            local.set_port(bound.port());
+            if !bound.ip().is_unspecified() {
+                local = bound;
+            }
+        }
+        Ok(local.into())
+    }
+
     fn fail_connect(&mut self, update: &mut ProxyUpdate, errno: i32) {
         self.awaiting_verdict = false;
         self.push_connect_rsp(-errno);
@@ -638,9 +686,7 @@ impl TsiStreamProxy {
         };
         let addr: SocketAddr = match self.family {
             Family::Inet => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, host_port).into(),
-            Family::Inet6 => {
-                SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, host_port, 0, 0).into()
-            }
+            Family::Inet6 => SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, host_port, 0, 0).into(),
             #[cfg(unix)]
             Family::Unix => return -libc::EINVAL,
         };
@@ -866,9 +912,9 @@ impl Proxy for TsiStreamProxy {
         let Some(destination) = req.addr.inet() else {
             return self.dial(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
         };
-        // The guest's socket family need not match the interceptor's; a fresh
-        // host socket of the right domain is safe here because nothing has
-        // been registered for polling yet.
+        // The guest's socket family need not match the interceptor's. Replace
+        // the transport before registering it for polling, but retain any
+        // explicit reservation independently of that transport's endpoint.
         let wanted = if intercept.endpoint.is_ipv4() {
             (Family::Inet, Domain::IPV4)
         } else {
@@ -882,7 +928,10 @@ impl Proxy for TsiStreamProxy {
                         .with_time(std::time::Duration::from_secs(60))
                         .with_interval(std::time::Duration::from_secs(15));
                     let _ = sock.set_tcp_keepalive(&ka);
-                    self.sock = sock;
+                    let original = std::mem::replace(&mut self.sock, sock);
+                    if self.host_bound.is_some() {
+                        self.intercept_reservation = Some(original);
+                    }
                 }
                 Err(e) => return self.dial(Err(e)),
             }
@@ -902,7 +951,7 @@ impl Proxy for TsiStreamProxy {
 
         let local = pkt.read_getname_req().is_some_and(|req| req.peer == 0);
         let peer = if local {
-            self.sock.local_addr()
+            self.guest_local_addr()
         } else {
             match self.intercept_peer {
                 Some(destination) => Ok(socket2::SockAddr::from(destination)),
