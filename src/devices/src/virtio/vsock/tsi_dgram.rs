@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use socket2::{Domain, Socket, Type};
 
 use super::super::Queue as VirtQueue;
+use super::super::linux_errno::LINUX_EAFNOSUPPORT;
 use super::defs;
 use super::defs::uapi;
 use super::dns_filter::{DNS_PORT, DnsRequest, HostDnsReply, sockaddr_port};
@@ -451,7 +452,17 @@ impl Proxy for TsiDgramProxy {
             #[cfg(not(target_os = "linux"))]
             None => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
         };
-        let (res, poll_host_socket) = match addr.and_then(|a| self.sock.connect(&a)) {
+        let connected =
+            if self.family == Family::Inet && req.addr.inet().is_some_and(|a| a.is_ipv6()) {
+                // Linux rejects this before changing the socket. Darwin can
+                // disconnect an existing UDP peer before returning the error.
+                // This is already a guest errno, not a native Winsock/BSD error.
+                Err(LINUX_EAFNOSUPPORT)
+            } else {
+                addr.and_then(|a| self.sock.connect(&a))
+                    .map_err(|err| sys::to_linux_errno(&err))
+            };
+        let (res, poll_host_socket) = match connected {
             Ok(()) => {
                 // A failed reconnect leaves the previous peer and its DNS
                 // interception active; commit the new policy with the socket.
@@ -468,9 +479,9 @@ impl Proxy for TsiDgramProxy {
                     (0, true)
                 }
             }
-            Err(e) => {
-                debug!("Error connecting: {e}");
-                (-sys::to_linux_errno(&e), false)
+            Err(errno) => {
+                debug!("Error connecting: Linux errno {errno}");
+                (-errno, false)
             }
         };
 

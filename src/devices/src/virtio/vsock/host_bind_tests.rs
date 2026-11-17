@@ -640,7 +640,7 @@ fn host_udp_failed_reconnect_keeps_dns_interception() {
     let bound = f.bind("127.0.0.1:0".parse().unwrap()).unwrap();
 
     // A rejected family change leaves the original kernel socket connected.
-    for (destination, succeeds) in [("127.0.0.1:53", true), ("[::1]:53", false)] {
+    for (destination, expected) in [("127.0.0.1:53", 0), ("[::1]:53", -97)] {
         let addr = VsockAddr::from(destination.parse::<SocketAddr>().unwrap());
         f.send(
             defs::TSI_CONNECT,
@@ -653,9 +653,28 @@ fn host_udp_failed_reconnect_keeps_dns_interception() {
         );
         let reply = f.muxer.rxq.lock().unwrap().pop();
         assert!(
-            matches!(&reply, Some(MuxerRx::ConnResponse { result, .. }) if if succeeds { *result == 0 } else { *result < 0 }),
+            matches!(&reply, Some(MuxerRx::ConnResponse { result, .. }) if *result == expected),
             "connect to {destination}: {reply:?}"
         );
+    }
+    // Ask the native socket through the guest protocol, rather than trusting
+    // the proxy's remembered peer: Darwin can lose the socket's actual peer.
+    f.send(
+        defs::TSI_GETNAME,
+        &[
+            &GUEST.to_le_bytes()[..],
+            &defs::TSI_PROXY_PORT.to_le_bytes(),
+            &1u32.to_le_bytes(),
+        ]
+        .concat(),
+    );
+    let reply = f.muxer.rxq.lock().unwrap().pop();
+    match reply {
+        Some(MuxerRx::GetnameResponse { data, .. }) => {
+            assert_eq!(data.result, 0);
+            assert_eq!(data.addr.inet(), Some("127.0.0.1:53".parse().unwrap()));
+        }
+        other => panic!("unexpected peer response: {other:?}"),
     }
     let mut packet = f.packet(defs::TSI_PROXY_PORT, b"query");
     packet.set_src_port(GUEST);
