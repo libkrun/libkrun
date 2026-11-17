@@ -33,12 +33,14 @@ pub struct NetWorker {
     mem: GuestMemoryMmap,
     backend: Box<dyn NetBackend + Send>,
 
-    rx_frame_buf: [u8; MAX_BUFFER_SIZE],
+    // Keep packet storage off the stack: the worker is moved through the
+    // thread's spawn/join machinery when quiescing and re-arming it.
+    rx_frame_buf: Box<[u8]>,
     rx_frame_buf_len: usize,
     rx_has_deferred_frame: bool,
 
     tx_iovec: Vec<(GuestAddress, usize)>,
-    tx_frame_buf: [u8; MAX_BUFFER_SIZE],
+    tx_frame_buf: Box<[u8]>,
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
 
@@ -93,11 +95,11 @@ impl NetWorker {
             backend,
             interrupt,
 
-            rx_frame_buf: [0u8; MAX_BUFFER_SIZE],
+            rx_frame_buf: vec![0u8; MAX_BUFFER_SIZE].into_boxed_slice(),
             rx_frame_buf_len: 0,
             rx_has_deferred_frame: false,
 
-            tx_frame_buf: [0u8; MAX_BUFFER_SIZE],
+            tx_frame_buf: vec![0u8; MAX_BUFFER_SIZE].into_boxed_slice(),
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
@@ -549,6 +551,39 @@ mod tests {
     use crate::virtio::queue::tests::VirtQueue;
     use std::os::fd::{IntoRawFd, RawFd};
     use std::sync::Arc;
+
+    #[test]
+    fn worker_can_stop_and_rearm_on_the_default_thread_stack() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+        let tx = VirtQueue::new(GuestAddress(0x4000), &mem, 8);
+        let queue = |ring: &VirtQueue| {
+            DeviceQueue::new(
+                ring.create_queue(),
+                Arc::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap()),
+            )
+        };
+        let (ours, _peer) =
+            socket2::Socket::pair(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        let stop = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let mut worker = NetWorker::new(
+            queue(&rx),
+            queue(&tx),
+            InterruptTransport::new(DummyIrqChip::new().into(), "net lifecycle test".into())
+                .unwrap(),
+            mem.clone(),
+            0,
+            VirtioNetBackend::UnixstreamFd(ours.into_raw_fd()),
+            stop.try_clone().unwrap(),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            stop.write(1).unwrap();
+            worker = worker.run().join().unwrap();
+            let (rx_state, tx_state) = worker.save_queue_states();
+            worker.restore_queue_states(&rx_state, &tx_state).unwrap();
+        }
+    }
 
     /// A TX chain too short to hold a frame after the vnet header is dropped,
     /// not handed to a backend that assumes a frame is there.
