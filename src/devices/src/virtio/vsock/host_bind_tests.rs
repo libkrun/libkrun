@@ -657,8 +657,8 @@ fn host_udp_failed_reconnect_keeps_dns_interception() {
             "connect to {destination}: {reply:?}"
         );
     }
-    // Ask the native socket through the guest protocol, rather than trusting
-    // the proxy's remembered peer: Darwin can lose the socket's actual peer.
+    // Ask through the guest protocol to verify that the rejected reconnect
+    // preserves the application's existing peer.
     f.send(
         defs::TSI_GETNAME,
         &[
@@ -772,7 +772,7 @@ fn host_udp_disconnect_is_capability_gated_and_does_not_allow_short_requests() {
     f.muxer.tsi_flags.insert(TsiFlags::HOST_BIND);
     for _ in 0..2 {
         f.send(defs::TSI_CONNECT, &disconnect);
-        let expected = if cfg!(target_os = "linux") { 0 } else { -95 };
+        let expected = if cfg!(windows) { -95 } else { 0 };
         assert!(matches!(f.muxer.rxq.lock().unwrap().pop(),
             Some(MuxerRx::ConnResponse { result, .. }) if result == expected));
     }
@@ -787,15 +787,130 @@ fn host_udp_disconnect_is_capability_gated_and_does_not_allow_short_requests() {
     );
     match f.muxer.rxq.lock().unwrap().pop() {
         Some(MuxerRx::GetnameResponse { data, .. }) => {
-            assert_eq!(
-                data.result,
-                if cfg!(target_os = "linux") { -107 } else { 0 }
-            );
-            if !cfg!(target_os = "linux") {
+            assert_eq!(data.result, if cfg!(windows) { 0 } else { -107 });
+            if cfg!(windows) {
                 assert_eq!(data.addr.inet(), Some(peer.local_addr().unwrap()));
             }
         }
         other => panic!("unexpected peer response: {other:?}"),
     }
     f.release();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn host_udp_queued_replies_survive_peer_changes_and_rx_backpressure() {
+    use super::super::host_datagram::{FRAME_HEADER, wait_readable};
+    for ip in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+        IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+    ] {
+        let host_ip = match ip {
+            IpAddr::V6(ip) => ip.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip.into()),
+            ip => ip,
+        };
+        for fixed in [false, true] {
+            for transition in ["connect", "reconnect", "disconnect"] {
+                let mut f = Fixture::new(granted(), None);
+                f.muxer.floor = FloorMode::MetadataOnly;
+                f.create(
+                    defs::SOCK_DGRAM,
+                    if ip.is_ipv4() {
+                        defs::LINUX_AF_INET
+                    } else {
+                        defs::LINUX_AF_INET6
+                    },
+                );
+                let requested = if fixed {
+                    let reservation = UdpSocket::bind(SocketAddr::new(host_ip, 0)).unwrap();
+                    SocketAddr::new(ip, reservation.local_addr().unwrap().port())
+                } else {
+                    SocketAddr::new(ip, 0)
+                };
+                let bound = f.bind(requested).unwrap();
+                let first = UdpSocket::bind(SocketAddr::new(host_ip, 0)).unwrap();
+                let second = UdpSocket::bind(SocketAddr::new(host_ip, 0)).unwrap();
+                let first_addr = SocketAddr::new(ip, first.local_addr().unwrap().port());
+                let connect = |f: &mut Fixture, addr: SocketAddr| {
+                    let addr = VsockAddr::from(addr);
+                    f.send(
+                        defs::TSI_CONNECT,
+                        &[
+                            &GUEST.to_le_bytes()[..],
+                            &addr.linux_len().to_le_bytes(),
+                            &addr.to_linux_bytes(),
+                        ]
+                        .concat(),
+                    );
+                    assert!(matches!(
+                        f.muxer.rxq.lock().unwrap().pop(),
+                        Some(MuxerRx::ConnResponse { result: 0, .. })
+                    ));
+                };
+                if transition != "connect" {
+                    connect(&mut f, first_addr);
+                }
+                let destination = SocketAddr::new(host_ip, bound.port());
+                first.send_to(b"", destination).unwrap();
+                first.send_to(b"queued before change", destination).unwrap();
+                let id = ((GUEST as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+                {
+                    let proxies = f.muxer.proxy_map.read().unwrap();
+                    let mut proxy = proxies.get(&id).unwrap().lock().unwrap();
+                    wait_readable(proxy.poll_handle());
+                    proxy.process_event(EventSet::IN);
+                }
+                assert!(f.muxer.pending_datagram_rx.lock().unwrap().contains(&id));
+                if transition == "disconnect" {
+                    f.send(
+                        defs::TSI_CONNECT,
+                        &[&GUEST.to_le_bytes()[..], &2u32.to_le_bytes(), &[0, 0]].concat(),
+                    );
+                    assert!(matches!(
+                        f.muxer.rxq.lock().unwrap().pop(),
+                        Some(MuxerRx::ConnResponse { result: 0, .. })
+                    ));
+                } else {
+                    connect(
+                        &mut f,
+                        SocketAddr::new(ip, second.local_addr().unwrap().port()),
+                    );
+                }
+                if fixed {
+                    assert_eq!(
+                        UdpSocket::bind(destination).unwrap_err().kind(),
+                        std::io::ErrorKind::AddrInUse
+                    );
+                }
+                let mem = f.mem.clone();
+                let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+                for (index, expected) in [b"".as_slice(), b"queued before change".as_slice()]
+                    .iter()
+                    .enumerate()
+                {
+                    rx.dtable[0].set(0x30000, (VSOCK_PKT_HDR_SIZE + 512) as u32, 2, 0);
+                    rx.avail.ring[index].set(0);
+                    rx.avail.idx.set((index + 1) as u16);
+                    assert!(
+                        f.muxer.resume_datagram_rx(),
+                        "{ip} fixed={fixed} {transition} packet={index}"
+                    );
+                    let mut frame =
+                        vec![0; rx.used.ring[index].get().len as usize - VSOCK_PKT_HDR_SIZE];
+                    mem.read_slice(
+                        &mut frame,
+                        GuestAddress(0x30000 + VSOCK_PKT_HDR_SIZE as u64),
+                    )
+                    .unwrap();
+                    let addr_len = u32::from_le_bytes(frame[12..16].try_into().unwrap());
+                    let sender =
+                        VsockAddr::parse_linux(&frame[16..FRAME_HEADER], addr_len).unwrap();
+                    assert_eq!(sender.inet(), Some(first_addr));
+                    assert_eq!(&frame[FRAME_HEADER..], *expected);
+                }
+                f.release();
+            }
+        }
+    }
 }

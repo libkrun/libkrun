@@ -47,6 +47,23 @@ impl HostDatagramRx {
     }
 
     pub fn receive_frame(&mut self, sock: &Socket, buf: &mut [u8]) -> io::Result<usize> {
+        self.receive_frame_with(buf, |uninit| {
+            #[cfg(unix)]
+            let (len, addr) = sock.recv_from_with_flags(uninit, libc::MSG_DONTWAIT)?;
+            #[cfg(windows)]
+            let (len, addr) = sock.recv_from(uninit)?;
+            let addr = addr
+                .as_socket()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "non-INET UDP sender"))?;
+            Ok((len, addr.into()))
+        })
+    }
+
+    pub fn receive_frame_with(
+        &mut self,
+        buf: &mut [u8],
+        mut receive: impl FnMut(&mut [MaybeUninit<u8>]) -> io::Result<(usize, VsockAddr)>,
+    ) -> io::Result<usize> {
         // Leave the host datagram untouched if this descriptor cannot carry
         // any payload. Do not confuse a short descriptor with UDP truncation.
         if buf.len() <= FRAME_HEADER {
@@ -69,14 +86,7 @@ impl HostDatagramRx {
                         self.payload.len(),
                     )
                 };
-                #[cfg(unix)]
-                let (len, addr) = sock.recv_from_with_flags(uninit, libc::MSG_DONTWAIT)?;
-                #[cfg(windows)]
-                let (len, addr) = sock.recv_from(uninit)?;
-                let addr = addr.as_socket().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "non-INET UDP sender")
-                })?;
-                (len, addr.into())
+                receive(uninit)?
             };
             self.sender = Some(sender);
             self.len = len;

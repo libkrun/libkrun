@@ -13,6 +13,8 @@ use super::dns_filter::{DNS_PORT, DnsRequest, HostDnsReply, sockaddr_port};
 use super::host_bind::{BindRequest, bind_inet};
 use super::host_datagram::{FRAME_HEADER, HostDatagramRx};
 use super::host_send::PendingHostSend;
+#[cfg(target_os = "macos")]
+use super::macos_datagram::MacDatagram;
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
@@ -54,6 +56,8 @@ pub struct TsiDgramProxy {
     /// being intercepted — sends on it are routed to the DNS worker.
     connected_dns: bool,
     host_rx: Option<HostDatagramRx>,
+    #[cfg(target_os = "macos")]
+    macos_datagram: Option<MacDatagram>,
     dns_identity: Option<Arc<()>>,
     host_peer: Option<SocketAddr>,
     host_send: Option<PendingHostSend>,
@@ -114,6 +118,8 @@ impl TsiDgramProxy {
             dns_sender,
             connected_dns: false,
             host_rx: None,
+            #[cfg(target_os = "macos")]
+            macos_datagram: None,
             dns_identity: None,
             host_peer: None,
             host_send: None,
@@ -260,12 +266,29 @@ impl TsiDgramProxy {
                 have_used = true;
                 continue;
             };
-            match self
+            #[cfg(target_os = "macos")]
+            let result = if let Some(datagram) = &mut self.macos_datagram {
+                self.host_rx
+                    .as_mut()
+                    .unwrap()
+                    .receive_frame_with(buf, |bytes| {
+                        datagram
+                            .receive(&self.sock, bytes)
+                            .map(|(n, addr)| (n, addr.into()))
+                    })
+            } else {
+                self.host_rx
+                    .as_mut()
+                    .unwrap()
+                    .receive_frame(&self.sock, buf)
+            };
+            #[cfg(not(target_os = "macos"))]
+            let result = self
                 .host_rx
                 .as_mut()
                 .unwrap()
-                .receive_frame(&self.sock, buf)
-            {
+                .receive_frame(&self.sock, buf);
+            match result {
                 Ok(len) => {
                     self.rx_cnt += Wrapping(len as u32);
                     self.init_pkt(&mut pkt);
@@ -316,6 +339,121 @@ impl TsiDgramProxy {
         }
     }
 
+    fn connect_socket(&mut self, address: &socket2::SockAddr) -> std::io::Result<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(datagram) = &mut self.macos_datagram {
+            return datagram.connect(&self.sock, address.as_socket().unwrap());
+        }
+        self.sock.connect(address)
+    }
+
+    fn socket_name(&self, local: bool) -> std::io::Result<socket2::SockAddr> {
+        #[cfg(target_os = "macos")]
+        if let Some(datagram) = &self.macos_datagram {
+            return if local {
+                datagram.local_addr(&self.sock)
+            } else {
+                datagram.peer_addr()
+            }
+            .map(Into::into);
+        }
+        if local {
+            self.sock.local_addr()
+        } else {
+            self.sock.peer_addr()
+        }
+    }
+
+    fn send_host_packet(
+        &mut self,
+        bytes: &[u8],
+        destination: SocketAddr,
+    ) -> std::io::Result<usize> {
+        #[cfg(target_os = "macos")]
+        if let Some(datagram) = &mut self.macos_datagram {
+            return datagram.send_to(&self.sock, bytes, destination);
+        }
+        if self.host_peer == Some(destination) {
+            self.sock.send(bytes)
+        } else {
+            self.sock.send_to(bytes, &destination.into())
+        }
+    }
+
+    fn disconnect_socket(&mut self) -> Result<(), i32> {
+        if self.host_rx.is_none() {
+            return Err(-95);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // The Linux kernel retains explicitly selected ports/addresses,
+            // releases automatic ports, and permits repeated disconnects.
+            let address: libc::sockaddr = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::connect(
+                    raw_handle(&self.sock),
+                    &address,
+                    std::mem::size_of::<libc::sa_family_t>() as libc::socklen_t,
+                )
+            };
+            if result != 0 {
+                return Err(-sys::to_linux_errno(&std::io::Error::last_os_error()));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let datagram = self.macos_datagram.as_mut().unwrap();
+            let replacement = datagram
+                .replacement_for_disconnect(&self.sock)
+                .map_err(|err| -sys::to_linux_errno(&err))?;
+            datagram
+                .save_received(&self.sock)
+                .map_err(|err| -sys::to_linux_errno(&err))?;
+            if let Some(replacement) = replacement {
+                if !self.pending_rx.lock().unwrap().contains(&self.id) {
+                    self.epoll
+                        .ctl(
+                            ControlOperation::Add,
+                            raw_handle(&replacement),
+                            &EpollEvent::new(EventSet::IN, self.id),
+                        )
+                        .map_err(|err| -sys::to_linux_errno(&err))?;
+                }
+                let _ = self.epoll.ctl(
+                    ControlOperation::Delete,
+                    raw_handle(&self.sock),
+                    &EpollEvent::default(),
+                );
+                self.sock = replacement;
+            }
+            datagram.disconnected();
+        }
+        #[cfg(windows)]
+        {
+            Err(-95)
+        }
+        #[cfg(not(windows))]
+        {
+            self.host_peer = None;
+            self.connected_dns = false;
+            self.sendto_addr = None;
+            self.status = ProxyStatus::Idle;
+            Ok(())
+        }
+    }
+
+    fn deliver_saved_datagrams(&mut self) -> ProxyUpdate {
+        #[cfg(target_os = "macos")]
+        if self
+            .macos_datagram
+            .as_ref()
+            .is_some_and(MacDatagram::has_saved)
+        {
+            return self.recv_host_datagrams();
+        }
+        ProxyUpdate::default()
+    }
+
     /// Bind the datagram socket to an unspecified local address so it can
     /// receive replies. Returns the bind result.
     fn bind_unspecified(&self) -> std::io::Result<()> {
@@ -362,7 +500,18 @@ impl Proxy for TsiDgramProxy {
         self.sock
             .set_recv_buffer_size(128 * 1024)
             .map_err(|e| -sys::to_linux_errno(&e))?;
+        #[cfg(target_os = "macos")]
+        let datagram = MacDatagram::new(
+            &self.sock,
+            req.addr.inet().ok_or(-97)?,
+            self.family == Family::Inet,
+        )
+        .map_err(|err| -sys::to_linux_errno(&err))?;
         let addr = bind_inet(&self.sock, self.family, req)?;
+        #[cfg(target_os = "macos")]
+        {
+            self.macos_datagram = Some(datagram);
+        }
         // sendto must keep this source port instead of trying to autobind again.
         self.listening = true;
         self.host_rx = Some(HostDatagramRx::default());
@@ -408,37 +557,11 @@ impl Proxy for TsiDgramProxy {
         self.sendto_addr = None;
     }
 
-    fn disconnect_host_datagram(&mut self) -> Result<(), i32> {
-        if self.host_rx.is_none() {
-            return Err(-95);
-        }
-        #[cfg(target_os = "linux")]
-        {
-            // The Linux kernel retains explicitly selected ports/addresses,
-            // releases automatic ports, and permits repeated disconnects.
-            let address: libc::sockaddr = unsafe { std::mem::zeroed() };
-            let result = unsafe {
-                libc::connect(
-                    raw_handle(&self.sock),
-                    &address,
-                    std::mem::size_of::<libc::sa_family_t>() as libc::socklen_t,
-                )
-            };
-            if result != 0 {
-                return Err(-sys::to_linux_errno(&std::io::Error::last_os_error()));
-            }
-            self.host_peer = None;
-            self.connected_dns = false;
-            self.sendto_addr = None;
-            self.status = ProxyStatus::Idle;
-            Ok(())
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            // Darwin disconnects can discard the explicit local address;
-            // do not mutate the socket until the host adapter preserves it.
-            Err(-95)
-        }
+    fn disconnect_host_datagram(&mut self) -> (Result<(), i32>, ProxyUpdate) {
+        let result = self.disconnect_socket();
+        // Captured replies need delivery even when queue pressure prevented
+        // the peer change. They no longer have native socket readiness.
+        (result, self.deliver_saved_datagrams())
     }
 
     fn poll_handle(&self) -> ProxyRawHandle {
@@ -492,7 +615,7 @@ impl Proxy for TsiDgramProxy {
                 // This is already a guest errno, not a native Winsock/BSD error.
                 Err(LINUX_EAFNOSUPPORT)
             } else {
-                addr.and_then(|a| self.sock.connect(&a))
+                addr.and_then(|a| self.connect_socket(&a))
                     .map_err(|err| sys::to_linux_errno(&err))
             };
         let (res, poll_host_socket) = match connected {
@@ -503,6 +626,10 @@ impl Proxy for TsiDgramProxy {
                 self.status = ProxyStatus::Connected;
                 if self.host_rx.is_some() {
                     self.host_peer = req.addr.inet();
+                    #[cfg(target_os = "macos")]
+                    if let Some(datagram) = &self.macos_datagram {
+                        self.host_peer = datagram.peer_addr().ok();
+                    }
                 }
                 if intercept {
                     debug!("connect: intercepting DNS socket");
@@ -536,7 +663,7 @@ impl Proxy for TsiDgramProxy {
             &self.snapshot_gate,
         );
 
-        let mut update = ProxyUpdate::default();
+        let mut update = self.deliver_saved_datagrams();
         if poll_host_socket && !self.listening {
             update.polling = Some((self.id, raw_handle(&self.sock), EventSet::IN));
         }
@@ -547,11 +674,7 @@ impl Proxy for TsiDgramProxy {
         debug!("process_getpeername");
 
         let local = pkt.read_getname_req().is_some_and(|req| req.peer == 0);
-        let name = if local {
-            self.sock.local_addr()
-        } else {
-            self.sock.peer_addr()
-        };
+        let name = self.socket_name(local);
         let (result, addr): (i32, VsockAddr) = match name {
             Ok(sa) => match sa.as_socket() {
                 Some(socket_addr) => (0, VsockAddr::Inet(socket_addr)),
@@ -610,7 +733,11 @@ impl Proxy for TsiDgramProxy {
             #[cfg(target_os = "linux")]
             let send_res = self.sock.send_with_flags(buf, libc::MSG_NOSIGNAL);
             #[cfg(not(target_os = "linux"))]
-            let send_res = self.sock.send(buf);
+            let send_res = if self.host_rx.is_some() && self.host_peer.is_some() {
+                self.send_host_packet(buf, self.host_peer.unwrap())
+            } else {
+                self.sock.send(buf)
+            };
 
             match send_res {
                 Ok(sent) => {
@@ -676,12 +803,9 @@ impl Proxy for TsiDgramProxy {
                         self.send_dns_query(buf, Some(addr));
                         return Ok(buf.len() as i32);
                     }
-                    let sent = if self.host_peer == Some(destination) {
-                        self.sock.send(buf)
-                    } else {
-                        self.sock.send_to(buf, &destination.into())
-                    }
-                    .map_err(|err| -sys::to_linux_errno(&err))?;
+                    let sent = self
+                        .send_host_packet(buf, destination)
+                        .map_err(|err| -sys::to_linux_errno(&err))?;
                     self.tx_cnt += Wrapping(sent as u32);
                     Ok(sent as i32)
                 })
@@ -724,10 +848,8 @@ impl Proxy for TsiDgramProxy {
                 };
 
                 match dst {
-                    Some(d) => match if self.host_peer.is_some() && self.host_peer == addr.inet() {
-                        // Darwin rejects sendto with an explicit destination
-                        // on a connected UDP socket, even for its own peer.
-                        self.sock.send(buf)
+                    Some(d) => match if self.host_rx.is_some() && d.as_socket().is_some() {
+                        self.send_host_packet(buf, d.as_socket().unwrap())
                     } else {
                         self.sock.send_to(buf, &d)
                     } {

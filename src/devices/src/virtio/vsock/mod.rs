@@ -11,6 +11,8 @@ mod event_handler;
 mod host_bind;
 mod host_datagram;
 mod host_send;
+#[cfg(target_os = "macos")]
+mod macos_datagram;
 mod muxer;
 mod muxer_rxq;
 mod muxer_thread;

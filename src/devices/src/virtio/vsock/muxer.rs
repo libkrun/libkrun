@@ -774,14 +774,15 @@ impl VsockMuxer {
         debug!("proxy connect request");
         if let Some(peer_port) = pkt.read_disconnect_req() {
             let id = ((peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-            let result = if self.tsi_flags.contains(TsiFlags::HOST_BIND) {
+            let (result, update) = if self.tsi_flags.contains(TsiFlags::HOST_BIND) {
                 match self.proxy_map.read().unwrap().get(&id) {
                     Some(proxy) => proxy.lock().unwrap().disconnect_host_datagram(),
-                    None => Err(-107), // Linux ENOTCONN.
+                    None => (Err(-107), ProxyUpdate::default()), // Linux ENOTCONN.
                 }
             } else {
-                Err(-95)
+                (Err(-95), ProxyUpdate::default())
             };
+            self.process_proxy_update(id, update);
             self.push_packet(MuxerRx::ConnResponse {
                 local_port: pkt.dst_port(),
                 peer_port: pkt.src_port(),

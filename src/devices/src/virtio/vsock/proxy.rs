@@ -211,8 +211,8 @@ pub trait Proxy: Send {
         Err(-95)
     }
     fn clear_sendto_addr(&mut self) {}
-    fn disconnect_host_datagram(&mut self) -> Result<(), i32> {
-        Err(-95)
+    fn disconnect_host_datagram(&mut self) -> (Result<(), i32>, ProxyUpdate) {
+        (Err(-95), ProxyUpdate::default())
     }
     fn receive_dns(
         &mut self,
