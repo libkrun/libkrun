@@ -17,6 +17,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked -p krun-socket
       - run: cargo clippy --locked -p krun-socket --all-targets -- -D warnings
+      - if: runner.os == 'Windows'
+        run: cargo test --locked -p krun-whp --lib
 
   check-windows:
     name: libkrun (Windows cross)
