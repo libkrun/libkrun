@@ -857,7 +857,7 @@ mod tests {
         let id = "bar";
         assert!(
             device_manager
-                .get_device(DeviceType::Virtio(type_id), &id)
+                .get_device(DeviceType::Virtio(type_id), id)
                 .is_none()
         );
     }

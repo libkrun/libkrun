@@ -29,6 +29,9 @@ jobs:
       - name: Test HVF helpers and compile the hardware restore regression
         run: cargo test --locked -p krun-hvf
 
+      - name: Test reclaimed and reused RAM in macOS checkpoints
+        run: cargo test --locked -p krun-vmm snapshot::tests::restored_macos_ram_keeps_reclaim_reuse_and_capture_on_one_backing -- --exact
+
   unit-tests-linux-x86_64:
     name: Unit tests (Linux x86_64)
     runs-on: ubuntu-26.04
