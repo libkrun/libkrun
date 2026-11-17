@@ -258,7 +258,8 @@ impl VsockMuxer {
             unix_ipc_port_map,
             tsi_flags,
             egress_policy,
-            floor: floor_mode(),
+            floor: floor_mode()
+                .with_host_network(tsi_flags.contains(TsiFlags::HIJACK_INET | TsiFlags::HOST_BIND)),
             dns_sender: None,
             dns_forwarder,
             snapshot_gate: Arc::new(SnapshotGate::default()),

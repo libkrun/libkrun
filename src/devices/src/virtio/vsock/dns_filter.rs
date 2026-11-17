@@ -228,6 +228,18 @@ pub(super) enum FloorMode {
     Strict,
 }
 
+impl FloorMode {
+    /// Host networking deliberately shares host loopback. This per-VM grant
+    /// leaves the metadata floor and any stricter deployment policy intact.
+    pub(super) fn with_host_network(self, enabled: bool) -> Self {
+        if enabled && self == Self::MetadataAndLoopback {
+            Self::MetadataOnly
+        } else {
+            self
+        }
+    }
+}
+
 /// Parse an explicit `SMOLVM_EGRESS_FLOOR` value into a mode. Returns `None`
 /// for an absent/unrecognized value so the caller falls back to the inferred
 /// default. Pure (no env) so it is unit-testable.
@@ -1127,6 +1139,22 @@ mod tests {
         assert!(is_addr_floored(&sockaddr_v4(169, 254, 169, 254, 80), meta));
         assert!(!is_addr_floored(&sockaddr_v4(127, 0, 0, 1, 80), meta));
         assert!(!is_addr_floored(&sockaddr_v4(0, 0, 0, 0, 80), meta));
+    }
+
+    #[test]
+    fn host_network_grants_loopback_without_weakening_strict_or_metadata_rules() {
+        let local = FloorMode::MetadataAndLoopback.with_host_network(true);
+        assert!(!is_addr_floored(&sockaddr_v4(127, 0, 0, 1, 80), local));
+        assert!(is_addr_floored(&sockaddr_v4(169, 254, 169, 254, 80), local));
+        let isolated = FloorMode::MetadataAndLoopback.with_host_network(false);
+        assert!(is_addr_floored(&sockaddr_v4(127, 0, 0, 1, 80), isolated));
+        let strict = FloorMode::Strict.with_host_network(true);
+        assert!(is_addr_floored(&sockaddr_v4(127, 0, 0, 1, 80), strict));
+        assert!(is_addr_floored(&sockaddr_v4(10, 0, 0, 1, 80), strict));
+        assert!(is_addr_floored(
+            &sockaddr_v4(169, 254, 169, 254, 80),
+            strict
+        ));
     }
 
     #[test]
