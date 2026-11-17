@@ -1448,6 +1448,67 @@ mod overlay_tests {
         std::fs::remove_file(&overlay_path).ok();
     }
 
+    /// Bytes the host file system holds for `path`, not its apparent length.
+    #[cfg(unix)]
+    fn allocated_bytes(path: &str) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().blocks() * 512
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_qcow2_discard_gives_the_freed_clusters_back_to_the_host() {
+        let base = TempFile::new().unwrap();
+        let size = 16 * 1024 * 1024u64;
+        base.as_file().set_len(size).unwrap();
+        let base_path = base.as_path().to_str().unwrap();
+        let overlay = format!("{base_path}.punch.qcow2");
+        create_overlay(&overlay, base_path, ImageType::Raw).unwrap();
+        let (disk, _) = open_disk_format(
+            &overlay,
+            ImageType::Qcow2,
+            true,
+            false,
+            false,
+            BlockIoEngine::Sync,
+            None,
+        )
+        .unwrap();
+        let data = vec![0x5a_u8; 8 * 1024 * 1024];
+        disk.writev(IoVector::from(&data[..]), 0).unwrap();
+        disk.flush().unwrap();
+        let written = allocated_bytes(&overlay);
+        assert!(
+            written >= 8 * 1024 * 1024,
+            "the write is allocated: {written}"
+        );
+
+        // What a guest's fstrim sends for a deleted file.
+        disk.discard_to_any(0, 8 * 1024 * 1024).unwrap();
+        disk.flush().unwrap();
+        let trimmed = allocated_bytes(&overlay);
+        assert!(
+            trimmed < 1024 * 1024,
+            "the discarded clusters stay in the file: {written} -> {trimmed} bytes"
+        );
+        let mut read = vec![1_u8; 4096];
+        disk.readv(IoVectorMut::from(&mut read[..]), 4 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(read, vec![0; 4096], "a discarded range reads as zeros");
+
+        // The freed clusters are reused, and hold only what is written to them.
+        let again = vec![0x33_u8; 64 * 1024];
+        disk.writev(IoVector::from(&again[..]), 1024 * 1024)
+            .unwrap();
+        let mut read = vec![0_u8; 128 * 1024];
+        disk.readv(IoVectorMut::from(&mut read[..]), 1024 * 1024)
+            .unwrap();
+        assert_eq!(&read[..64 * 1024], &again[..]);
+        assert_eq!(&read[64 * 1024..], &vec![0; 64 * 1024][..]);
+        drop(disk);
+        std::fs::remove_file(overlay).unwrap();
+    }
+
     fn tail_discard_keeps_raw_capacity(zero: bool) {
         use std::io::{Read, Seek, SeekFrom, Write};
 

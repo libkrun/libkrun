@@ -514,6 +514,8 @@ impl<S: Storage> Allocator<S> {
         let rb_bits = self.header.rb_bits();
         let rb_entries = 1 << rb_bits;
         let (mut rt_index, mut rb_index) = start.rt_rb_indices(rb_bits);
+        // Clusters nothing references any more, as runs of (first, count).
+        let mut unused: Vec<(HostCluster, u64)> = Vec::new();
 
         while count > ClusterCount(0) {
             let in_rb_count = cmp::min((rb_entries - rb_index) as u64, count.0) as usize;
@@ -524,6 +526,12 @@ impl<S: Storage> Allocator<S> {
                     for i in rb_index..(rb_index + in_rb_count) {
                         if let Err(err) = rb.decrement(i) {
                             event!(Level::WARN, "Failed to free cluster: {err}");
+                        } else if rb.is_zero(i) {
+                            let cluster = HostCluster::from_ref_indices(rt_index, i, rb_bits);
+                            match unused.last_mut() {
+                                Some((first, n)) if first.0 + *n == cluster.0 => *n += 1,
+                                _ => unused.push((cluster, 1)),
+                            }
                         }
                     }
                 }
@@ -540,6 +548,20 @@ impl<S: Storage> Allocator<S> {
             count -= ClusterCount(in_rb_count as u64);
             rb_index = 0;
             rt_index += 1;
+        }
+
+        // Give unreferenced clusters back to the host file system. Otherwise a
+        // guest's discarded data stays allocated in the image file: the host
+        // keeps the space, and anything copying the file's data extents (a
+        // checkpoint) copies the stale clusters. They read back as zeros, which
+        // is what a fresh allocation would hold anyway. Best effort, and done
+        // under the allocator, so no new allocation can claim them meanwhile.
+        let cb = self.header.cluster_bits();
+        for (first, n) in unused {
+            let offset = first.offset(cb).0;
+            if let Err(err) = self.file.discard(offset, n << cb).await {
+                event!(Level::DEBUG, "Failed to discard {n} freed clusters: {err}");
+            }
         }
     }
 }
