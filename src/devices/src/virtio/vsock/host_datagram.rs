@@ -10,8 +10,10 @@
 //! maximum-size UDP datagram intact across the guest's small virtio buffers.
 //!
 //! Storage is allocated only on first receive, reused, and bounded to one
-//! datagram per host-bound socket. Legacy TSI sockets do not use this framing.
+//! in-flight datagram plus eight queued synthetic DNS replies per host-bound
+//! socket. Legacy TSI sockets do not use this framing.
 
+use std::collections::VecDeque;
 use std::io;
 use std::mem::MaybeUninit;
 
@@ -29,9 +31,21 @@ pub struct HostDatagramRx {
     len: usize,
     offset: usize,
     sequence: u32,
+    injected: VecDeque<(VsockAddr, Vec<u8>)>,
 }
 
 impl HostDatagramRx {
+    /// Synthetic replies share framing and sequence state with real packets.
+    /// Bound queued DNS replies like a UDP receive buffer; overload drops the
+    /// newest reply so a resolver can retry, without discarding a partial frame.
+    pub fn enqueue(&mut self, sender: VsockAddr, payload: Vec<u8>) -> bool {
+        if payload.len() > MAX_DATAGRAM || self.injected.len() == 8 {
+            return false;
+        }
+        self.injected.push_back((sender, payload));
+        true
+    }
+
     pub fn receive_frame(&mut self, sock: &Socket, buf: &mut [u8]) -> io::Result<usize> {
         // Leave the host datagram untouched if this descriptor cannot carry
         // any payload. Do not confuse a short descriptor with UDP truncation.
@@ -43,22 +57,28 @@ impl HostDatagramRx {
         }
         if self.sender.is_none() {
             self.payload.resize(MAX_DATAGRAM, 0);
-            // SAFETY: recv_from initializes only the returned prefix; the
-            // backing bytes were initialized already and remain owned here.
-            let uninit = unsafe {
-                std::slice::from_raw_parts_mut(
-                    self.payload.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-                    self.payload.len(),
-                )
+            let (len, sender) = if let Some((sender, payload)) = self.injected.pop_front() {
+                self.payload[..payload.len()].copy_from_slice(&payload);
+                (payload.len(), sender)
+            } else {
+                // SAFETY: recv_from initializes only the returned prefix; the
+                // backing bytes were initialized already and remain owned here.
+                let uninit = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        self.payload.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                        self.payload.len(),
+                    )
+                };
+                #[cfg(unix)]
+                let (len, addr) = sock.recv_from_with_flags(uninit, libc::MSG_DONTWAIT)?;
+                #[cfg(windows)]
+                let (len, addr) = sock.recv_from(uninit)?;
+                let addr = addr.as_socket().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "non-INET UDP sender")
+                })?;
+                (len, addr.into())
             };
-            #[cfg(unix)]
-            let (len, addr) = sock.recv_from_with_flags(uninit, libc::MSG_DONTWAIT)?;
-            #[cfg(windows)]
-            let (len, addr) = sock.recv_from(uninit)?;
-            let addr = addr
-                .as_socket()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "non-INET UDP sender"))?;
-            self.sender = Some(addr.into());
+            self.sender = Some(sender);
             self.len = len;
             self.offset = 0;
             self.sequence = self.sequence.wrapping_add(1);
@@ -154,6 +174,47 @@ mod tests {
                 assert!(rx.payload.capacity() <= MAX_DATAGRAM);
             }
         }
+    }
+
+    #[test]
+    fn injected_replies_do_not_interrupt_fragments_and_the_queue_is_bounded() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        client
+            .send_to(&[7; 1024], server.local_addr().unwrap())
+            .unwrap();
+        let sock: Socket = server.into();
+        wait_readable(super::super::proxy::raw_handle(&sock));
+        let mut rx = HostDatagramRx::default();
+        let mut frame = [0; FRAME_HEADER + 256];
+        assert_eq!(rx.receive_frame(&sock, &mut frame).unwrap(), frame.len());
+        let sequence = u32::from_le_bytes(frame[..4].try_into().unwrap());
+        let dns: VsockAddr = SocketAddr::from((Ipv4Addr::LOCALHOST, 53)).into();
+        for i in 0..8 {
+            assert!(rx.enqueue(dns.clone(), vec![i; i as usize]));
+        }
+        assert!(!rx.enqueue(dns.clone(), b"full".to_vec()));
+        assert!(!rx.enqueue(dns, vec![0; MAX_DATAGRAM + 1]));
+        for offset in [256u32, 512, 768] {
+            assert_eq!(rx.receive_frame(&sock, &mut frame).unwrap(), frame.len());
+            assert_eq!(u32::from_le_bytes(frame[..4].try_into().unwrap()), sequence);
+            assert_eq!(u32::from_le_bytes(frame[8..12].try_into().unwrap()), offset);
+            assert_eq!(frame[FRAME_HEADER..], [7; 256]);
+        }
+        for i in 0..8 {
+            let count = rx.receive_frame(&sock, &mut frame).unwrap();
+            assert_eq!(count, FRAME_HEADER + i);
+            assert_eq!(frame[FRAME_HEADER..count], vec![i as u8; i]);
+            assert_eq!(
+                u32::from_le_bytes(frame[..4].try_into().unwrap()),
+                sequence + 1 + i as u32
+            );
+        }
+        assert_eq!(
+            rx.receive_frame(&sock, &mut frame).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(rx.payload.capacity() <= MAX_DATAGRAM);
     }
 
     #[test]

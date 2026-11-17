@@ -41,7 +41,8 @@ use crate::virtio::InterruptTransport;
 #[path = "host_bind_tests.rs"]
 mod host_bind_tests;
 
-pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
+pub type ProxyTable = RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>;
+pub type ProxyMap = Arc<ProxyTable>;
 
 /// A muxer RX queue item.
 #[derive(Debug)]
@@ -350,6 +351,7 @@ impl VsockMuxer {
             let (dns_sender, dns_receiver) = unbounded::<DnsRequest>();
             let worker = DnsWorker::new(
                 dns_receiver,
+                Arc::downgrade(&self.proxy_map),
                 self.egress_policy.clone(),
                 self.dns_forwarder,
                 mem.clone(),

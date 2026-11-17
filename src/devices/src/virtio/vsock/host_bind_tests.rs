@@ -153,6 +153,24 @@ fn host_bind_returns_errors_for_bad_packets_and_missing_proxies() {
 
 #[test]
 fn host_bind_reserves_ports_across_vms_and_releases_them_on_close() {
+    // Other tests spawn children concurrently. Even CLOEXEC sockets remain
+    // referenced between clone and exec, so closing the parent's copy need
+    // not release a port immediately. Own these sockets in an isolated test
+    // process, with no concurrent spawns, instead of retrying a failed release.
+    const CHILD: &str = "LIBKRUN_BIND_RELEASE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "virtio::vsock::muxer::host_bind_tests::host_bind_reserves_ports_across_vms_and_releases_them_on_close", "--nocapture"])
+            .env(CHILD, "1")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     for kind in [defs::SOCK_STREAM, defs::SOCK_DGRAM] {
         for (family, ip) in [
             (defs::LINUX_AF_INET, Ipv4Addr::LOCALHOST.into()),
@@ -458,4 +476,156 @@ fn a_denied_legacy_udp_destination_cannot_reuse_the_last_allowed_one() {
         std::io::ErrorKind::WouldBlock
     );
     f.release();
+}
+
+#[test]
+fn host_dns_replies_resume_after_refill_and_do_not_reach_reused_sockets() {
+    use super::super::host_datagram::FRAME_HEADER;
+    for ip in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        let mut f = Fixture::new(granted(), None);
+        f.muxer.floor = FloorMode::MetadataOnly;
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        f.muxer.dns_sender = Some(sender);
+        let family = if ip.is_ipv4() {
+            defs::LINUX_AF_INET
+        } else {
+            defs::LINUX_AF_INET6
+        };
+        f.create(defs::SOCK_DGRAM, family);
+        f.bind(SocketAddr::new(ip, 0)).unwrap();
+        let resolver = SocketAddr::new(ip, 53);
+        assert_eq!(f.acknowledged_send(1, resolver, b"query"), 5);
+        let request = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(request.query, b"query");
+        let reply = request.host_reply.unwrap();
+        assert_eq!(reply.source.inet(), Some(resolver));
+        let identity = reply.identity.clone();
+        let gate = f.muxer.snapshot_gate.clone();
+        let activity = gate.enter();
+        let id = ((GUEST as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+        let payload: Vec<_> = (0..8192).map(|i| (i % 251) as u8).collect();
+        // No guest descriptors: keep the whole answer until buffers arrive.
+        assert!(
+            !f.muxer
+                .proxy_map
+                .read()
+                .unwrap()
+                .get(&id)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .receive_dns(reply, payload.clone(), &activity)
+        );
+        assert!(f.muxer.pending_datagram_rx.lock().unwrap().contains(&id));
+        let mem = f.mem.clone();
+        let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+        let mut available = 0u16;
+        let mut recovered = Vec::new();
+        let mut sequence = None;
+        while recovered.len() < payload.len() {
+            let buffer = 0x30000;
+            rx.dtable[0].set(buffer, (VSOCK_PKT_HDR_SIZE + 512) as u32, 2, 0);
+            rx.avail.ring[available as usize % 8].set(0);
+            available += 1;
+            rx.avail.idx.set(available);
+            assert!(f.muxer.resume_datagram_rx());
+            let used = rx.used.ring[(available as usize - 1) % 8].get();
+            let mut frame = vec![0; used.len as usize - VSOCK_PKT_HDR_SIZE];
+            mem.read_slice(&mut frame, GuestAddress(buffer + VSOCK_PKT_HDR_SIZE as u64))
+                .unwrap();
+            let word = |at| u32::from_le_bytes(frame[at..at + 4].try_into().unwrap());
+            assert_eq!(word(4) as usize, payload.len());
+            assert_eq!(word(8) as usize, recovered.len());
+            assert_eq!(
+                VsockAddr::parse_linux(&frame[16..FRAME_HEADER], word(12))
+                    .unwrap()
+                    .inet(),
+                Some(resolver)
+            );
+            if let Some(previous) = sequence {
+                assert_eq!(word(0), previous);
+            }
+            sequence = Some(word(0));
+            recovered.extend_from_slice(&frame[FRAME_HEADER..]);
+        }
+        assert_eq!(recovered, payload);
+        let current_peer = UdpSocket::bind(SocketAddr::new(ip, 0)).unwrap();
+        let current_addr = current_peer.local_addr().unwrap();
+        let current = VsockAddr::from(current_addr);
+        f.send(
+            defs::TSI_CONNECT,
+            &[
+                &GUEST.to_le_bytes()[..],
+                &current.linux_len().to_le_bytes(),
+                &current.to_linux_bytes(),
+            ]
+            .concat(),
+        );
+        assert!(matches!(
+            f.muxer.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::ConnResponse { result: 0, .. })
+        ));
+        rx.dtable[0].set(0x30000, (VSOCK_PKT_HDR_SIZE + 512) as u32, 2, 0);
+        rx.avail.ring[available as usize % 8].set(0);
+        rx.avail.idx.set(available + 1);
+        let stale_peer = super::super::dns_filter::HostDnsReply {
+            identity: identity.clone(),
+            source: resolver.into(),
+        };
+        assert!(
+            !f.muxer
+                .proxy_map
+                .read()
+                .unwrap()
+                .get(&id)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .receive_dns(stale_peer, b"old peer".to_vec(), &activity)
+        );
+        assert_eq!(
+            rx.used.idx.get(),
+            available,
+            "reconnected socket must reject the old resolver"
+        );
+        let current_reply = super::super::dns_filter::HostDnsReply {
+            identity: identity.clone(),
+            source: current_addr.into(),
+        };
+        assert!(
+            f.muxer
+                .proxy_map
+                .read()
+                .unwrap()
+                .get(&id)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .receive_dns(current_reply, b"current".to_vec(), &activity)
+        );
+        assert_eq!(rx.used.idx.get(), available + 1);
+        f.release();
+        f.create(defs::SOCK_DGRAM, family);
+        f.bind(SocketAddr::new(ip, 0)).unwrap();
+        let old = super::super::dns_filter::HostDnsReply {
+            identity,
+            source: resolver.into(),
+        };
+        assert!(
+            !f.muxer
+                .proxy_map
+                .read()
+                .unwrap()
+                .get(&id)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .receive_dns(old, b"stale".to_vec(), &activity)
+        );
+        assert!(f.muxer.pending_datagram_rx.lock().unwrap().is_empty());
+        f.release();
+    }
 }

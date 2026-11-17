@@ -211,6 +211,14 @@ pub trait Proxy: Send {
         Err(-95)
     }
     fn clear_sendto_addr(&mut self) {}
+    fn receive_dns(
+        &mut self,
+        _reply: super::dns_filter::HostDnsReply,
+        _data: Vec<u8>,
+        _activity: &super::snapshot_gate::SnapshotActivity<'_>,
+    ) -> bool {
+        false
+    }
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate;
     /// Connect through a [`StreamIntercept`] instead of to `req.addr` directly.
     /// Proxies without a redirected path fall back to a plain connect.

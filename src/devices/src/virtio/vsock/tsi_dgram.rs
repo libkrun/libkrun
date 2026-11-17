@@ -8,7 +8,7 @@ use socket2::{Domain, Socket, Type};
 use super::super::Queue as VirtQueue;
 use super::defs;
 use super::defs::uapi;
-use super::dns_filter::{DNS_PORT, DnsRequest, sockaddr_port};
+use super::dns_filter::{DNS_PORT, DnsRequest, HostDnsReply, sockaddr_port};
 use super::host_bind::{BindRequest, bind_inet};
 use super::host_datagram::{FRAME_HEADER, HostDatagramRx};
 use super::host_send::PendingHostSend;
@@ -21,7 +21,7 @@ use super::proxy::{
     Family, Proxy, ProxyError, ProxyRawHandle, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
     raw_handle,
 };
-use super::snapshot_gate::SnapshotGate;
+use super::snapshot_gate::{SnapshotActivity, SnapshotGate};
 use super::sys;
 use super::vsock_addr::VsockAddr;
 use crossbeam_channel::Sender;
@@ -53,6 +53,7 @@ pub struct TsiDgramProxy {
     /// being intercepted — sends on it are routed to the DNS worker.
     connected_dns: bool,
     host_rx: Option<HostDatagramRx>,
+    dns_identity: Option<Arc<()>>,
     host_peer: Option<SocketAddr>,
     host_send: Option<PendingHostSend>,
     pending_rx: Arc<Mutex<HashSet<u64>>>,
@@ -112,6 +113,7 @@ impl TsiDgramProxy {
             dns_sender,
             connected_dns: false,
             host_rx: None,
+            dns_identity: None,
             host_peer: None,
             host_send: None,
             pending_rx,
@@ -122,12 +124,18 @@ impl TsiDgramProxy {
     /// Hand a guest DNS query to the worker thread instead of sending it out the
     /// host socket. `tx_cnt` is advanced by the query length so the response's
     /// `fwd_cnt` stays monotonic — identical to the normal send paths — without
-    /// the worker ever touching per-proxy state.
-    fn send_dns_query(&mut self, buf: &[u8]) {
+    /// consulting host resolver configuration on the muxer thread.
+    fn send_dns_query(&mut self, buf: &[u8], source: Option<VsockAddr>) {
         self.tx_cnt += Wrapping(buf.len() as u32);
         if let Some(sender) = &self.dns_sender {
             let _ = sender.send(DnsRequest {
                 query: buf.to_vec(),
+                host_reply: source
+                    .filter(|_| self.host_rx.is_some())
+                    .map(|source| HostDnsReply {
+                        identity: self.dns_identity.as_ref().unwrap().clone(),
+                        source,
+                    }),
                 peer_port: self.peer_port,
                 fwd_cnt: self.tx_cnt.0,
                 cid: self.cid,
@@ -229,9 +237,14 @@ impl TsiDgramProxy {
     }
 
     fn recv_host_datagrams(&mut self) -> ProxyUpdate {
+        let gate = self.snapshot_gate.clone();
+        let activity = gate.enter();
+        self.drain_host_datagrams(&activity)
+    }
+
+    fn drain_host_datagrams(&mut self, _activity: &SnapshotActivity<'_>) -> ProxyUpdate {
         let mut have_used = false;
         let mut exhausted = true;
-        let _activity = self.snapshot_gate.enter();
         let mut queue = self.queue.lock().unwrap();
         while let Some(head) = queue.pop(&self.mem) {
             let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) else {
@@ -337,12 +350,6 @@ impl TsiDgramProxy {
 
 impl Proxy for TsiDgramProxy {
     fn bind_host(&mut self, req: &BindRequest) -> Result<VsockAddr, i32> {
-        // The legacy DNS worker emits unframed datagrams. A host-mode socket
-        // must use the host resolver directly until that worker speaks the
-        // same sender-preserving protocol; never silently mix wire formats.
-        if self.dns_sender.is_some() {
-            return Err(-95); // EOPNOTSUPP
-        }
         if self.listening || self.status != ProxyStatus::Idle {
             return Err(-libc::EINVAL);
         }
@@ -358,6 +365,7 @@ impl Proxy for TsiDgramProxy {
         // sendto must keep this source port instead of trying to autobind again.
         self.listening = true;
         self.host_rx = Some(HostDatagramRx::default());
+        self.dns_identity = Some(Arc::new(()));
         Ok(addr.into())
     }
 
@@ -368,6 +376,31 @@ impl Proxy for TsiDgramProxy {
         self.sendto_addr = None;
         self.host_send = Some(send);
         Ok(())
+    }
+
+    fn receive_dns(
+        &mut self,
+        reply: HostDnsReply,
+        data: Vec<u8>,
+        activity: &SnapshotActivity<'_>,
+    ) -> bool {
+        if !self
+            .dns_identity
+            .as_ref()
+            .is_some_and(|identity| Arc::ptr_eq(identity, &reply.identity))
+            || self
+                .host_peer
+                .is_some_and(|peer| reply.source.inet() != Some(peer))
+        {
+            return false;
+        }
+        let Some(rx) = self.host_rx.as_mut() else {
+            return false;
+        };
+        if !rx.enqueue(reply.source, data) {
+            return false;
+        }
+        self.drain_host_datagrams(activity).signal_queue
     }
 
     fn clear_sendto_addr(&mut self) {
@@ -520,7 +553,7 @@ impl Proxy for TsiDgramProxy {
                 .data()
                 .or_else(|| (self.host_rx.is_some() && pkt.len() == 0).then_some(&[]))
             {
-                self.send_dns_query(buf);
+                self.send_dns_query(buf, self.host_peer.map(Into::into));
             }
             return ProxyUpdate::default();
         }
@@ -594,6 +627,10 @@ impl Proxy for TsiDgramProxy {
                         .data()
                         .or_else(|| (pkt.len() == 0).then_some(&[]))
                         .ok_or(-22)?;
+                    if self.dns_sender.is_some() && destination.port() == DNS_PORT {
+                        self.send_dns_query(buf, Some(addr));
+                        return Ok(buf.len() as i32);
+                    }
                     let sent = if self.host_peer == Some(destination) {
                         self.sock.send(buf)
                     } else {
@@ -627,7 +664,7 @@ impl Proxy for TsiDgramProxy {
                 // Unconnected DNS query (sendto a resolver:53): route to the
                 // worker instead of the host socket.
                 if self.dns_sender.is_some() && sockaddr_port(&addr) == Some(DNS_PORT) {
-                    self.send_dns_query(buf);
+                    self.send_dns_query(buf, Some(addr.clone()));
                     return;
                 }
 
