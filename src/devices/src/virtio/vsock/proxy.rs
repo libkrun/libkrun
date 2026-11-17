@@ -190,6 +190,12 @@ impl StreamIntercept {
 }
 
 pub trait Proxy: Send {
+    fn close_host_stream(
+        &mut self,
+        _request: &super::host_close::CloseRequest,
+    ) -> (i32, ProxyUpdate) {
+        (-95, ProxyUpdate::default())
+    }
     /// Raw handle the muxer registers with the epoll layer for this proxy's host
     /// socket. Cross-platform replacement for the former `AsRawFd` supertrait.
     fn poll_handle(&self) -> ProxyRawHandle;

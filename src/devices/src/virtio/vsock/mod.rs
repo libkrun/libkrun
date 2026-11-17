@@ -9,6 +9,7 @@ mod device;
 mod dns_filter;
 mod event_handler;
 mod host_bind;
+mod host_close;
 mod host_datagram;
 mod host_send;
 mod host_sockopt;
@@ -112,6 +113,7 @@ mod defs {
     pub const TSI_BIND: u32 = 1032;
     pub const TSI_HOST_SENDTO_ADDR: u32 = 1033;
     pub const TSI_HOST_SETSOCKOPT: u32 = 1034;
+    pub const TSI_HOST_STREAM_CLOSE: u32 = 1035;
 
     // Linux definitions that we need for cross-platform compatibility.
     // AF_UNIX over TSI is Linux-only; the constant is unused on macOS/Windows.

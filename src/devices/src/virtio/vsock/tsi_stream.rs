@@ -15,6 +15,7 @@ use super::super::linux_errno::{LINUX_EADDRINUSE, LINUX_EAGAIN, LINUX_ECONNREFUS
 use super::defs;
 use super::defs::uapi;
 use super::host_bind::{BindRequest, bind_inet};
+use super::host_close::{self, CloseRequest};
 use super::host_sockopt::SocketBuffers;
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
@@ -90,6 +91,8 @@ pub struct TsiStreamProxy {
     /// Keep its bounded queue until the host accepts it or the transport fails.
     /// The closed-proxy grace timer must not silently truncate this output.
     guest_released: bool,
+    close_watermark: Option<Wrapping<u32>>,
+    close_fin_sent: bool,
     buffers: SocketBuffers,
     /// True while we have paused reading the host socket (guest RX credit
     /// exhausted, or the remote half-closed). Kept separate from the epoll
@@ -185,6 +188,8 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             tx_buf: VecDeque::new(),
             guest_released: false,
+            close_watermark: None,
+            close_fin_sent: false,
             buffers: SocketBuffers::default(),
             preamble: VecDeque::new(),
             intercept_peer: None,
@@ -240,6 +245,8 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             tx_buf: VecDeque::new(),
             guest_released: false,
+            close_watermark: None,
+            close_fin_sent: false,
             buffers,
             preamble: VecDeque::new(),
             intercept_peer: None,
@@ -737,13 +744,21 @@ impl TsiStreamProxy {
     /// what lets a stalled send keep OUT armed without losing the RX side.
     fn conn_evset(&self) -> EventSet {
         connected_event_set(
-            self.rx_paused || self.guest_released,
+            self.rx_paused || self.guest_released || self.close_watermark.is_some(),
             !self.tx_buf.is_empty() || !self.preamble.is_empty(),
         )
     }
 
     fn repoll(&self) -> Option<(u64, ProxyRawHandle, EventSet)> {
         Some((self.id, raw_handle(&self.sock), self.conn_evset()))
+    }
+
+    fn output_pending(&self) -> bool {
+        !self.tx_buf.is_empty()
+            || !self.preamble.is_empty()
+            || self
+                .close_watermark
+                .is_some_and(|count| count != self.tx_cnt)
     }
 
     /// Non-blocking drain of `tx_buf` to the host socket. Advances `tx_cnt` for
@@ -789,11 +804,13 @@ impl TsiStreamProxy {
                 }
             }
         }
-        if self.write_shutdown_pending && self.tx_buf.is_empty() {
+        let finish_close = self.close_watermark.is_some() && !self.close_fin_sent;
+        if (self.write_shutdown_pending || finish_close) && !self.output_pending() {
             self.sock.shutdown(std::net::Shutdown::Write).map_err(|e| {
                 warn!("flush_tx: host write shutdown failed id={}: {e}", self.id);
             })?;
             self.write_shutdown_pending = false;
+            self.close_fin_sent |= finish_close;
         }
         Ok(advanced)
     }
@@ -829,6 +846,67 @@ impl TsiStreamProxy {
 }
 
 impl Proxy for TsiStreamProxy {
+    fn close_host_stream(&mut self, req: &CloseRequest) -> (i32, ProxyUpdate) {
+        if req.flags == host_close::ABORT {
+            let result = self
+                .sock
+                .set_linger(Some(Duration::ZERO))
+                .map_or_else(|e| -sys::to_linux_errno(&e), |_| 0);
+            return (
+                result,
+                ProxyUpdate {
+                    remove_proxy: ProxyRemoval::Immediate,
+                    ..Default::default()
+                },
+            );
+        }
+        if !matches!(
+            self.status,
+            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+        ) {
+            return (
+                0,
+                ProxyUpdate {
+                    remove_proxy: ProxyRemoval::Immediate,
+                    ..Default::default()
+                },
+            );
+        }
+        let watermark = Wrapping(req.tx_count);
+        let remaining = (watermark - self.tx_cnt).0 as usize;
+        if remaining > defs::CONN_TX_BUF_SIZE
+            || remaining < self.tx_buf.len()
+            || self.close_watermark.is_some_and(|count| count != watermark)
+        {
+            return (-22, ProxyUpdate::default());
+        }
+        self.close_watermark = Some(watermark);
+        self.rx_paused = true;
+        if self.flush_tx().is_err() {
+            return (
+                -32,
+                ProxyUpdate {
+                    remove_proxy: ProxyRemoval::Immediate,
+                    ..Default::default()
+                },
+            );
+        }
+        let result = if req.flags != host_close::WAIT {
+            0
+        } else if !self.close_fin_sent {
+            1
+        } else {
+            host_close::complete(&self.sock)
+                .map_or_else(|e| -sys::to_linux_errno(&e), |done| i32::from(!done))
+        };
+        (
+            result,
+            ProxyUpdate {
+                polling: self.repoll(),
+                ..Default::default()
+            },
+        )
+    }
     fn request_credit(&mut self) -> ProxyUpdate {
         if !matches!(
             self.status,
@@ -1088,6 +1166,14 @@ impl Proxy for TsiStreamProxy {
                 );
                 Err(())
             }
+            Some(buf)
+                if self.close_watermark.is_some_and(|count| {
+                    self.tx_buf.len() + buf.len() > (count - self.tx_cnt).0 as usize
+                }) =>
+            {
+                warn!("sendmsg: payload exceeds close watermark id={}", self.id);
+                Err(())
+            }
             Some(buf) => {
                 self.tx_buf.extend(buf.iter().copied());
                 Ok(())
@@ -1097,10 +1183,17 @@ impl Proxy for TsiStreamProxy {
 
         match accepted.and_then(|()| self.flush_tx()) {
             Ok(advanced) => {
-                if advanced && self.maybe_send_credit_update() {
+                if advanced
+                    && !self.guest_released
+                    && self.close_watermark.is_none()
+                    && self.maybe_send_credit_update()
+                {
                     update.signal_queue = true;
                 }
                 update.polling = self.repoll();
+                if self.guest_released && !self.output_pending() {
+                    update.remove_proxy = ProxyRemoval::Immediate;
+                }
             }
             Err(()) => {
                 self.push_reset();
@@ -1176,7 +1269,7 @@ impl Proxy for TsiStreamProxy {
     }
 
     fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
-        if self.guest_released {
+        if self.guest_released || self.close_watermark.is_some() {
             return ProxyUpdate::default();
         }
         debug!(
@@ -1301,7 +1394,7 @@ impl Proxy for TsiStreamProxy {
             self.rx_paused = true;
         }
         if send_off {
-            if self.tx_buf.is_empty() && self.preamble.is_empty() {
+            if !self.output_pending() {
                 if let Err(e) = self.sock.shutdown(std::net::Shutdown::Write) {
                     warn!("error shutting down socket send half: {e}");
                 }
@@ -1328,7 +1421,7 @@ impl Proxy for TsiStreamProxy {
         let draining = matches!(
             self.status,
             ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
-        ) && (!self.tx_buf.is_empty() || !self.preamble.is_empty());
+        ) && self.output_pending();
         if draining {
             self.guest_released = true;
             self.rx_paused = true;
@@ -1347,17 +1440,17 @@ impl Proxy for TsiStreamProxy {
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
-        if self.guest_released {
+        if self.guest_released || self.close_watermark.is_some() {
             // The guest no longer consumes RX or credit replies. Finish only
             // its output, releasing the descriptor immediately after handoff.
             // Failed/forced teardown resets the peer in Drop if bytes remain.
             let failed = self.flush_tx().is_err();
-            let drained = self.tx_buf.is_empty() && self.preamble.is_empty();
+            let drained = !self.output_pending();
             // Windows FD_CLOSE also reports an orderly receive half-close;
             // the peer can still read our queued output. Let send establish
             // whether the write half failed instead of aborting on HANG_UP.
             return ProxyUpdate {
-                remove_proxy: if failed || drained {
+                remove_proxy: if failed || (drained && self.guest_released) {
                     ProxyRemoval::Immediate
                 } else {
                     ProxyRemoval::Keep
@@ -1537,7 +1630,7 @@ impl Drop for TsiStreamProxy {
         // VM teardown or a transport error must not turn incomplete output
         // into a successful-looking EOF. Zero linger is an immediate abort;
         // positive linger would block the shared event loop and is never set.
-        if !self.tx_buf.is_empty() || !self.preamble.is_empty() {
+        if self.output_pending() {
             let _ = self.sock.set_linger(Some(Duration::ZERO));
         }
         // The guest can replace what is at the path while we listen; remove it

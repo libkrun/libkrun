@@ -1026,6 +1026,44 @@ impl VsockMuxer {
         });
     }
 
+    fn process_host_stream_close(&self, pkt: &VsockPacket) {
+        let request = pkt.data().and_then(super::host_close::CloseRequest::parse);
+        let allowed = self
+            .tsi_flags
+            .contains(TsiFlags::HIJACK_INET | TsiFlags::HOST_BIND)
+            && self.host_port_map.is_none();
+        let (result, update) = if !allowed {
+            (-1, None)
+        } else if let Some(req) = request {
+            let id = ((req.peer_port as u64) << 32) | req.local_port as u64;
+            let map = self.proxy_map.read().unwrap();
+            match map.get(&id) {
+                Some(proxy) => {
+                    let (result, update) = proxy.lock().unwrap().close_host_stream(&req);
+                    (result, Some((id, update)))
+                }
+                // The peer may have reset and the closed-proxy grace period
+                // expired while the guest was in a long linger wait.
+                None => (0, None),
+            }
+        } else {
+            (-22, None)
+        };
+        if let Some((id, update)) = update {
+            self.process_proxy_update(id, update);
+        }
+        // Normal and abortive closes do not wait on the control socket. Only
+        // positive linger needs a response, so avoid queueing unused replies.
+        if request.is_some_and(|req| req.flags != super::host_close::WAIT) {
+            return;
+        }
+        self.push_packet(MuxerRx::BindResponse {
+            local_port: pkt.dst_port(),
+            peer_port: pkt.src_port(),
+            data: BindResponse::status(if result == 0 { Ok(()) } else { Err(result) }),
+        });
+    }
+
     fn process_bind_request(&self, pkt: &VsockPacket) {
         // This is a new capability, not a way around the legacy publishing
         // allow-list. Even an empty map deliberately forbids direct host binds.
@@ -1194,6 +1232,7 @@ impl VsockMuxer {
             defs::TSI_SENDTO_DATA if self.tsi_flags.tsi_enabled() => self.process_sendto_data(pkt),
             defs::TSI_BIND => self.process_bind_request(pkt),
             defs::TSI_HOST_SETSOCKOPT => self.process_host_setsockopt(pkt),
+            defs::TSI_HOST_STREAM_CLOSE => self.process_host_stream_close(pkt),
             defs::TSI_HOST_SENDTO_ADDR => self.process_host_sendto_addr(pkt),
             defs::TSI_LISTEN if self.tsi_flags.tsi_enabled() => self.process_listen_request(pkt),
             defs::TSI_ACCEPT if self.tsi_flags.tsi_enabled() => self.process_accept_request(pkt),

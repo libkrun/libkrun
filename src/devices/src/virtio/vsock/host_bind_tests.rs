@@ -1448,3 +1448,75 @@ fn receive_buffer_options_control_routed_datagrams_before_and_after_bind() {
         }
     }
 }
+
+#[test]
+fn host_close_validates_permissions_and_wire_before_removing_a_socket() {
+    let wire = [
+        GUEST.to_le_bytes(),
+        defs::TSI_PROXY_PORT.to_le_bytes(),
+        0u32.to_le_bytes(),
+        2u32.to_le_bytes(),
+    ]
+    .concat();
+    let mut invalid = wire.clone();
+    invalid[12] = 3;
+    for (flags, map, body, expected) in [
+        (TsiFlags::HIJACK_INET, None, wire.as_slice(), -1),
+        (granted(), Some(HashMap::new()), wire.as_slice(), -1),
+        (granted(), None, &wire[..15], -22),
+        (granted(), None, invalid.as_slice(), -22),
+    ] {
+        let mut f = Fixture::new(flags, map);
+        f.create(defs::SOCK_STREAM, defs::LINUX_AF_INET);
+        f.send(defs::TSI_HOST_STREAM_CLOSE, body);
+        let Some(MuxerRx::BindResponse {
+            local_port,
+            peer_port,
+            data,
+        }) = f.muxer.rxq.lock().unwrap().pop()
+        else {
+            panic!("missing close status")
+        };
+        assert_eq!(local_port, defs::TSI_HOST_STREAM_CLOSE);
+        assert_eq!(peer_port, CONTROL);
+        let mut response = [0xa5; 136];
+        assert_eq!(data.write(&mut response), 136);
+        assert_eq!(
+            i32::from_le_bytes(response[..4].try_into().unwrap()),
+            expected
+        );
+        assert!(response[4..].iter().all(|b| *b == 0));
+        assert_eq!(f.muxer.proxy_map.read().unwrap().len(), 1);
+        f.release();
+    }
+}
+
+#[test]
+fn only_waiting_closes_receive_status_and_repeated_close_is_complete() {
+    for flags in [0u32, 1, 2] {
+        let mut f = Fixture::new(granted(), None);
+        f.create(defs::SOCK_STREAM, defs::LINUX_AF_INET);
+        let wire = [
+            GUEST.to_le_bytes(),
+            defs::TSI_PROXY_PORT.to_le_bytes(),
+            0u32.to_le_bytes(),
+            flags.to_le_bytes(),
+        ]
+        .concat();
+        for _ in 0..2 {
+            f.send(defs::TSI_HOST_STREAM_CLOSE, &wire);
+            assert!(f.muxer.proxy_map.read().unwrap().is_empty());
+            let response = f.muxer.rxq.lock().unwrap().pop();
+            if flags == 2 {
+                let Some(MuxerRx::BindResponse { data, .. }) = response else {
+                    panic!("missing close status")
+                };
+                let mut bytes = [0xa5; 136];
+                data.write(&mut bytes);
+                assert_eq!(bytes, [0; 136]);
+            } else {
+                assert!(response.is_none());
+            }
+        }
+    }
+}

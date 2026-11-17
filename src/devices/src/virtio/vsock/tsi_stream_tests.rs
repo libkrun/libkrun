@@ -7,6 +7,10 @@ use utils::epoll::{ControlOperation, Epoll, EpollEvent};
 use vm_memory::{Bytes, GuestAddress};
 
 fn stream_fixture(ip: IpAddr) -> (TsiStreamProxy, VsockPacket) {
+    stream_payload_fixture(ip, &[])
+}
+
+fn stream_payload_fixture(ip: IpAddr, payload: &[u8]) -> (TsiStreamProxy, VsockPacket) {
     let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
     let queue = TestQueue::new(GuestAddress(0x1000), &mem, 8).create_queue();
     let proxy = TsiStreamProxy::new(
@@ -29,7 +33,10 @@ fn stream_fixture(ip: IpAddr) -> (TsiStreamProxy, VsockPacket) {
     .unwrap();
     let tx = TestQueue::new(GuestAddress(0x3000), &mem, 8);
     mem.write_slice(&[0; 44], GuestAddress(0x8000)).unwrap();
-    tx.dtable[0].set(0x8000, 44, 0, 0);
+    mem.write_obj(payload.len() as u32, GuestAddress(0x8000 + 24))
+        .unwrap();
+    mem.write_slice(payload, GuestAddress(0x8000 + 44)).unwrap();
+    tx.dtable[0].set(0x8000, 44 + payload.len() as u32, 0, 0);
     tx.avail.ring[0].set(0);
     tx.avail.idx.set(1);
     let mut pkt = VsockPacket::from_tx_virtq_head(&tx.create_queue().pop(&mem).unwrap()).unwrap();
@@ -625,5 +632,161 @@ fn accepted_connections_inherit_credit_budgets_without_retuning() {
             child.rxq.lock().unwrap().pop(),
             Some(MuxerRx::CreditUpdate { fwd_cnt: 8192, .. })
         ));
+    }
+}
+
+#[test]
+fn explicit_abort_resets_even_without_queued_output() {
+    use std::io::{ErrorKind, Read};
+    use std::net::{Ipv6Addr, TcpStream};
+    for ip in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        let (mut proxy, listener) = connecting(ip, true);
+        proxy.process_event(EventSet::OUT);
+        let mut remote = TcpStream::from(listener.unwrap().accept().unwrap().0);
+        remote
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (result, update) = proxy.close_host_stream(&CloseRequest {
+            peer_port: 0,
+            local_port: 0,
+            tx_count: 0,
+            flags: host_close::ABORT,
+        });
+        assert_eq!(result, 0);
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Immediate));
+        drop(proxy);
+        assert_eq!(
+            remote.read(&mut [0]).unwrap_err().kind(),
+            ErrorKind::ConnectionReset
+        );
+    }
+}
+
+#[test]
+fn close_watermark_preserves_data_that_arrives_after_release() {
+    use std::io::{ErrorKind, Read};
+    use std::net::{Ipv6Addr, TcpStream};
+    for ip in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        let (mut proxy, listener) = connecting(ip, true);
+        proxy.process_event(EventSet::OUT);
+        let mut remote = TcpStream::from(listener.unwrap().accept().unwrap().0);
+        remote.set_nonblocking(true).unwrap();
+        let payload = b"late payload";
+        proxy.tx_cnt = Wrapping(u32::MAX - 3);
+        let expected = (proxy.tx_cnt + Wrapping(payload.len() as u32)).0;
+        let req = CloseRequest {
+            peer_port: 0,
+            local_port: 0,
+            tx_count: expected,
+            flags: host_close::WAIT,
+        };
+        assert_eq!(proxy.close_host_stream(&req).0, 1);
+        assert!(!proxy.close_fin_sent);
+        assert_eq!(
+            remote.read(&mut [0]).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+        assert!(matches!(proxy.release().remove_proxy, ProxyRemoval::Keep));
+        // Reordered shutdown must not put FIN before the missing payload.
+        let (_memory, mut pkt) = stream_fixture(ip);
+        pkt.set_flags(uapi::VSOCK_FLAGS_SHUTDOWN_SEND);
+        proxy.shutdown(&pkt);
+        assert_eq!(
+            remote.read(&mut [0]).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+        let (_memory, packet) = stream_payload_fixture(ip, payload);
+        assert!(matches!(
+            proxy.sendmsg(&packet).remove_proxy,
+            ProxyRemoval::Immediate
+        ));
+        assert_eq!(proxy.tx_cnt.0, expected);
+        drop(proxy);
+        remote.set_nonblocking(false).unwrap();
+        remote
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut actual = Vec::new();
+        remote.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, payload);
+    }
+}
+
+#[test]
+fn payload_beyond_the_close_watermark_is_rejected_before_transmission() {
+    let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let (mut proxy, _listener) = connecting(ip, true);
+    proxy.process_event(EventSet::OUT);
+    let req = CloseRequest {
+        peer_port: 0,
+        local_port: 0,
+        tx_count: 1,
+        flags: host_close::WAIT,
+    };
+    assert_eq!(proxy.close_host_stream(&req).0, 1);
+    let (_memory, packet) = stream_payload_fixture(ip, b"too many bytes");
+    let update = proxy.sendmsg(&packet);
+    assert!(matches!(update.remove_proxy, ProxyRemoval::Deferred));
+    assert_eq!(proxy.status, ProxyStatus::Closed);
+    assert_eq!(proxy.tx_cnt.0, 0);
+    assert!(proxy.tx_buf.is_empty());
+}
+
+#[test]
+fn linger_completion_waits_for_output_and_fin_acknowledgment() {
+    use std::io::Read;
+    use std::net::{Ipv6Addr, TcpStream};
+    use std::time::Instant;
+    for ip in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        let (mut proxy, listener) = connecting(ip, true);
+        proxy.process_event(EventSet::OUT);
+        let mut remote = TcpStream::from(listener.unwrap().accept().unwrap().0);
+        remote
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        proxy.sock.set_send_buffer_size(4096).unwrap();
+        let payload = vec![0x45; 4 * 1024 * 1024];
+        proxy.tx_buf.extend(&payload);
+        let req = CloseRequest {
+            peer_port: 0,
+            local_port: 0,
+            tx_count: payload.len() as u32,
+            flags: host_close::WAIT,
+        };
+        assert_eq!(proxy.close_host_stream(&req).0, 1);
+        assert!(!proxy.close_fin_sent);
+        let reader = std::thread::spawn(move || {
+            let mut actual = Vec::new();
+            remote.read_to_end(&mut actual).unwrap();
+            actual
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let update = proxy.process_event(EventSet::OUT);
+            assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+            let (result, _) = proxy.close_host_stream(&req);
+            if result == 0 {
+                break;
+            }
+            assert_eq!(result, 1);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(proxy.close_fin_sent);
+        assert!(matches!(
+            proxy.release().remove_proxy,
+            ProxyRemoval::Immediate
+        ));
+        drop(proxy);
+        assert_eq!(reader.join().unwrap(), payload);
     }
 }
