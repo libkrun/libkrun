@@ -1792,7 +1792,10 @@ fn build_restore_ctx_with_memory_mode(
             vmm::snapshot::map_guest_memory_file(&descs, &memory_file)
                 .map_err(|e| format!("map guest memory: {e}"))?
         };
-        #[cfg(all(unix, not(target_os = "linux")))]
+        #[cfg(target_os = "macos")]
+        let guest_memory = vmm::snapshot::map_owned_macos_memory_file(&descs, &memory_file)
+            .map_err(|e| format!("map guest memory: {e}"))?;
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
         let guest_memory = vmm::snapshot::map_guest_memory_file(&descs, &memory_file)
             .map_err(|e| format!("map guest memory: {e}"))?;
         // Windows cannot unlink a live file mapping when smolvm consumes the

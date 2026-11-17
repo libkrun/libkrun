@@ -2561,6 +2561,88 @@ fn guest_ram_dir() -> String {
     std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string())
 }
 
+/// Give a portable restore its own shared RAM file. Reclamation may punch
+/// holes in this file, and subsequent APFS checkpoints must see those holes
+/// and every write when the guest reuses them. Mapping an unowned image and
+/// replacing freed ranges with anonymous pages disconnects those writes from
+/// the file that the checkpoint fast path clones.
+#[cfg(target_os = "macos")]
+pub(crate) fn clone_restored_guest_ram(source: &File) -> std::io::Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    reap_orphaned_guest_ram();
+    let directory = std::path::PathBuf::from(guest_ram_dir());
+    let dir = File::open(&directory)?;
+    loop {
+        let name = format!(
+            "smolvm-guest-ram-{}-restore-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let c_name = CString::new(name.as_str()).expect("generated RAM filename");
+        let path = directory.join(&name);
+        let cloned =
+            unsafe { libc::fclonefileat(source.as_raw_fd(), dir.as_raw_fd(), c_name.as_ptr(), 0) }
+                == 0;
+        if !cloned {
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EEXIST) => continue,
+                Some(libc::EXDEV | libc::ENOTSUP) => {}
+                _ => return Err(error),
+            }
+            let destination = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            };
+            let copied = unsafe {
+                libc::fcopyfile(
+                    source.as_raw_fd(),
+                    destination.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    libc::COPYFILE_DATA | libc::COPYFILE_DATA_SPARSE,
+                )
+            };
+            if copied != 0 {
+                let error = std::io::Error::last_os_error();
+                let _ = std::fs::remove_file(&path);
+                return Err(error);
+            }
+        }
+        let result = (|| {
+            // The input may be read-only. Change only the new clone's mode.
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)?;
+            #[cfg(not(feature = "tee"))]
+            devices::virtio::balloon::register_owned_guest_ram_file(&file);
+            Ok(file)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&path);
+        }
+        return result;
+    }
+}
+
 /// Reap guest-RAM backing files left by forkable goldens whose process is gone.
 ///
 /// macOS has no `memfd` and no `DELETE_ON_CLOSE`, and a forkable golden is

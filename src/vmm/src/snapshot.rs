@@ -941,6 +941,17 @@ pub fn map_guest_memory_file(
         .map_err(|error| io::Error::other(format!("map guest memory image: {error:?}")))
 }
 
+/// Restore into an independent APFS clone, retaining shared file mappings so
+/// balloon reclamation, guest writes and subsequent checkpoints agree.
+#[cfg(target_os = "macos")]
+pub fn map_owned_macos_memory_file(
+    descs: &[MemoryRegionDesc],
+    file: &File,
+) -> io::Result<GuestMemoryMmap> {
+    let owned = crate::builder::clone_restored_guest_ram(file)?;
+    map_guest_memory_file(descs, &owned)
+}
+
 /// Promote a portable sparse memory image into sealable Linux memfds without
 /// scanning or allocating its holes.
 ///
@@ -4492,6 +4503,107 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn restored_macos_ram_keeps_reclaim_reuse_and_capture_on_one_backing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const SIZE: usize = 64 * 1024 * 1024;
+        const PAGE: usize = 16384;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "libkrun-macos-owned-restore-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let input_path = directory.join("input");
+        let input = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&input_path)
+            .unwrap();
+        input.set_len(SIZE as u64).unwrap();
+        input.write_all_at(&[0xA5; PAGE], PAGE as u64).unwrap();
+        input
+            .set_permissions(fs::Permissions::from_mode(0o400))
+            .unwrap();
+        drop(input);
+        let input = File::open(&input_path).unwrap();
+        let descs = [MemoryRegionDesc {
+            gpa: 0,
+            len: SIZE as u64,
+        }];
+        let first = map_owned_macos_memory_file(&descs, &input).unwrap();
+        let second = map_owned_macos_memory_file(&descs, &input).unwrap();
+        let backing = first.iter().next().unwrap().file_offset().unwrap().file();
+        let second_backing = second.iter().next().unwrap().file_offset().unwrap().file();
+        assert_ne!(
+            backing.metadata().unwrap().ino(),
+            input.metadata().unwrap().ino()
+        );
+        assert_ne!(
+            backing.metadata().unwrap().ino(),
+            second_backing.metadata().unwrap().ino()
+        );
+        assert!(backing.metadata().unwrap().blocks() * 512 < (SIZE / 8) as u64);
+
+        // Exercise the owned-file operation used by balloon reclamation. No
+        // hypervisor is needed to verify the host mapping/capture boundary.
+        let hole = libc::fpunchhole_t {
+            fp_flags: 0,
+            reserved: 0,
+            fp_offset: PAGE as i64,
+            fp_length: PAGE as i64,
+        };
+        assert_eq!(
+            unsafe { libc::fcntl(backing.as_raw_fd(), libc::F_PUNCHHOLE, &hole) },
+            0
+        );
+        let mut bytes = [0; PAGE];
+        first
+            .read_slice(&mut bytes, GuestAddress(PAGE as u64))
+            .unwrap();
+        assert_eq!(bytes, [0; PAGE]);
+        first
+            .write_slice(&[0x37; PAGE], GuestAddress(PAGE as u64))
+            .unwrap();
+        let capture_dir = directory.join("capture");
+        fs::create_dir(&capture_dir).unwrap();
+        let generation = start_deferred_memory_save(&first, &capture_dir).unwrap();
+        first
+            .write_slice(&[0x59; PAGE], GuestAddress(PAGE as u64))
+            .unwrap();
+        let mut stream = Vec::new();
+        generation.finish_stream(&mut stream).unwrap();
+        assert_eq!(&stream[16 + PAGE..16 + PAGE * 2], &[0x37; PAGE]);
+        input.read_exact_at(&mut bytes, PAGE as u64).unwrap();
+        assert_eq!(bytes, [0xA5; PAGE], "restore must not modify its input");
+        second
+            .read_slice(&mut bytes, GuestAddress(PAGE as u64))
+            .unwrap();
+        assert_eq!(bytes, [0xA5; PAGE], "restores must not alias one another");
+        assert_eq!(
+            input.metadata().unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        for file in [backing, second_backing] {
+            let mut path = [0_i8; libc::PATH_MAX as usize];
+            assert_eq!(
+                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) },
+                0
+            );
+            let path = unsafe { std::ffi::CStr::from_ptr(path.as_ptr()) }
+                .to_str()
+                .unwrap();
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn deferred_macos_stream_preserves_boundary_and_cleans_files() {
         const SIZE: usize = 4 * 1024 * 1024;
         let backing = crate::builder::create_guest_ram_memfd(SIZE).unwrap();
@@ -4944,7 +5056,6 @@ mod tests {
         let mut wire = Vec::new();
         super::stream_sparse_ram(&mut refs, &mut wire).unwrap();
         drop(refs);
-        drop(sources);
         let image = decode_sparse_ram(&wire);
         let mut expected = vec![0_u8; len + 8192];
         live.read_exact_at(&mut expected[..head as usize], 0)
