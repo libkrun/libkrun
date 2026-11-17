@@ -4378,7 +4378,7 @@ pub mod tests {
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn test_create_vcpus_x86_64() {
         let vcpu_count = 2;
 
@@ -4452,7 +4452,10 @@ pub mod tests {
         let err = Internal(Error::Serial(io::Error::from_raw_os_error(0)));
         let _ = format!("{err}{err:?}");
 
+        #[cfg(unix)]
         let err = InvalidKernelBundle(vm_memory::mmap::MmapRegionError::InvalidPointer);
+        #[cfg(windows)]
+        let err = InvalidKernelBundle(io::Error::other("invalid kernel mapping"));
         let _ = format!("{err}{err:?}");
 
         let err = KernelCmdline(String::from("dummy --cmdline"));
