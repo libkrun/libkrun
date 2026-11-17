@@ -6,6 +6,7 @@ use std::num::Wrapping;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use socket2::{Domain, Socket, Type};
 
@@ -85,6 +86,10 @@ pub struct TsiStreamProxy {
     /// blocks, so the host never buffers unboundedly and the muxer thread never
     /// blocks.
     tx_buf: VecDeque<u8>,
+    /// The guest has closed, but accepted output still belongs to this flow.
+    /// Keep its bounded queue until the host accepts it or the transport fails.
+    /// The closed-proxy grace timer must not silently truncate this output.
+    guest_released: bool,
     buffers: SocketBuffers,
     /// True while we have paused reading the host socket (guest RX credit
     /// exhausted, or the remote half-closed). Kept separate from the epoll
@@ -179,6 +184,7 @@ impl TsiStreamProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             tx_buf: VecDeque::new(),
+            guest_released: false,
             buffers: SocketBuffers::default(),
             preamble: VecDeque::new(),
             intercept_peer: None,
@@ -233,6 +239,7 @@ impl TsiStreamProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             tx_buf: VecDeque::new(),
+            guest_released: false,
             buffers,
             preamble: VecDeque::new(),
             intercept_peer: None,
@@ -730,7 +737,7 @@ impl TsiStreamProxy {
     /// what lets a stalled send keep OUT armed without losing the RX side.
     fn conn_evset(&self) -> EventSet {
         connected_event_set(
-            self.rx_paused,
+            self.rx_paused || self.guest_released,
             !self.tx_buf.is_empty() || !self.preamble.is_empty(),
         )
     }
@@ -1169,6 +1176,9 @@ impl Proxy for TsiStreamProxy {
     }
 
     fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
+        if self.guest_released {
+            return ProxyUpdate::default();
+        }
         debug!(
             "update_credit: buf_alloc={} rx_cnt={} fwd_cnt={}",
             pkt.buf_alloc(),
@@ -1312,27 +1322,50 @@ impl Proxy for TsiStreamProxy {
             "release: id={}, tx_cnt={}, last_tx_cnt={}",
             self.id, self.tx_cnt, self.last_tx_cnt_sent
         );
-        // The guest closed its socket. With no guest bytes still waiting for
-        // the host socket, close it now: holding it through the reaper's grace
-        // period kept one host descriptor per closed connection for 5 s, so a
-        // guest opening and closing a few thousand connections a second held
-        // tens of thousands of descriptors and hit the process's limit. Bytes
-        // still buffered keep the deferral so they get their chance to drain.
-        let remove_proxy = if self.status == ProxyStatus::Listening
-            || (self.tx_buf.is_empty() && self.preamble.is_empty())
-        {
-            ProxyRemoval::Immediate
-        } else {
-            ProxyRemoval::Deferred
-        };
+        // Kernel TCP owns bytes already handed to the socket. Bytes still in
+        // our forwarding queue need OUT readiness, not the closed-proxy timer:
+        // a peer may legitimately stop reading for longer than its five seconds.
+        let draining = matches!(
+            self.status,
+            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+        ) && (!self.tx_buf.is_empty() || !self.preamble.is_empty());
+        if draining {
+            self.guest_released = true;
+            self.rx_paused = true;
+        }
         ProxyUpdate {
-            remove_proxy,
+            remove_proxy: if draining {
+                ProxyRemoval::Keep
+            } else {
+                ProxyRemoval::Immediate
+            },
+            polling: if draining { self.repoll() } else { None },
             ..Default::default()
         }
     }
 
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
+
+        if self.guest_released {
+            // The guest no longer consumes RX or credit replies. Finish only
+            // its output, releasing the descriptor immediately after handoff.
+            // Failed/forced teardown resets the peer in Drop if bytes remain.
+            let failed = self.flush_tx().is_err();
+            let drained = self.tx_buf.is_empty() && self.preamble.is_empty();
+            // Windows FD_CLOSE also reports an orderly receive half-close;
+            // the peer can still read our queued output. Let send establish
+            // whether the write half failed instead of aborting on HANG_UP.
+            return ProxyUpdate {
+                remove_proxy: if failed || drained {
+                    ProxyRemoval::Immediate
+                } else {
+                    ProxyRemoval::Keep
+                },
+                polling: self.repoll(),
+                ..Default::default()
+            };
+        }
 
         if self.awaiting_verdict && self.status == ProxyStatus::Connecting {
             self.advance_verdict(&mut update);
@@ -1499,11 +1532,17 @@ impl Proxy for TsiStreamProxy {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl Drop for TsiStreamProxy {
     fn drop(&mut self) {
+        // VM teardown or a transport error must not turn incomplete output
+        // into a successful-looking EOF. Zero linger is an immediate abort;
+        // positive linger would block the shared event loop and is never set.
+        if !self.tx_buf.is_empty() || !self.preamble.is_empty() {
+            let _ = self.sock.set_linger(Some(Duration::ZERO));
+        }
         // The guest can replace what is at the path while we listen; remove it
         // only if it is still a socket node.
+        #[cfg(target_os = "linux")]
         if let Some(path) = &self.unixsock_path
             && super::vsock_addr::is_unix_socket_node(path)
         {

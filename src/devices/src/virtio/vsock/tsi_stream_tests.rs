@@ -411,6 +411,106 @@ fn shutdown_delivers_queued_bytes_before_eof() {
 }
 
 #[test]
+fn release_drains_accepted_output_without_the_closed_proxy_timer() {
+    use std::io::Read;
+    use std::net::{Ipv6Addr, TcpStream};
+    use std::time::{Duration, Instant};
+
+    for ip in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        for waiting_credit in [false, true] {
+            let (mut proxy, listener) = connecting(ip, true);
+            proxy.process_event(EventSet::OUT);
+            proxy.rxq.lock().unwrap().pop();
+            let (remote, _) = listener.unwrap().accept().unwrap();
+            let mut remote = TcpStream::from(remote);
+            remote
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            proxy.sock.set_send_buffer_size(4096).unwrap();
+            // A large queue makes the real socket backpressure before the
+            // reader starts, independently of host TCP autotuning defaults.
+            let expected = vec![0x72; 4 * 1024 * 1024];
+            proxy.tx_buf.extend(&expected);
+            proxy.flush_tx().unwrap();
+            assert!(!proxy.tx_buf.is_empty());
+            if waiting_credit {
+                proxy.status = ProxyStatus::WaitingCreditUpdate;
+                proxy.rx_paused = true;
+            }
+            let (_memory, packet) = stream_fixture(ip);
+            // Release can arrive both on the control port and as a vsock RST.
+            for _ in 0..2 {
+                let update = proxy.release();
+                assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+                assert!(update.polling.unwrap().2.contains(EventSet::OUT));
+                assert!(!proxy.conn_evset().contains(EventSet::IN));
+            }
+            proxy.update_peer_credit(&packet);
+            assert!(!proxy.conn_evset().contains(EventSet::IN));
+            remote.shutdown(std::net::Shutdown::Write).unwrap();
+            // Windows reports an orderly remote half-close as HANG_UP. The
+            // peer still receives output, so that event cannot discard it.
+            let update = proxy.process_event(EventSet::HANG_UP);
+            assert!(!proxy.tx_buf.is_empty());
+            assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+            let reader = std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                remote.read_to_end(&mut bytes).unwrap();
+                bytes
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let update = proxy.process_event(EventSet::OUT);
+                assert!(!update.signal_queue);
+                assert!(proxy.rxq.lock().unwrap().is_empty());
+                if matches!(update.remove_proxy, ProxyRemoval::Immediate) {
+                    assert!(proxy.tx_buf.is_empty());
+                    break;
+                }
+                assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+                assert!(
+                    Instant::now() < deadline,
+                    "released stream stopped draining"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(proxy);
+            assert_eq!(reader.join().unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn forced_teardown_with_pending_output_resets_instead_of_truncating() {
+    use std::io::{ErrorKind, Read};
+    use std::net::{Ipv6Addr, TcpStream};
+    use std::time::Duration;
+
+    for ip in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        let (mut proxy, listener) = connecting(ip, true);
+        proxy.process_event(EventSet::OUT);
+        let (remote, _) = listener.unwrap().accept().unwrap();
+        let mut remote = TcpStream::from(remote);
+        remote
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        proxy.tx_buf.extend(b"accepted but not yet forwarded");
+        drop(proxy);
+        let mut bytes = Vec::new();
+        assert_eq!(
+            remote.read_to_end(&mut bytes).unwrap_err().kind(),
+            ErrorKind::ConnectionReset
+        );
+    }
+}
+
+#[test]
 fn empty_shutdown_flags_leave_stream_writable() {
     use std::io::Read;
     use std::net::TcpStream;
