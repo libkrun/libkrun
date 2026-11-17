@@ -173,6 +173,8 @@ pub struct VsockMuxer {
     failed_creates: Mutex<FailedCreates>,
     #[cfg(target_os = "macos")]
     host_icmp: Option<Result<Arc<super::macos_icmp::MacIcmp>, i32>>,
+    #[cfg(target_os = "macos")]
+    host_udp_router: Option<Result<Arc<super::macos_udp_router::DatagramRouter>, i32>>,
 }
 
 /// Bound on [`FailedCreates`]: guest sockets that fail to get a host socket
@@ -253,7 +255,15 @@ impl VsockMuxer {
                 .map(Arc::new)
                 .map_err(|error| -sys::to_linux_errno(&error))
         });
+        #[cfg(target_os = "macos")]
+        let host_udp_router = tsi_flags.contains(TsiFlags::HOST_BIND).then(|| {
+            super::macos_udp_router::DatagramRouter::new(&epoll)
+                .map(Arc::new)
+                .map_err(|error| -sys::to_linux_errno(&error))
+        });
         VsockMuxer {
+            #[cfg(target_os = "macos")]
+            host_udp_router,
             #[cfg(target_os = "macos")]
             host_icmp,
             cid,
@@ -399,6 +409,11 @@ impl VsockMuxer {
             self.snapshot_gate.clone(),
             #[cfg(target_os = "macos")]
             self.host_icmp
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .cloned(),
+            #[cfg(target_os = "macos")]
+            self.host_udp_router
                 .as_ref()
                 .and_then(|result| result.as_ref().ok())
                 .cloned(),
@@ -768,6 +783,11 @@ impl VsockMuxer {
                         self.snapshot_gate.clone(),
                         self.pending_datagram_rx.clone(),
                         self.epoll.clone(),
+                        #[cfg(target_os = "macos")]
+                        self.host_udp_router
+                            .as_ref()
+                            .and_then(|result| result.as_ref().ok())
+                            .cloned(),
                     ) {
                         Ok(proxy) => {
                             self.proxy_map
@@ -970,6 +990,33 @@ impl VsockMuxer {
         }
     }
 
+    fn process_host_setsockopt(&self, pkt: &VsockPacket) {
+        let allowed = self
+            .tsi_flags
+            .contains(TsiFlags::HIJACK_INET | TsiFlags::HOST_BIND)
+            && self.host_port_map.is_none();
+        let result = if !allowed {
+            Err(-1)
+        } else if let Some(req) = pkt
+            .data()
+            .and_then(super::host_sockopt::OptionRequest::parse)
+        {
+            let id = ((req.peer_port as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+            let proxies = self.proxy_map.read().unwrap();
+            match proxies.get(&id) {
+                Some(proxy) => proxy.lock().unwrap().set_host_option(&req),
+                None => Err(-9),
+            }
+        } else {
+            Err(-22)
+        };
+        self.push_packet(MuxerRx::BindResponse {
+            local_port: pkt.dst_port(),
+            peer_port: pkt.src_port(),
+            data: BindResponse::status(result),
+        });
+    }
+
     fn process_bind_request(&self, pkt: &VsockPacket) {
         // This is a new capability, not a way around the legacy publishing
         // allow-list. Even an empty map deliberately forbids direct host binds.
@@ -988,10 +1035,10 @@ impl VsockMuxer {
                     let mut proxy = proxy.lock().unwrap();
                     #[cfg(target_os = "macos")]
                     let result = if proxy.is_dgram() {
-                        match &self.host_icmp {
-                            Some(Ok(_)) => proxy.bind_host(&req),
-                            Some(Err(error)) => Err(*error),
-                            None => Err(-95),
+                        match (&self.host_icmp, &self.host_udp_router) {
+                            (Some(Ok(_)), Some(Ok(_))) => proxy.bind_host(&req),
+                            (Some(Err(error)), _) | (_, Some(Err(error))) => Err(*error),
+                            _ => Err(-95),
                         }
                     } else {
                         proxy.bind_host(&req)
@@ -1137,6 +1184,7 @@ impl VsockMuxer {
             defs::TSI_SENDTO_ADDR if self.tsi_flags.tsi_enabled() => self.process_sendto_addr(pkt),
             defs::TSI_SENDTO_DATA if self.tsi_flags.tsi_enabled() => self.process_sendto_data(pkt),
             defs::TSI_BIND => self.process_bind_request(pkt),
+            defs::TSI_HOST_SETSOCKOPT => self.process_host_setsockopt(pkt),
             defs::TSI_HOST_SENDTO_ADDR => self.process_host_sendto_addr(pkt),
             defs::TSI_LISTEN if self.tsi_flags.tsi_enabled() => self.process_listen_request(pkt),
             defs::TSI_ACCEPT if self.tsi_flags.tsi_enabled() => self.process_accept_request(pkt),

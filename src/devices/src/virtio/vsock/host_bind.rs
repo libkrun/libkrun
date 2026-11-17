@@ -34,6 +34,19 @@ pub struct BindRequest {
 }
 
 impl BindRequest {
+    #[cfg(target_os = "macos")]
+    pub fn datagram_v6_only(&self) -> bool {
+        self.options & V6_ONLY != 0
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn datagram_reuse(&self) -> [bool; 2] {
+        [
+            self.options & REUSE_ADDR != 0,
+            self.options & REUSE_PORT != 0,
+        ]
+    }
+
     pub fn parse(data: &[u8]) -> Option<Self> {
         let header = data.get(..12)?;
         let peer_port = u32::from_le_bytes(header[0..4].try_into().ok()?);
@@ -73,6 +86,13 @@ impl From<Result<VsockAddr, i32>> for BindResponse {
 }
 
 impl BindResponse {
+    pub fn status(result: Result<(), i32>) -> Self {
+        Self {
+            result: result.err().unwrap_or(0),
+            addr: None,
+        }
+    }
+
     /// Return the exact initialized reply length, never the descriptor size.
     pub fn write(&self, buf: &mut [u8]) -> usize {
         let Some(buf) = buf.get_mut(..136) else {
@@ -111,8 +131,13 @@ pub fn bind_inet(sock: &Socket, family: Family, req: &BindRequest) -> Result<Soc
         // explicit bind must honor the guest instead, including the default
         // exclusive reservation before listen().
         sock.set_reuse_address(req.options & REUSE_ADDR != 0)?;
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "macos")))]
         sock.set_reuse_port(req.options & REUSE_PORT != 0)?;
+        #[cfg(target_os = "macos")]
+        sock.set_reuse_port(
+            req.options & REUSE_PORT != 0
+                || (sock.r#type()? == socket2::Type::DGRAM && req.options & REUSE_ADDR != 0),
+        )?;
         if addr.is_ipv6() {
             sock.set_only_v6(req.options & V6_ONLY != 0)?;
         }

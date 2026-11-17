@@ -204,6 +204,10 @@ pub trait Proxy: Send {
     }
     /// Reserve a host address before listen/send, returning the actual address
     /// chosen for port zero. Host IPC and other proxies cannot use this path.
+    fn set_host_option(&mut self, _req: &super::host_sockopt::OptionRequest) -> Result<(), i32> {
+        Err(-95)
+    }
+
     fn bind_host(&mut self, _req: &BindRequest) -> Result<VsockAddr, i32> {
         Err(-95) // Linux EOPNOTSUPP, including on non-Linux hosts.
     }

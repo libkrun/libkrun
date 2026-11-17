@@ -37,7 +37,7 @@ pub struct TsiDgramProxy {
     cid: u64,
     local_port: u32,
     peer_port: u32,
-    sock: Socket,
+    sock: Arc<Socket>,
     pub status: ProxyStatus,
     sendto_addr: Option<VsockAddr>,
     listening: bool,
@@ -58,6 +58,10 @@ pub struct TsiDgramProxy {
     host_rx: Option<HostDatagramRx>,
     #[cfg(target_os = "macos")]
     macos_datagram: Option<MacDatagram>,
+    #[cfg(target_os = "macos")]
+    macos_reuse: [bool; 2],
+    #[cfg(target_os = "macos")]
+    macos_router: Option<Arc<super::macos_udp_router::DatagramRouter>>,
     dns_identity: Option<Arc<()>>,
     host_peer: Option<SocketAddr>,
     host_send: Option<PendingHostSend>,
@@ -80,6 +84,9 @@ impl TsiDgramProxy {
         snapshot_gate: Arc<SnapshotGate>,
         pending_rx: Arc<Mutex<HashSet<u64>>>,
         epoll: Epoll,
+        #[cfg(target_os = "macos")] macos_router: Option<
+            Arc<super::macos_udp_router::DatagramRouter>,
+        >,
     ) -> Result<Self, ProxyError> {
         let (family, domain) = match family {
             defs::LINUX_AF_INET => (Family::Inet, Domain::IPV4),
@@ -103,7 +110,7 @@ impl TsiDgramProxy {
             cid,
             local_port: 0,
             peer_port,
-            sock,
+            sock: Arc::new(sock),
             status: ProxyStatus::Idle,
             sendto_addr: None,
             listening: false,
@@ -121,6 +128,10 @@ impl TsiDgramProxy {
             host_rx: None,
             #[cfg(target_os = "macos")]
             macos_datagram: None,
+            #[cfg(target_os = "macos")]
+            macos_reuse: [false; 2],
+            #[cfg(target_os = "macos")]
+            macos_router,
             dns_identity: None,
             host_peer: None,
             host_send: None,
@@ -441,7 +452,7 @@ impl TsiDgramProxy {
                     raw_handle(&self.sock),
                     &EpollEvent::default(),
                 );
-                self.sock = replacement;
+                self.sock = Arc::new(replacement);
             }
             datagram.disconnected();
         }
@@ -505,6 +516,21 @@ impl TsiDgramProxy {
 }
 
 impl Proxy for TsiDgramProxy {
+    fn set_host_option(&mut self, req: &super::host_sockopt::OptionRequest) -> Result<(), i32> {
+        #[cfg(target_os = "macos")]
+        {
+            req.apply_datagram(&self.sock, &mut self.macos_reuse)?;
+            if let Some(datagram) = &self.macos_datagram {
+                datagram.set_reuse_port(self.macos_reuse[1]);
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            req.apply(&self.sock)
+        }
+    }
+
     fn bind_host(&mut self, req: &BindRequest) -> Result<VsockAddr, i32> {
         if self.listening || self.status != ProxyStatus::Idle {
             return Err(-libc::EINVAL);
@@ -518,15 +544,24 @@ impl Proxy for TsiDgramProxy {
             .set_recv_buffer_size(128 * 1024)
             .map_err(|e| -sys::to_linux_errno(&e))?;
         #[cfg(target_os = "macos")]
-        let datagram = MacDatagram::new(
+        let mut datagram = MacDatagram::new(
             &self.sock,
             req.addr.inet().ok_or(-97)?,
             self.family == Family::Inet,
+            self.id,
+            self.macos_router.clone().ok_or(-95)?,
         )
         .map_err(|err| -sys::to_linux_errno(&err))?;
         let addr = bind_inet(&self.sock, self.family, req)?;
         #[cfg(target_os = "macos")]
         {
+            self.macos_reuse = req.datagram_reuse();
+            datagram.bound(
+                &self.sock,
+                addr,
+                self.macos_reuse[1],
+                req.datagram_v6_only(),
+            );
             self.macos_datagram = Some(datagram);
         }
         // sendto must keep this source port instead of trying to autobind again.

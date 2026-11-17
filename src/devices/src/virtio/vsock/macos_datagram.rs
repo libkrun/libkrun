@@ -10,11 +10,15 @@ use std::mem::{MaybeUninit, size_of, size_of_val, zeroed};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::fd::AsRawFd;
 use std::ptr;
+use std::sync::{Arc, Mutex};
+
+use super::macos_udp_router::{DatagramRouter, Endpoint};
 
 use socket2::{Domain, SockAddr, Socket, Type};
 
 const MAX_SAVED_BYTES: usize = 256 * 1024;
 const MAX_SAVED_DATAGRAMS: usize = 512;
+#[cfg(test)]
 const MAX_DATAGRAM: usize = super::host_datagram::MAX_DATAGRAM;
 
 pub struct MacDatagram {
@@ -24,9 +28,12 @@ pub struct MacDatagram {
     deferred_bind: bool,
     saved: VecDeque<(SocketAddr, Box<[u8]>)>,
     saved_bytes: usize,
+    router: Arc<DatagramRouter>,
+    endpoint: Arc<Mutex<Endpoint>>,
+    registered_port: Option<u16>,
 }
 
-fn canonical_ip(ip: IpAddr) -> IpAddr {
+pub(super) fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(ip) => ip
             .to_ipv4_mapped()
@@ -36,7 +43,7 @@ fn canonical_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
-fn canonical_peer(peer: SocketAddr) -> SocketAddr {
+pub(super) fn canonical_peer(peer: SocketAddr) -> SocketAddr {
     match peer {
         SocketAddr::V6(peer) => match peer.ip().to_ipv4_mapped() {
             Some(ip) => SocketAddr::new(ip.into(), peer.port()),
@@ -70,8 +77,45 @@ fn receive_packet_info(socket: &Socket, ipv4: bool) -> io::Result<()> {
     }
 }
 
+pub(super) fn is_broadcast(ip: Ipv4Addr) -> io::Result<bool> {
+    if ip.is_broadcast() {
+        return Ok(true);
+    }
+    let mut head = ptr::null_mut();
+    // SAFETY: getifaddrs initializes an owned list; all pointers below are
+    // checked before access and the list is freed exactly once.
+    unsafe {
+        if libc::getifaddrs(&mut head) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut current = head;
+        let mut found = false;
+        while let Some(interface) = current.as_ref() {
+            if interface.ifa_flags & libc::IFF_BROADCAST as u32 != 0
+                && !interface.ifa_dstaddr.is_null()
+                && (*interface.ifa_dstaddr).sa_family as i32 == libc::AF_INET
+            {
+                let address = &*interface.ifa_dstaddr.cast::<libc::sockaddr_in>();
+                if Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()) == ip {
+                    found = true;
+                    break;
+                }
+            }
+            current = interface.ifa_next;
+        }
+        libc::freeifaddrs(head);
+        Ok(found)
+    }
+}
+
 impl MacDatagram {
-    pub fn new(socket: &Socket, original: SocketAddr, ipv4: bool) -> io::Result<Self> {
+    pub fn new(
+        socket: &Arc<Socket>,
+        original: SocketAddr,
+        ipv4: bool,
+        id: u64,
+        router: Arc<DatagramRouter>,
+    ) -> io::Result<Self> {
         receive_packet_info(socket, ipv4)?;
         Ok(Self {
             original,
@@ -80,10 +124,50 @@ impl MacDatagram {
             deferred_bind: false,
             saved: VecDeque::new(),
             saved_bytes: 0,
+            router,
+            endpoint: Arc::new(Mutex::new(Endpoint::new(id, original, false))),
+            registered_port: None,
         })
     }
 
+    pub fn bound(
+        &mut self,
+        socket: &Arc<Socket>,
+        actual: SocketAddr,
+        reuse_port: bool,
+        only_v6: bool,
+    ) {
+        let id = self.endpoint.lock().unwrap().id;
+        if let Some(port) = self.registered_port
+            && port != actual.port()
+        {
+            self.router.unregister(id, port);
+        }
+        {
+            let mut entry = self.endpoint.lock().unwrap();
+            entry.bound = actual;
+            entry.socket = Arc::downgrade(socket);
+            entry.only_v6 = only_v6;
+            entry.reuse_port = reuse_port;
+            entry.order = self.router.next_order();
+        }
+        self.router.register(&self.endpoint);
+        self.registered_port = Some(actual.port());
+    }
+
+    pub fn set_reuse_port(&self, enabled: bool) {
+        self.endpoint.lock().unwrap().reuse_port = enabled;
+    }
+
+    fn update_peer(&self) {
+        let mut entry = self.endpoint.lock().unwrap();
+        entry.peer = self.peer;
+        entry.selected = self.selected;
+        entry.order = self.router.next_order();
+    }
+
     fn guest_address(&self, address: SocketAddr) -> SocketAddr {
+        let address = canonical_peer(address);
         if self.original.is_ipv6()
             && let SocketAddr::V4(address) = address
         {
@@ -92,15 +176,30 @@ impl MacDatagram {
         address
     }
 
-    fn bind_if_needed(&mut self, socket: &Socket) -> io::Result<()> {
+    fn bind_if_needed(&mut self, socket: &Arc<Socket>) -> io::Result<()> {
         if self.deferred_bind {
             socket.bind(&self.original.into())?;
+            let actual = socket
+                .local_addr()?
+                .as_socket()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+            let (reuse_port, only_v6) = {
+                let entry = self.endpoint.lock().unwrap();
+                (entry.reuse_port, entry.only_v6)
+            };
+            self.bound(socket, actual, reuse_port, only_v6);
             self.deferred_bind = false;
         }
         Ok(())
     }
 
-    pub fn connect(&mut self, socket: &Socket, destination: SocketAddr) -> io::Result<()> {
+    pub fn connect(&mut self, socket: &Arc<Socket>, destination: SocketAddr) -> io::Result<()> {
+        if !socket.broadcast()?
+            && let IpAddr::V4(ip) = canonical_ip(destination.ip())
+            && is_broadcast(ip)?
+        {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
         self.bind_if_needed(socket)?;
         let probe = Socket::new(Domain::for_address(self.original), Type::DGRAM, None)?;
         probe.set_broadcast(socket.broadcast()?)?;
@@ -123,6 +222,7 @@ impl MacDatagram {
         self.save_received(socket)?;
         self.peer = Some(self.guest_address(peer));
         self.selected = Some(self.guest_address(selected));
+        self.update_peer();
         Ok(())
     }
 
@@ -155,10 +255,14 @@ impl MacDatagram {
         replacement.set_reuse_address(socket.reuse_address()?)?;
         replacement.set_reuse_port(socket.reuse_port()?)?;
         replacement.set_broadcast(socket.broadcast()?)?;
+        replacement.set_keepalive(socket.keepalive()?)?;
         replacement.set_send_buffer_size(socket.send_buffer_size()?)?;
         replacement.set_recv_buffer_size(socket.recv_buffer_size()?)?;
         if self.original.is_ipv6() {
             replacement.set_only_v6(socket.only_v6()?)?;
+            replacement.set_unicast_hops_v6(socket.unicast_hops_v6()?)?;
+        } else {
+            replacement.set_ttl(socket.ttl()?)?;
         }
         receive_packet_info(&replacement, self.original.is_ipv4())?;
         Ok(Some(replacement))
@@ -168,11 +272,18 @@ impl MacDatagram {
         self.selected = None;
         self.peer = None;
         self.deferred_bind = self.original.port() == 0;
+        self.update_peer();
+        if self.deferred_bind
+            && let Some(port) = self.registered_port.take()
+        {
+            self.router
+                .unregister(self.endpoint.lock().unwrap().id, port);
+        }
     }
 
     pub fn send_to(
         &mut self,
-        socket: &Socket,
+        socket: &Arc<Socket>,
         bytes: &[u8],
         destination: SocketAddr,
     ) -> io::Result<usize> {
@@ -244,7 +355,7 @@ impl MacDatagram {
     }
 
     pub fn has_saved(&self) -> bool {
-        !self.saved.is_empty()
+        !self.saved.is_empty() || self.endpoint.lock().unwrap().has_packets()
     }
 
     fn admits(&self, sender: SocketAddr, destination: Option<IpAddr>) -> bool {
@@ -260,44 +371,26 @@ impl MacDatagram {
     /// Capture them before changing that policy or replacing an auto-bound FD.
     /// Limit both storage and work; on pressure the caller keeps the old peer,
     /// delivers captured packets, and the guest can retry the transition.
-    pub fn save_received(&mut self, socket: &Socket) -> io::Result<()> {
-        let mut probe = [MaybeUninit::uninit(); 1];
-        match socket.recv_from_with_flags(&mut probe, libc::MSG_PEEK | libc::MSG_DONTWAIT) {
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-            Err(error) => return Err(error),
-            Ok(_) => {}
+    pub fn save_received(&mut self, _socket: &Socket) -> io::Result<()> {
+        if let Some(port) = self.registered_port {
+            self.router.capture_port(port)?;
         }
-        let mut bytes = vec![MaybeUninit::new(0); MAX_DATAGRAM];
-        for _ in 0..MAX_SAVED_DATAGRAMS {
-            let (length, sender, destination) =
-                match receive_with_destination(socket, &mut bytes, libc::MSG_PEEK) {
-                    Ok(packet) => packet,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                    Err(error) => return Err(error),
-                };
-            let admitted = self.admits(sender, destination);
-            if admitted
-                && (self.saved.len() == MAX_SAVED_DATAGRAMS
-                    || self.saved_bytes + length > MAX_SAVED_BYTES)
-            {
-                return Err(io::Error::from_raw_os_error(libc::ENOBUFS));
-            }
-            // The proxy lock owns the only reader; the peeked datagram remains
-            // first in the socket queue until this receive consumes it.
-            let (length, sender, _) = receive_with_destination(socket, &mut bytes, 0)?;
-            if admitted {
-                // SAFETY: recvmsg initialized exactly the returned prefix.
-                let payload =
-                    unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), length) };
-                self.saved
-                    .push_back((self.guest_address(sender), payload.into()));
-                self.saved_bytes += length;
-            }
-        }
-        match socket.recv_from_with_flags(&mut probe, libc::MSG_PEEK | libc::MSG_DONTWAIT) {
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
-            Err(error) => Err(error),
-            Ok(_) => Err(io::ErrorKind::WouldBlock.into()),
+        loop {
+            let packet = {
+                let mut entry = self.endpoint.lock().unwrap();
+                if let Some(length) = entry.next_len()
+                    && (self.saved.len() == MAX_SAVED_DATAGRAMS
+                        || self.saved_bytes + length > MAX_SAVED_BYTES)
+                {
+                    return Err(io::Error::from_raw_os_error(libc::ENOBUFS));
+                }
+                entry.pop()
+            };
+            let Some((sender, payload)) = packet else {
+                return Ok(());
+            };
+            self.saved_bytes += payload.len();
+            self.saved.push_back((self.guest_address(sender), payload));
         }
     }
 
@@ -314,10 +407,26 @@ impl MacDatagram {
             }
             return Ok((length, sender));
         }
+        let routed = self.endpoint.lock().unwrap().pop();
+        if let Some((sender, payload)) = routed {
+            let length = bytes.len().min(payload.len());
+            for (byte, value) in bytes.iter_mut().zip(&payload[..length]) {
+                byte.write(*value);
+            }
+            return Ok((length, self.guest_address(sender)));
+        }
         // Bound work even if another host process floods this port with packets
         // from a peer which the Linux guest has not connected to.
         for _ in 0..32 {
-            let (length, sender, destination) = receive_with_destination(socket, bytes, 0)?;
+            let (id, port) = {
+                let entry = self.endpoint.lock().unwrap();
+                (entry.id, entry.bound.port())
+            };
+            let Some((length, sender, destination)) =
+                self.router.receive(id, port, socket, bytes)?
+            else {
+                continue;
+            };
             if self.admits(sender, destination) {
                 return Ok((length, self.guest_address(sender)));
             }
@@ -326,7 +435,16 @@ impl MacDatagram {
     }
 }
 
-fn receive_with_destination(
+impl Drop for MacDatagram {
+    fn drop(&mut self) {
+        if let Some(port) = self.registered_port {
+            self.router
+                .unregister(self.endpoint.lock().unwrap().id, port);
+        }
+    }
+}
+
+pub(super) fn receive_with_destination(
     socket: &Socket,
     bytes: &mut [MaybeUninit<u8>],
     flags: i32,
@@ -386,14 +504,68 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn disconnect_replacement_retains_host_socket_options() {
+        for original in ["127.0.0.1:0", "[::1]:0"] {
+            let original: SocketAddr = original.parse().unwrap();
+            let socket =
+                Arc::new(Socket::new(Domain::for_address(original), Type::DGRAM, None).unwrap());
+            socket.set_keepalive(true).unwrap();
+            socket.set_broadcast(true).unwrap();
+            socket.set_reuse_address(true).unwrap();
+            socket.set_reuse_port(true).unwrap();
+            if original.is_ipv6() {
+                socket.set_only_v6(true).unwrap();
+                socket.set_unicast_hops_v6(83).unwrap();
+            } else {
+                socket.set_ttl(37).unwrap();
+            }
+            let adapter = MacDatagram::new(
+                &socket,
+                original,
+                original.is_ipv4(),
+                1,
+                Arc::new(DatagramRouter::new(&utils::epoll::Epoll::new().unwrap()).unwrap()),
+            )
+            .unwrap();
+            let replacement = adapter
+                .replacement_for_disconnect(&socket)
+                .unwrap()
+                .unwrap();
+            assert!(replacement.keepalive().unwrap());
+            assert!(replacement.broadcast().unwrap());
+            assert!(replacement.reuse_address().unwrap());
+            assert!(replacement.reuse_port().unwrap());
+            if original.is_ipv6() {
+                assert!(replacement.only_v6().unwrap());
+                assert_eq!(replacement.unicast_hops_v6().unwrap(), 83);
+            } else {
+                assert_eq!(replacement.ttl().unwrap(), 37);
+            }
+        }
+    }
+
+    #[test]
     fn mapped_ipv4_replies_keep_the_guest_ipv6_family() {
         for bind in ["[::ffff:127.0.0.1]:0", "[::]:0"] {
             let original: SocketAddr = bind.parse().unwrap();
-            let socket = Socket::new(Domain::IPV6, Type::DGRAM, None).unwrap();
+            let socket = Arc::new(Socket::new(Domain::IPV6, Type::DGRAM, None).unwrap());
             socket.set_only_v6(false).unwrap();
             socket.set_nonblocking(true).unwrap();
             socket.bind(&original.into()).unwrap();
-            let mut adapter = MacDatagram::new(&socket, original, false).unwrap();
+            let mut adapter = MacDatagram::new(
+                &socket,
+                original,
+                false,
+                1,
+                Arc::new(DatagramRouter::new(&utils::epoll::Epoll::new().unwrap()).unwrap()),
+            )
+            .unwrap();
+            adapter.bound(
+                &socket,
+                socket.local_addr().unwrap().as_socket().unwrap(),
+                false,
+                false,
+            );
             let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
             peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
             let destination = SocketAddrV6::new(
@@ -420,12 +592,25 @@ mod tests {
     fn queued_reply_limits_preserve_the_old_peer_and_allow_retry() {
         for (payload_size, count) in [(0, MAX_SAVED_DATAGRAMS), (65_507, 4)] {
             let original: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let socket = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
+            let socket = Arc::new(Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap());
             socket.set_recv_buffer_size(128 * 1024).unwrap();
             socket.set_nonblocking(true).unwrap();
             socket.bind(&original.into()).unwrap();
             let bound = socket.local_addr().unwrap().as_socket().unwrap();
-            let mut adapter = MacDatagram::new(&socket, original, true).unwrap();
+            let mut adapter = MacDatagram::new(
+                &socket,
+                original,
+                true,
+                1,
+                Arc::new(DatagramRouter::new(&utils::epoll::Epoll::new().unwrap()).unwrap()),
+            )
+            .unwrap();
+            adapter.bound(
+                &socket,
+                socket.local_addr().unwrap().as_socket().unwrap(),
+                false,
+                false,
+            );
             let first = UdpSocket::bind(original).unwrap();
             socket2::SockRef::from(&first)
                 .set_send_buffer_size(128 * 1024)

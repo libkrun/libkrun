@@ -798,6 +798,10 @@ impl TsiStreamProxy {
 }
 
 impl Proxy for TsiStreamProxy {
+    fn set_host_option(&mut self, req: &super::host_sockopt::OptionRequest) -> Result<(), i32> {
+        req.apply(&self.sock)
+    }
+
     fn bind_host(&mut self, req: &BindRequest) -> Result<VsockAddr, i32> {
         if self.host_bound.is_some() || self.status != ProxyStatus::Idle {
             return Err(-libc::EINVAL);

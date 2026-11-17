@@ -32,6 +32,8 @@ pub struct MuxerThread {
     snapshot_gate: Arc<SnapshotGate>,
     #[cfg(target_os = "macos")]
     host_icmp: Option<Arc<super::macos_icmp::MacIcmp>>,
+    #[cfg(target_os = "macos")]
+    host_udp_router: Option<Arc<super::macos_udp_router::DatagramRouter>>,
 }
 
 impl MuxerThread {
@@ -48,6 +50,9 @@ impl MuxerThread {
         unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
         snapshot_gate: Arc<SnapshotGate>,
         #[cfg(target_os = "macos")] host_icmp: Option<Arc<super::macos_icmp::MacIcmp>>,
+        #[cfg(target_os = "macos")] host_udp_router: Option<
+            Arc<super::macos_udp_router::DatagramRouter>,
+        >,
     ) -> Self {
         MuxerThread {
             cid,
@@ -62,6 +67,8 @@ impl MuxerThread {
             snapshot_gate,
             #[cfg(target_os = "macos")]
             host_icmp,
+            #[cfg(target_os = "macos")]
+            host_udp_router,
         }
     }
 
@@ -266,6 +273,27 @@ impl MuxerThread {
                             );
                         }
 
+                        #[cfg(target_os = "macos")]
+                        if id == super::macos_udp_router::ROUTER_EVENT {
+                            if let Some(router) = &self.host_udp_router {
+                                for recipient in router.take_ready() {
+                                    let update =
+                                        self.proxy_map.read().unwrap().get(&recipient).map(
+                                            |proxy| {
+                                                proxy.lock().unwrap().process_event(EventSet::IN)
+                                            },
+                                        );
+                                    if let Some(update) = update {
+                                        self.process_proxy_update(
+                                            recipient,
+                                            update,
+                                            &mut thread_rng,
+                                        );
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         #[cfg(target_os = "macos")]
                         if super::macos_icmp::MacIcmp::owns_event(id) {
                             if let Some(collector) = &self.host_icmp {

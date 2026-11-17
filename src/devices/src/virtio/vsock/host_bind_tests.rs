@@ -1075,3 +1075,176 @@ fn host_udp_error_routing_rejects_other_flows_and_preserves_backpressure() {
     assert_eq!(rx.used.idx.get(), 1);
     f.release();
 }
+
+#[test]
+fn host_socket_options_require_permission_and_an_existing_proxy() {
+    let wire = [
+        GUEST.to_le_bytes(),
+        1u32.to_le_bytes(),
+        6u32.to_le_bytes(),
+        1u32.to_le_bytes(),
+    ]
+    .concat();
+    for (flags, map, body, expected) in [
+        (TsiFlags::HIJACK_INET, None, wire.as_slice(), -1),
+        (granted(), Some(HashMap::new()), wire.as_slice(), -1),
+        (granted(), None, &wire[..15], -22),
+        (granted(), None, wire.as_slice(), -9),
+    ] {
+        let mut f = Fixture::new(flags, map);
+        f.send(defs::TSI_HOST_SETSOCKOPT, body);
+        let Some(MuxerRx::BindResponse { data, .. }) = f.muxer.rxq.lock().unwrap().pop() else {
+            panic!("missing option status");
+        };
+        let mut response = [0xa5; 136];
+        assert_eq!(data.write(&mut response), 136);
+        assert_eq!(
+            i32::from_le_bytes(response[..4].try_into().unwrap()),
+            expected
+        );
+        assert!(response[4..].iter().all(|byte| *byte == 0));
+        assert!(f.muxer.proxy_map.read().unwrap().is_empty());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn shared_udp_redirects_survive_guest_receive_backpressure() {
+    use super::super::host_datagram::{FRAME_HEADER, wait_readable};
+    let mut f = Fixture::new(granted(), None);
+    f.muxer.floor = FloorMode::MetadataOnly;
+    f.create(defs::SOCK_DGRAM, defs::LINUX_AF_INET);
+    let bound = f.bind("0.0.0.0:0".parse().unwrap()).unwrap();
+    f.send(
+        defs::TSI_HOST_SETSOCKOPT,
+        &[
+            GUEST.to_le_bytes(),
+            1u32.to_le_bytes(),
+            2u32.to_le_bytes(),
+            1u32.to_le_bytes(),
+        ]
+        .concat(),
+    );
+    let Some(MuxerRx::BindResponse { data, .. }) = f.muxer.rxq.lock().unwrap().pop() else {
+        panic!("missing option status");
+    };
+    let mut status = [0; 136];
+    data.write(&mut status);
+    assert_eq!(i32::from_le_bytes(status[..4].try_into().unwrap()), 0);
+    let second = GUEST + 1;
+    f.send(
+        defs::TSI_PROXY_CREATE,
+        &[
+            &second.to_le_bytes()[..],
+            &defs::LINUX_AF_INET.to_le_bytes(),
+            &defs::SOCK_DGRAM.to_le_bytes(),
+        ]
+        .concat(),
+    );
+    let addr = VsockAddr::from(bound);
+    f.send(
+        defs::TSI_BIND,
+        &[
+            &second.to_le_bytes()[..],
+            &addr.linux_len().to_le_bytes(),
+            &1u32.to_le_bytes(),
+            &addr.to_linux_bytes(),
+        ]
+        .concat(),
+    );
+    assert_eq!(f.bind_result().unwrap(), bound);
+    let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let destination = SocketAddr::from(([127, 0, 0, 1], bound.port()));
+    for payload in [b"".as_slice(), b"redirected".as_slice()] {
+        sender.send_to(payload, destination).unwrap();
+    }
+    let first_id = ((GUEST as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+    let second_id = ((second as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+    {
+        let map = f.muxer.proxy_map.read().unwrap();
+        let mut proxy = map[&first_id].lock().unwrap();
+        wait_readable(proxy.poll_handle());
+        assert!(!proxy.process_event(EventSet::IN).signal_queue);
+    }
+    assert!(
+        f.muxer
+            .pending_datagram_rx
+            .lock()
+            .unwrap()
+            .contains(&first_id)
+    );
+    // The packets already arrived for the second (latest) binding before
+    // it changes peer, even though Darwin stored them on the first FD.
+    let alternate = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let peer = VsockAddr::from(alternate.local_addr().unwrap());
+    f.send(
+        defs::TSI_CONNECT,
+        &[
+            &second.to_le_bytes()[..],
+            &peer.linux_len().to_le_bytes(),
+            &peer.to_linux_bytes(),
+        ]
+        .concat(),
+    );
+    assert!(matches!(
+        f.muxer.rxq.lock().unwrap().pop(),
+        Some(MuxerRx::ConnResponse { result: 0, .. })
+    ));
+    let mem = f.mem.clone();
+    let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+    rx.dtable[0].set(0x30000, (VSOCK_PKT_HDR_SIZE + 512) as u32, 2, 0);
+    rx.avail.ring[0].set(0);
+    rx.avail.idx.set(1);
+    let delivered = f.muxer.resume_datagram_rx();
+    let router = f.muxer.host_udp_router.as_ref().unwrap().as_ref().unwrap();
+    assert_eq!(router.take_ready(), [second_id]);
+    if !delivered {
+        let map = f.muxer.proxy_map.read().unwrap();
+        assert!(
+            map[&second_id]
+                .lock()
+                .unwrap()
+                .process_event(EventSet::IN)
+                .signal_queue
+        );
+    }
+    assert_eq!(
+        mem.read_obj::<u32>(GuestAddress(0x30000 + 20)).unwrap(),
+        second,
+        "queued packets must retain the recipient selected before the peer change"
+    );
+    assert_eq!(
+        rx.used.ring[0].get().len as usize,
+        VSOCK_PKT_HDR_SIZE + FRAME_HEADER
+    );
+    assert!(
+        f.muxer
+            .pending_datagram_rx
+            .lock()
+            .unwrap()
+            .contains(&second_id)
+    );
+    rx.avail.ring[1].set(0);
+    rx.avail.idx.set(2);
+    assert!(f.muxer.resume_datagram_rx());
+    let mut payload = [0; 10];
+    mem.read_slice(
+        &mut payload,
+        GuestAddress(0x30000 + (VSOCK_PKT_HDR_SIZE + FRAME_HEADER) as u64),
+    )
+    .unwrap();
+    assert_eq!(&payload, b"redirected");
+    rx.avail.ring[2].set(0);
+    rx.avail.idx.set(3);
+    assert!(!f.muxer.resume_datagram_rx());
+    assert_eq!(rx.used.idx.get(), 2);
+    f.send(
+        defs::TSI_PROXY_RELEASE,
+        &[
+            &second.to_le_bytes()[..],
+            &defs::TSI_PROXY_PORT.to_le_bytes(),
+        ]
+        .concat(),
+    );
+    f.release();
+}
