@@ -2229,8 +2229,7 @@ impl<'a> AttachDevice<'a> for InputDevice<'a> {
         let input = Input::new(config_backend, events_backend)
             .map_err(|e| VmmError::Internal(format!("input: {e:?}")))?;
         let inner = Arc::new(Mutex::new(input));
-        let id = inner.lock().unwrap().id().to_string();
-        ctx.register(&id, inner)
+        ctx.register(&format!("virtio_input{}", ctx.device_index()), inner)
     }
 }
 
