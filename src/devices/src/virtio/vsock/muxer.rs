@@ -629,6 +629,7 @@ impl VsockMuxer {
                 queue.clone(),
                 self.rxq.clone(),
                 self.snapshot_gate.clone(),
+                self.tsi_flags.contains(TsiFlags::HOST_BIND),
             ) {
                 Ok(mut proxy) => {
                     let rc = proxy.relisten(d.guest_port, d.backlog, &self.host_port_map);
@@ -743,6 +744,7 @@ impl VsockMuxer {
                         queue.clone(),
                         self.rxq.clone(),
                         self.snapshot_gate.clone(),
+                        self.tsi_flags.contains(TsiFlags::HOST_BIND),
                     ) {
                         Ok(proxy) => {
                             self.proxy_map
@@ -1001,7 +1003,7 @@ impl VsockMuxer {
             .data()
             .and_then(super::host_sockopt::OptionRequest::parse)
         {
-            let id = ((req.peer_port as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+            let id = ((req.peer_port as u64) << 32) | req.local_port as u64;
             let proxies = self.proxy_map.read().unwrap();
             match proxies.get(&id) {
                 Some(proxy) => proxy.lock().unwrap().set_host_option(&req),

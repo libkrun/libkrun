@@ -24,6 +24,7 @@ fn stream_fixture(ip: IpAddr) -> (TsiStreamProxy, VsockPacket) {
         Arc::new(Mutex::new(queue)),
         Arc::new(Mutex::new(MuxerRxQ::new())),
         Arc::new(SnapshotGate::default()),
+        true,
     )
     .unwrap();
     let tx = TestQueue::new(GuestAddress(0x3000), &mem, 8);
@@ -183,6 +184,8 @@ fn redirected_connections_keep_guest_address_family_and_explicit_reservations() 
                 }),
             ] {
                 let (mut proxy, pkt) = stream_fixture(guest_ip);
+                proxy.sock.set_nodelay(true).unwrap();
+                assert!(!proxy.sock.keepalive().unwrap());
                 let domain = if guest_ip.is_ipv4() {
                     Domain::IPV4
                 } else {
@@ -217,6 +220,11 @@ fn redirected_connections_keep_guest_address_family_and_explicit_reservations() 
                         addr: destination.into(),
                     },
                     &intercept,
+                );
+                assert!(proxy.sock.nodelay().unwrap());
+                assert!(
+                    !proxy.sock.keepalive().unwrap(),
+                    "redirect must not enable idle probes"
                 );
                 // Accepting the TCP connection does not complete the guest dial;
                 // the interceptor must receive the preamble and give a verdict.
@@ -279,5 +287,13 @@ fn redirected_connections_keep_guest_address_family_and_explicit_reservations() 
                 }
             }
         }
+    }
+}
+
+#[test]
+fn host_stream_does_not_enable_keepalive_without_a_guest_request() {
+    for ip in ["127.0.0.1", "::1"] {
+        let (proxy, _) = stream_fixture(ip.parse().unwrap());
+        assert!(!proxy.sock.keepalive().unwrap());
     }
 }

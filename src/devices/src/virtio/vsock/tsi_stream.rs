@@ -114,6 +114,7 @@ impl TsiStreamProxy {
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
         snapshot_gate: Arc<SnapshotGate>,
+        host_network: bool,
     ) -> Result<Self, ProxyError> {
         let (family, domain) = match family {
             defs::LINUX_AF_INET => (Family::Inet, Domain::IPV4),
@@ -139,12 +140,13 @@ impl TsiStreamProxy {
             let _ = sock.set_only_v6(false);
         }
 
-        // Enable TCP keepalive to prevent silent drops on idle INET connections.
+        // Legacy forwarding uses transport keepalive. Host-network sockets start
+        // with Linux SO_KEEPALIVE disabled and follow the guest application.
         #[cfg(target_os = "linux")]
         let is_unix = family == Family::Unix;
         #[cfg(not(target_os = "linux"))]
         let is_unix = false;
-        if !is_unix {
+        if !host_network && !is_unix {
             let ka = socket2::TcpKeepalive::new()
                 .with_time(std::time::Duration::from_secs(60))
                 .with_interval(std::time::Duration::from_secs(15));
@@ -927,11 +929,12 @@ impl Proxy for TsiStreamProxy {
         if self.family != wanted.0 {
             match Socket::new(wanted.1, Type::STREAM, None) {
                 Ok(sock) => {
-                    let _ = sock.set_nonblocking(true);
-                    let ka = socket2::TcpKeepalive::new()
-                        .with_time(std::time::Duration::from_secs(60))
-                        .with_interval(std::time::Duration::from_secs(15));
-                    let _ = sock.set_tcp_keepalive(&ka);
+                    if let Err(error) = sock
+                        .set_nonblocking(true)
+                        .and_then(|()| super::host_sockopt::copy_tcp_options(&self.sock, &sock))
+                    {
+                        return self.dial(Err(error));
+                    }
                     let original = std::mem::replace(&mut self.sock, sock);
                     if self.host_bound.is_some() {
                         self.intercept_reservation = Some(original);

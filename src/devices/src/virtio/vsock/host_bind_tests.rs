@@ -1080,6 +1080,7 @@ fn host_udp_error_routing_rejects_other_flows_and_preserves_backpressure() {
 fn host_socket_options_require_permission_and_an_existing_proxy() {
     let wire = [
         GUEST.to_le_bytes(),
+        defs::TSI_PROXY_PORT.to_le_bytes(),
         1u32.to_le_bytes(),
         6u32.to_le_bytes(),
         1u32.to_le_bytes(),
@@ -1088,7 +1089,7 @@ fn host_socket_options_require_permission_and_an_existing_proxy() {
     for (flags, map, body, expected) in [
         (TsiFlags::HIJACK_INET, None, wire.as_slice(), -1),
         (granted(), Some(HashMap::new()), wire.as_slice(), -1),
-        (granted(), None, &wire[..15], -22),
+        (granted(), None, &wire[..19], -22),
         (granted(), None, wire.as_slice(), -9),
     ] {
         let mut f = Fixture::new(flags, map);
@@ -1119,6 +1120,7 @@ fn shared_udp_redirects_survive_guest_receive_backpressure() {
         defs::TSI_HOST_SETSOCKOPT,
         &[
             GUEST.to_le_bytes(),
+            defs::TSI_PROXY_PORT.to_le_bytes(),
             1u32.to_le_bytes(),
             2u32.to_le_bytes(),
             1u32.to_le_bytes(),
@@ -1247,4 +1249,60 @@ fn shared_udp_redirects_survive_guest_receive_backpressure() {
         .concat(),
     );
     f.release();
+}
+
+#[test]
+fn accepted_socket_options_target_the_child_not_its_listener() {
+    use super::super::proxy::Family;
+    use socket2::{Domain, Socket, Type};
+    let mut f = Fixture::new(granted(), None);
+    let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    let accepted = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    let child_port = 4242u32;
+    for (port, socket) in [(defs::TSI_PROXY_PORT, &listener), (child_port, &accepted)] {
+        let id = ((GUEST as u64) << 32) | port as u64;
+        let proxy = TsiStreamProxy::new_reverse(
+            id,
+            3,
+            0,
+            Family::Inet,
+            port,
+            GUEST,
+            socket.try_clone().unwrap(),
+            f.mem.clone(),
+            f.muxer.queue.as_ref().unwrap().clone(),
+            f.muxer.rxq.clone(),
+            f.muxer.snapshot_gate.clone(),
+        );
+        f.muxer
+            .proxy_map
+            .write()
+            .unwrap()
+            .insert(id, Mutex::new(Box::new(proxy)));
+    }
+    f.send(
+        defs::TSI_HOST_SETSOCKOPT,
+        &[
+            GUEST.to_le_bytes(),
+            child_port.to_le_bytes(),
+            6u32.to_le_bytes(),
+            1u32.to_le_bytes(),
+            1u32.to_le_bytes(),
+        ]
+        .concat(),
+    );
+    let Some(MuxerRx::BindResponse { data, .. }) = f.muxer.rxq.lock().unwrap().pop() else {
+        panic!("missing option reply");
+    };
+    let mut status = [0u8; 136];
+    data.write(&mut status);
+    assert_eq!(i32::from_le_bytes(status[..4].try_into().unwrap()), 0);
+    assert!(
+        accepted.nodelay().unwrap(),
+        "accepted transport must receive the option"
+    );
+    assert!(
+        !listener.nodelay().unwrap(),
+        "listener must retain its options"
+    );
 }
