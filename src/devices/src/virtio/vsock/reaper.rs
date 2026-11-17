@@ -4,7 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::proxy::Proxy;
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
 // Grace period before removing a closed proxy from the map.
@@ -68,8 +68,15 @@ impl ReaperThread {
     fn work(&mut self) {
         loop {
             let timeout = self.check_expiration();
-            if let Ok(id) = self.receiver.recv_timeout(timeout) {
-                self.released_map.insert(id, Instant::now());
+            match self.receiver.recv_timeout(timeout) {
+                Ok(id) => {
+                    self.released_map.insert(id, Instant::now());
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                // Once the muxer is gone there is no future release to wait
+                // for. Retaining its map here leaked sockets and spun on the
+                // permanently disconnected channel during VMM teardown.
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
     }
@@ -85,6 +92,25 @@ impl ReaperThread {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_the_muxer_releases_the_reaper_and_its_proxy_map() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let map: ProxyMap = Arc::new(RwLock::new(HashMap::new()));
+        let weak = Arc::downgrade(&map);
+        let (finished, done) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            let mut reaper = ReaperThread::new(receiver, map);
+            reaper.work();
+            drop(reaper);
+            finished.send(()).unwrap();
+        });
+        drop(sender);
+        done.recv_timeout(Duration::from_secs(2))
+            .expect("reaper retained a destroyed muxer");
+        worker.join().unwrap();
+        assert!(weak.upgrade().is_none());
+    }
 
     #[test]
     fn proxies_released_in_the_same_instant_still_expire() {
