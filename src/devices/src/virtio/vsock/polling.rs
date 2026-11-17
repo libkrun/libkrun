@@ -48,7 +48,7 @@ mod tests {
         let fd = proxy.poll_handle();
         let proxies: ProxyMap = Arc::new(RwLock::new(HashMap::from([(
             2,
-            Mutex::new(Box::new(proxy) as Box<dyn Proxy>),
+            Arc::new(Mutex::new(Box::new(proxy) as Box<dyn Proxy>)),
         )])));
         let mut epoll = Epoll::new().unwrap();
         update_live_polling(&proxies, &epoll, 2, fd, EventSet::IN);

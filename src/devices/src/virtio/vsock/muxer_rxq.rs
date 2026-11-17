@@ -100,6 +100,48 @@ impl MuxerRxQ {
 
 pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
     match rx {
+        MuxerRx::HostSendResponse {
+            peer_port,
+            sequence,
+            result,
+        } => {
+            pkt.set_op(uapi::VSOCK_OP_RW)
+                .set_src_cid(uapi::VSOCK_HOST_CID)
+                .set_dst_cid(cid)
+                .set_src_port(defs::TSI_HOST_SENDTO_ADDR)
+                .set_dst_port(peer_port)
+                .set_type(uapi::VSOCK_TYPE_DGRAM)
+                .set_flags(0)
+                .set_buf_alloc(0)
+                .set_fwd_cnt(0);
+            let len = if let Some(buf) = pkt.buf_mut().and_then(|buf| buf.get_mut(..12)) {
+                buf[..8].copy_from_slice(&sequence.to_le_bytes());
+                buf[8..12].copy_from_slice(&result.to_le_bytes());
+                12
+            } else {
+                0
+            };
+            pkt.set_len(len);
+        }
+
+        MuxerRx::BindResponse {
+            local_port,
+            peer_port,
+            data,
+        } => {
+            pkt.set_op(uapi::VSOCK_OP_RW)
+                .set_src_cid(uapi::VSOCK_HOST_CID)
+                .set_dst_cid(cid)
+                .set_src_port(local_port)
+                .set_dst_port(peer_port)
+                .set_type(uapi::VSOCK_TYPE_DGRAM)
+                .set_flags(0)
+                .set_buf_alloc(0)
+                .set_fwd_cnt(0);
+            let len = pkt.buf_mut().map(|buf| data.write(buf)).unwrap_or(0);
+            pkt.set_len(len as u32);
+        }
+
         MuxerRx::Reset {
             local_port,
             peer_port,

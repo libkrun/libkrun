@@ -68,9 +68,10 @@ const MAX_CONNECT_RETRIES: u32 = 10000;
 fn proxy_sock_create(id: u64) -> Result<Socket, ProxyError> {
     let sock = Socket::new(Domain::UNIX, Type::STREAM, None).map_err(ProxyError::CreatingSocket)?;
 
-    if let Err(e) = sock.set_nonblocking(true) {
-        warn!("error switching to non-blocking: id={id}, err={e}");
-    }
+    sock.set_nonblocking(true).map_err(|error| {
+        warn!("error switching to non-blocking: id={id}, err={error}");
+        ProxyError::CreatingSocket(error)
+    })?;
 
     Ok(sock)
 }
@@ -811,8 +812,7 @@ impl UnixAcceptorProxy {
             id, path, peer_port
         );
 
-        let sock =
-            Socket::new(Domain::UNIX, Type::STREAM, None).map_err(ProxyError::CreatingSocket)?;
+        let sock = proxy_sock_create(id)?;
         debug!(
             "[VSOCK_TIMING] UnixAcceptorProxy socket created in {:?}",
             start.elapsed()
@@ -904,7 +904,12 @@ impl Proxy for UnixAcceptorProxy {
             );
             let accept_start = std::time::Instant::now();
 
-            match self.sock.accept() {
+            // Linux does not inherit O_NONBLOCK from a listener; require it
+            // before exposing this connection to the shared forwarding loop.
+            match self.sock.accept().and_then(|(socket, address)| {
+                socket.set_nonblocking(true)?;
+                Ok((socket, address))
+            }) {
                 Ok((new_sock, _addr)) => {
                     debug!(
                         "[VSOCK_TIMING] UnixAcceptorProxy id={:#x} accepted connection in {:?}",
@@ -918,6 +923,7 @@ impl Proxy for UnixAcceptorProxy {
                         NewProxyType::Unix,
                     ));
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => warn!("error accepting connection: id={}, err={}", self.id, e),
             };
             update.signal_queue = true;
@@ -945,6 +951,89 @@ mod tests {
 
     const HDR: u64 = 0x10000;
     const DATA: u64 = 0x11000;
+
+    #[cfg(unix)]
+    struct SocketFile(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for SocketFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn acceptor() -> (UnixAcceptorProxy, SocketFile) {
+        let path = std::env::temp_dir().join(format!("krun-ipc-{:x}", rand::random::<u64>()));
+        let listener = UnixAcceptorProxy::new(1, &path, 2048).unwrap();
+        (listener, SocketFile(path))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ipc_listener_does_not_wait_on_stale_readiness() {
+        let (mut listener, _file) = acceptor();
+        assert!(listener.sock.nonblocking().unwrap());
+        // Readiness may be stale; an empty accept queue must not stop the muxer.
+        let update = listener.process_event(EventSet::IN);
+        assert!(update.new_proxy.is_none());
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ipc_accepted_socket_yields_under_backpressure_and_resumes() {
+        let (mut listener, file) = acceptor();
+        let address = utils::SocketPath::new(&file.0).unwrap();
+        let mut peer = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        peer.connect(&SockAddr::unix(address.path()).unwrap())
+            .unwrap();
+        let update = listener.process_event(EventSet::IN);
+        let (_, socket, _, NewProxyType::Unix) = update.new_proxy.unwrap() else {
+            panic!("expected an accepted IPC socket");
+        };
+        assert!(socket.nonblocking().unwrap());
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
+        let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+        let (mut proxy, unused_peer) = proxy_with_peer(&mem, &rx);
+        drop(unused_peer);
+        proxy.sock = socket;
+        proxy.status = ProxyStatus::Connected;
+        proxy.sock.set_send_buffer_size(4096).unwrap();
+        peer.set_recv_buffer_size(4096).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        proxy.tx_buf.resize(defs::CONN_TX_BUF_SIZE, 0x5a);
+        assert!(proxy.flush_tx().unwrap());
+        assert!(
+            !proxy.tx_buf.is_empty(),
+            "the unread peer must exert pressure"
+        );
+        assert!(proxy.repoll().unwrap().2.contains(EventSet::OUT));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut received = Vec::new();
+        while received.len() < defs::CONN_TX_BUF_SIZE {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "IPC forwarding stalled"
+            );
+            let mut bytes = [0; 8192];
+            match peer.read(&mut bytes) {
+                Ok(0) => panic!("IPC socket closed before all bytes arrived"),
+                Ok(count) => received.extend_from_slice(&bytes[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("IPC read failed: {error}"),
+            }
+            proxy.process_event(EventSet::OUT);
+        }
+        assert_eq!(received, vec![0x5a; defs::CONN_TX_BUF_SIZE]);
+        assert!(proxy.tx_buf.is_empty());
+        assert_eq!(proxy.tx_cnt.0 as usize, received.len());
+        assert!(!proxy.repoll().unwrap().2.contains(EventSet::OUT));
+    }
 
     fn proxy_with_peer(mem: &GuestMemoryMmap, rx: &TestQueue) -> (UnixProxy, Socket) {
         let (ours, peer) = Socket::pair(Domain::UNIX, Type::STREAM, None).unwrap();

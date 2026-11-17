@@ -4,11 +4,16 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
+use std::time::Instant;
 
 use socket2::Socket;
 
+use super::host_bind::BindRequest;
+use super::host_send::PendingHostSend;
+use super::host_sockopt::SocketBuffers;
 use super::muxer::MuxerRx;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
+use super::vsock_addr::VsockAddr;
 use serde::{Deserialize, Serialize};
 use utils::epoll::EventSet;
 
@@ -120,12 +125,12 @@ pub enum ProxyRemoval {
     Keep,
     Immediate,
     Deferred,
+    /// Guest has closed; drain accepted output with a bounded idle lifetime.
+    Drain,
 }
 
-#[derive(Default)]
 pub enum NewProxyType {
-    #[default]
-    Tcp,
+    Tcp(SocketBuffers),
     /// Host-IPC AF_UNIX connection accepted by `UnixAcceptorProxy`. Available on
     /// all platforms with AF_UNIX support (Unix and Windows).
     Unix,
@@ -188,6 +193,17 @@ impl StreamIntercept {
 }
 
 pub trait Proxy: Send {
+    /// Deadline for a guest-released stream that still owns accepted output.
+    fn drain_deadline(&self) -> Option<Instant> {
+        None
+    }
+
+    fn close_host_stream(
+        &mut self,
+        _request: &super::host_close::CloseRequest,
+    ) -> (i32, ProxyUpdate) {
+        (-95, ProxyUpdate::default())
+    }
     /// Raw handle the muxer registers with the epoll layer for this proxy's host
     /// socket. Cross-platform replacement for the former `AsRawFd` supertrait.
     fn poll_handle(&self) -> ProxyRawHandle;
@@ -197,6 +213,37 @@ pub trait Proxy: Send {
     /// Whether this proxy is a UDP/datagram proxy. The muxer uses this to gate
     /// DNS interception to datagram sockets only.
     fn is_dgram(&self) -> bool {
+        false
+    }
+    /// Reserve a host address before listen/send, returning the actual address
+    /// chosen for port zero. Host IPC and other proxies cannot use this path.
+    fn set_host_option(&mut self, _req: &super::host_sockopt::OptionRequest) -> Result<(), i32> {
+        Err(-95)
+    }
+
+    fn bind_host(&mut self, _req: &BindRequest) -> Result<VsockAddr, i32> {
+        Err(-95) // Linux EOPNOTSUPP, including on non-Linux hosts.
+    }
+    fn prepare_host_send(&mut self, _send: PendingHostSend) -> Result<(), i32> {
+        Err(-95)
+    }
+    #[cfg(target_os = "macos")]
+    fn receive_host_error(
+        &mut self,
+        _error: &super::macos_icmp::DatagramError,
+    ) -> Option<ProxyUpdate> {
+        None
+    }
+    fn clear_sendto_addr(&mut self) {}
+    fn disconnect_host_datagram(&mut self) -> (Result<(), i32>, ProxyUpdate) {
+        (Err(-95), ProxyUpdate::default())
+    }
+    fn receive_dns(
+        &mut self,
+        _reply: super::dns_filter::HostDnsReply,
+        _data: Vec<u8>,
+        _activity: &super::snapshot_gate::SnapshotActivity<'_>,
+    ) -> bool {
         false
     }
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate;
@@ -225,6 +272,9 @@ pub trait Proxy: Send {
     ) -> ProxyUpdate;
     fn accept(&mut self, req: TsiAcceptReq) -> ProxyUpdate;
     fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
+    fn request_credit(&mut self) -> ProxyUpdate {
+        ProxyUpdate::default()
+    }
     fn push_op_request(&self) {}
     fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
     fn enqueue_accept(&mut self) {}

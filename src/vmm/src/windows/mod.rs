@@ -14,4 +14,5 @@
 //! such a host to validate are marked with `TODO(whp-host)`.
 
 pub mod lazy_mem;
+pub(crate) mod snapshot_memory;
 pub mod vstate;

@@ -26,6 +26,17 @@ impl SnapshotGate {
         SnapshotActivity { gate: self }
     }
 
+    /// A producer holding a proxy lock must never wait for snapshot release:
+    /// reset may need that same lock while the gate is closed.
+    pub(super) fn try_enter(&self) -> Option<SnapshotActivity<'_>> {
+        let mut state = self.state.lock().unwrap();
+        if state.paused || state.transport_reset {
+            return None;
+        }
+        state.active += 1;
+        Some(SnapshotActivity { gate: self })
+    }
+
     pub(super) fn pause(&self) {
         let mut state = self.state.lock().unwrap();
         state.paused = true;
@@ -68,7 +79,7 @@ impl SnapshotGate {
     }
 }
 
-pub(super) struct SnapshotActivity<'a> {
+pub struct SnapshotActivity<'a> {
     gate: &'a SnapshotGate,
 }
 
@@ -88,6 +99,21 @@ mod tests {
     use std::time::Duration;
 
     use super::SnapshotGate;
+
+    #[test]
+    fn a_producer_holding_other_locks_never_waits_at_a_closed_gate() {
+        let gate = SnapshotGate::default();
+        gate.pause();
+        assert!(gate.try_enter().is_none());
+        gate.resume();
+        drop(gate.try_enter().unwrap());
+        gate.hold_for_transport_reset();
+        assert!(gate.try_enter().is_none());
+        gate.release_transport_reset();
+        drop(gate.try_enter().unwrap());
+        gate.pause(); // all successful entries were released
+        gate.resume();
+    }
 
     #[test]
     fn transport_reset_hold_blocks_writers_until_released() {

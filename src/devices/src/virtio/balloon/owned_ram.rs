@@ -46,6 +46,7 @@ pub fn mark_guest_ram_shared() {
 
 /// Run `release` if `file` is a RAM file this VMM owns and has not shared,
 /// holding off [`mark_guest_ram_shared`] until it returns. `None` otherwise.
+#[cfg(unix)]
 pub(crate) fn with_owned_backing<R>(file: &File, release: impl FnOnce() -> R) -> Option<R> {
     let shared = SHARED.read().unwrap_or_else(|e| e.into_inner());
     if *shared {

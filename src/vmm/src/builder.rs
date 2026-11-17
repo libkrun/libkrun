@@ -20,7 +20,9 @@ use std::os::fd::{BorrowedFd, FromRawFd};
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle};
 #[cfg(windows)]
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
+use std::sync::atomic::AtomicI32;
+#[cfg(unix)]
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use utils::windows::SendHandle;
@@ -127,6 +129,8 @@ use vm_memory::{FileOffset, GuestAddress, GuestMemoryMmap};
 /// Errors associated with starting the instance.
 #[derive(Debug)]
 pub enum StartMicrovmError {
+    /// Host networking requires a matching kernel protocol.
+    HostNetwork(&'static str),
     /// Unable to attach block device to Vmm.
     AttachBlockDevice(io::Error),
     #[cfg(target_os = "macos")]
@@ -356,6 +360,7 @@ impl Display for StartMicrovmError {
                 f,
                 "The kernel doesn't fit in the microVM memory (load_addr={load_addr}, size={size})"
             ),
+            HostNetwork(message) => write!(f, "Host networking is unavailable: {message}"),
             KernelFormatUnsupported => {
                 write!(f, "The supplied kernel format is not supported.")
             }
@@ -648,6 +653,11 @@ pub fn build_microvm(
     // a cloned RestoreCtx until vCPU restore would otherwise keep the complete
     // inherited mapping resident alongside the promoted copy (2x guest RAM).
     let restoring = restore.is_some();
+    if restoring && vm_resources.vsock.tsi_flags().contains(TsiFlags::HOST_BIND) {
+        return Err(StartMicrovmError::HostNetwork(
+            "checkpoint restore has no negotiated host-network protocol",
+        ));
+    }
     #[cfg(target_os = "linux")]
     let (
         restore_mem,
@@ -912,10 +922,10 @@ pub fn build_microvm(
     // another host. macOS guests boot without pointer authentication, which
     // keeps every checkpoint restorable on Linux arm64.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    kernel_cmdline.insert_str("arm64.nopauth").unwrap();
+    kernel_cmdline.insert_kernel_arg("arm64.nopauth")?;
 
     if let Some(cmdline) = &vm_resources.kernel_cmdline.krun_env {
-        kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+        kernel_cmdline.insert_kernel_args(cmdline.as_str())?;
     }
 
     if let Some(kernel_console) = &vm_resources.kernel_console {
@@ -1700,10 +1710,10 @@ pub fn build_microvm(
         attach_unixsock_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
         let tsi_flags = vm_resources.vsock.tsi_flags();
         if tsi_flags.contains(TsiFlags::HIJACK_INET) {
-            vmm.kernel_cmdline.insert_str("tsi_hijack")?;
+            vmm.kernel_cmdline.insert_kernel_arg("tsi_hijack")?;
         }
         if tsi_flags.contains(TsiFlags::HIJACK_UNIX) {
-            vmm.kernel_cmdline.insert_str("tsi_hijack_unix")?;
+            vmm.kernel_cmdline.insert_kernel_arg("tsi_hijack_unix")?;
         }
     }
 
@@ -1717,18 +1727,18 @@ pub fn build_microvm(
     // as a fallback, so the PIT broadcast tick is not needed.
     #[cfg(target_os = "windows")]
     if !whp::enlightened() && std::env::var_os("SMOLVM_WHP_LAPIC_TIMER").is_none() {
-        vmm.kernel_cmdline.insert_str("nolapic_timer")?;
+        vmm.kernel_cmdline.insert_kernel_arg("nolapic_timer")?;
     }
     #[cfg(target_os = "windows")]
     if let Ok(extra) = std::env::var("SMOLVM_WHP_CMDLINE") {
-        vmm.kernel_cmdline.insert_str(&extra)?;
+        vmm.kernel_cmdline.insert_kernel_args(&extra)?;
     }
 
     #[cfg(feature = "net")]
     attach_net_devices(&mut vmm, &vm_resources.net, intc.clone())?;
     #[cfg(feature = "net")]
     if vm_resources.dhcp_client {
-        vmm.kernel_cmdline.insert_str("KRUN_DHCP=1")?;
+        vmm.kernel_cmdline.insert_kernel_arg("KRUN_DHCP=1")?;
     }
 
     // Live virtio-fs devices are registered after every other device, so adding
@@ -1753,16 +1763,25 @@ pub fn build_microvm(
     if !restoring && vmm.prototype_cpu_topology.is_some() {
         // Kernel options must precede the epilog's `--` application separator.
         vmm.kernel_cmdline
-            .insert_str(format!("maxcpus={}", vcpus.len()))?;
+            .insert_kernel_arg(&format!("maxcpus={}", vcpus.len()))?;
     }
     #[cfg(target_os = "macos")]
     if !restoring && vmm.mac_cpu_topology.is_some() {
         vmm.kernel_cmdline
-            .insert_str(format!("maxcpus={}", vcpu_config.vcpu_count))?;
+            .insert_kernel_arg(&format!("maxcpus={}", vcpu_config.vcpu_count))?;
     }
     if let Some(s) = &vm_resources.kernel_cmdline.epilog {
         vmm.kernel_cmdline.insert_str(s).unwrap();
     };
+    if vm_resources.vsock.get().is_some() {
+        vmm.kernel_cmdline.insert_kernel_arg(
+            if vm_resources.vsock.tsi_flags().contains(TsiFlags::HOST_BIND) {
+                "tsi_host_network=1"
+            } else {
+                "tsi_host_network=0"
+            },
+        )?;
+    }
     vmm_timing!("devices attached");
 
     // Boot-time system configuration (cmdline, zero-page/FDT, boot regs) is
@@ -1876,6 +1895,7 @@ fn load_external_kernel(
     guest_mem: &GuestMemoryMmap,
     arch_mem_info: &ArchMemoryInfo,
     external_kernel: &ExternalKernel,
+    host_network: bool,
 ) -> std::result::Result<
     (GuestAddress, Option<InitrdConfig>, Option<String>, bool),
     StartMicrovmError,
@@ -1890,6 +1910,9 @@ fn load_external_kernel(
         KernelFormat::Raw => {
             let data: Vec<u8> = std::fs::read(external_kernel.path.clone())
                 .map_err(StartMicrovmError::RawOpenKernel)?;
+            if host_network {
+                crate::host_network::require_image(&data)?;
+            }
             guest_mem.write(&data, GuestAddress(0x8000_0000)).unwrap();
             GuestAddress(0x8000_0000)
         }
@@ -1913,6 +1936,9 @@ fn load_external_kernel(
                 .map_err(StartMicrovmError::ElfOpenKernel)?;
             let load_result = loader::Elf::load(guest_mem, None, &mut file, None)
                 .map_err(StartMicrovmError::ElfLoadKernel)?;
+            if host_network {
+                crate::host_network::require_loaded(guest_mem, load_result.kernel_end)?;
+            }
             match load_result.pvh_boot_cap {
                 loader::PvhBootCapability::PvhEntryPresent(guest_address) => {
                     pvh = true;
@@ -1935,6 +1961,9 @@ fn load_external_kernel(
                 let mut kernel_data: Vec<u8> = Vec::new();
                 gz.read_to_end(&mut kernel_data)
                     .map_err(StartMicrovmError::PeGzDecoder)?;
+                if host_network {
+                    crate::host_network::require_image(&kernel_data)?;
+                }
                 guest_mem
                     .write(&kernel_data, GuestAddress(0x8000_0000))
                     .unwrap();
@@ -1961,6 +1990,9 @@ fn load_external_kernel(
                     None,
                 )
                 .map_err(StartMicrovmError::ImageBz2LoadKernel)?;
+                if host_network {
+                    crate::host_network::require_loaded(guest_mem, load_result.kernel_end)?;
+                }
                 load_result.kernel_load
             } else {
                 return Err(StartMicrovmError::ImageBz2Invalid);
@@ -1987,6 +2019,9 @@ fn load_external_kernel(
                     None,
                 )
                 .map_err(StartMicrovmError::ImageGzLoadKernel)?;
+                if host_network {
+                    crate::host_network::require_loaded(guest_mem, load_result.kernel_end)?;
+                }
                 load_result.kernel_load
             } else {
                 return Err(StartMicrovmError::ImageGzInvalid);
@@ -2011,6 +2046,9 @@ fn load_external_kernel(
                     None,
                 )
                 .map_err(StartMicrovmError::ImageZstdLoadKernel)?;
+                if host_network {
+                    crate::host_network::require_loaded(guest_mem, load_result.kernel_end)?;
+                }
                 load_result.kernel_load
             } else {
                 return Err(StartMicrovmError::ImageZstdInvalid);
@@ -2056,6 +2094,23 @@ fn load_payload(
     _arch_mem_info: &ArchMemoryInfo,
     payload: &Payload,
 ) -> std::result::Result<LoadedPayload, StartMicrovmError> {
+    let host_network = _vm_resources
+        .vsock
+        .tsi_flags()
+        .contains(TsiFlags::HOST_BIND);
+    if host_network {
+        if let Some(bundle) = &_vm_resources.kernel_bundle {
+            // The bundle's pointer/length already form the payload contract
+            // used by the copy/map paths below; no guest is running yet.
+            let image =
+                unsafe { std::slice::from_raw_parts(bundle.host_addr as *const u8, bundle.size) };
+            crate::host_network::require_image(image)?;
+        } else if !matches!(payload, Payload::ExternalKernel(_)) {
+            return Err(StartMicrovmError::HostNetwork(
+                "firmware boot does not identify the guest kernel protocol",
+            ));
+        }
+    }
     match payload {
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         Payload::KernelCopy => {
@@ -2255,7 +2310,7 @@ fn load_payload(
         }
         Payload::ExternalKernel(external_kernel) => {
             let (entry_addr, initrd_config, cmdline, pvh) =
-                load_external_kernel(&guest_mem, _arch_mem_info, external_kernel)?;
+                load_external_kernel(&guest_mem, _arch_mem_info, external_kernel, host_network)?;
             Ok(LoadedPayload {
                 guest_mem,
                 entry_addr,
@@ -4323,7 +4378,7 @@ pub mod tests {
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn test_create_vcpus_x86_64() {
         let vcpu_count = 2;
 
@@ -4397,7 +4452,10 @@ pub mod tests {
         let err = Internal(Error::Serial(io::Error::from_raw_os_error(0)));
         let _ = format!("{err}{err:?}");
 
+        #[cfg(unix)]
         let err = InvalidKernelBundle(vm_memory::mmap::MmapRegionError::InvalidPointer);
+        #[cfg(windows)]
+        let err = InvalidKernelBundle(io::Error::other("invalid kernel mapping"));
         let _ = format!("{err}{err:?}");
 
         let err = KernelCmdline(String::from("dummy --cmdline"));

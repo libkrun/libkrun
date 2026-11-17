@@ -1,11 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 #[cfg(target_os = "linux")]
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::num::Wrapping;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use socket2::{Domain, Socket, Type};
 
@@ -13,6 +14,9 @@ use super::super::Queue as VirtQueue;
 use super::super::linux_errno::{LINUX_EADDRINUSE, LINUX_EAGAIN, LINUX_ECONNREFUSED};
 use super::defs;
 use super::defs::uapi;
+use super::host_bind::{BindRequest, bind_inet};
+use super::host_close::{self, CloseRequest};
+use super::host_sockopt::SocketBuffers;
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
@@ -28,6 +32,14 @@ use super::vsock_addr::VsockAddr;
 use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
+
+#[cfg(test)]
+#[path = "tsi_stream_tests.rs"]
+mod tests;
+
+// Once the guest is gone, retain accepted output only while it advances.
+// This portable policy bounds stalled queues without blocking the muxer.
+const DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct TsiStreamProxy {
     id: u64,
@@ -56,6 +68,10 @@ pub struct TsiStreamProxy {
     /// `try_listen`/`relisten`). Captured into a [`ListenerDesc`] so a fork clone
     /// can re-establish the host-side listener. 0 = not a listener.
     listen_guest_port: u16,
+    host_bound: Option<SocketAddr>,
+    /// A cross-family interceptor uses a separate transport socket. Retain
+    /// the guest's explicitly bound socket so its address remains reserved.
+    intercept_reservation: Option<Socket>,
     /// Listen backlog requested by the guest, for the same reason.
     listen_backlog: i32,
     /// Set once the remote peer half-closed its send side (our recv hit EOF) and
@@ -63,6 +79,9 @@ pub struct TsiStreamProxy {
     /// the shutdown and marks that remote→guest is done while guest→remote still
     /// flows.
     local_read_shutdown: bool,
+    /// Delay the host FIN until all bytes accepted before guest shutdown have
+    /// reached the host socket. Never block the muxer while draining them.
+    write_shutdown_pending: bool,
     /// Guest->host bytes accepted from the guest but not yet written to the host
     /// socket, because the host socket's send buffer was full (a slow or stalled
     /// remote peer — the #1093 blackhole shape). Drained on EPOLLOUT. Bounded by
@@ -72,6 +91,14 @@ pub struct TsiStreamProxy {
     /// blocks, so the host never buffers unboundedly and the muxer thread never
     /// blocks.
     tx_buf: VecDeque<u8>,
+    /// The guest has closed, but accepted output still belongs to this flow.
+    /// Keep its bounded queue while the host accepts output, with an idle deadline.
+    /// The closed-proxy grace timer must not silently truncate this output.
+    guest_released: bool,
+    drain_progress: Option<Instant>,
+    close_watermark: Option<Wrapping<u32>>,
+    close_fin_sent: bool,
+    buffers: SocketBuffers,
     /// True while we have paused reading the host socket (guest RX credit
     /// exhausted, or the remote half-closed). Kept separate from the epoll
     /// interest so TX-flush (OUT) and RX-read (IN) interest compose correctly
@@ -105,6 +132,7 @@ impl TsiStreamProxy {
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
         snapshot_gate: Arc<SnapshotGate>,
+        host_network: bool,
     ) -> Result<Self, ProxyError> {
         let (family, domain) = match family {
             defs::LINUX_AF_INET => (Family::Inet, Domain::IPV4),
@@ -130,12 +158,13 @@ impl TsiStreamProxy {
             let _ = sock.set_only_v6(false);
         }
 
-        // Enable TCP keepalive to prevent silent drops on idle INET connections.
+        // Legacy forwarding uses transport keepalive. Host-network sockets start
+        // with Linux SO_KEEPALIVE disabled and follow the guest application.
         #[cfg(target_os = "linux")]
         let is_unix = family == Family::Unix;
         #[cfg(not(target_os = "linux"))]
         let is_unix = false;
-        if !is_unix {
+        if !host_network && !is_unix {
             let ka = socket2::TcpKeepalive::new()
                 .with_time(std::time::Duration::from_secs(60))
                 .with_interval(std::time::Duration::from_secs(15));
@@ -163,6 +192,11 @@ impl TsiStreamProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             tx_buf: VecDeque::new(),
+            guest_released: false,
+            drain_progress: None,
+            close_watermark: None,
+            close_fin_sent: false,
+            buffers: SocketBuffers::default(),
             preamble: VecDeque::new(),
             intercept_peer: None,
             awaiting_verdict: false,
@@ -171,8 +205,11 @@ impl TsiStreamProxy {
             #[cfg(target_os = "linux")]
             unixsock_path: None,
             listen_guest_port: 0,
+            host_bound: None,
+            intercept_reservation: None,
             listen_backlog: 0,
             local_read_shutdown: false,
+            write_shutdown_pending: false,
         })
     }
 
@@ -185,6 +222,7 @@ impl TsiStreamProxy {
         local_port: u32,
         peer_port: u32,
         sock: Socket,
+        buffers: SocketBuffers,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
@@ -212,6 +250,11 @@ impl TsiStreamProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             tx_buf: VecDeque::new(),
+            guest_released: false,
+            drain_progress: None,
+            close_watermark: None,
+            close_fin_sent: false,
+            buffers,
             preamble: VecDeque::new(),
             intercept_peer: None,
             awaiting_verdict: false,
@@ -220,8 +263,11 @@ impl TsiStreamProxy {
             #[cfg(target_os = "linux")]
             unixsock_path: None,
             listen_guest_port: 0,
+            host_bound: None,
+            intercept_reservation: None,
             listen_backlog: 0,
             local_read_shutdown: false,
+            write_shutdown_pending: false,
         }
     }
 
@@ -282,6 +328,10 @@ impl TsiStreamProxy {
         let guest_listen_port = req.addr.inet().map(|s| s.port()).unwrap_or(0);
 
         let bind_res: std::io::Result<()> = match mapped {
+            Some(addr) if self.host_bound == Some(addr) => Ok(()),
+            Some(_) if self.host_bound.is_some() => {
+                return -libc::EINVAL;
+            }
             Some(addr) => self.sock.bind(&addr.into()),
             #[cfg(target_os = "linux")]
             None => self.bind_unix(req),
@@ -339,7 +389,8 @@ impl TsiStreamProxy {
     }
 
     fn peer_avail_credit(&self) -> usize {
-        (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
+        self.peer_buf_alloc
+            .saturating_sub((self.rx_cnt - self.peer_fwd_cnt).0) as usize
     }
 
     fn recv_to_pkt(&self, pkt: &mut VsockPacket) -> RecvPkt {
@@ -380,6 +431,9 @@ impl TsiStreamProxy {
     }
 
     fn recv_pkt(&mut self) -> (bool, bool) {
+        if self.local_read_shutdown {
+            return (false, false);
+        }
         let mut have_used = false;
         let mut wait_credit = false;
         let _snapshot_activity = self.snapshot_gate.enter();
@@ -557,6 +611,49 @@ impl TsiStreamProxy {
         }
     }
 
+    fn guest_local_addr(&self) -> std::io::Result<socket2::SockAddr> {
+        let local = self.sock.local_addr()?;
+        if self.intercept_peer.is_none() {
+            return Ok(local);
+        }
+        let Some(local) = local.as_socket() else {
+            return Ok(local);
+        };
+        // Interceptors are loopback endpoints. Translate their transport's
+        // local address into the original guest family, just as getpeername
+        // exposes the original destination rather than the interceptor.
+        let mut local: SocketAddr = match (self.family, local) {
+            (Family::Inet6, SocketAddr::V4(addr)) => {
+                let ip = if addr.ip().is_unspecified() {
+                    Ipv6Addr::UNSPECIFIED
+                } else {
+                    addr.ip().to_ipv6_mapped()
+                };
+                SocketAddrV6::new(ip, addr.port(), 0, 0).into()
+            }
+            (Family::Inet, SocketAddr::V6(addr)) => {
+                let ip = if addr.ip().is_loopback() {
+                    Ipv4Addr::LOCALHOST
+                } else if addr.ip().is_unspecified() {
+                    Ipv4Addr::UNSPECIFIED
+                } else {
+                    addr.ip()
+                        .to_ipv4_mapped()
+                        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EAFNOSUPPORT))?
+                };
+                SocketAddrV4::new(ip, addr.port()).into()
+            }
+            (_, addr) => addr,
+        };
+        if let Some(bound) = self.host_bound {
+            local.set_port(bound.port());
+            if !bound.ip().is_unspecified() {
+                local = bound;
+            }
+        }
+        Ok(local.into())
+    }
+
     fn fail_connect(&mut self, update: &mut ProxyUpdate, errno: i32) {
         self.awaiting_verdict = false;
         self.push_connect_rsp(-errno);
@@ -626,9 +723,7 @@ impl TsiStreamProxy {
         };
         let addr: SocketAddr = match self.family {
             Family::Inet => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, host_port).into(),
-            Family::Inet6 => {
-                SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, host_port, 0, 0).into()
-            }
+            Family::Inet6 => SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, host_port, 0, 0).into(),
             #[cfg(unix)]
             Family::Unix => return -libc::EINVAL,
         };
@@ -656,13 +751,27 @@ impl TsiStreamProxy {
     /// what lets a stalled send keep OUT armed without losing the RX side.
     fn conn_evset(&self) -> EventSet {
         connected_event_set(
-            self.rx_paused,
+            self.rx_paused || self.guest_released || self.close_watermark.is_some(),
             !self.tx_buf.is_empty() || !self.preamble.is_empty(),
         )
     }
 
     fn repoll(&self) -> Option<(u64, ProxyRawHandle, EventSet)> {
         Some((self.id, raw_handle(&self.sock), self.conn_evset()))
+    }
+
+    fn record_drain_progress(&mut self) {
+        if self.guest_released {
+            self.drain_progress = Some(Instant::now());
+        }
+    }
+
+    fn output_pending(&self) -> bool {
+        !self.tx_buf.is_empty()
+            || !self.preamble.is_empty()
+            || self
+                .close_watermark
+                .is_some_and(|count| count != self.tx_cnt)
     }
 
     /// Non-blocking drain of `tx_buf` to the host socket. Advances `tx_cnt` for
@@ -679,6 +788,7 @@ impl TsiStreamProxy {
                 Ok(0) => return Ok(false),
                 Ok(n) => {
                     self.preamble.drain(..n);
+                    self.record_drain_progress();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -698,6 +808,7 @@ impl TsiStreamProxy {
                 Ok(n) => {
                     self.tx_cnt += Wrapping(n as u32);
                     self.tx_buf.drain(..n);
+                    self.record_drain_progress();
                     advanced = true;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -708,30 +819,40 @@ impl TsiStreamProxy {
                 }
             }
         }
+        let finish_close = self.close_watermark.is_some() && !self.close_fin_sent;
+        if (self.write_shutdown_pending || finish_close) && !self.output_pending() {
+            self.sock.shutdown(std::net::Shutdown::Write).map_err(|e| {
+                warn!("flush_tx: host write shutdown failed id={}: {e}", self.id);
+            })?;
+            self.write_shutdown_pending = false;
+            self.close_fin_sent |= finish_close;
+        }
         Ok(advanced)
     }
 
-    /// Emit a vsock credit update to the guest if `tx_cnt` has advanced by at
-    /// least half the guest's advertised buffer since the last one. Returns
-    /// whether a packet was pushed (caller should signal the queue).
-    fn maybe_send_credit_update(&mut self) -> bool {
-        if self.peer_buf_alloc != 0
-            && (self.tx_cnt - self.last_tx_cnt_sent).0 >= self.peer_buf_alloc / 2
-        {
-            self.last_tx_cnt_sent = self.tx_cnt;
-            let rx = MuxerRx::CreditUpdate {
+    fn send_credit_update(&mut self) {
+        self.last_tx_cnt_sent = self.tx_cnt;
+        push_packet(
+            self.cid,
+            MuxerRx::CreditUpdate {
                 local_port: self.local_port,
                 peer_port: self.peer_port,
                 fwd_cnt: self.tx_cnt.0,
-            };
-            push_packet(
-                self.cid,
-                rx,
-                &self.rxq,
-                &self.queue,
-                &self.mem,
-                &self.snapshot_gate,
-            );
+            },
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
+    }
+
+    /// Return credit before a small explicit send budget can be exhausted.
+    fn maybe_send_credit_update(&mut self) -> bool {
+        let window = self.buffers.send.map_or(self.peer_buf_alloc, |capacity| {
+            self.peer_buf_alloc.min(capacity as u32)
+        });
+        if window != 0 && (self.tx_cnt - self.last_tx_cnt_sent).0 >= (window / 2).max(1) {
+            self.send_credit_update();
             true
         } else {
             false
@@ -740,6 +861,100 @@ impl TsiStreamProxy {
 }
 
 impl Proxy for TsiStreamProxy {
+    fn drain_deadline(&self) -> Option<Instant> {
+        self.drain_progress.map(|last| last + DRAIN_IDLE_TIMEOUT)
+    }
+
+    fn close_host_stream(&mut self, req: &CloseRequest) -> (i32, ProxyUpdate) {
+        if req.flags == host_close::ABORT {
+            let result = self
+                .sock
+                .set_linger(Some(Duration::ZERO))
+                .map_or_else(|e| -sys::to_linux_errno(&e), |_| 0);
+            return (
+                result,
+                ProxyUpdate {
+                    remove_proxy: ProxyRemoval::Immediate,
+                    ..Default::default()
+                },
+            );
+        }
+        if !matches!(
+            self.status,
+            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+        ) {
+            return (
+                0,
+                ProxyUpdate {
+                    remove_proxy: ProxyRemoval::Immediate,
+                    ..Default::default()
+                },
+            );
+        }
+        let watermark = Wrapping(req.tx_count);
+        let remaining = (watermark - self.tx_cnt).0 as usize;
+        if remaining > defs::CONN_TX_BUF_SIZE
+            || remaining < self.tx_buf.len()
+            || self.close_watermark.is_some_and(|count| count != watermark)
+        {
+            return (-22, ProxyUpdate::default());
+        }
+        self.close_watermark = Some(watermark);
+        self.rx_paused = true;
+        if self.flush_tx().is_err() {
+            return (
+                -32,
+                ProxyUpdate {
+                    remove_proxy: ProxyRemoval::Immediate,
+                    ..Default::default()
+                },
+            );
+        }
+        let result = if req.flags != host_close::WAIT {
+            0
+        } else if !self.close_fin_sent {
+            1
+        } else {
+            host_close::complete(&self.sock)
+                .map_or_else(|e| -sys::to_linux_errno(&e), |done| i32::from(!done))
+        };
+        (
+            result,
+            ProxyUpdate {
+                polling: self.repoll(),
+                ..Default::default()
+            },
+        )
+    }
+    fn request_credit(&mut self) -> ProxyUpdate {
+        if !matches!(
+            self.status,
+            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+        ) {
+            return ProxyUpdate::default();
+        }
+        self.send_credit_update();
+        ProxyUpdate {
+            signal_queue: true,
+            ..Default::default()
+        }
+    }
+
+    fn set_host_option(&mut self, req: &super::host_sockopt::OptionRequest) -> Result<(), i32> {
+        self.buffers
+            .apply(req, &self.sock, false)
+            .unwrap_or_else(|| req.apply(&self.sock))
+    }
+
+    fn bind_host(&mut self, req: &BindRequest) -> Result<VsockAddr, i32> {
+        if self.host_bound.is_some() || self.status != ProxyStatus::Idle {
+            return Err(-libc::EINVAL);
+        }
+        let addr = bind_inet(&self.sock, self.family, req)?;
+        self.host_bound = Some(addr);
+        Ok(addr.into())
+    }
+
     fn poll_handle(&self) -> ProxyRawHandle {
         raw_handle(&self.sock)
     }
@@ -774,7 +989,9 @@ impl Proxy for TsiStreamProxy {
         }
     }
 
-    fn connect(&mut self, _pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
+    fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
+        // The guest may use a dedicated reply socket for asynchronous dials.
+        self.control_port = pkt.src_port();
         if !req.addr.suits_family(self.family) {
             warn!(
                 "connect: id={} refused address {} for its family",
@@ -835,16 +1052,17 @@ impl Proxy for TsiStreamProxy {
 
     fn connect_intercepted(
         &mut self,
-        _pkt: &VsockPacket,
+        pkt: &VsockPacket,
         req: TsiConnectReq,
         intercept: &StreamIntercept,
     ) -> ProxyUpdate {
+        self.control_port = pkt.src_port();
         let Some(destination) = req.addr.inet() else {
             return self.dial(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
         };
-        // The guest's socket family need not match the interceptor's; a fresh
-        // host socket of the right domain is safe here because nothing has
-        // been registered for polling yet.
+        // The guest's socket family need not match the interceptor's. Replace
+        // the transport before registering it for polling, but retain any
+        // explicit reservation independently of that transport's endpoint.
         let wanted = if intercept.endpoint.is_ipv4() {
             (Family::Inet, Domain::IPV4)
         } else {
@@ -853,12 +1071,17 @@ impl Proxy for TsiStreamProxy {
         if self.family != wanted.0 {
             match Socket::new(wanted.1, Type::STREAM, None) {
                 Ok(sock) => {
-                    let _ = sock.set_nonblocking(true);
-                    let ka = socket2::TcpKeepalive::new()
-                        .with_time(std::time::Duration::from_secs(60))
-                        .with_interval(std::time::Duration::from_secs(15));
-                    let _ = sock.set_tcp_keepalive(&ka);
-                    self.sock = sock;
+                    if let Err(error) = sock
+                        .set_nonblocking(true)
+                        .and_then(|()| super::host_sockopt::copy_tcp_options(&self.sock, &sock))
+                        .and_then(|()| self.buffers.copy_to(&sock, false))
+                    {
+                        return self.dial(Err(error));
+                    }
+                    let original = std::mem::replace(&mut self.sock, sock);
+                    if self.host_bound.is_some() {
+                        self.intercept_reservation = Some(original);
+                    }
                 }
                 Err(e) => return self.dial(Err(e)),
             }
@@ -876,9 +1099,14 @@ impl Proxy for TsiStreamProxy {
     fn getpeername(&mut self, pkt: &VsockPacket) {
         debug!("getpeername: id={}", self.id);
 
-        let peer = match self.intercept_peer {
-            Some(destination) => Ok(socket2::SockAddr::from(destination)),
-            None => self.sock.peer_addr(),
+        let local = pkt.read_getname_req().is_some_and(|req| req.peer == 0);
+        let peer = if local {
+            self.guest_local_addr()
+        } else {
+            match self.intercept_peer {
+                Some(destination) => Ok(socket2::SockAddr::from(destination)),
+                None => self.sock.peer_addr(),
+            }
         };
         let (result, addr_len, addr): (i32, u32, VsockAddr) = match peer {
             Ok(sa) => match sa.as_socket() {
@@ -957,6 +1185,14 @@ impl Proxy for TsiStreamProxy {
                 );
                 Err(())
             }
+            Some(buf)
+                if self.close_watermark.is_some_and(|count| {
+                    self.tx_buf.len() + buf.len() > (count - self.tx_cnt).0 as usize
+                }) =>
+            {
+                warn!("sendmsg: payload exceeds close watermark id={}", self.id);
+                Err(())
+            }
             Some(buf) => {
                 self.tx_buf.extend(buf.iter().copied());
                 Ok(())
@@ -966,10 +1202,17 @@ impl Proxy for TsiStreamProxy {
 
         match accepted.and_then(|()| self.flush_tx()) {
             Ok(advanced) => {
-                if advanced && self.maybe_send_credit_update() {
+                if advanced
+                    && !self.guest_released
+                    && self.close_watermark.is_none()
+                    && self.maybe_send_credit_update()
+                {
                     update.signal_queue = true;
                 }
                 update.polling = self.repoll();
+                if self.guest_released && !self.output_pending() {
+                    update.remove_proxy = ProxyRemoval::Immediate;
+                }
             }
             Err(()) => {
                 self.push_reset();
@@ -1045,6 +1288,9 @@ impl Proxy for TsiStreamProxy {
     }
 
     fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
+        if self.guest_released || self.close_watermark.is_some() {
+            return ProxyUpdate::default();
+        }
         debug!(
             "update_credit: buf_alloc={} rx_cnt={} fwd_cnt={}",
             pkt.buf_alloc(),
@@ -1056,7 +1302,7 @@ impl Proxy for TsiStreamProxy {
 
         self.status = ProxyStatus::Connected;
 
-        self.rx_paused = false;
+        self.rx_paused = self.local_read_shutdown;
         ProxyUpdate {
             polling: self.repoll(),
             ..Default::default()
@@ -1159,18 +1405,28 @@ impl Proxy for TsiStreamProxy {
         let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
         let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 
-        let how = if recv_off && send_off {
-            std::net::Shutdown::Both
-        } else if recv_off {
-            std::net::Shutdown::Read
-        } else {
-            std::net::Shutdown::Write
-        };
-
-        if let Err(e) = self.sock.shutdown(how) {
-            warn!("error sending shutdown to socket: {e}");
+        if recv_off && !self.local_read_shutdown {
+            if let Err(e) = self.sock.shutdown(std::net::Shutdown::Read) {
+                warn!("error shutting down socket receive half: {e}");
+            }
+            self.local_read_shutdown = true;
+            self.rx_paused = true;
         }
-        ProxyUpdate::default()
+        if send_off {
+            if !self.output_pending() {
+                if let Err(e) = self.sock.shutdown(std::net::Shutdown::Write) {
+                    warn!("error shutting down socket send half: {e}");
+                }
+            } else {
+                // OUT remains armed until flush_tx has sent the queued bytes
+                // and can place FIN after them. Receive credit is independent.
+                self.write_shutdown_pending = true;
+            }
+        }
+        ProxyUpdate {
+            polling: self.repoll(),
+            ..Default::default()
+        }
     }
 
     fn release(&mut self) -> ProxyUpdate {
@@ -1178,21 +1434,25 @@ impl Proxy for TsiStreamProxy {
             "release: id={}, tx_cnt={}, last_tx_cnt={}",
             self.id, self.tx_cnt, self.last_tx_cnt_sent
         );
-        // The guest closed its socket. With no guest bytes still waiting for
-        // the host socket, close it now: holding it through the reaper's grace
-        // period kept one host descriptor per closed connection for 5 s, so a
-        // guest opening and closing a few thousand connections a second held
-        // tens of thousands of descriptors and hit the process's limit. Bytes
-        // still buffered keep the deferral so they get their chance to drain.
-        let remove_proxy = if self.status == ProxyStatus::Listening
-            || (self.tx_buf.is_empty() && self.preamble.is_empty())
-        {
-            ProxyRemoval::Immediate
-        } else {
-            ProxyRemoval::Deferred
-        };
+        // Kernel TCP owns bytes already handed to the socket. Bytes still in
+        // our forwarding queue need OUT readiness, not the closed-proxy timer:
+        // a peer may legitimately stop reading for longer than its five seconds.
+        let draining = matches!(
+            self.status,
+            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+        ) && self.output_pending();
+        if draining {
+            self.drain_progress.get_or_insert_with(Instant::now);
+            self.guest_released = true;
+            self.rx_paused = true;
+        }
         ProxyUpdate {
-            remove_proxy,
+            remove_proxy: if draining {
+                ProxyRemoval::Drain
+            } else {
+                ProxyRemoval::Immediate
+            },
+            polling: if draining { self.repoll() } else { None },
             ..Default::default()
         }
     }
@@ -1200,28 +1460,58 @@ impl Proxy for TsiStreamProxy {
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
+        if self.guest_released || self.close_watermark.is_some() {
+            // The guest no longer consumes RX or credit replies. Finish only
+            // its output, releasing the descriptor immediately after handoff.
+            // Failed/forced teardown resets the peer in Drop if bytes remain.
+            let failed = self.flush_tx().is_err();
+            let drained = !self.output_pending();
+            // Windows FD_CLOSE also reports an orderly receive half-close;
+            // the peer can still read our queued output. Let send establish
+            // whether the write half failed instead of aborting on HANG_UP.
+            return ProxyUpdate {
+                remove_proxy: if failed || (drained && self.guest_released) {
+                    ProxyRemoval::Immediate
+                } else {
+                    ProxyRemoval::Keep
+                },
+                polling: self.repoll(),
+                ..Default::default()
+            };
+        }
+
         if self.awaiting_verdict && self.status == ProxyStatus::Connecting {
             self.advance_verdict(&mut update);
             return update;
         }
 
+        let connect_events = EventSet::OUT | EventSet::HANG_UP;
+        #[cfg(target_os = "linux")]
+        let connect_events = connect_events | EventSet::ERROR;
+        if self.status == ProxyStatus::Connecting && evset.intersects(connect_events) {
+            // Writability means that the nonblocking dial finished, not that
+            // it succeeded. An error can arrive without HANG_UP (or without
+            // OUT on Linux); consume SO_ERROR before acknowledging the dial.
+            match self.sock.take_error() {
+                Ok(Some(error)) | Err(error) => {
+                    self.fail_connect(&mut update, sys::to_linux_errno(&error));
+                }
+                Ok(None) if evset.contains(EventSet::OUT) && !evset.contains(EventSet::HANG_UP) => {
+                    self.switch_to_connected();
+                    self.push_connect_rsp(0);
+                    update.signal_queue = true;
+                    // Wait for OP_REQUEST to establish the guest transport
+                    // before polling this socket for data.
+                    update.polling = Some((self.id, raw_handle(&self.sock), EventSet::empty()));
+                }
+                Ok(None) => self.fail_connect(&mut update, LINUX_ECONNREFUSED),
+            }
+            return update;
+        }
+
         if evset.contains(EventSet::HANG_UP) {
             debug!("process_event: HANG_UP");
-            if self.status == ProxyStatus::Connecting {
-                // Report why the dial failed (timed out, unreachable, out of
-                // local ports), in the guest's errno numbering; a refusal is
-                // only the fallback when the socket holds no error.
-                let errno = match self.sock.take_error() {
-                    Ok(Some(e)) => sys::to_linux_errno(&e),
-                    _ => LINUX_ECONNREFUSED,
-                };
-                self.push_connect_rsp(-errno);
-                self.status = ProxyStatus::Closed;
-                update.polling = Some((self.id, raw_handle(&self.sock), EventSet::empty()));
-                update.signal_queue = true;
-                update.remove_proxy = ProxyRemoval::Deferred;
-                return update;
-            } else if self.status == ProxyStatus::Connected {
+            if self.status == ProxyStatus::Connected {
                 // Drain any remaining data before signaling closure.
                 let (signal_queue, _) = self.recv_pkt();
                 update.signal_queue = signal_queue;
@@ -1293,14 +1583,23 @@ impl Proxy for TsiStreamProxy {
             } else if self.status == ProxyStatus::Listening
                 || self.status == ProxyStatus::WaitingOnAccept
             {
-                match self.sock.accept() {
+                // Linux does not inherit O_NONBLOCK across accept(). The muxer
+                // must never block while forwarding to an unread host socket.
+                match self.sock.accept().and_then(|(socket, address)| {
+                    socket.set_nonblocking(true)?;
+                    Ok((socket, address))
+                }) {
                     Ok((new_sock, _addr)) => {
                         // Use the original vsock ephemeral port (encoded in the
                         // high 32 bits of self.id) rather than self.peer_port,
                         // which listen() overwrites with the VM TCP port.
                         let vsock_peer_port = (self.id >> 32) as u32;
-                        update.new_proxy =
-                            Some((vsock_peer_port, new_sock, self.family, NewProxyType::Tcp));
+                        update.new_proxy = Some((
+                            vsock_peer_port,
+                            new_sock,
+                            self.family,
+                            NewProxyType::Tcp(self.buffers),
+                        ));
                     }
                     Err(e) => warn!("error accepting connection: id={}, err={}", self.id, e),
                 };
@@ -1313,14 +1612,10 @@ impl Proxy for TsiStreamProxy {
 
         if evset.contains(EventSet::OUT) {
             debug!("process_event: OUT");
-            if self.status == ProxyStatus::Connecting {
-                self.switch_to_connected();
-                self.push_connect_rsp(0);
-                update.signal_queue = true;
-                // Stop listening for events in the TCP socket until we receive
-                // OP_REQUEST and the vsock transport is fully established.
-                update.polling = Some((self.id(), raw_handle(&self.sock), EventSet::empty()));
-            } else if self.status == ProxyStatus::Connected {
+            if matches!(
+                self.status,
+                ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+            ) {
                 // The host socket drained: flush buffered guest->host bytes and,
                 // if enough progressed, re-open the guest's credit window. This
                 // is what makes the non-blocking send in `sendmsg` complete
@@ -1350,11 +1645,17 @@ impl Proxy for TsiStreamProxy {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl Drop for TsiStreamProxy {
     fn drop(&mut self) {
+        // VM teardown or a transport error must not turn incomplete output
+        // into a successful-looking EOF. Zero linger is an immediate abort;
+        // positive linger would block the shared event loop and is never set.
+        if self.output_pending() {
+            let _ = self.sock.set_linger(Some(Duration::ZERO));
+        }
         // The guest can replace what is at the path while we listen; remove it
         // only if it is still a socket node.
+        #[cfg(target_os = "linux")]
         if let Some(path) = &self.unixsock_path
             && super::vsock_addr::is_unix_socket_node(path)
         {

@@ -5,8 +5,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;
+use std::sync::Arc;
 
 use bitflags::bitflags;
 use log::debug;
@@ -147,14 +148,14 @@ impl EpollEvent {
 
 #[derive(Debug)]
 pub struct Epoll {
-    queue: RawFd,
+    queue: Arc<OwnedFd>,
     kevs: Vec<Kevent>,
 }
 
 impl Clone for Epoll {
     fn clone(&self) -> Self {
         Epoll {
-            queue: self.queue,
+            queue: self.queue.clone(),
             kevs: Vec::new(),
         }
     }
@@ -167,7 +168,8 @@ impl Epoll {
             Err(io::Error::last_os_error())
         } else {
             Ok(Epoll {
-                queue,
+                // SAFETY: kqueue returned a new, exclusively owned descriptor.
+                queue: Arc::new(unsafe { OwnedFd::from_raw_fd(queue) }),
                 kevs: Vec::new(),
             })
         }
@@ -214,7 +216,7 @@ impl Epoll {
                 }
                 let ret = unsafe {
                     libc::kevent(
-                        self.queue,
+                        self.queue.as_raw_fd(),
                         kevs.as_ptr() as *const libc::kevent,
                         kevs.len() as i32,
                         ptr::null_mut(),
@@ -266,7 +268,14 @@ impl Epoll {
                 // on its own: an unregistered READ (ENOENT) must not keep WRITE registered.
                 for kev in &kevs {
                     let ret = unsafe {
-                        libc::kevent(self.queue, &kev.0, 1, ptr::null_mut(), 0, ptr::null())
+                        libc::kevent(
+                            self.queue.as_raw_fd(),
+                            &kev.0,
+                            1,
+                            ptr::null_mut(),
+                            0,
+                            ptr::null(),
+                        )
                     };
                     if ret == -1 {
                         let err = io::Error::last_os_error();
@@ -309,7 +318,7 @@ impl Epoll {
         debug_assert!(spare.len() >= max_events);
         let ret = unsafe {
             libc::kevent(
-                self.queue,
+                self.queue.as_raw_fd(),
                 ptr::null(),
                 0,
                 spare.as_mut_ptr().cast::<libc::kevent>(),
@@ -368,14 +377,23 @@ impl Epoll {
             data: delay_us as isize,
             udata: udata as *mut libc::c_void,
         };
-        let ret = unsafe { libc::kevent(self.queue, &kev, 1, ptr::null_mut(), 0, ptr::null()) };
+        let ret = unsafe {
+            libc::kevent(
+                self.queue.as_raw_fd(),
+                &kev,
+                1,
+                ptr::null_mut(),
+                0,
+                ptr::null(),
+            )
+        };
         assert_eq!(ret, 0);
     }
 }
 
 impl AsRawFd for Epoll {
     fn as_raw_fd(&self) -> RawFd {
-        self.queue
+        self.queue.as_raw_fd()
     }
 }
 
@@ -449,7 +467,7 @@ mod tests {
         const MAX_EVENTS: usize = 10;
 
         let mut epoll = Epoll::new().unwrap();
-        assert_eq!(epoll.queue, epoll.as_raw_fd());
+        assert_eq!(epoll.queue.as_raw_fd(), epoll.as_raw_fd());
 
         // Let's test different scenarios for `epoll_ctl()` and `epoll_wait()` functionality.
 
@@ -525,5 +543,41 @@ mod tests {
         assert_eq!(ev_count, 1);
         assert_eq!(ready_events[0].data(), event_fd_1.as_raw_fd() as u64);
         assert_eq!(ready_events[0].events(), EventSet::IN.bits());
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use std::net::UdpSocket;
+
+    #[test]
+    fn dropping_either_poll_owner_preserves_registered_socket_delivery() {
+        for drop_original in [false, true] {
+            let original = Epoll::new().unwrap();
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            original
+                .ctl(
+                    ControlOperation::Add,
+                    socket.as_raw_fd(),
+                    &EpollEvent::new(EventSet::IN, 37),
+                )
+                .unwrap();
+            let cloned = original.clone();
+            let mut remaining = if drop_original {
+                drop(original);
+                cloned
+            } else {
+                drop(cloned);
+                original
+            };
+            let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+            sender
+                .send_to(b"alive", socket.local_addr().unwrap())
+                .unwrap();
+            let mut events = [EpollEvent::default(); 1];
+            assert_eq!(remaining.wait(1, 2000, &mut events).unwrap(), 1);
+            assert_eq!(events[0].data(), 37);
+        }
     }
 }

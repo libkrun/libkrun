@@ -24,6 +24,8 @@ pub enum Error {
     HasSpace,
     /// Key/Value Operation would have had an equals sign in it.
     HasEquals,
+    /// An unterminated quoted value would swallow an appended kernel option.
+    UnbalancedQuotes,
     /// Operation would have made the command line too large.
     TooLarge,
 }
@@ -39,6 +41,7 @@ impl fmt::Display for Error {
                 Error::InvalidAscii => "Command line string contains non-printable ASCII character",
                 Error::HasSpace => "Command line string contains a space",
                 Error::HasEquals => "Command line string contains an equals sign",
+                Error::UnbalancedQuotes => "Kernel command line contains an unterminated quote",
                 Error::TooLarge => "Command line inserting string would make command line too long",
             }
         )
@@ -122,6 +125,51 @@ impl Cmdline {
         self.len() == 0
     }
 
+    /// Add a kernel option before the first unquoted init-argument separator.
+    /// Later kernel options win over earlier values; init arguments are kept.
+    pub fn insert_kernel_arg(&mut self, argument: &str) -> Result<()> {
+        valid_str(argument)?;
+        if argument.contains(' ') {
+            return Err(Error::HasSpace);
+        }
+        self.insert_kernel_args(argument)
+    }
+
+    /// Insert a kernel command-line fragment before existing init arguments.
+    /// Used for generated options and init environment variables, which the
+    /// kernel must parse before its `--` separator.
+    pub fn insert_kernel_args(&mut self, argument: &str) -> Result<()> {
+        valid_str(argument)?;
+        let mut quoted = false;
+        let mut start = 0;
+        let mut separator = None;
+        for (offset, ch) in self
+            .line
+            .char_indices()
+            .chain(std::iter::once((self.line.len(), ' ')))
+        {
+            if ch == '"' {
+                quoted = !quoted;
+            }
+            if ch == ' ' && !quoted {
+                if matches!(&self.line[start..offset], "--" | "\"--\"") {
+                    separator = Some(start);
+                    break;
+                }
+                start = offset + 1;
+            }
+        }
+        if let Some(offset) = separator {
+            self.has_capacity(argument.len())?;
+            self.line.insert_str(offset, &format!("{argument} "));
+            Ok(())
+        } else if quoted {
+            Err(Error::UnbalancedQuotes)
+        } else {
+            self.insert_str(argument)
+        }
+    }
+
     /// Validates and inserts a key value pair into this command line.
     pub fn insert<T: AsRef<str>>(&mut self, key: T, val: T) -> Result<()> {
         let k = key.as_ref();
@@ -129,15 +177,7 @@ impl Cmdline {
 
         valid_element(k)?;
         valid_element(v)?;
-        self.has_capacity(k.len() + v.len() + 1)?;
-
-        self.start_push();
-        self.line.push_str(k);
-        self.line.push('=');
-        self.line.push_str(v);
-        self.end_push();
-
-        Ok(())
+        self.insert_kernel_arg(&format!("{k}={v}"))
     }
 
     /// Validates and inserts a string to the end of the current command line.
@@ -275,6 +315,70 @@ mod tests {
         assert_eq!(
             Error::TooLarge.to_string().as_str(),
             "Command line inserting string would make command line too long"
+        );
+    }
+}
+
+#[cfg(test)]
+mod kernel_argument_tests {
+    use super::*;
+    #[test]
+    fn kernel_options_precede_init_arguments_and_follow_earlier_values() {
+        for (before, after) in [
+            ("", "tsi_host_network=1"),
+            ("quiet", "quiet tsi_host_network=1"),
+            (
+                "tsi_host_network=0 -- app tsi_host_network=0",
+                "tsi_host_network=0 tsi_host_network=1 -- app tsi_host_network=0",
+            ),
+            ("-- app", "tsi_host_network=1 -- app"),
+            ("quiet \"--\" app", "quiet tsi_host_network=1 \"--\" app"),
+            (
+                "option=\"before -- after\" -- app",
+                "option=\"before -- after\" tsi_host_network=1 -- app",
+            ),
+        ] {
+            let mut line = Cmdline::new(256);
+            line.insert_str(before).unwrap();
+            line.insert_kernel_arg("tsi_host_network=1").unwrap();
+            assert_eq!(line.as_str(), after);
+        }
+    }
+    #[test]
+    fn kernel_option_insertion_keeps_capacity_and_validation_rules() {
+        let mut line = Cmdline::new(10);
+        line.insert_str("-- app").unwrap();
+        assert_eq!(line.insert_kernel_arg("long=option"), Err(Error::TooLarge));
+        assert_eq!(line.as_str(), "-- app");
+        assert_eq!(line.insert_kernel_arg("two args"), Err(Error::HasSpace));
+    }
+
+    #[test]
+    fn unterminated_kernel_quote_cannot_swallow_the_mode() {
+        let mut line = Cmdline::new(256);
+        line.insert_str("option=\"value").unwrap();
+        assert_eq!(
+            line.insert_kernel_arg("tsi_host_network=1"),
+            Err(Error::UnbalancedQuotes)
+        );
+        assert_eq!(line.as_str(), "option=\"value");
+        let mut line = Cmdline::new(256);
+        line.insert_str("quiet -- app \"value").unwrap();
+        line.insert_kernel_arg("tsi_host_network=1").unwrap();
+        assert_eq!(line.as_str(), "quiet tsi_host_network=1 -- app \"value");
+    }
+
+    #[test]
+    fn device_options_and_init_environment_precede_existing_separator() {
+        let mut line = Cmdline::new(256);
+        line.insert_str("quiet -- app").unwrap();
+        line.insert("virtio_mmio.device", "4K@0xd0000000:5")
+            .unwrap();
+        line.insert_kernel_args("KRUN_INIT=/probe VALUE=\"two words\"")
+            .unwrap();
+        assert_eq!(
+            line.as_str(),
+            "quiet virtio_mmio.device=4K@0xd0000000:5 KRUN_INIT=/probe VALUE=\"two words\" -- app"
         );
     }
 }

@@ -404,6 +404,12 @@ int32_t krun_add_virtiofs4(uint32_t ctx_id,
 /* TSI (Transparent Socket Impersonation) feature flags for vsock */
 #define KRUN_TSI_HIJACK_INET  (1 << 0)
 #define KRUN_TSI_HIJACK_UNIX  (1 << 1)
+/* Select experimental host TCP/UDP networking; requires HIJACK_INET and no
+ * port map. The runtime selects the guest mode automatically and refuses to
+ * boot kernels without the matching host-network ABI. Checkpoint restore and
+ * the Nitro transport are not supported in this mode.
+ */
+#define KRUN_TSI_HOST_BIND    (1 << 2)
 
 /* Taken from uapi/linux/virtio_net.h */
 #define NET_FEATURE_CSUM 1 << 0
@@ -1003,13 +1009,22 @@ int32_t krun_add_vsock_port2(uint32_t ctx_id,
  *
  * Arguments:
  *  "ctx_id"       - the configuration context ID.
- *  "tsi_features" - bitmask of TSI features (KRUN_TSI_HIJACK_INET, KRUN_TSI_HIJACK_UNIX)
+ *  "tsi_features" - bitmask of TSI features (KRUN_TSI_HIJACK_INET, KRUN_TSI_HIJACK_UNIX,
+ *                   KRUN_TSI_HOST_BIND)
  *                   Use 0 to add vsock without any TSI hijacking.
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_add_vsock(uint32_t ctx_id, uint32_t tsi_features);
+
+/**
+ * Return the runtime's experimental host-network wire ABI.
+ * A nonzero ABI does not assert that the selected kernel supports it:
+ * krun_start_enter validates the loaded kernel and reports -EOPNOTSUPP with
+ * krun_get_last_error when its host-network ABI is missing or incompatible.
+ */
+uint32_t krun_get_host_network_abi(void);
 
 /**
  * Set the egress policy for TSI networking.

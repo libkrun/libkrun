@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -12,16 +12,18 @@ use super::dns_filter::{
     DnsRequest, DnsWorker, EgressPolicy, FloorMode, floor_mode, is_addr_floored,
     is_addr_host_loopback, sockaddr_port,
 };
+use super::host_bind::{BindRequest, BindResponse};
+use super::host_send::{HostSendRequest, PendingHostSend};
 use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::muxer_thread::MuxerThread;
 use super::packet::TsiConnectReq;
 use super::packet::{TsiGetnameRsp, VsockPacket};
 use super::polling::update_live_polling;
 use super::proxy::ProxyRawHandle;
-use super::proxy::{
-    ListenerDesc, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, StreamIntercept,
-};
-use super::reaper::ReaperThread;
+#[cfg(test)]
+use super::proxy::ProxyRemoval;
+use super::proxy::{ListenerDesc, Proxy, ProxyError, ProxyStatus, ProxyUpdate, StreamIntercept};
+use super::reaper::{ReapRequest, ReaperThread, apply_removal};
 use super::snapshot_gate::SnapshotGate;
 use super::sys;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -36,11 +38,27 @@ use vm_memory::GuestMemoryMmap;
 
 use crate::virtio::InterruptTransport;
 
-pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
+#[cfg(test)]
+#[path = "host_bind_tests.rs"]
+mod host_bind_tests;
+
+pub type ProxyHandle = Arc<Mutex<Box<dyn Proxy>>>;
+pub type ProxyTable = RwLock<HashMap<u64, ProxyHandle>>;
+pub type ProxyMap = Arc<ProxyTable>;
 
 /// A muxer RX queue item.
 #[derive(Debug)]
 pub enum MuxerRx {
+    HostSendResponse {
+        peer_port: u32,
+        sequence: u64,
+        result: i32,
+    },
+    BindResponse {
+        local_port: u32,
+        peer_port: u32,
+        data: BindResponse,
+    },
     Reset {
         local_port: u32,
         peer_port: u32,
@@ -131,7 +149,8 @@ pub struct VsockMuxer {
     epoll: Epoll,
     interrupt: Option<InterruptTransport>,
     proxy_map: ProxyMap,
-    reaper_sender: Option<Sender<u64>>,
+    pending_datagram_rx: Arc<Mutex<HashSet<u64>>>,
+    reaper_sender: Option<Sender<ReapRequest>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     tsi_flags: TsiFlags,
     /// Optional egress policy (CIDRs + DNS allow-hosts + learned IPs).
@@ -154,6 +173,10 @@ pub struct VsockMuxer {
     /// so the guest's connect fails with the reason (say, the host process
     /// is out of file descriptors) instead of a refusal from nowhere.
     failed_creates: Mutex<FailedCreates>,
+    #[cfg(target_os = "macos")]
+    host_icmp: Option<Result<Arc<super::macos_icmp::MacIcmp>, i32>>,
+    #[cfg(target_os = "macos")]
+    host_udp_router: Option<Result<Arc<super::macos_udp_router::DatagramRouter>, i32>>,
 }
 
 /// Bound on [`FailedCreates`]: guest sockets that fail to get a host socket
@@ -227,20 +250,39 @@ impl VsockMuxer {
         }
         let egress_policy = EgressPolicy::new(egress_cidrs, egress_hosts, egress_resolvers)
             .map(|policy| Arc::new(RwLock::new(policy)));
+        let epoll = Epoll::new().unwrap();
+        #[cfg(target_os = "macos")]
+        let host_icmp = tsi_flags.contains(TsiFlags::HOST_BIND).then(|| {
+            super::macos_icmp::MacIcmp::new(&epoll)
+                .map(Arc::new)
+                .map_err(|error| -sys::to_linux_errno(&error))
+        });
+        #[cfg(target_os = "macos")]
+        let host_udp_router = tsi_flags.contains(TsiFlags::HOST_BIND).then(|| {
+            super::macos_udp_router::DatagramRouter::new(&epoll)
+                .map(Arc::new)
+                .map_err(|error| -sys::to_linux_errno(&error))
+        });
         VsockMuxer {
+            #[cfg(target_os = "macos")]
+            host_udp_router,
+            #[cfg(target_os = "macos")]
+            host_icmp,
             cid,
             host_port_map,
             queue: None,
             mem: None,
             rxq: Arc::new(Mutex::new(MuxerRxQ::new())),
-            epoll: Epoll::new().unwrap(),
+            epoll,
             interrupt: None,
             proxy_map: Arc::new(RwLock::new(HashMap::new())),
+            pending_datagram_rx: Arc::new(Mutex::new(HashSet::new())),
             reaper_sender: None,
             unix_ipc_port_map,
             tsi_flags,
             egress_policy,
-            floor: floor_mode(),
+            floor: floor_mode()
+                .with_host_network(tsi_flags.contains(TsiFlags::HIJACK_INET | TsiFlags::HOST_BIND)),
             dns_sender: None,
             dns_forwarder,
             snapshot_gate: Arc::new(SnapshotGate::default()),
@@ -333,6 +375,7 @@ impl VsockMuxer {
             let (dns_sender, dns_receiver) = unbounded::<DnsRequest>();
             let worker = DnsWorker::new(
                 dns_receiver,
+                Arc::downgrade(&self.proxy_map),
                 self.egress_policy.clone(),
                 self.dns_forwarder,
                 mem.clone(),
@@ -366,6 +409,16 @@ impl VsockMuxer {
             sender.clone(),
             self.unix_ipc_port_map.clone().unwrap_or_default(),
             self.snapshot_gate.clone(),
+            #[cfg(target_os = "macos")]
+            self.host_icmp
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .cloned(),
+            #[cfg(target_os = "macos")]
+            self.host_udp_router
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .cloned(),
         );
         thread.run();
         debug!("[VSOCK_TIMING] MuxerThread spawned");
@@ -426,6 +479,35 @@ impl VsockMuxer {
 
     pub(crate) fn rx_held_for_transport_reset(&self) -> bool {
         self.snapshot_gate.is_held_for_transport_reset()
+    }
+
+    /// Resume only host datagrams that exhausted the RX descriptors. Called
+    /// after dropping the virtqueue lock: proxies acquire it while delivering.
+    pub(crate) fn resume_datagram_rx(&self) -> bool {
+        if !self.tsi_flags.contains(TsiFlags::HOST_BIND) {
+            return false;
+        }
+        let ids: Vec<_> = self
+            .pending_datagram_rx
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        let mut used = false;
+        for id in ids {
+            let update = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+                (
+                    proxy.clone(),
+                    proxy.lock().unwrap().process_event(EventSet::IN),
+                )
+            });
+            if let Some(update) = update {
+                used |= update.1.signal_queue;
+                self.process_proxy_update(id, update);
+            }
+        }
+        used
     }
 
     pub(crate) fn has_pending_rx(&self) -> bool {
@@ -496,7 +578,7 @@ impl VsockMuxer {
         let removed = {
             let mut map = self.proxy_map.write().unwrap();
             let before = map.len();
-            map.retain(|_id, proxy| proxy.get_mut().unwrap().is_listener());
+            map.retain(|_id, proxy| proxy.lock().unwrap().is_listener());
             before - map.len()
         };
         self.rxq.lock().unwrap().clear();
@@ -549,6 +631,7 @@ impl VsockMuxer {
                 queue.clone(),
                 self.rxq.clone(),
                 self.snapshot_gate.clone(),
+                self.tsi_flags.contains(TsiFlags::HOST_BIND),
             ) {
                 Ok(mut proxy) => {
                     let rc = proxy.relisten(d.guest_port, d.backlog, &self.host_port_map);
@@ -557,7 +640,7 @@ impl VsockMuxer {
                         self.proxy_map
                             .write()
                             .unwrap()
-                            .insert(id, Mutex::new(Box::new(proxy)));
+                            .insert(id, Arc::new(Mutex::new(Box::new(proxy))));
                         self.update_polling(id, fd, EventSet::IN);
                         info!(
                             "restored TSI inbound listener: guest_port={} (id={:#x})",
@@ -587,7 +670,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_proxy_update(&self, id: u64, update: ProxyUpdate) {
+    fn process_proxy_update(&self, id: u64, (source, update): (ProxyHandle, ProxyUpdate)) {
         if let Some(polling) = update.polling {
             update_live_polling(
                 &self.proxy_map,
@@ -598,21 +681,13 @@ impl VsockMuxer {
             );
         }
 
-        match update.remove_proxy {
-            ProxyRemoval::Keep => {}
-            ProxyRemoval::Immediate => {
-                info!("immediately removing proxy: {id}");
-                self.proxy_map.write().unwrap().remove(&id);
-            }
-            ProxyRemoval::Deferred => {
-                info!("deferring proxy removal: {id}");
-                if let Some(reaper_sender) = &self.reaper_sender
-                    && reaper_sender.send(id).is_err()
-                {
-                    self.proxy_map.write().unwrap().remove(&id);
-                }
-            }
-        }
+        apply_removal(
+            &self.proxy_map,
+            self.reaper_sender.as_ref(),
+            id,
+            &source,
+            update.remove_proxy,
+        );
 
         if update.signal_queue
             && let Some(interrupt) = &self.interrupt
@@ -669,12 +744,13 @@ impl VsockMuxer {
                         queue.clone(),
                         self.rxq.clone(),
                         self.snapshot_gate.clone(),
+                        self.tsi_flags.contains(TsiFlags::HOST_BIND),
                     ) {
                         Ok(proxy) => {
                             self.proxy_map
                                 .write()
                                 .unwrap()
-                                .insert(id, Mutex::new(Box::new(proxy)));
+                                .insert(id, Arc::new(Mutex::new(Box::new(proxy))));
                         }
                         Err(e) => {
                             let open = self.proxy_map.read().unwrap().len();
@@ -707,12 +783,19 @@ impl VsockMuxer {
                         self.rxq.clone(),
                         self.dns_sender.clone(),
                         self.snapshot_gate.clone(),
+                        self.pending_datagram_rx.clone(),
+                        self.epoll.clone(),
+                        #[cfg(target_os = "macos")]
+                        self.host_udp_router
+                            .as_ref()
+                            .and_then(|result| result.as_ref().ok())
+                            .cloned(),
                     ) {
                         Ok(proxy) => {
                             self.proxy_map
                                 .write()
                                 .unwrap()
-                                .insert(id, Mutex::new(Box::new(proxy)));
+                                .insert(id, Arc::new(Mutex::new(Box::new(proxy))));
                         }
                         Err(e) => {
                             let open = self.proxy_map.read().unwrap().len();
@@ -727,11 +810,35 @@ impl VsockMuxer {
 
     fn process_connect(&self, pkt: &VsockPacket) {
         debug!("proxy connect request");
+        if let Some(peer_port) = pkt.read_disconnect_req() {
+            let id = ((peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+            let (result, update) = if self.tsi_flags.contains(TsiFlags::HOST_BIND) {
+                match self.proxy_map.read().unwrap().get(&id) {
+                    Some(proxy) => {
+                        let (result, update) = proxy.lock().unwrap().disconnect_host_datagram();
+                        (result, Some((proxy.clone(), update)))
+                    }
+                    None => (Err(-107), None), // Linux ENOTCONN.
+                }
+            } else {
+                (Err(-95), None)
+            };
+            if let Some(update) = update {
+                self.process_proxy_update(id, update);
+            }
+            self.push_packet(MuxerRx::ConnResponse {
+                local_port: pkt.dst_port(),
+                peer_port: pkt.src_port(),
+                result: result.err().unwrap_or(0),
+            });
+            return;
+        }
         if let Some(req) = pkt.read_connect_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("proxy connect request: id={id}");
             let update = match self.proxy_map.read().unwrap().get(&id) {
                 Some(proxy) => {
+                    let source = proxy.clone();
                     let mut proxy = proxy.lock().unwrap();
                     // A DGRAM connect to a resolver (port 53) is allowed so
                     // it can be intercepted; any other destination must pass
@@ -750,10 +857,11 @@ impl VsockMuxer {
                         !proxy.is_dgram()
                             && req.addr.inet().is_some_and(|a| a.port() == intercept.port)
                     });
-                    match redirected {
+                    let update = match redirected {
                         Some(intercept) => proxy.connect_intercepted(pkt, req, intercept),
                         None => proxy.connect(pkt, req),
-                    }
+                    };
+                    (source, update)
                 }
                 None => {
                     // No proxy: its host socket could not be created (say why),
@@ -775,6 +883,12 @@ impl VsockMuxer {
             };
             // Applied with no proxy_map guard held: a removal takes the write lock.
             self.process_proxy_update(id, update);
+        } else {
+            self.push_packet(MuxerRx::ConnResponse {
+                local_port: pkt.dst_port(),
+                peer_port: pkt.src_port(),
+                result: -22,
+            });
         }
     }
 
@@ -809,6 +923,11 @@ impl VsockMuxer {
             // intercepted; any other destination must pass the egress policy.
             if !self.is_dns_dest(&req.addr) && !self.is_ip_allowed(&req.addr) {
                 warn!("egress policy denied sendto {}", req.addr);
+                // Never let the following payload reuse a prior destination.
+                let id = ((req.peer_port as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+                if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
+                    proxy.lock().unwrap().clear_sendto_addr();
+                }
                 return;
             }
 
@@ -819,11 +938,56 @@ impl VsockMuxer {
                 .read()
                 .unwrap()
                 .get(&id)
-                .map(|proxy| proxy.lock().unwrap().sendto_addr(req));
+                .map(|proxy| (proxy.clone(), proxy.lock().unwrap().sendto_addr(req)));
 
             if let Some(update) = update {
                 self.process_proxy_update(id, update);
             }
+        }
+    }
+
+    fn process_host_sendto_addr(&self, pkt: &VsockPacket) {
+        let Some(mut req) = pkt.data().and_then(HostSendRequest::parse) else {
+            self.push_packet(MuxerRx::HostSendResponse {
+                peer_port: pkt.src_port(),
+                sequence: 0,
+                result: -22,
+            });
+            return;
+        };
+        if !self
+            .tsi_flags
+            .contains(TsiFlags::HIJACK_INET | TsiFlags::HOST_BIND)
+            || self.host_port_map.is_some()
+        {
+            req.destination = Err(-1);
+        } else if req
+            .destination
+            .as_ref()
+            .is_ok_and(|addr| !self.is_ip_allowed(addr))
+        {
+            req.destination = Err(-13);
+        }
+        let id = ((req.peer_port as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+        let result = self
+            .proxy_map
+            .read()
+            .unwrap()
+            .get(&id)
+            .ok_or(-9)
+            .and_then(|proxy| {
+                proxy.lock().unwrap().prepare_host_send(PendingHostSend {
+                    control_port: pkt.src_port(),
+                    sequence: req.sequence,
+                    destination: req.destination,
+                })
+            });
+        if let Err(result) = result {
+            self.push_packet(MuxerRx::HostSendResponse {
+                peer_port: pkt.src_port(),
+                sequence: req.sequence,
+                result,
+            });
         }
     }
 
@@ -835,17 +999,143 @@ impl VsockMuxer {
         }
     }
 
+    fn process_host_setsockopt(&self, pkt: &VsockPacket) {
+        let allowed = self
+            .tsi_flags
+            .contains(TsiFlags::HIJACK_INET | TsiFlags::HOST_BIND)
+            && self.host_port_map.is_none();
+        let result = if !allowed {
+            Err(-1)
+        } else if let Some(req) = pkt
+            .data()
+            .and_then(super::host_sockopt::OptionRequest::parse)
+        {
+            let id = ((req.peer_port as u64) << 32) | req.local_port as u64;
+            let proxies = self.proxy_map.read().unwrap();
+            match proxies.get(&id) {
+                Some(proxy) => proxy.lock().unwrap().set_host_option(&req),
+                None => Err(-9),
+            }
+        } else {
+            Err(-22)
+        };
+        self.push_packet(MuxerRx::BindResponse {
+            local_port: pkt.dst_port(),
+            peer_port: pkt.src_port(),
+            data: BindResponse::status(result),
+        });
+    }
+
+    fn process_host_stream_close(&self, pkt: &VsockPacket) {
+        let request = pkt.data().and_then(super::host_close::CloseRequest::parse);
+        let allowed = self
+            .tsi_flags
+            .contains(TsiFlags::HIJACK_INET | TsiFlags::HOST_BIND)
+            && self.host_port_map.is_none();
+        let (result, update) = if !allowed {
+            (-1, None)
+        } else if let Some(req) = request {
+            let id = ((req.peer_port as u64) << 32) | req.local_port as u64;
+            let map = self.proxy_map.read().unwrap();
+            match map.get(&id) {
+                Some(proxy) => {
+                    let (result, update) = proxy.lock().unwrap().close_host_stream(&req);
+                    (result, Some((id, (proxy.clone(), update))))
+                }
+                // The peer may have reset and the closed-proxy grace period
+                // expired while the guest was in a long linger wait.
+                None => (0, None),
+            }
+        } else {
+            (-22, None)
+        };
+        if let Some((id, update)) = update {
+            self.process_proxy_update(id, update);
+        }
+        // Normal and abortive closes do not wait on the control socket. Only
+        // positive linger needs a response, so avoid queueing unused replies.
+        if request.is_some_and(|req| req.flags != super::host_close::WAIT) {
+            return;
+        }
+        self.push_packet(MuxerRx::BindResponse {
+            local_port: pkt.dst_port(),
+            peer_port: pkt.src_port(),
+            data: BindResponse::status(if result == 0 { Ok(()) } else { Err(result) }),
+        });
+    }
+
+    fn process_bind_request(&self, pkt: &VsockPacket) {
+        // This is a new capability, not a way around the legacy publishing
+        // allow-list. Even an empty map deliberately forbids direct host binds.
+        let allowed = self
+            .tsi_flags
+            .contains(TsiFlags::HIJACK_INET | TsiFlags::HOST_BIND)
+            && self.host_port_map.is_none();
+        let mut update = None;
+        let result = if !allowed {
+            Err(-libc::EPERM)
+        } else if let Some(req) = pkt.data().and_then(BindRequest::parse) {
+            let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+            let map = self.proxy_map.read().unwrap();
+            match map.get(&id) {
+                Some(proxy) => {
+                    let source = proxy.clone();
+                    let mut proxy = proxy.lock().unwrap();
+                    #[cfg(target_os = "macos")]
+                    let result = if proxy.is_dgram() {
+                        match (&self.host_icmp, &self.host_udp_router) {
+                            (Some(Ok(_)), Some(Ok(_))) => proxy.bind_host(&req),
+                            (Some(Err(error)), _) | (_, Some(Err(error))) => Err(*error),
+                            _ => Err(-95),
+                        }
+                    } else {
+                        proxy.bind_host(&req)
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let result = proxy.bind_host(&req);
+                    if result.is_ok() && proxy.is_dgram() {
+                        update = Some((
+                            id,
+                            (
+                                source,
+                                ProxyUpdate {
+                                    polling: Some((id, proxy.poll_handle(), EventSet::IN)),
+                                    ..Default::default()
+                                },
+                            ),
+                        ));
+                    }
+                    result
+                }
+                None => Err(-libc::EBADF),
+            }
+        } else {
+            Err(-libc::EINVAL)
+        };
+        // Register UDP reads with no proxy-map lock held. The host socket is
+        // already bound when success is sent; conflicts cannot be hidden by
+        // later best-effort publication.
+        if let Some((id, update)) = update {
+            self.process_proxy_update(id, update);
+        }
+        self.push_packet(MuxerRx::BindResponse {
+            local_port: pkt.dst_port(),
+            peer_port: pkt.src_port(),
+            data: BindResponse::from(result),
+        });
+    }
+
     fn process_listen_request(&self, pkt: &VsockPacket) {
         debug!("DGRAM listen request: src={}", pkt.src_port());
         if let Some(req) = pkt.read_listen_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("DGRAM listen request: id={id}");
-            let update = self
-                .proxy_map
-                .read()
-                .unwrap()
-                .get(&id)
-                .map(|proxy| proxy.lock().unwrap().listen(pkt, req, &self.host_port_map));
+            let update = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+                (
+                    proxy.clone(),
+                    proxy.lock().unwrap().listen(pkt, req, &self.host_port_map),
+                )
+            });
             match update {
                 Some(update) => self.process_proxy_update(id, update),
                 None => self.push_packet(MuxerRx::ListenResponse {
@@ -867,7 +1157,7 @@ impl VsockMuxer {
                 .read()
                 .unwrap()
                 .get(&id)
-                .map(|proxy| proxy.lock().unwrap().accept(req));
+                .map(|proxy| (proxy.clone(), proxy.lock().unwrap().accept(req)));
             match update {
                 Some(update) => self.process_proxy_update(id, update),
                 None => self.push_packet(MuxerRx::AcceptResponse {
@@ -888,7 +1178,7 @@ impl VsockMuxer {
                 id, req.local_port, req.peer_port
             );
             let update = if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
-                Some(proxy.lock().unwrap().release())
+                Some((proxy.clone(), proxy.lock().unwrap().release()))
             } else {
                 debug!(
                     "release without proxy: id={}, proxies={}",
@@ -914,7 +1204,7 @@ impl VsockMuxer {
 
         let update = if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
             debug!("DGRAM allowing OP_RW for {}", pkt.src_port());
-            Some(proxy_lock.lock().unwrap().sendmsg(pkt))
+            Some((proxy_lock.clone(), proxy_lock.lock().unwrap().sendmsg(pkt)))
         } else {
             debug!("DGRAM ignoring OP_RW for {}", pkt.src_port());
             None
@@ -944,6 +1234,10 @@ impl VsockMuxer {
             defs::TSI_GETNAME if self.tsi_flags.tsi_enabled() => self.process_getname(pkt),
             defs::TSI_SENDTO_ADDR if self.tsi_flags.tsi_enabled() => self.process_sendto_addr(pkt),
             defs::TSI_SENDTO_DATA if self.tsi_flags.tsi_enabled() => self.process_sendto_data(pkt),
+            defs::TSI_BIND => self.process_bind_request(pkt),
+            defs::TSI_HOST_SETSOCKOPT => self.process_host_setsockopt(pkt),
+            defs::TSI_HOST_STREAM_CLOSE => self.process_host_stream_close(pkt),
+            defs::TSI_HOST_SENDTO_ADDR => self.process_host_sendto_addr(pkt),
             defs::TSI_LISTEN if self.tsi_flags.tsi_enabled() => self.process_listen_request(pkt),
             defs::TSI_ACCEPT if self.tsi_flags.tsi_enabled() => self.process_accept_request(pkt),
             defs::TSI_PROXY_RELEASE if self.tsi_flags.tsi_enabled() => {
@@ -973,7 +1267,11 @@ impl VsockMuxer {
         let mut proxy_map = self.proxy_map.write().unwrap();
 
         if let Some(proxy) = proxy_map.get(&id) {
-            let update = proxy.lock().unwrap().confirm_connect(pkt);
+            let update = proxy
+                .lock()
+                .unwrap()
+                .confirm_connect(pkt)
+                .map(|update| (proxy.clone(), update));
             // The write guard must be gone before a removal re-takes it.
             drop(proxy_map);
             if let Some(update) = update {
@@ -1047,9 +1345,10 @@ impl VsockMuxer {
                     return;
                 }
                 unix.confirm_connect(pkt);
-                proxy_map.insert(id, Mutex::new(Box::new(unix)));
+                let source: ProxyHandle = Arc::new(Mutex::new(Box::new(unix)));
+                proxy_map.insert(id, source.clone());
                 drop(proxy_map);
-                self.process_proxy_update(id, update);
+                self.process_proxy_update(id, (source, update));
             }
         }
     }
@@ -1063,12 +1362,12 @@ impl VsockMuxer {
             pkt.src_port(),
             pkt.dst_port()
         );
-        let update = self
-            .proxy_map
-            .read()
-            .unwrap()
-            .get(&id)
-            .map(|proxy| proxy.lock().unwrap().process_op_response(pkt));
+        let update = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+            (
+                proxy.clone(),
+                proxy.lock().unwrap().process_op_response(pkt),
+            )
+        });
 
         if update.is_none() {
             debug!(
@@ -1079,7 +1378,7 @@ impl VsockMuxer {
 
         update
             .as_ref()
-            .and_then(|u| u.push_accept)
+            .and_then(|(_, u)| u.push_accept)
             .and_then(|(_id, parent_id)| {
                 self.proxy_map
                     .read()
@@ -1101,7 +1400,20 @@ impl VsockMuxer {
             .read()
             .unwrap()
             .get(&id)
-            .map(|proxy| proxy.lock().unwrap().shutdown(pkt));
+            .map(|proxy| (proxy.clone(), proxy.lock().unwrap().shutdown(pkt)));
+        if let Some(update) = update {
+            self.process_proxy_update(id, update);
+        }
+    }
+
+    fn process_op_credit_request(&self, pkt: &VsockPacket) {
+        let id = ((pkt.src_port() as u64) << 32) | pkt.dst_port() as u64;
+        let update = self
+            .proxy_map
+            .read()
+            .unwrap()
+            .get(&id)
+            .map(|proxy| (proxy.clone(), proxy.lock().unwrap().request_credit()));
         if let Some(update) = update {
             self.process_proxy_update(id, update);
         }
@@ -1115,7 +1427,7 @@ impl VsockMuxer {
             .read()
             .unwrap()
             .get(&id)
-            .map(|proxy| proxy.lock().unwrap().update_peer_credit(pkt));
+            .map(|proxy| (proxy.clone(), proxy.lock().unwrap().update_peer_credit(pkt)));
         if let Some(update) = update {
             self.process_proxy_update(id, update);
         }
@@ -1129,12 +1441,12 @@ impl VsockMuxer {
         // would reset the connection (a guest download dying "unexpected
         // EOF"). On Unix the extra recv attempt just reports WouldBlock when
         // nothing is buffered.
-        let drain = self
-            .proxy_map
-            .read()
-            .unwrap()
-            .get(&id)
-            .map(|proxy| proxy.lock().unwrap().process_event(EventSet::IN));
+        let drain = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+            (
+                proxy.clone(),
+                proxy.lock().unwrap().process_event(EventSet::IN),
+            )
+        });
         if let Some(update) = drain {
             self.process_proxy_update(id, update);
         }
@@ -1149,7 +1461,7 @@ impl VsockMuxer {
                 pkt.src_port(),
                 pkt.dst_port()
             );
-            proxy_lock.lock().unwrap().sendmsg(pkt)
+            (proxy_lock.clone(), proxy_lock.lock().unwrap().sendmsg(pkt))
         });
         if let Some(update) = update {
             self.process_proxy_update(id, update);
@@ -1195,7 +1507,7 @@ impl VsockMuxer {
                 pkt.src_port(),
                 pkt.dst_port()
             );
-            Some(proxy_lock.lock().unwrap().release())
+            Some((proxy_lock.clone(), proxy_lock.lock().unwrap().release()))
         } else {
             debug!("[VSOCK_TIMING] OP_RST: no proxy found for id={:#x}", id);
             None
@@ -1219,6 +1531,7 @@ impl VsockMuxer {
                 uapi::VSOCK_OP_RESPONSE => "RESPONSE",
                 uapi::VSOCK_OP_SHUTDOWN => "SHUTDOWN",
                 uapi::VSOCK_OP_CREDIT_UPDATE => "CREDIT_UPDATE",
+                uapi::VSOCK_OP_CREDIT_REQUEST => "CREDIT_REQUEST",
                 uapi::VSOCK_OP_RW => "RW",
                 uapi::VSOCK_OP_RST => "RST",
                 _ => "UNKNOWN",
@@ -1249,6 +1562,7 @@ impl VsockMuxer {
             uapi::VSOCK_OP_RESPONSE => self.process_op_response(pkt),
             uapi::VSOCK_OP_SHUTDOWN => self.process_op_shutdown(pkt),
             uapi::VSOCK_OP_CREDIT_UPDATE => self.process_op_credit_update(pkt),
+            uapi::VSOCK_OP_CREDIT_REQUEST => self.process_op_credit_request(pkt),
             uapi::VSOCK_OP_RW => self.process_stream_rw(pkt),
             uapi::VSOCK_OP_RST => self.process_stream_rst(pkt),
             _ => warn!("stream: unhandled op={}", pkt.op()),
@@ -1524,7 +1838,7 @@ mod tests {
                     .proxy_map
                     .write()
                     .unwrap()
-                    .insert(id, Mutex::new(Box::new(RemovedOnUpdate)));
+                    .insert(id, Arc::new(Mutex::new(Box::new(RemovedOnUpdate))));
             };
             let tsi_req = |extra: &[u8]| [&GUEST.to_le_bytes()[..], extra].concat();
             let stream_id = ((GUEST as u64) << 32) | 620;

@@ -25,6 +25,7 @@ flate2 = "1.0.35"
 libc = ">=0.2.39"
 linux-loader = { version = "0.13.2", features = ["bzimage", "elf", "pe"] }
 log = "0.4.0"
+memchr = "2.8"
 vm-memory = { version = "0.17.0", default-features = false, features = ["backend-mmap"] }
 vmm-sys-util = "0.14"
 krun_display = { package = "krun-display", version = "0.1.0", path = "../display", optional = true, features = ["bindgen_clang_runtime"] }

@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,7 +31,7 @@ use vm_memory::GuestMemoryMmap;
 use super::vsock_addr::VsockAddr;
 
 use super::super::Queue as VirtQueue;
-use super::muxer::{MuxerRx, push_packet};
+use super::muxer::{MuxerRx, ProxyTable, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::snapshot_gate::SnapshotGate;
 use crate::virtio::InterruptTransport;
@@ -228,6 +228,18 @@ pub(super) enum FloorMode {
     Strict,
 }
 
+impl FloorMode {
+    /// Host networking deliberately shares host loopback. This per-VM grant
+    /// leaves the metadata floor and any stricter deployment policy intact.
+    pub(super) fn with_host_network(self, enabled: bool) -> Self {
+        if enabled && self == Self::MetadataAndLoopback {
+            Self::MetadataOnly
+        } else {
+            self
+        }
+    }
+}
+
 /// Parse an explicit `SMOLVM_EGRESS_FLOOR` value into a mode. Returns `None`
 /// for an absent/unrecognized value so the caller falls back to the inferred
 /// default. Pure (no env) so it is unit-testable.
@@ -353,11 +365,17 @@ pub(super) fn is_addr_host_loopback(addr: &VsockAddr) -> bool {
     sockaddr_ip(addr).is_some_and(is_host_loopback)
 }
 
-/// Work item handed from the muxer thread to the DNS worker thread. Carries an
-/// owned copy of the query and the vsock addressing needed to deliver the
-/// response — no shared handles, so passing it is cheap and lock-free.
+/// Sender metadata and a socket lifetime token for framed host-mode replies.
+pub struct HostDnsReply {
+    /// Socket lifetime identity; an old reply must not reach a reused vsock port.
+    pub identity: Arc<()>,
+    pub source: VsockAddr,
+}
+
+/// An owned query and its reply address; no host socket is retained.
 pub(super) struct DnsRequest {
     pub query: Vec<u8>,
+    pub host_reply: Option<HostDnsReply>,
     pub peer_port: u32,
     pub fwd_cnt: u32,
     pub cid: u64,
@@ -365,6 +383,7 @@ pub(super) struct DnsRequest {
 
 /// What a DNS worker thread needs to answer a query and deliver the answer.
 struct DnsShared {
+    proxies: Weak<ProxyTable>,
     policy: Option<Arc<RwLock<EgressPolicy>>>,
     forwarder: Option<SocketAddr>,
     mem: GuestMemoryMmap,
@@ -382,6 +401,30 @@ impl DnsShared {
         else {
             return;
         };
+        if let Some(reply) = req.host_reply {
+            let Some(proxies) = self.proxies.upgrade() else {
+                return;
+            };
+            let id = ((req.peer_port as u64) << 32) | super::defs::TSI_PROXY_PORT as u64;
+            loop {
+                let table = proxies.read().unwrap();
+                let Some(proxy) = table.get(&id) else {
+                    return;
+                };
+                let mut proxy = proxy.lock().unwrap();
+                if let Some(activity) = self.snapshot_gate.try_enter() {
+                    if proxy.receive_dns(reply, response, &activity) {
+                        self.interrupt.signal_used_queue();
+                    }
+                    return;
+                }
+                // Reset may need these locks while RX is paused. Wait only
+                // after releasing them; revalidate socket identity on retry.
+                drop(proxy);
+                drop(table);
+                drop(self.snapshot_gate.enter());
+            }
+        }
         push_packet(
             req.cid,
             MuxerRx::DgramDataDnsResponse {
@@ -416,6 +459,7 @@ impl DnsWorker {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         receiver: Receiver<DnsRequest>,
+        proxies: Weak<ProxyTable>,
         policy: Option<Arc<RwLock<EgressPolicy>>>,
         forwarder: Option<SocketAddr>,
         mem: GuestMemoryMmap,
@@ -427,6 +471,7 @@ impl DnsWorker {
         Self {
             receiver,
             shared: Arc::new(DnsShared {
+                proxies,
                 policy,
                 forwarder,
                 mem,
@@ -1094,6 +1139,22 @@ mod tests {
         assert!(is_addr_floored(&sockaddr_v4(169, 254, 169, 254, 80), meta));
         assert!(!is_addr_floored(&sockaddr_v4(127, 0, 0, 1, 80), meta));
         assert!(!is_addr_floored(&sockaddr_v4(0, 0, 0, 0, 80), meta));
+    }
+
+    #[test]
+    fn host_network_grants_loopback_without_weakening_strict_or_metadata_rules() {
+        let local = FloorMode::MetadataAndLoopback.with_host_network(true);
+        assert!(!is_addr_floored(&sockaddr_v4(127, 0, 0, 1, 80), local));
+        assert!(is_addr_floored(&sockaddr_v4(169, 254, 169, 254, 80), local));
+        let isolated = FloorMode::MetadataAndLoopback.with_host_network(false);
+        assert!(is_addr_floored(&sockaddr_v4(127, 0, 0, 1, 80), isolated));
+        let strict = FloorMode::Strict.with_host_network(true);
+        assert!(is_addr_floored(&sockaddr_v4(127, 0, 0, 1, 80), strict));
+        assert!(is_addr_floored(&sockaddr_v4(10, 0, 0, 1, 80), strict));
+        assert!(is_addr_floored(
+            &sockaddr_v4(169, 254, 169, 254, 80),
+            strict
+        ));
     }
 
     #[test]

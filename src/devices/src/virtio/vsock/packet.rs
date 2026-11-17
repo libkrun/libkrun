@@ -593,6 +593,17 @@ impl VsockPacket {
         }
     }
 
+    /// AF_UNSPEC is a disconnect operation, never an egress destination.
+    pub fn read_disconnect_req(&self) -> Option<u32> {
+        let buf = self.buf()?.get(..self.len() as usize)?;
+        let header = buf.get(..10)?;
+        let addr_len = byte_order::read_le_u32(&header[4..]) as usize;
+        if !(2..=128).contains(&addr_len) || buf.len() < 8 + addr_len {
+            return None;
+        }
+        (header[8..10] == [0, 0]).then(|| byte_order::read_le_u32(header))
+    }
+
     pub fn read_connect_req(&self) -> Option<TsiConnectReq> {
         if self.buf_size >= 8 {
             let buf = self.buf().unwrap();
