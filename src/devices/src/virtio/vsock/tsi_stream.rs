@@ -30,6 +30,10 @@ use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
 
+#[cfg(test)]
+#[path = "tsi_stream_tests.rs"]
+mod tests;
+
 pub struct TsiStreamProxy {
     id: u64,
     cid: u64,
@@ -1227,23 +1231,33 @@ impl Proxy for TsiStreamProxy {
             return update;
         }
 
+        let connect_events = EventSet::OUT | EventSet::HANG_UP;
+        #[cfg(target_os = "linux")]
+        let connect_events = connect_events | EventSet::ERROR;
+        if self.status == ProxyStatus::Connecting && evset.intersects(connect_events) {
+            // Writability means that the nonblocking dial finished, not that
+            // it succeeded. An error can arrive without HANG_UP (or without
+            // OUT on Linux); consume SO_ERROR before acknowledging the dial.
+            match self.sock.take_error() {
+                Ok(Some(error)) | Err(error) => {
+                    self.fail_connect(&mut update, sys::to_linux_errno(&error));
+                }
+                Ok(None) if evset.contains(EventSet::OUT) && !evset.contains(EventSet::HANG_UP) => {
+                    self.switch_to_connected();
+                    self.push_connect_rsp(0);
+                    update.signal_queue = true;
+                    // Wait for OP_REQUEST to establish the guest transport
+                    // before polling this socket for data.
+                    update.polling = Some((self.id, raw_handle(&self.sock), EventSet::empty()));
+                }
+                Ok(None) => self.fail_connect(&mut update, LINUX_ECONNREFUSED),
+            }
+            return update;
+        }
+
         if evset.contains(EventSet::HANG_UP) {
             debug!("process_event: HANG_UP");
-            if self.status == ProxyStatus::Connecting {
-                // Report why the dial failed (timed out, unreachable, out of
-                // local ports), in the guest's errno numbering; a refusal is
-                // only the fallback when the socket holds no error.
-                let errno = match self.sock.take_error() {
-                    Ok(Some(e)) => sys::to_linux_errno(&e),
-                    _ => LINUX_ECONNREFUSED,
-                };
-                self.push_connect_rsp(-errno);
-                self.status = ProxyStatus::Closed;
-                update.polling = Some((self.id, raw_handle(&self.sock), EventSet::empty()));
-                update.signal_queue = true;
-                update.remove_proxy = ProxyRemoval::Deferred;
-                return update;
-            } else if self.status == ProxyStatus::Connected {
+            if self.status == ProxyStatus::Connected {
                 // Drain any remaining data before signaling closure.
                 let (signal_queue, _) = self.recv_pkt();
                 update.signal_queue = signal_queue;
@@ -1335,14 +1349,7 @@ impl Proxy for TsiStreamProxy {
 
         if evset.contains(EventSet::OUT) {
             debug!("process_event: OUT");
-            if self.status == ProxyStatus::Connecting {
-                self.switch_to_connected();
-                self.push_connect_rsp(0);
-                update.signal_queue = true;
-                // Stop listening for events in the TCP socket until we receive
-                // OP_REQUEST and the vsock transport is fully established.
-                update.polling = Some((self.id(), raw_handle(&self.sock), EventSet::empty()));
-            } else if self.status == ProxyStatus::Connected {
+            if self.status == ProxyStatus::Connected {
                 // The host socket drained: flush buffered guest->host bytes and,
                 // if enough progressed, re-open the guest's credit window. This
                 // is what makes the non-blocking send in `sendmsg` complete
