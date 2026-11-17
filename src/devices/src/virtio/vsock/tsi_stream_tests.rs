@@ -3,7 +3,7 @@
 use super::*;
 use crate::virtio::queue::tests::VirtQueue as TestQueue;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent};
-use vm_memory::GuestAddress;
+use vm_memory::{Bytes, GuestAddress};
 
 fn connecting(ip: std::net::IpAddr, listening: bool) -> (TsiStreamProxy, Option<Socket>) {
     let domain = if ip.is_ipv4() {
@@ -38,13 +38,26 @@ fn connecting(ip: std::net::IpAddr, listening: bool) -> (TsiStreamProxy, Option<
         1024,
         7000,
         7100,
-        mem,
+        mem.clone(),
         Arc::new(Mutex::new(queue)),
         Arc::new(Mutex::new(MuxerRxQ::new())),
         Arc::new(SnapshotGate::default()),
     )
     .unwrap();
-    proxy.dial(Ok(address));
+    let tx = TestQueue::new(GuestAddress(0x3000), &mem, 8);
+    mem.write_slice(&[0; 44], GuestAddress(0x8000)).unwrap();
+    tx.dtable[0].set(0x8000, 44, 0, 0);
+    tx.avail.ring[0].set(0);
+    tx.avail.idx.set(1);
+    let mut pkt = VsockPacket::from_tx_virtq_head(&tx.create_queue().pop(&mem).unwrap()).unwrap();
+    pkt.set_src_port(7300); // Distinct from the proxy creation control port.
+    proxy.connect(
+        &pkt,
+        TsiConnectReq {
+            peer_port: 7000,
+            addr: address.as_socket().unwrap().into(),
+        },
+    );
     assert_eq!(proxy.status, ProxyStatus::Connecting);
     let mut epoll = Epoll::new().unwrap();
     epoll
@@ -70,7 +83,7 @@ fn check_connect_result(events: EventSet, listening: bool) {
         let update = proxy.process_event(events);
         let expected = if listening { 0 } else { -LINUX_ECONNREFUSED };
         assert!(matches!(proxy.rxq.lock().unwrap().pop(),
-            Some(MuxerRx::ConnResponse { result, .. }) if result == expected));
+            Some(MuxerRx::ConnResponse { result, peer_port: 7300, .. }) if result == expected));
         assert!(proxy.rxq.lock().unwrap().is_empty());
         assert!(update.signal_queue);
         assert!(update.polling.unwrap().2.is_empty());

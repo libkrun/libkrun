@@ -795,7 +795,9 @@ impl Proxy for TsiStreamProxy {
         }
     }
 
-    fn connect(&mut self, _pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
+    fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
+        // The guest may use a dedicated reply socket for asynchronous dials.
+        self.control_port = pkt.src_port();
         if !req.addr.suits_family(self.family) {
             warn!(
                 "connect: id={} refused address {} for its family",
@@ -856,10 +858,11 @@ impl Proxy for TsiStreamProxy {
 
     fn connect_intercepted(
         &mut self,
-        _pkt: &VsockPacket,
+        pkt: &VsockPacket,
         req: TsiConnectReq,
         intercept: &StreamIntercept,
     ) -> ProxyUpdate {
+        self.control_port = pkt.src_port();
         let Some(destination) = req.addr.inet() else {
             return self.dial(Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
         };
