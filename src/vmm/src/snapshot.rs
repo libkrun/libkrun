@@ -515,11 +515,20 @@ pub fn write_guest_memory<W: Write>(
         let host = mem
             .get_host_address(gpa)
             .map_err(|e| io::Error::other(format!("get_host_address: {e:?}")))?;
-        // Safety: `host` points to `len` bytes of live guest RAM owned by the
-        // mmap region currently being iterated. The VM is paused, so the bytes
-        // are stable for the duration of the copy.
-        let bytes = unsafe { std::slice::from_raw_parts(host as *const u8, len as usize) };
-        out.write_all(bytes)?;
+        #[cfg(windows)]
+        // SAFETY: this region owns the address range and the caller has frozen
+        // the VM. Device windows may be reserved, so never form a slice over
+        // them until the Windows writer has checked their committed spans.
+        unsafe {
+            crate::windows::snapshot_memory::write_region(host, len as usize, out)?;
+        }
+        #[cfg(not(windows))]
+        {
+            // Safety: `host` points to `len` bytes of live guest RAM owned by
+            // this region, stable while the VM is paused.
+            let bytes = unsafe { std::slice::from_raw_parts(host as *const u8, len as usize) };
+            out.write_all(bytes)?;
+        }
         descs.push(MemoryRegionDesc {
             gpa: gpa.raw_value(),
             len,
@@ -5578,6 +5587,64 @@ mod tests {
         let mut got = vec![0u8; size];
         dst.read_slice(&mut got, GuestAddress(0)).unwrap();
         assert_eq!(got, pattern, "restored bytes must match the snapshot");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_checkpoint_roundtrip_with_reserved_device_window() {
+        use std::fs::{self, OpenOptions};
+        use std::io::{Seek, SeekFrom};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc,
+            VirtualQuery,
+        };
+
+        let ram = vm_memory::GuestRegionMmap::from_range(GuestAddress(0), 65536, None).unwrap();
+        let window = vm_memory::MmapRegion::new_reserved(65536).unwrap();
+        let address = window.as_ptr();
+        assert!(
+            !unsafe { VirtualAlloc(address.add(4096).cast(), 4096, MEM_COMMIT, PAGE_READWRITE) }
+                .is_null()
+        );
+        unsafe { address.add(4096).write_bytes(0xa5, 4096) };
+        let src = GuestMemoryMmap::from_regions(vec![
+            ram,
+            vm_memory::GuestRegionMmap::new(window, GuestAddress(0x100000)).unwrap(),
+        ])
+        .unwrap();
+        src.write_slice(&[0x5a; 65536], GuestAddress(0)).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("krun-reserved-snapshot-{}.bin", std::process::id()));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let descs = write_guest_memory(&src, &mut file).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 131072);
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        assert_ne!(
+            unsafe { VirtualQuery(address.cast(), &mut info, size_of_val(&info)) },
+            0
+        );
+        assert_eq!(
+            info.State, MEM_RESERVE,
+            "capture must not commit the unused window"
+        );
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let restored = load_guest_memory(&descs, &mut file).unwrap();
+        let mut got = vec![0; 65536];
+        restored.read_slice(&mut got, GuestAddress(0)).unwrap();
+        assert_eq!(got, vec![0x5a; 65536]);
+        restored
+            .read_slice(&mut got, GuestAddress(0x100000))
+            .unwrap();
+        let mut expected = vec![0; 65536];
+        expected[4096..8192].fill(0xa5);
+        assert_eq!(got, expected);
+        drop(file);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

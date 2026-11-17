@@ -444,9 +444,8 @@ mod tests {
     use crate::resources::VmResources;
     use crate::vmm_config::kernel_cmdline::KernelCmdlineConfig;
     use crate::vmm_config::machine_config::{CpuFeaturesTemplate, VmConfig, VmConfigError};
-    use crate::vmm_config::vsock::tests::{TempSockFile, default_config};
+    use crate::vmm_config::vsock::tests::default_config;
     use crate::vstate::VcpuConfig;
-    use utils::tempfile::TempFile;
 
     fn default_kernel_cmdline() -> KernelCmdlineConfig {
         KernelCmdlineConfig {
@@ -487,6 +486,10 @@ mod tests {
             serial_consoles: Vec::new(),
             virtio_consoles: Vec::new(),
             kernel_console: None,
+            #[cfg(target_os = "windows")]
+            console_output: None,
+            #[cfg(target_os = "windows")]
+            disable_implicit_console: false,
             dhcp_client: false,
         }
     }
@@ -552,8 +555,7 @@ mod tests {
     #[test]
     fn test_set_vsock_device() {
         let mut vm_resources = default_vm_resources();
-        let tmp_sock_file = TempSockFile::new(TempFile::new().unwrap());
-        let new_vsock_cfg = default_config(&tmp_sock_file);
+        let new_vsock_cfg = default_config();
         assert!(vm_resources.vsock.get().is_none());
         vm_resources
             .set_vsock_device(new_vsock_cfg.clone())

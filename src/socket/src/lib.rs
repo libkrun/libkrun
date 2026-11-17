@@ -4,6 +4,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+mod windows;
+
 /// An address and the private directory that keeps it resolvable.
 ///
 /// Keep this value while advertising its address: a datagram peer may reply
@@ -16,6 +19,8 @@ pub struct SocketPath {
     path: PathBuf,
     #[cfg(unix)]
     _directory: Option<tempfile::TempDir>,
+    #[cfg(windows)]
+    _directory: Option<windows::Alias>,
 }
 
 impl SocketPath {
@@ -68,7 +73,11 @@ impl SocketPath {
                 _directory: Some(directory),
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            windows::address(path)
+        }
+        #[cfg(not(any(unix, windows)))]
         Ok(Self { path: path.into() })
     }
 

@@ -1345,9 +1345,18 @@ pub struct WhpVcpu {
     exit_context: WHV_RUN_VP_EXIT_CONTEXT,
 }
 
+// The Windows SDK declares WHV_UINT128 with 16-byte alignment. windows-sys
+// loses that annotation, so its register union alone is only 8-byte aligned.
+// Keep both stack arrays and heap elements aligned at every WHP call boundary.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct AlignedRegisters<T>(T);
+
+const _: () = assert!(mem::size_of::<AlignedRegisters<WHV_REGISTER_VALUE>>() == 16);
+
 impl WhpVcpu {
     fn activity_state(&self) -> Result<u64, Error> {
-        let mut value: WHV_REGISTER_VALUE = unsafe { mem::zeroed() };
+        let mut value = AlignedRegisters(WHV_REGISTER_VALUE::default());
         let name = WHvRegisterInternalActivityState;
         let hr = unsafe {
             WHvGetVirtualProcessorRegisters(
@@ -1355,11 +1364,11 @@ impl WhpVcpu {
                 self.index,
                 &name,
                 1,
-                &mut value,
+                &mut value.0,
             )
         };
         if hr == S_OK {
-            Ok(unsafe { value.Reg64 })
+            Ok(unsafe { value.0.Reg64 })
         } else {
             Err(Error::GetRegisters(hr))
         }
@@ -1519,7 +1528,7 @@ impl WhpVcpu {
         names: [WHV_REGISTER_NAME; N],
     ) -> Result<[WHV_REGISTER_VALUE; N], Error> {
         // Create a zeroed array on the stack to hold the results
-        let mut values: [WHV_REGISTER_VALUE; N] = unsafe { mem::zeroed() };
+        let mut values = AlignedRegisters([WHV_REGISTER_VALUE::default(); N]);
 
         let hr = unsafe {
             WHvGetVirtualProcessorRegisters(
@@ -1527,7 +1536,7 @@ impl WhpVcpu {
                 self.index,
                 names.as_ptr(),
                 N as u32,
-                values.as_mut_ptr(),
+                values.0.as_mut_ptr(),
             )
         };
 
@@ -1535,7 +1544,7 @@ impl WhpVcpu {
             Err(Error::GetRegisters(hr))
         } else {
             // Return the array directly!
-            Ok(values)
+            Ok(values.0)
         }
     }
 
@@ -1566,12 +1575,12 @@ impl WhpVcpu {
         }
     }
 
-    fn set_whp_registers(
+    fn set_whp_registers<const N: usize>(
         &self,
         names: &[WHV_REGISTER_NAME],
-        values: &[WHV_REGISTER_VALUE],
+        values: &AlignedRegisters<[WHV_REGISTER_VALUE; N]>,
     ) -> Result<(), Error> {
-        assert_eq!(names.len(), values.len());
+        assert_eq!(names.len(), N);
         let count = names.len() as u32;
 
         let hr = unsafe {
@@ -1580,7 +1589,7 @@ impl WhpVcpu {
                 self.index,
                 names.as_ptr(),
                 count,
-                values.as_ptr(),
+                values.0.as_ptr(),
             )
         };
         if hr != S_OK {
@@ -1595,11 +1604,11 @@ impl WhpVcpu {
         pairs: [(WHV_REGISTER_NAME, WHV_REGISTER_VALUE); N],
     ) -> Result<(), Error> {
         let mut names: [WHV_REGISTER_NAME; N] = unsafe { mem::zeroed() };
-        let mut values: [WHV_REGISTER_VALUE; N] = unsafe { mem::zeroed() };
+        let mut values = AlignedRegisters([WHV_REGISTER_VALUE::default(); N]);
 
         for i in 0..N {
             names[i] = pairs[i].0;
-            values[i] = pairs[i].1;
+            values.0[i] = pairs[i].1;
         }
 
         self.set_whp_registers(&names, &values)
@@ -1610,11 +1619,11 @@ impl WhpVcpu {
         pairs: [(WHV_REGISTER_NAME, u64); N],
     ) -> Result<(), Error> {
         let mut names: [WHV_REGISTER_NAME; N] = unsafe { mem::zeroed() };
-        let mut values: [WHV_REGISTER_VALUE; N] = unsafe { mem::zeroed() };
+        let mut values = AlignedRegisters([WHV_REGISTER_VALUE::default(); N]);
 
         for i in 0..N {
             names[i] = pairs[i].0;
-            values[i].Reg64 = pairs[i].1;
+            values.0[i].Reg64 = pairs[i].1;
         }
 
         self.set_whp_registers(&names, &values)
@@ -1858,8 +1867,8 @@ impl WhpVcpuState {
 /// Converts a raw 16-byte register value to a `WHV_REGISTER_VALUE`.
 fn bytes_to_reg_value(bytes: &[u8; 16]) -> WHV_REGISTER_VALUE {
     // SAFETY: `WHV_REGISTER_VALUE` is a 16-byte POD union (`Reg128` is its widest
-    // member); any 16-byte pattern is a valid bit-image of it.
-    unsafe { *(bytes.as_ptr() as *const WHV_REGISTER_VALUE) }
+    // member); any 16-byte pattern is valid, and byte arrays need not be aligned.
+    unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<WHV_REGISTER_VALUE>()) }
 }
 
 /// Converts a `WHV_REGISTER_VALUE` to its raw 16-byte image.
@@ -1883,31 +1892,34 @@ impl WhpVcpu {
         let mut reg_names: Vec<WHV_REGISTER_NAME>;
         let mut reg_values: Vec<[u8; 16]>;
 
-        let mut batch: Vec<WHV_REGISTER_VALUE> = vec![unsafe { mem::zeroed() }; n];
+        let mut batch = vec![AlignedRegisters(WHV_REGISTER_VALUE::default()); n];
         let hr = unsafe {
             WHvGetVirtualProcessorRegisters(
                 part,
                 self.index,
                 CHECKPOINT_REGS.as_ptr(),
                 n as u32,
-                batch.as_mut_ptr(),
+                batch.as_mut_ptr().cast(),
             )
         };
         if hr == S_OK {
             reg_names = CHECKPOINT_REGS.to_vec();
-            reg_values = batch.iter().map(reg_value_to_bytes).collect();
+            reg_values = batch
+                .iter()
+                .map(|value| reg_value_to_bytes(&value.0))
+                .collect();
         } else {
             // Per-register fallback: keep only registers the host recognizes.
             reg_names = Vec::with_capacity(n);
             reg_values = Vec::with_capacity(n);
             for &name in CHECKPOINT_REGS {
-                let mut value: WHV_REGISTER_VALUE = unsafe { mem::zeroed() };
+                let mut value = AlignedRegisters(WHV_REGISTER_VALUE::default());
                 let hr = unsafe {
-                    WHvGetVirtualProcessorRegisters(part, self.index, &name, 1, &mut value)
+                    WHvGetVirtualProcessorRegisters(part, self.index, &name, 1, &mut value.0)
                 };
                 if hr == S_OK {
                     reg_names.push(name);
-                    reg_values.push(reg_value_to_bytes(&value));
+                    reg_values.push(reg_value_to_bytes(&value.0));
                 }
             }
             if reg_names.is_empty() {
@@ -1974,8 +1986,11 @@ impl WhpVcpu {
             })?;
         }
         let part = self.vm.partition_handle();
-        let values: Vec<WHV_REGISTER_VALUE> =
-            state.reg_values.iter().map(bytes_to_reg_value).collect();
+        let values: Vec<_> = state
+            .reg_values
+            .iter()
+            .map(|bytes| AlignedRegisters(bytes_to_reg_value(bytes)))
+            .collect();
 
         let hr = unsafe {
             WHvSetVirtualProcessorRegisters(
@@ -1983,7 +1998,7 @@ impl WhpVcpu {
                 self.index,
                 state.reg_names.as_ptr(),
                 state.reg_names.len() as u32,
-                values.as_ptr(),
+                values.as_ptr().cast(),
             )
         };
         if hr != S_OK {
@@ -2003,7 +2018,7 @@ impl WhpVcpu {
             ];
             for (name, value) in state.reg_names.iter().zip(values.iter()) {
                 let hr =
-                    unsafe { WHvSetVirtualProcessorRegisters(part, self.index, name, 1, value) };
+                    unsafe { WHvSetVirtualProcessorRegisters(part, self.index, name, 1, &value.0) };
                 if hr != S_OK {
                     if CORE.contains(name) {
                         error!("restoring core vCPU register {name} failed: HRESULT 0x{hr:08x}");
@@ -2099,5 +2114,62 @@ impl Drop for WhpVcpu {
                 self.index
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod register_alignment_tests {
+    use super::*;
+
+    #[test]
+    fn register_arrays_and_heap_elements_have_the_sdk_alignment() {
+        assert_eq!(mem::align_of::<AlignedRegisters<WHV_REGISTER_VALUE>>(), 16);
+        let stack = AlignedRegisters([WHV_REGISTER_VALUE::default(); 3]);
+        assert_eq!(stack.0.as_ptr() as usize % 16, 0);
+        let heap = vec![AlignedRegisters(WHV_REGISTER_VALUE::default()); CHECKPOINT_REGS.len()];
+        for value in &heap {
+            assert_eq!(&value.0 as *const _ as usize % 16, 0);
+        }
+    }
+
+    #[test]
+    fn checkpoint_register_bytes_need_no_alignment() {
+        let mut bytes = AlignedRegisters([0u8; 32]);
+        for (i, byte) in bytes.0[1..17].iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        let unaligned: &[u8; 16] = bytes.0[1..17].try_into().unwrap();
+        assert_eq!(unaligned.as_ptr() as usize % 16, 1);
+        assert_eq!(
+            reg_value_to_bytes(&bytes_to_reg_value(unaligned)),
+            *unaligned
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an enabled Windows Hypervisor Platform host"]
+    fn native_register_and_checkpoint_roundtrip() {
+        check_hypervisor().unwrap();
+        let vm = Arc::new(WhpVm::new(1).unwrap());
+        let vcpu = WhpVcpu::new(vm, 0).unwrap();
+        for value in 0..128 {
+            vcpu.set_registers64([(WHvX64RegisterRax, value), (WHvX64RegisterRbx, !value)])
+                .unwrap();
+            assert_eq!(
+                vcpu.get_registers64([WHvX64RegisterRax, WHvX64RegisterRbx])
+                    .unwrap(),
+                [value, !value]
+            );
+            let raw = WHV_REGISTER_VALUE { Reg64: value + 1 };
+            vcpu.set_registers([(WHvX64RegisterRcx, raw)]).unwrap();
+            assert_eq!(
+                vcpu.get_registers64([WHvX64RegisterRcx]).unwrap(),
+                [value + 1]
+            );
+        }
+        let state = vcpu.save_state().unwrap();
+        vcpu.set_registers64([(WHvX64RegisterRax, 0)]).unwrap();
+        vcpu.restore_state(&state).unwrap();
+        assert_eq!(vcpu.get_registers64([WHvX64RegisterRax]).unwrap(), [127]);
     }
 }

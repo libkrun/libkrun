@@ -1,11 +1,27 @@
 name: Code Quality
-on: [pull_request]
+on:
+  pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  socket-paths:
+    name: Socket paths (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked -p krun-socket
+      - run: cargo clippy --locked -p krun-socket --all-targets -- -D warnings
+      - if: runner.os == 'Windows'
+        run: cargo test --locked -p krun-whp --lib
+
   check-windows:
     name: libkrun (Windows cross)
     runs-on: ubuntu-22.04
@@ -22,6 +38,30 @@ jobs:
           sudo apt-get install -y gcc-mingw-w64-x86-64 musl-tools clang libclang-dev
       - name: Check the Windows block and network backend
         run: cargo check --locked --target x86_64-pc-windows-gnu -p libkrun --features blk,net
+      - name: Build Windows VMM regression tests
+        run: cargo test --locked --target x86_64-pc-windows-gnu -p krun-vmm --features blk,net --lib --no-run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-vmm-tests
+          path: target/x86_64-pc-windows-gnu/debug/deps/krun_vmm-*.exe
+          if-no-files-found: error
+
+  test-windows-vmm:
+    name: VMM regressions (Windows native)
+    needs: check-windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-vmm-tests
+          path: vmm-tests
+      - name: Test native Windows memory and VMM helpers
+        shell: pwsh
+        run: |
+          $tests = @(Get-ChildItem vmm-tests -Filter 'krun_vmm-*.exe')
+          if ($tests.Count -ne 1) { throw 'Expected one VMM test executable' }
+          & $tests[0].FullName --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   code-quality-linux-x86_64:
     name: libkrun (Linux x86_64)

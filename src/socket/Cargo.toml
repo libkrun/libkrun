@@ -8,3 +8,12 @@ description = "Short-lived private addresses for filesystem Unix sockets"
 [target.'cfg(unix)'.dependencies]
 tempfile = "3"
 
+[target.'cfg(windows)'.dependencies]
+getrandom = "0.3"
+junction = "2.1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_System_Com"] }
+
+[dev-dependencies]
+socket2 = "0.5"
+tempfile = "3"
+
