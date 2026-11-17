@@ -1019,7 +1019,7 @@ int32_t krun_add_vsock_port2(uint32_t ctx_id,
 int32_t krun_add_vsock(uint32_t ctx_id, uint32_t tsi_features);
 
 /**
- * Return the runtime's experimental host-network wire ABI (currently 2).
+ * Return the runtime's experimental host-network wire ABI.
  * A nonzero ABI does not assert that the selected kernel supports it:
  * krun_start_enter validates the loaded kernel and reports -EOPNOTSUPP with
  * krun_get_last_error when its host-network ABI is missing or incompatible.
