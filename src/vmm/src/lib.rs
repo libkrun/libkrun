@@ -19,6 +19,8 @@ pub mod arm_board;
 pub mod builder;
 /// Checkpointed CPU discovery policy and live creation bookkeeping.
 pub mod cpu_growth;
+mod host_network;
+pub use host_network::ABI_VERSION as HOST_NETWORK_ABI_VERSION;
 #[cfg(target_os = "linux")]
 pub mod demand_paging;
 pub(crate) mod device_manager;

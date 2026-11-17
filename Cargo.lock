@@ -903,6 +903,7 @@ dependencies = [
  "libc",
  "linux-loader",
  "log",
+ "memchr",
  "nix 0.30.1",
  "serde",
  "serde_json",

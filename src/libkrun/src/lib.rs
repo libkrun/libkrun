@@ -5327,6 +5327,12 @@ pub unsafe extern "C" fn krun_get_default_init(
     -libc::ENOTSUP
 }
 
+/// Runtime wire ABI; the selected kernel is independently checked at boot.
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_get_host_network_abi() -> u32 {
+    vmm::HOST_NETWORK_ABI_VERSION
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
     let tsi_flags = match TsiFlags::from_bits(tsi_features) {
@@ -5827,6 +5833,10 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     match &ctx_cfg.vsock_config {
         VsockConfig::Disabled => (),
         VsockConfig::Explicit { tsi_flags } => {
+            if tsi_flags.contains(TsiFlags::HOST_BIND) && ctx_cfg.tsi_port_map.is_some() {
+                set_last_error("host networking cannot be combined with a port publishing map");
+                return -libc::EINVAL;
+            }
             let vsock_device_config = VsockDeviceConfig {
                 vsock_id: "vsock0".to_string(),
                 guest_cid: 3,
@@ -5918,7 +5928,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     ) {
         Ok(vmm) => vmm,
         Err(e) => {
-            let errno = start_errno(&format!("{e:?}"));
+            let errno = if matches!(e, vmm::builder::StartMicrovmError::HostNetwork(_)) {
+                libc::EOPNOTSUPP
+            } else {
+                start_errno(&format!("{e:?}"))
+            };
             error!("Building the microVM failed (errno {errno}): {e:?}");
             set_last_error(format!("build microVM: {e}"));
             return -errno;
@@ -6027,6 +6041,12 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
         Some(ctx_cfg) => ctx_cfg,
         None => return -libc::ENOENT,
     };
+
+    if matches!(ctx_cfg.vsock_config, VsockConfig::Explicit { tsi_flags } if tsi_flags.contains(TsiFlags::HOST_BIND))
+    {
+        set_last_error("host networking is not supported by the Nitro transport");
+        return -libc::EOPNOTSUPP;
+    }
 
     let Ok(enclave) = NitroEnclave::try_from(ctx_cfg) else {
         return -libc::EINVAL;
