@@ -772,6 +772,23 @@ impl VsockMuxer {
 
     fn process_connect(&self, pkt: &VsockPacket) {
         debug!("proxy connect request");
+        if let Some(peer_port) = pkt.read_disconnect_req() {
+            let id = ((peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+            let result = if self.tsi_flags.contains(TsiFlags::HOST_BIND) {
+                match self.proxy_map.read().unwrap().get(&id) {
+                    Some(proxy) => proxy.lock().unwrap().disconnect_host_datagram(),
+                    None => Err(-107), // Linux ENOTCONN.
+                }
+            } else {
+                Err(-95)
+            };
+            self.push_packet(MuxerRx::ConnResponse {
+                local_port: pkt.dst_port(),
+                peer_port: pkt.src_port(),
+                result: result.err().unwrap_or(0),
+            });
+            return;
+        }
         if let Some(req) = pkt.read_connect_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("proxy connect request: id={id}");
@@ -820,6 +837,12 @@ impl VsockMuxer {
             };
             // Applied with no proxy_map guard held: a removal takes the write lock.
             self.process_proxy_update(id, update);
+        } else {
+            self.push_packet(MuxerRx::ConnResponse {
+                local_port: pkt.dst_port(),
+                peer_port: pkt.src_port(),
+                result: -22,
+            });
         }
     }
 

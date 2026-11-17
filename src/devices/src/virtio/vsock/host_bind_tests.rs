@@ -713,3 +713,89 @@ fn host_udp_failed_reconnect_keeps_dns_interception() {
     assert!(receiver.try_recv().is_err());
     f.release();
 }
+
+#[test]
+fn host_udp_disconnect_is_capability_gated_and_does_not_allow_short_requests() {
+    let mut f = Fixture::new(granted(), None);
+    f.muxer.floor = FloorMode::MetadataOnly;
+    f.create(defs::SOCK_DGRAM, defs::LINUX_AF_INET);
+    f.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = VsockAddr::from(peer.local_addr().unwrap());
+    f.send(
+        defs::TSI_CONNECT,
+        &[
+            &GUEST.to_le_bytes()[..],
+            &address.linux_len().to_le_bytes(),
+            &address.to_linux_bytes(),
+        ]
+        .concat(),
+    );
+    assert!(matches!(
+        f.muxer.rxq.lock().unwrap().pop(),
+        Some(MuxerRx::ConnResponse { result: 0, .. })
+    ));
+
+    let disconnect = [&GUEST.to_le_bytes()[..], &2u32.to_le_bytes(), &[0, 0]].concat();
+    for malformed in [
+        disconnect[..9].to_vec(),
+        [&GUEST.to_le_bytes()[..], &129u32.to_le_bytes(), &[0; 129]].concat(),
+    ] {
+        f.send(defs::TSI_CONNECT, &malformed);
+        assert!(matches!(
+            f.muxer.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::ConnResponse { result: -22, .. })
+        ));
+    }
+    f.muxer.tsi_flags.remove(TsiFlags::HOST_BIND);
+    f.send(defs::TSI_CONNECT, &disconnect);
+    assert!(matches!(
+        f.muxer.rxq.lock().unwrap().pop(),
+        Some(MuxerRx::ConnResponse { result: -95, .. })
+    ));
+    f.send(
+        defs::TSI_GETNAME,
+        &[
+            &GUEST.to_le_bytes()[..],
+            &defs::TSI_PROXY_PORT.to_le_bytes(),
+            &1u32.to_le_bytes(),
+        ]
+        .concat(),
+    );
+    match f.muxer.rxq.lock().unwrap().pop() {
+        Some(MuxerRx::GetnameResponse { data, .. }) => {
+            assert_eq!(data.result, 0);
+            assert_eq!(data.addr.inet(), Some(peer.local_addr().unwrap()));
+        }
+        other => panic!("unexpected peer response: {other:?}"),
+    }
+    f.muxer.tsi_flags.insert(TsiFlags::HOST_BIND);
+    for _ in 0..2 {
+        f.send(defs::TSI_CONNECT, &disconnect);
+        let expected = if cfg!(target_os = "linux") { 0 } else { -95 };
+        assert!(matches!(f.muxer.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::ConnResponse { result, .. }) if result == expected));
+    }
+    f.send(
+        defs::TSI_GETNAME,
+        &[
+            &GUEST.to_le_bytes()[..],
+            &defs::TSI_PROXY_PORT.to_le_bytes(),
+            &1u32.to_le_bytes(),
+        ]
+        .concat(),
+    );
+    match f.muxer.rxq.lock().unwrap().pop() {
+        Some(MuxerRx::GetnameResponse { data, .. }) => {
+            assert_eq!(
+                data.result,
+                if cfg!(target_os = "linux") { -107 } else { 0 }
+            );
+            if !cfg!(target_os = "linux") {
+                assert_eq!(data.addr.inet(), Some(peer.local_addr().unwrap()));
+            }
+        }
+        other => panic!("unexpected peer response: {other:?}"),
+    }
+    f.release();
+}

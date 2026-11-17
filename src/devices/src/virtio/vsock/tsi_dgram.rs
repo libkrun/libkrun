@@ -408,6 +408,39 @@ impl Proxy for TsiDgramProxy {
         self.sendto_addr = None;
     }
 
+    fn disconnect_host_datagram(&mut self) -> Result<(), i32> {
+        if self.host_rx.is_none() {
+            return Err(-95);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // The Linux kernel retains explicitly selected ports/addresses,
+            // releases automatic ports, and permits repeated disconnects.
+            let address: libc::sockaddr = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::connect(
+                    raw_handle(&self.sock),
+                    &address,
+                    std::mem::size_of::<libc::sa_family_t>() as libc::socklen_t,
+                )
+            };
+            if result != 0 {
+                return Err(-sys::to_linux_errno(&std::io::Error::last_os_error()));
+            }
+            self.host_peer = None;
+            self.connected_dns = false;
+            self.sendto_addr = None;
+            self.status = ProxyStatus::Idle;
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Darwin disconnects can discard the explicit local address;
+            // do not mutate the socket until the host adapter preserves it.
+            Err(-95)
+        }
+    }
+
     fn poll_handle(&self) -> ProxyRawHandle {
         raw_handle(&self.sock)
     }
