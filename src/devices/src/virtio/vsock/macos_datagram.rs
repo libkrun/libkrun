@@ -4,7 +4,6 @@
 //! Connecting a separate route probe avoids changing the reserved receive
 //! socket; per-message packet info supplies the selected source address.
 
-use std::collections::VecDeque;
 use std::io;
 use std::mem::{MaybeUninit, size_of, size_of_val, zeroed};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
@@ -16,8 +15,6 @@ use super::macos_udp_router::{DatagramRouter, Endpoint};
 
 use socket2::{Domain, SockAddr, Socket, Type};
 
-const MAX_SAVED_BYTES: usize = 256 * 1024;
-const MAX_SAVED_DATAGRAMS: usize = 512;
 #[cfg(test)]
 const MAX_DATAGRAM: usize = super::host_datagram::MAX_DATAGRAM;
 
@@ -26,8 +23,6 @@ pub struct MacDatagram {
     selected: Option<SocketAddr>,
     peer: Option<SocketAddr>,
     deferred_bind: bool,
-    saved: VecDeque<(SocketAddr, Box<[u8]>)>,
-    saved_bytes: usize,
     router: Arc<DatagramRouter>,
     endpoint: Arc<Mutex<Endpoint>>,
     registered_port: Option<u16>,
@@ -122,8 +117,6 @@ impl MacDatagram {
             selected: None,
             peer: None,
             deferred_bind: false,
-            saved: VecDeque::new(),
-            saved_bytes: 0,
             router,
             endpoint: Arc::new(Mutex::new(Endpoint::new(id, original, false))),
             registered_port: None,
@@ -153,6 +146,10 @@ impl MacDatagram {
         }
         self.router.register(&self.endpoint);
         self.registered_port = Some(actual.port());
+    }
+
+    pub fn set_receive_capacity(&self, capacity: usize) {
+        self.router.set_receive_capacity(&self.endpoint, capacity);
     }
 
     pub fn set_reuse_port(&self, enabled: bool) {
@@ -355,7 +352,7 @@ impl MacDatagram {
     }
 
     pub fn has_saved(&self) -> bool {
-        !self.saved.is_empty() || self.endpoint.lock().unwrap().has_packets()
+        self.endpoint.lock().unwrap().has_packets()
     }
 
     fn admits(&self, sender: SocketAddr, destination: Option<IpAddr>) -> bool {
@@ -375,23 +372,10 @@ impl MacDatagram {
         if let Some(port) = self.registered_port {
             self.router.capture_port(port)?;
         }
-        loop {
-            let packet = {
-                let mut entry = self.endpoint.lock().unwrap();
-                if let Some(length) = entry.next_len()
-                    && (self.saved.len() == MAX_SAVED_DATAGRAMS
-                        || self.saved_bytes + length > MAX_SAVED_BYTES)
-                {
-                    return Err(io::Error::from_raw_os_error(libc::ENOBUFS));
-                }
-                entry.pop()
-            };
-            let Some((sender, payload)) = packet else {
-                return Ok(());
-            };
-            self.saved_bytes += payload.len();
-            self.saved.push_back((self.guest_address(sender), payload));
-        }
+        // Captured packets stay assigned to this endpoint across peer changes.
+        // One queue preserves their order and shares the receive budget with
+        // subsequent routed packets without a second allocation or allowance.
+        Ok(())
     }
 
     pub fn receive(
@@ -399,14 +383,6 @@ impl MacDatagram {
         socket: &Socket,
         bytes: &mut [MaybeUninit<u8>],
     ) -> io::Result<(usize, SocketAddr)> {
-        if let Some((sender, payload)) = self.saved.pop_front() {
-            self.saved_bytes -= payload.len();
-            let length = bytes.len().min(payload.len());
-            for (byte, value) in bytes.iter_mut().zip(&payload[..length]) {
-                byte.write(*value);
-            }
-            return Ok((length, sender));
-        }
         let routed = self.endpoint.lock().unwrap().pop();
         if let Some((sender, payload)) = routed {
             let length = bytes.len().min(payload.len());
@@ -590,7 +566,13 @@ mod tests {
     }
     #[test]
     fn queued_reply_limits_preserve_the_old_peer_and_allow_retry() {
-        for (payload_size, count) in [(0, MAX_SAVED_DATAGRAMS), (65_507, 4)] {
+        for (payload_size, count, capacity) in [
+            (0, 512, 256 * 1024),
+            (65_507, 3, 256 * 1024),
+            (0, 16, 8192),
+            (1024, 5, 8192),
+            (1024, 682, 1024 * 1024),
+        ] {
             let original: SocketAddr = "127.0.0.1:0".parse().unwrap();
             let socket = Arc::new(Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap());
             socket.set_recv_buffer_size(128 * 1024).unwrap();
@@ -618,6 +600,7 @@ mod tests {
             let first_addr = first.local_addr().unwrap();
             let second = UdpSocket::bind(original).unwrap();
             let second_addr = second.local_addr().unwrap();
+            adapter.set_receive_capacity(capacity);
             adapter.connect(&socket, first_addr).unwrap();
             let payload = vec![42; payload_size];
             for _ in 0..count {
@@ -625,8 +608,10 @@ mod tests {
                 super::super::host_datagram::wait_readable(socket.as_raw_fd());
                 adapter.save_received(&socket).unwrap();
             }
-            assert_eq!(adapter.saved_bytes, count * payload_size);
-            assert_eq!(adapter.saved.len(), count);
+            assert!(adapter.has_saved());
+            if capacity == 8192 {
+                adapter.set_receive_capacity(2304);
+            }
             first.send_to(&payload, bound).unwrap();
             super::super::host_datagram::wait_readable(socket.as_raw_fd());
             assert_eq!(
@@ -642,7 +627,7 @@ mod tests {
                 let (length, source) = adapter.receive(&socket, &mut bytes).unwrap();
                 assert_eq!((length, source), (payload_size, first_addr));
             }
-            assert_eq!(adapter.saved_bytes, 0);
+            assert!(!adapter.has_saved());
             adapter.connect(&socket, second_addr).unwrap();
             assert_eq!(adapter.peer_addr().unwrap(), second_addr);
             assert_eq!(

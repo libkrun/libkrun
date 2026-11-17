@@ -14,6 +14,7 @@ use super::super::linux_errno::{LINUX_EADDRINUSE, LINUX_EAGAIN, LINUX_ECONNREFUS
 use super::defs;
 use super::defs::uapi;
 use super::host_bind::{BindRequest, bind_inet};
+use super::host_sockopt::SocketBuffers;
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
@@ -84,6 +85,7 @@ pub struct TsiStreamProxy {
     /// blocks, so the host never buffers unboundedly and the muxer thread never
     /// blocks.
     tx_buf: VecDeque<u8>,
+    buffers: SocketBuffers,
     /// True while we have paused reading the host socket (guest RX credit
     /// exhausted, or the remote half-closed). Kept separate from the epoll
     /// interest so TX-flush (OUT) and RX-read (IN) interest compose correctly
@@ -177,6 +179,7 @@ impl TsiStreamProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             tx_buf: VecDeque::new(),
+            buffers: SocketBuffers::default(),
             preamble: VecDeque::new(),
             intercept_peer: None,
             awaiting_verdict: false,
@@ -202,6 +205,7 @@ impl TsiStreamProxy {
         local_port: u32,
         peer_port: u32,
         sock: Socket,
+        buffers: SocketBuffers,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
@@ -229,6 +233,7 @@ impl TsiStreamProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             tx_buf: VecDeque::new(),
+            buffers,
             preamble: VecDeque::new(),
             intercept_peer: None,
             awaiting_verdict: false,
@@ -363,7 +368,8 @@ impl TsiStreamProxy {
     }
 
     fn peer_avail_credit(&self) -> usize {
-        (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
+        self.peer_buf_alloc
+            .saturating_sub((self.rx_cnt - self.peer_fwd_cnt).0) as usize
     }
 
     fn recv_to_pkt(&self, pkt: &mut VsockPacket) -> RecvPkt {
@@ -785,27 +791,29 @@ impl TsiStreamProxy {
         Ok(advanced)
     }
 
-    /// Emit a vsock credit update to the guest if `tx_cnt` has advanced by at
-    /// least half the guest's advertised buffer since the last one. Returns
-    /// whether a packet was pushed (caller should signal the queue).
-    fn maybe_send_credit_update(&mut self) -> bool {
-        if self.peer_buf_alloc != 0
-            && (self.tx_cnt - self.last_tx_cnt_sent).0 >= self.peer_buf_alloc / 2
-        {
-            self.last_tx_cnt_sent = self.tx_cnt;
-            let rx = MuxerRx::CreditUpdate {
+    fn send_credit_update(&mut self) {
+        self.last_tx_cnt_sent = self.tx_cnt;
+        push_packet(
+            self.cid,
+            MuxerRx::CreditUpdate {
                 local_port: self.local_port,
                 peer_port: self.peer_port,
                 fwd_cnt: self.tx_cnt.0,
-            };
-            push_packet(
-                self.cid,
-                rx,
-                &self.rxq,
-                &self.queue,
-                &self.mem,
-                &self.snapshot_gate,
-            );
+            },
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
+    }
+
+    /// Return credit before a small explicit send budget can be exhausted.
+    fn maybe_send_credit_update(&mut self) -> bool {
+        let window = self.buffers.send.map_or(self.peer_buf_alloc, |capacity| {
+            self.peer_buf_alloc.min(capacity as u32)
+        });
+        if window != 0 && (self.tx_cnt - self.last_tx_cnt_sent).0 >= (window / 2).max(1) {
+            self.send_credit_update();
             true
         } else {
             false
@@ -814,8 +822,24 @@ impl TsiStreamProxy {
 }
 
 impl Proxy for TsiStreamProxy {
+    fn request_credit(&mut self) -> ProxyUpdate {
+        if !matches!(
+            self.status,
+            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+        ) {
+            return ProxyUpdate::default();
+        }
+        self.send_credit_update();
+        ProxyUpdate {
+            signal_queue: true,
+            ..Default::default()
+        }
+    }
+
     fn set_host_option(&mut self, req: &super::host_sockopt::OptionRequest) -> Result<(), i32> {
-        req.apply(&self.sock)
+        self.buffers
+            .apply(req, &self.sock, false)
+            .unwrap_or_else(|| req.apply(&self.sock))
     }
 
     fn bind_host(&mut self, req: &BindRequest) -> Result<VsockAddr, i32> {
@@ -946,6 +970,7 @@ impl Proxy for TsiStreamProxy {
                     if let Err(error) = sock
                         .set_nonblocking(true)
                         .and_then(|()| super::host_sockopt::copy_tcp_options(&self.sock, &sock))
+                        .and_then(|()| self.buffers.copy_to(&sock, false))
                     {
                         return self.dial(Err(error));
                     }
@@ -1418,8 +1443,12 @@ impl Proxy for TsiStreamProxy {
                         // high 32 bits of self.id) rather than self.peer_port,
                         // which listen() overwrites with the VM TCP port.
                         let vsock_peer_port = (self.id >> 32) as u32;
-                        update.new_proxy =
-                            Some((vsock_peer_port, new_sock, self.family, NewProxyType::Tcp));
+                        update.new_proxy = Some((
+                            vsock_peer_port,
+                            new_sock,
+                            self.family,
+                            NewProxyType::Tcp(self.buffers),
+                        ));
                     }
                     Err(e) => warn!("error accepting connection: id={}, err={}", self.id, e),
                 };

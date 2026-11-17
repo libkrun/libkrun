@@ -1269,6 +1269,7 @@ fn accepted_socket_options_target_the_child_not_its_listener() {
             port,
             GUEST,
             socket.try_clone().unwrap(),
+            Default::default(),
             f.mem.clone(),
             f.muxer.queue.as_ref().unwrap().clone(),
             f.muxer.rxq.clone(),
@@ -1305,4 +1306,145 @@ fn accepted_socket_options_target_the_child_not_its_listener() {
         !listener.nodelay().unwrap(),
         "listener must retain its options"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_udp_buffers_survive_bind_and_update_the_actual_transport() {
+    use socket2::SockRef;
+    use std::os::fd::BorrowedFd;
+    for family in [defs::LINUX_AF_INET, defs::LINUX_AF_INET6] {
+        for before_bind in [false, true] {
+            let mut f = Fixture::new(granted(), None);
+            f.create(defs::SOCK_DGRAM, family);
+            let addr = if family == defs::LINUX_AF_INET {
+                "127.0.0.1:0"
+            } else {
+                "[::1]:0"
+            }
+            .parse()
+            .unwrap();
+            if !before_bind {
+                f.bind(addr).unwrap();
+            }
+            for option in [7u32, 8u32] {
+                f.send(
+                    defs::TSI_HOST_SETSOCKOPT,
+                    &[
+                        GUEST.to_le_bytes(),
+                        defs::TSI_PROXY_PORT.to_le_bytes(),
+                        1u32.to_le_bytes(),
+                        option.to_le_bytes(),
+                        8192u32.to_le_bytes(),
+                    ]
+                    .concat(),
+                );
+                let Some(MuxerRx::BindResponse { data, .. }) = f.muxer.rxq.lock().unwrap().pop()
+                else {
+                    panic!("missing option result")
+                };
+                let mut response = [0; 136];
+                data.write(&mut response);
+                assert_eq!(i32::from_le_bytes(response[..4].try_into().unwrap()), 0);
+            }
+            if before_bind {
+                f.bind(addr).unwrap();
+            }
+            let map = f.muxer.proxy_map.read().unwrap();
+            let id = ((GUEST as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+            let proxy = map.get(&id).unwrap().lock().unwrap();
+            // The locked proxy owns the descriptor for the entire borrow.
+            let fd = unsafe { BorrowedFd::borrow_raw(proxy.poll_handle()) };
+            let socket = SockRef::from(&fd);
+            assert_eq!(socket.recv_buffer_size().unwrap(), 8192);
+            assert_eq!(
+                socket.send_buffer_size().unwrap(),
+                if cfg!(target_os = "macos") {
+                    128 * 1024
+                } else {
+                    8192
+                }
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn receive_buffer_options_control_routed_datagrams_before_and_after_bind() {
+    use super::super::host_datagram::FRAME_HEADER;
+    for (family, address) in [
+        (defs::LINUX_AF_INET, "127.0.0.1:0"),
+        (defs::LINUX_AF_INET6, "[::1]:0"),
+    ] {
+        for before_bind in [true, false] {
+            for capacity in [8192u32, 2 * 1024 * 1024] {
+                let mut f = Fixture::new(granted(), None);
+                f.create(defs::SOCK_DGRAM, family);
+                let mut bound = None;
+                if !before_bind {
+                    bound = Some(f.bind(address.parse().unwrap()).unwrap());
+                }
+                f.send(
+                    defs::TSI_HOST_SETSOCKOPT,
+                    &[
+                        GUEST.to_le_bytes(),
+                        defs::TSI_PROXY_PORT.to_le_bytes(),
+                        1u32.to_le_bytes(),
+                        8u32.to_le_bytes(),
+                        capacity.to_le_bytes(),
+                    ]
+                    .concat(),
+                );
+                let Some(MuxerRx::BindResponse { data, .. }) = f.muxer.rxq.lock().unwrap().pop()
+                else {
+                    panic!("missing option status")
+                };
+                let mut status = [0; 136];
+                data.write(&mut status);
+                assert_eq!(i32::from_le_bytes(status[..4].try_into().unwrap()), 0);
+                let bound = bound.unwrap_or_else(|| f.bind(address.parse().unwrap()).unwrap());
+                let router = f
+                    .muxer
+                    .host_udp_router
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .clone();
+                let sender = SocketAddr::new(bound.ip(), 4500);
+                for index in 0..640u32 {
+                    let mut payload = [83; 1024];
+                    payload[..4].copy_from_slice(&index.to_le_bytes());
+                    assert!(!router.route(0, bound.port(), sender, Some(bound.ip()), &payload));
+                }
+                let expected = if capacity == 8192 { 5 } else { 640 };
+                let mem = f.mem.clone();
+                let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+                rx.dtable[0].set(0x30000, 2048, 2, 0);
+                let id = ((GUEST as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+                for index in 0..=expected {
+                    rx.avail.ring[index % 8].set(0);
+                    rx.avail.idx.set((index + 1) as u16);
+                    let map = f.muxer.proxy_map.read().unwrap();
+                    map[&id].lock().unwrap().process_event(EventSet::IN);
+                    assert_eq!(rx.used.idx.get() as usize, (index + 1).min(expected));
+                    if index < expected {
+                        let mut payload = [0; 1024];
+                        mem.read_slice(
+                            &mut payload,
+                            GuestAddress(0x30000 + (VSOCK_PKT_HDR_SIZE + FRAME_HEADER) as u64),
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            u32::from_le_bytes(payload[..4].try_into().unwrap()),
+                            index as u32
+                        );
+                        assert!(payload[4..].iter().all(|byte| *byte == 83));
+                    }
+                }
+                f.release();
+            }
+        }
+    }
 }

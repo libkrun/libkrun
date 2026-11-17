@@ -431,3 +431,95 @@ fn empty_shutdown_flags_leave_stream_writable() {
     remote.read_exact(&mut received).unwrap();
     assert_eq!(&received, b"still writable");
 }
+
+#[test]
+fn buffer_shrink_and_small_send_windows_preserve_credit_accounting() {
+    let (mut proxy, _) = stream_fixture(Ipv4Addr::LOCALHOST.into());
+    proxy.peer_buf_alloc = 8192;
+    proxy.rx_cnt = Wrapping(16384);
+    proxy.peer_fwd_cnt = Wrapping(0);
+    assert_eq!(
+        proxy.peer_avail_credit(),
+        0,
+        "shrinking must not wrap to unlimited credit"
+    );
+    proxy.peer_fwd_cnt = Wrapping(12288);
+    assert_eq!(proxy.peer_avail_credit(), 4096);
+    proxy.peer_buf_alloc = 262144;
+    proxy.buffers.send = Some(8192);
+    proxy.tx_cnt = Wrapping(4096);
+    assert!(proxy.maybe_send_credit_update());
+    assert!(matches!(
+        proxy.rxq.lock().unwrap().pop(),
+        Some(MuxerRx::CreditUpdate { fwd_cnt: 4096, .. })
+    ));
+    assert!(!proxy.maybe_send_credit_update());
+    proxy.status = ProxyStatus::WaitingCreditUpdate;
+    proxy.tx_cnt = Wrapping(4100);
+    let update = proxy.request_credit();
+    assert!(update.signal_queue);
+    assert_eq!(proxy.status, ProxyStatus::WaitingCreditUpdate);
+    assert!(matches!(
+        proxy.rxq.lock().unwrap().pop(),
+        Some(MuxerRx::CreditUpdate { fwd_cnt: 4100, .. })
+    ));
+    proxy.status = ProxyStatus::Closed;
+    assert!(!proxy.request_credit().signal_queue);
+    assert!(proxy.rxq.lock().unwrap().is_empty());
+}
+
+#[test]
+fn accepted_connections_inherit_credit_budgets_without_retuning() {
+    for ip in [
+        Ipv4Addr::LOCALHOST.into(),
+        std::net::Ipv6Addr::LOCALHOST.into(),
+    ] {
+        let (mut listener, _) = stream_fixture(ip);
+        listener.sock.bind(&SocketAddr::new(ip, 0).into()).unwrap();
+        listener.sock.listen(1).unwrap();
+        listener.status = ProxyStatus::Listening;
+        listener.buffers.send = Some(8192);
+        listener.buffers.receive = Some(32768);
+        let _client =
+            std::net::TcpStream::connect(listener.sock.local_addr().unwrap().as_socket().unwrap())
+                .unwrap();
+        let mut epoll = Epoll::new().unwrap();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                raw_handle(&listener.sock),
+                &EpollEvent::new(EventSet::IN, 1),
+            )
+            .unwrap();
+        let mut events = [EpollEvent::default()];
+        assert_eq!(epoll.wait(1, 2000, &mut events).unwrap(), 1);
+        let update = listener.process_event(EventSet::IN);
+        let (peer_port, socket, family, NewProxyType::Tcp(buffers)) = update.new_proxy.unwrap()
+        else {
+            panic!("expected an accepted TCP connection");
+        };
+        let mut child = TsiStreamProxy::new_reverse(
+            2,
+            listener.cid,
+            listener.id,
+            family,
+            7500,
+            peer_port,
+            socket,
+            buffers,
+            listener.mem.clone(),
+            listener.queue.clone(),
+            listener.rxq.clone(),
+            listener.snapshot_gate.clone(),
+        );
+        listener.buffers.send = Some(1048576);
+        assert_eq!(child.buffers.receive, Some(32768));
+        child.peer_buf_alloc = 32768;
+        child.tx_cnt = Wrapping(8192);
+        assert!(child.maybe_send_credit_update());
+        assert!(matches!(
+            child.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::CreditUpdate { fwd_cnt: 8192, .. })
+        ));
+    }
+}

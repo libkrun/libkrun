@@ -84,6 +84,81 @@ pub fn copy_tcp_options(source: &Socket, destination: &Socket) -> io::Result<()>
     destination.set_keepalive(source.keepalive()?)
 }
 
+/// Explicit transport budgets, capped by the native socket allocation. Guest
+/// readback retains Linux's canonical bookkeeping value; a forced guest request
+/// does not grant the VMM host privileges or an unbounded forwarding queue.
+/// Keeping only explicit settings avoids disabling host TCP autotuning when an
+/// interceptor replaces an otherwise untuned socket.
+#[derive(Clone, Copy, Default)]
+pub struct SocketBuffers {
+    pub send: Option<usize>,
+    pub receive: Option<usize>,
+}
+
+impl SocketBuffers {
+    fn set(socket: &Socket, receive: bool, capacity: usize, datagram: bool) -> io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        let native = capacity / 2;
+        #[cfg(not(target_os = "linux"))]
+        let native = if datagram && !receive {
+            // Darwin treats SO_SNDBUF as a maximum datagram length, whereas
+            // Linux can enqueue a packet larger than its send-buffer budget.
+            // The synchronous guest send path admits one datagram at a time.
+            capacity.max(128 * 1024)
+        } else {
+            capacity
+        };
+        #[cfg(target_os = "linux")]
+        let _ = datagram;
+        let actual = if receive {
+            socket.set_recv_buffer_size(native)?;
+            socket.recv_buffer_size()?
+        } else {
+            socket.set_send_buffer_size(native)?;
+            socket.send_buffer_size()?
+        };
+        Ok(capacity.min(actual))
+    }
+
+    pub fn apply(
+        &mut self,
+        request: &OptionRequest,
+        socket: &Socket,
+        datagram: bool,
+    ) -> Option<Result<(), i32>> {
+        let receive = match (request.level, request.option) {
+            (1, 7) => false,
+            (1, 8) => true,
+            _ => return None,
+        };
+        if request.value <= 0 {
+            return Some(Err(-22));
+        }
+        let capacity = request.value as usize;
+        Some(
+            Self::set(socket, receive, capacity, datagram)
+                .map(|actual| {
+                    if receive {
+                        self.receive = Some(actual);
+                    } else {
+                        self.send = Some(actual);
+                    }
+                })
+                .map_err(|error| -sys::to_linux_errno(&error)),
+        )
+    }
+
+    pub fn copy_to(&self, socket: &Socket, datagram: bool) -> io::Result<()> {
+        if let Some(capacity) = self.send {
+            Self::set(socket, false, capacity, datagram)?;
+        }
+        if let Some(capacity) = self.receive {
+            Self::set(socket, true, capacity, datagram)?;
+        }
+        Ok(())
+    }
+}
+
 pub struct OptionRequest {
     pub peer_port: u32,
     pub local_port: u32,
@@ -183,6 +258,76 @@ mod tests {
             level,
             option,
             value,
+        }
+    }
+
+    #[test]
+    fn explicit_buffer_budgets_reach_host_sockets_and_survive_replacement() {
+        for domain in [Domain::IPV4, Domain::IPV6] {
+            for datagram in [false, true] {
+                let kind = if datagram { Type::DGRAM } else { Type::STREAM };
+                let socket = Socket::new(domain, kind, None).unwrap();
+                let mut buffers = SocketBuffers::default();
+                for capacity in [8192, 131072, 2097152, i32::MAX] {
+                    for option in [7, 8] {
+                        assert_eq!(
+                            buffers.apply(&request(1, option, capacity), &socket, datagram),
+                            Some(Ok(()))
+                        );
+                        let actual = if option == 7 {
+                            socket.send_buffer_size().unwrap()
+                        } else {
+                            socket.recv_buffer_size().unwrap()
+                        };
+                        let expected = if cfg!(not(target_os = "linux")) && datagram && option == 7
+                        {
+                            (capacity as usize).max(128 * 1024)
+                        } else {
+                            capacity as usize
+                        };
+                        if capacity != i32::MAX {
+                            assert_eq!(actual, expected);
+                        } else {
+                            assert!(actual > 0 && actual <= capacity as usize);
+                        }
+                        let effective = if option == 7 {
+                            buffers.send
+                        } else {
+                            buffers.receive
+                        };
+                        assert_eq!(effective, Some((capacity as usize).min(actual)));
+                        for invalid in [-1, 0] {
+                            assert_eq!(
+                                buffers.apply(&request(1, option, invalid), &socket, datagram),
+                                Some(Err(-22))
+                            );
+                            assert_eq!(
+                                if option == 7 {
+                                    socket.send_buffer_size().unwrap()
+                                } else {
+                                    socket.recv_buffer_size().unwrap()
+                                },
+                                actual
+                            );
+                        }
+                    }
+                    let other = if domain == Domain::IPV4 {
+                        Domain::IPV6
+                    } else {
+                        Domain::IPV4
+                    };
+                    let replacement = Socket::new(other, kind, None).unwrap();
+                    buffers.copy_to(&replacement, datagram).unwrap();
+                    assert_eq!(
+                        replacement.send_buffer_size().unwrap(),
+                        socket.send_buffer_size().unwrap()
+                    );
+                    assert_eq!(
+                        replacement.recv_buffer_size().unwrap(),
+                        socket.recv_buffer_size().unwrap()
+                    );
+                }
+            }
         }
     }
 

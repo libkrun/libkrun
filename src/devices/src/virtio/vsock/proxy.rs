@@ -9,6 +9,7 @@ use socket2::Socket;
 
 use super::host_bind::BindRequest;
 use super::host_send::PendingHostSend;
+use super::host_sockopt::SocketBuffers;
 use super::muxer::MuxerRx;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
 use super::vsock_addr::VsockAddr;
@@ -125,10 +126,8 @@ pub enum ProxyRemoval {
     Deferred,
 }
 
-#[derive(Default)]
 pub enum NewProxyType {
-    #[default]
-    Tcp,
+    Tcp(SocketBuffers),
     /// Host-IPC AF_UNIX connection accepted by `UnixAcceptorProxy`. Available on
     /// all platforms with AF_UNIX support (Unix and Windows).
     Unix,
@@ -259,6 +258,9 @@ pub trait Proxy: Send {
     ) -> ProxyUpdate;
     fn accept(&mut self, req: TsiAcceptReq) -> ProxyUpdate;
     fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
+    fn request_credit(&mut self) -> ProxyUpdate {
+        ProxyUpdate::default()
+    }
     fn push_op_request(&self) {}
     fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
     fn enqueue_accept(&mut self) {}

@@ -1351,6 +1351,19 @@ impl VsockMuxer {
         }
     }
 
+    fn process_op_credit_request(&self, pkt: &VsockPacket) {
+        let id = ((pkt.src_port() as u64) << 32) | pkt.dst_port() as u64;
+        let update = self
+            .proxy_map
+            .read()
+            .unwrap()
+            .get(&id)
+            .map(|proxy| proxy.lock().unwrap().request_credit());
+        if let Some(update) = update {
+            self.process_proxy_update(id, update);
+        }
+    }
+
     fn process_op_credit_update(&self, pkt: &VsockPacket) {
         debug!("OP_CREDIT_UPDATE");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
@@ -1463,6 +1476,7 @@ impl VsockMuxer {
                 uapi::VSOCK_OP_RESPONSE => "RESPONSE",
                 uapi::VSOCK_OP_SHUTDOWN => "SHUTDOWN",
                 uapi::VSOCK_OP_CREDIT_UPDATE => "CREDIT_UPDATE",
+                uapi::VSOCK_OP_CREDIT_REQUEST => "CREDIT_REQUEST",
                 uapi::VSOCK_OP_RW => "RW",
                 uapi::VSOCK_OP_RST => "RST",
                 _ => "UNKNOWN",
@@ -1493,6 +1507,7 @@ impl VsockMuxer {
             uapi::VSOCK_OP_RESPONSE => self.process_op_response(pkt),
             uapi::VSOCK_OP_SHUTDOWN => self.process_op_shutdown(pkt),
             uapi::VSOCK_OP_CREDIT_UPDATE => self.process_op_credit_update(pkt),
+            uapi::VSOCK_OP_CREDIT_REQUEST => self.process_op_credit_request(pkt),
             uapi::VSOCK_OP_RW => self.process_stream_rw(pkt),
             uapi::VSOCK_OP_RST => self.process_stream_rst(pkt),
             _ => warn!("stream: unhandled op={}", pkt.op()),

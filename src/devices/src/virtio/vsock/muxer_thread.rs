@@ -137,7 +137,7 @@ impl MuxerThread {
                 new_id, peer_port, local_port, id
             );
             let new_proxy: Box<dyn Proxy> = match proxy_type {
-                NewProxyType::Tcp => Box::new(TsiStreamProxy::new_reverse(
+                NewProxyType::Tcp(buffers) => Box::new(TsiStreamProxy::new_reverse(
                     new_id,
                     self.cid,
                     id,
@@ -145,6 +145,7 @@ impl MuxerThread {
                     local_port,
                     peer_port,
                     accept_fd,
+                    buffers,
                     self.mem.clone(),
                     self.queue.clone(),
                     self.rxq.clone(),

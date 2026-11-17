@@ -13,6 +13,7 @@ use super::dns_filter::{DNS_PORT, DnsRequest, HostDnsReply, sockaddr_port};
 use super::host_bind::{BindRequest, bind_inet};
 use super::host_datagram::{FRAME_HEADER, HostDatagramRx};
 use super::host_send::PendingHostSend;
+use super::host_sockopt::SocketBuffers;
 #[cfg(target_os = "macos")]
 use super::macos_datagram::MacDatagram;
 use super::muxer::{MuxerRx, push_packet};
@@ -68,6 +69,7 @@ pub struct TsiDgramProxy {
     host_error: Option<i32>,
     pending_rx: Arc<Mutex<HashSet<u64>>>,
     epoll: Epoll,
+    buffers: SocketBuffers,
 }
 
 impl TsiDgramProxy {
@@ -138,6 +140,7 @@ impl TsiDgramProxy {
             host_error: None,
             pending_rx,
             epoll,
+            buffers: SocketBuffers::default(),
         })
     }
 
@@ -517,6 +520,16 @@ impl TsiDgramProxy {
 
 impl Proxy for TsiDgramProxy {
     fn set_host_option(&mut self, req: &super::host_sockopt::OptionRequest) -> Result<(), i32> {
+        if let Some(result) = self.buffers.apply(req, &self.sock, true) {
+            result?;
+            #[cfg(target_os = "macos")]
+            if let Some(datagram) = &self.macos_datagram
+                && let Some(capacity) = self.buffers.receive
+            {
+                datagram.set_receive_capacity(capacity);
+            }
+            return Ok(());
+        }
         #[cfg(target_os = "macos")]
         {
             req.apply_datagram(&self.sock, &mut self.macos_reuse)?;
@@ -537,12 +550,16 @@ impl Proxy for TsiDgramProxy {
         }
         // macOS's default UDP send buffer is only 9 KiB. A Linux host-mode
         // socket must be able to carry a full UDP datagram in either direction.
-        self.sock
-            .set_send_buffer_size(128 * 1024)
-            .map_err(|e| -sys::to_linux_errno(&e))?;
-        self.sock
-            .set_recv_buffer_size(128 * 1024)
-            .map_err(|e| -sys::to_linux_errno(&e))?;
+        if self.buffers.send.is_none() {
+            self.sock
+                .set_send_buffer_size(128 * 1024)
+                .map_err(|e| -sys::to_linux_errno(&e))?;
+        }
+        if self.buffers.receive.is_none() {
+            self.sock
+                .set_recv_buffer_size(128 * 1024)
+                .map_err(|e| -sys::to_linux_errno(&e))?;
+        }
         #[cfg(target_os = "macos")]
         let mut datagram = MacDatagram::new(
             &self.sock,
@@ -556,6 +573,9 @@ impl Proxy for TsiDgramProxy {
         #[cfg(target_os = "macos")]
         {
             self.macos_reuse = req.datagram_reuse();
+            if let Some(capacity) = self.buffers.receive {
+                datagram.set_receive_capacity(capacity);
+            }
             datagram.bound(
                 &self.sock,
                 addr,

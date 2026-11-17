@@ -19,8 +19,11 @@ use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use super::macos_datagram::{canonical_ip, canonical_peer, is_broadcast, receive_with_destination};
 
 pub const ROUTER_EVENT: u64 = u64::MAX - 2;
-const MAX_BYTES: usize = 256 * 1024;
-const MAX_PACKETS: usize = 512;
+const DEFAULT_RECEIVE_CAPACITY: usize = 256 * 1024;
+// Charge queue metadata even for empty datagrams; this also bounds their count.
+const PACKET_OVERHEAD: usize = 512;
+// Bound work per peer transition independently of the configured queue size.
+const CAPTURE_BATCH: usize = 512;
 type Packet = (SocketAddr, Box<[u8]>);
 type PortEndpoints = HashMap<u64, Weak<Mutex<Endpoint>>>;
 
@@ -35,6 +38,7 @@ pub struct Endpoint {
     pub socket: Weak<Socket>,
     packets: VecDeque<Packet>,
     bytes: usize,
+    receive_capacity: usize,
 }
 
 impl Endpoint {
@@ -50,12 +54,14 @@ impl Endpoint {
             socket: Weak::new(),
             packets: VecDeque::new(),
             bytes: 0,
+            receive_capacity: DEFAULT_RECEIVE_CAPACITY,
         }
     }
 
     pub fn pop(&mut self) -> Option<Packet> {
         let packet = self.packets.pop_front()?;
-        self.bytes -= packet.1.len();
+        self.bytes -= packet.1.len() + PACKET_OVERHEAD;
+        self.trim_reservation();
         Some(packet)
     }
 
@@ -63,8 +69,20 @@ impl Endpoint {
         !self.packets.is_empty()
     }
 
-    pub fn next_len(&self) -> Option<usize> {
-        self.packets.front().map(|packet| packet.1.len())
+    fn admits(&self, length: usize) -> bool {
+        length <= super::host_datagram::MAX_DATAGRAM
+            && (self.packets.is_empty()
+                || length + PACKET_OVERHEAD <= self.receive_capacity.saturating_sub(self.bytes))
+    }
+
+    fn trim_reservation(&mut self) {
+        // Preserve accepted packets on shrink, then release excess deque
+        // storage once draining brings the queue under the new budget.
+        if self.bytes <= self.receive_capacity
+            && self.packets.capacity() > 2 * (self.receive_capacity / PACKET_OVERHEAD).max(1)
+        {
+            self.packets.shrink_to_fit();
+        }
     }
 
     fn score(&self, sender: SocketAddr, destination: IpAddr) -> Option<u8> {
@@ -119,6 +137,15 @@ impl DatagramRouter {
             sequence: AtomicU64::new(1),
             read_gate: Mutex::new(()),
         })
+    }
+
+    pub fn set_receive_capacity(&self, endpoint: &Arc<Mutex<Endpoint>>, capacity: usize) {
+        // Serialize with capture's peek/check/consume sequence so a concurrent
+        // shrink cannot discard a datagram during a peer transition.
+        let _gate = self.read_gate.lock().unwrap();
+        let mut entry = endpoint.lock().unwrap();
+        entry.receive_capacity = capacity;
+        entry.trim_reservation();
     }
 
     pub fn next_order(&self) -> u64 {
@@ -221,11 +248,11 @@ impl DatagramRouter {
         payload: &[u8],
     ) -> bool {
         let mut entry = recipient.lock().unwrap();
-        if entry.packets.len() == MAX_PACKETS || entry.bytes + payload.len() > MAX_BYTES {
+        if !entry.admits(payload.len()) {
             return false;
         }
         entry.packets.push_back((sender, payload.into()));
-        entry.bytes += payload.len();
+        entry.bytes += payload.len() + PACKET_OVERHEAD;
         let id = entry.id;
         drop(entry);
         self.wake_recipient(id);
@@ -290,7 +317,7 @@ impl DatagramRouter {
                 entry.socket.upgrade().map(|socket| (entry.id, socket))
             })
             .collect();
-        let mut remaining = MAX_PACKETS;
+        let mut remaining = CAPTURE_BATCH;
         let mut bytes = vec![MaybeUninit::new(0); super::host_datagram::MAX_DATAGRAM];
         for (source, socket) in sockets {
             loop {
@@ -306,7 +333,7 @@ impl DatagramRouter {
                 let recipient = self.recipient(source, port, sender, destination);
                 if let Some(endpoint) = &recipient {
                     let entry = endpoint.lock().unwrap();
-                    if entry.packets.len() == MAX_PACKETS || entry.bytes + length > MAX_BYTES {
+                    if !entry.admits(length) {
                         return Err(io::Error::from_raw_os_error(libc::ENOBUFS));
                     }
                 }
@@ -391,13 +418,54 @@ mod tests {
             assert_eq!(router.take_ready(), [2]);
             assert_eq!(epoll.wait(1, 0, &mut events).unwrap(), 0);
             let mut entry = second.lock().unwrap();
-            assert_eq!(entry.packets.len(), if size == 0 { 512 } else { 4 });
-            assert!(entry.bytes <= MAX_BYTES);
+            assert_eq!(entry.packets.len(), if size == 0 { 512 } else { 3 });
+            assert!(entry.bytes <= DEFAULT_RECEIVE_CAPACITY);
             while let Some((sender, data)) = entry.pop() {
                 assert_eq!(sender, "[::1]:4000".parse().unwrap());
                 assert_eq!(data.as_ref(), payload);
             }
             assert_eq!(entry.bytes, 0);
+        }
+    }
+
+    #[test]
+    fn receive_budgets_cover_empty_packets_growth_shrink_and_oversized_first_packet() {
+        for size in [0, 1024] {
+            let router = DatagramRouter::new(&Epoll::new().unwrap()).unwrap();
+            let recipient = endpoint(&router, 1, "[::]:5000");
+            let sender = "[::1]:4000".parse().unwrap();
+            let payload = vec![73; size];
+            router.set_receive_capacity(&recipient, 8192);
+            let small = 8192 / (size + PACKET_OVERHEAD);
+            for _ in 0..small {
+                assert!(router.enqueue(&recipient, sender, &payload));
+            }
+            assert!(!router.enqueue(&recipient, sender, &payload));
+            router.set_receive_capacity(&recipient, 2 * 1024 * 1024);
+            for _ in small..1024 {
+                assert!(router.enqueue(&recipient, sender, &payload));
+            }
+            router.set_receive_capacity(&recipient, 1024);
+            assert!(!router.enqueue(&recipient, sender, &payload));
+            let mut entry = recipient.lock().unwrap();
+            for _ in 0..1024 {
+                let (source, received) = entry.pop().unwrap();
+                assert_eq!(source, sender);
+                assert_eq!(received.as_ref(), payload);
+            }
+            assert_eq!(entry.bytes, 0);
+            assert!(
+                entry.packets.capacity() <= 4,
+                "shrink must release spare metadata storage"
+            );
+            drop(entry);
+            // Linux permits one datagram bigger than the receive budget when
+            // the queue is empty. It still blocks all further arrivals.
+            let large = vec![89; 65507];
+            assert!(router.enqueue(&recipient, sender, &large));
+            assert!(!router.enqueue(&recipient, sender, &[]));
+            assert_eq!(recipient.lock().unwrap().pop().unwrap().1.as_ref(), large);
+            assert!(router.enqueue(&recipient, sender, &[]));
         }
     }
 
