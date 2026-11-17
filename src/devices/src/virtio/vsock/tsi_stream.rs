@@ -72,6 +72,9 @@ pub struct TsiStreamProxy {
     /// the shutdown and marks that remote→guest is done while guest→remote still
     /// flows.
     local_read_shutdown: bool,
+    /// Delay the host FIN until all bytes accepted before guest shutdown have
+    /// reached the host socket. Never block the muxer while draining them.
+    write_shutdown_pending: bool,
     /// Guest->host bytes accepted from the guest but not yet written to the host
     /// socket, because the host socket's send buffer was full (a slow or stalled
     /// remote peer — the #1093 blackhole shape). Drained on EPOLLOUT. Bounded by
@@ -186,6 +189,7 @@ impl TsiStreamProxy {
             intercept_reservation: None,
             listen_backlog: 0,
             local_read_shutdown: false,
+            write_shutdown_pending: false,
         })
     }
 
@@ -237,6 +241,7 @@ impl TsiStreamProxy {
             intercept_reservation: None,
             listen_backlog: 0,
             local_read_shutdown: false,
+            write_shutdown_pending: false,
         }
     }
 
@@ -399,6 +404,9 @@ impl TsiStreamProxy {
     }
 
     fn recv_pkt(&mut self) -> (bool, bool) {
+        if self.local_read_shutdown {
+            return (false, false);
+        }
         let mut have_used = false;
         let mut wait_credit = false;
         let _snapshot_activity = self.snapshot_gate.enter();
@@ -767,6 +775,12 @@ impl TsiStreamProxy {
                     return Err(());
                 }
             }
+        }
+        if self.write_shutdown_pending && self.tx_buf.is_empty() {
+            self.sock.shutdown(std::net::Shutdown::Write).map_err(|e| {
+                warn!("flush_tx: host write shutdown failed id={}: {e}", self.id);
+            })?;
+            self.write_shutdown_pending = false;
         }
         Ok(advanced)
     }
@@ -1141,7 +1155,7 @@ impl Proxy for TsiStreamProxy {
 
         self.status = ProxyStatus::Connected;
 
-        self.rx_paused = false;
+        self.rx_paused = self.local_read_shutdown;
         ProxyUpdate {
             polling: self.repoll(),
             ..Default::default()
@@ -1244,18 +1258,28 @@ impl Proxy for TsiStreamProxy {
         let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
         let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 
-        let how = if recv_off && send_off {
-            std::net::Shutdown::Both
-        } else if recv_off {
-            std::net::Shutdown::Read
-        } else {
-            std::net::Shutdown::Write
-        };
-
-        if let Err(e) = self.sock.shutdown(how) {
-            warn!("error sending shutdown to socket: {e}");
+        if recv_off && !self.local_read_shutdown {
+            if let Err(e) = self.sock.shutdown(std::net::Shutdown::Read) {
+                warn!("error shutting down socket receive half: {e}");
+            }
+            self.local_read_shutdown = true;
+            self.rx_paused = true;
         }
-        ProxyUpdate::default()
+        if send_off {
+            if self.tx_buf.is_empty() && self.preamble.is_empty() {
+                if let Err(e) = self.sock.shutdown(std::net::Shutdown::Write) {
+                    warn!("error shutting down socket send half: {e}");
+                }
+            } else {
+                // OUT remains armed until flush_tx has sent the queued bytes
+                // and can place FIN after them. Receive credit is independent.
+                self.write_shutdown_pending = true;
+            }
+        }
+        ProxyUpdate {
+            polling: self.repoll(),
+            ..Default::default()
+        }
     }
 
     fn release(&mut self) -> ProxyUpdate {
@@ -1408,7 +1432,10 @@ impl Proxy for TsiStreamProxy {
 
         if evset.contains(EventSet::OUT) {
             debug!("process_event: OUT");
-            if self.status == ProxyStatus::Connected {
+            if matches!(
+                self.status,
+                ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+            ) {
                 // The host socket drained: flush buffered guest->host bytes and,
                 // if enough progressed, re-open the guest's credit window. This
                 // is what makes the non-blocking send in `sendmsg` complete

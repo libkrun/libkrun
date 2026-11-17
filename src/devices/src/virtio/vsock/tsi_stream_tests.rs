@@ -297,3 +297,137 @@ fn host_stream_does_not_enable_keepalive_without_a_guest_request() {
         assert!(!proxy.sock.keepalive().unwrap());
     }
 }
+
+#[test]
+fn shutdown_delivers_queued_bytes_before_eof() {
+    use std::io::{Read, Write};
+    use std::net::{Ipv6Addr, TcpStream};
+    use std::time::{Duration, Instant};
+
+    for ip in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        for saturated in [false, true] {
+            for waiting_credit in [false, true] {
+                for flags in [
+                    uapi::VSOCK_FLAGS_SHUTDOWN_SEND,
+                    uapi::VSOCK_FLAGS_SHUTDOWN_SEND | uapi::VSOCK_FLAGS_SHUTDOWN_RCV,
+                ] {
+                    let (mut proxy, listener) = connecting(ip, true);
+                    proxy.process_event(EventSet::OUT);
+                    proxy.rxq.lock().unwrap().pop();
+                    let (remote, _) = listener.unwrap().accept().unwrap();
+                    let mut remote = TcpStream::from(remote);
+                    remote
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    proxy.sock.set_send_buffer_size(4096).unwrap();
+                    let mut expected = Vec::new();
+                    if saturated {
+                        let bytes = [0x31; 16384];
+                        loop {
+                            match proxy.sock.send(&bytes) {
+                                Ok(n) => {
+                                    assert!(n > 0);
+                                    expected.extend_from_slice(&bytes[..n]);
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(e) => panic!("{e}"),
+                            }
+                            assert!(
+                                expected.len() < 16 * 1024 * 1024,
+                                "host socket never backpressured"
+                            );
+                        }
+                    }
+                    let payload = vec![0x72; 32768];
+                    expected.extend_from_slice(&payload);
+                    proxy.tx_buf.extend(&payload);
+                    if waiting_credit {
+                        proxy.status = ProxyStatus::WaitingCreditUpdate;
+                        proxy.rx_paused = true;
+                    }
+                    let (_packet_memory, mut packet) = stream_fixture(ip);
+                    packet.set_flags(flags);
+                    proxy.shutdown(&packet);
+                    // Repeated shutdown must neither truncate the queue nor
+                    // re-enable a receive half that has already been closed.
+                    proxy.shutdown(&packet);
+                    let reader = std::thread::spawn(move || {
+                        let mut bytes = Vec::new();
+                        remote.read_to_end(&mut bytes).unwrap();
+                        if flags == uapi::VSOCK_FLAGS_SHUTDOWN_SEND {
+                            remote.write_all(b"response").unwrap();
+                        }
+                        bytes
+                    });
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while !proxy.tx_buf.is_empty() && Instant::now() < deadline {
+                        let update = proxy.process_event(EventSet::OUT);
+                        assert_ne!(
+                            proxy.status,
+                            ProxyStatus::Closed,
+                            "shutdown discarded queued output"
+                        );
+                        assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+                        std::thread::yield_now();
+                    }
+                    assert!(
+                        proxy.tx_buf.is_empty(),
+                        "queued output stalled while receive credit was exhausted"
+                    );
+                    assert_eq!(
+                        reader.join().unwrap(),
+                        expected,
+                        "remote saw EOF before all bytes"
+                    );
+                    assert_eq!(proxy.tx_cnt.0, payload.len() as u32);
+                    assert!(!proxy.conn_evset().contains(EventSet::OUT));
+                    if flags == uapi::VSOCK_FLAGS_SHUTDOWN_SEND {
+                        let mut response = [0; 8];
+                        let mut received = 0;
+                        let deadline = Instant::now() + Duration::from_secs(3);
+                        while received < response.len() {
+                            match sys::recv_into(&proxy.sock, &mut response[received..]) {
+                                Ok(0) => panic!("response truncated"),
+                                Ok(n) => received += n,
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    assert!(Instant::now() < deadline, "response timed out");
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                Err(e) => panic!("response: {e}"),
+                            }
+                        }
+                        assert_eq!(&response, b"response");
+                    } else {
+                        proxy.update_peer_credit(&packet);
+                        assert!(!proxy.conn_evset().contains(EventSet::IN));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_shutdown_flags_leave_stream_writable() {
+    use std::io::Read;
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let (mut proxy, listener) = connecting(ip, true);
+    proxy.process_event(EventSet::OUT);
+    let (remote, _) = listener.unwrap().accept().unwrap();
+    let mut remote = TcpStream::from(remote);
+    remote
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let (_packet_memory, packet) = stream_fixture(ip);
+    proxy.shutdown(&packet);
+    proxy.tx_buf.extend(b"still writable");
+    assert!(proxy.flush_tx().unwrap());
+    let mut received = [0; 14];
+    remote.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"still writable");
+}
