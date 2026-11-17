@@ -498,6 +498,10 @@ fn accepted_connections_inherit_credit_budgets_without_retuning() {
         else {
             panic!("expected an accepted TCP connection");
         };
+        // Linux does not inherit O_NONBLOCK from the listening socket.
+        // A blocking child can stall the entire muxer when its peer stops reading.
+        #[cfg(unix)]
+        assert!(socket.nonblocking().unwrap());
         let mut child = TsiStreamProxy::new_reverse(
             2,
             listener.cid,

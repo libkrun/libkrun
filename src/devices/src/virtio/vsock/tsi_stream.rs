@@ -1437,7 +1437,12 @@ impl Proxy for TsiStreamProxy {
             } else if self.status == ProxyStatus::Listening
                 || self.status == ProxyStatus::WaitingOnAccept
             {
-                match self.sock.accept() {
+                // Linux does not inherit O_NONBLOCK across accept(). The muxer
+                // must never block while forwarding to an unread host socket.
+                match self.sock.accept().and_then(|(socket, address)| {
+                    socket.set_nonblocking(true)?;
+                    Ok((socket, address))
+                }) {
                     Ok((new_sock, _addr)) => {
                         // Use the original vsock ephemeral port (encoded in the
                         // high 32 bits of self.id) rather than self.peer_port,
