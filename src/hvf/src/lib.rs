@@ -993,16 +993,56 @@ where
     }
 }
 
+/// How the host pages of a reclaimed guest range are let go.
+pub enum ReclaimBacking {
+    /// A RAM file this VMM owns, as its fd and the range's offset in it: the
+    /// range is punched out of the file, since dropping the mapping alone
+    /// leaves the pages allocated in it.
+    OwnedFile(i32, u64),
+    /// Anything else: anonymous RAM, or a private view of a file this VMM does
+    /// not own, which is every restored or branched machine's RAM (laid over
+    /// the reservation with `MAP_PRIVATE | MAP_FIXED` and carrying no file
+    /// metadata, so the two cannot be told apart here). `madvise` releases
+    /// nothing from a private file view: the range keeps the file's old
+    /// contents, the host keeps paying for it, and every capture saves it. So
+    /// the range is replaced with fresh anonymous pages, which read as zeros
+    /// and cost nothing until the guest writes them; on anonymous RAM that is
+    /// what releasing it already meant.
+    Unowned,
+}
+
+/// Map fresh anonymous memory over `[host, host + len)` with guest RAM's
+/// protection, dropping whatever backed it.
+fn replace_with_anonymous(host: u64, len: u64) -> std::io::Result<()> {
+    // Safety: the range lies inside one live guest-RAM mapping this VMM owns,
+    // MAP_FIXED replaces it in place with the protection guest RAM is mapped
+    // with, and the caller has unmapped it from the guest for the duration.
+    let mapped = unsafe {
+        libc::mmap(
+            host as *mut libc::c_void,
+            len as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+            -1,
+            0,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Release a balloon-reported guest range: drop its stage-2 mapping so the
 /// host pages stop being hypervisor-pinned, then let the host purge them.
 /// Called from the balloon device thread; must complete before the report is
 /// acked to the guest. Ranges are shrunk inward to host-page alignment (the
 /// guest reports in multiples of at least 4 MiB, so edge loss is negligible).
 ///
-/// `backing` is the RAM file and the offset of `gpa` in it when the pages live
-/// in a file this VMM owns: they are punched out of it, since dropping the
-/// mapping alone leaves them allocated in the file.
-pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64, backing: Option<(i32, u64)>) {
+/// `backing` says how the pages are let go; see [`ReclaimBacking`]. Either way
+/// the range reads back as zeros afterwards.
+pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64, backing: ReclaimBacking) {
     let ps = host_page_size();
     let start = (gpa + ps - 1) & !(ps - 1);
     let end = (gpa + len) & !(ps - 1);
@@ -1028,8 +1068,12 @@ pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64, backing: Option
     let result = reclaim_range_with_ops(
         || unsafe { hv_vm_unmap(start, alen as usize) },
         || {
+            let (fd, offset) = match backing {
+                ReclaimBacking::Unowned => return replace_with_anonymous(host, alen),
+                ReclaimBacking::OwnedFile(fd, offset) => (fd, offset),
+            };
             #[cfg(target_os = "macos")]
-            if let Some((fd, offset)) = backing {
+            {
                 let hole = libc::fpunchhole_t {
                     fp_flags: 0,
                     reserved: 0,
@@ -1041,7 +1085,7 @@ pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64, backing: Option
                 }
             }
             #[cfg(not(target_os = "macos"))]
-            let _ = backing;
+            let _ = (fd, offset);
             let ret = unsafe { libc::madvise(host as *mut libc::c_void, alen as usize, advice) };
             if ret == 0 {
                 Ok(())
@@ -1529,6 +1573,75 @@ mod balloon_reclaim_tests {
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     };
+
+    /// A private view of a file keeps the file's contents whatever `madvise`
+    /// says, so a reclaimed range of it must be replaced: afterwards it reads
+    /// as zeros, the file is untouched, and the dirtied pages are released.
+    #[test]
+    fn an_unowned_private_file_view_is_replaced_with_zero_pages() {
+        use std::io::Write;
+        let ps = host_page_size() as usize;
+        let len = 64 * ps;
+        let path = std::env::temp_dir().join(format!("hvf-reclaim-{}", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        file.write_all(&vec![0xAB; len]).unwrap();
+        use std::os::fd::AsRawFd;
+        let view = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(view, libc::MAP_FAILED);
+        let bytes = unsafe { std::slice::from_raw_parts_mut(view as *mut u8, len) };
+        bytes.fill(0xCD); // private copies, as a guest's writes make
+        let resident_before = resident_pages(view, len);
+
+        replace_with_anonymous(view as u64, len as u64).unwrap();
+        // Before anything reads the range: reading faults zero pages back in.
+        let resident_after = resident_pages(view, len);
+
+        let bytes = unsafe { std::slice::from_raw_parts(view as *const u8, len) };
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "the range must read as zeros"
+        );
+        let mut on_disk = vec![0u8; len];
+        use std::io::{Read, Seek};
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut on_disk).unwrap();
+        assert!(
+            on_disk.iter().all(|&b| b == 0xAB),
+            "the file is not changed"
+        );
+        assert!(
+            resident_after < resident_before,
+            "the dirtied pages are released: {resident_before} -> {resident_after}"
+        );
+        unsafe { libc::munmap(view, len) };
+    }
+
+    /// Pages of `[addr, addr + len)` that are resident, by `mincore`.
+    fn resident_pages(addr: *mut libc::c_void, len: usize) -> usize {
+        let ps = host_page_size() as usize;
+        let mut vec = vec![0 as libc::c_char; len.div_ceil(ps)];
+        assert_eq!(
+            unsafe { libc::mincore(addr, len, vec.as_mut_ptr().cast()) },
+            0
+        );
+        vec.iter().filter(|&&v| v & 1 != 0).count()
+    }
 
     #[test]
     fn reclaim_restores_mapping_before_ack_boundary() {

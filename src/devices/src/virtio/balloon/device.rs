@@ -697,14 +697,17 @@ fn release_region_part(mem: &GuestMemoryMmap, gpa: u64, host_addr: *mut u8, len:
                     gpa,
                     host_addr as u64,
                     len,
-                    Some((file.as_raw_fd(), offset)),
+                    hvf::ReclaimBacking::OwnedFile(file.as_raw_fd(), offset),
                 )
             });
             if punched.is_some() {
                 return true;
             }
         }
-        hvf::balloon_reclaim_range(gpa, host_addr as u64, len, None);
+        // Anonymous RAM, or a restored or branched machine's private view of a
+        // file: replaced with fresh zero pages, which both releases them and
+        // keeps the file's stale contents out of the next capture.
+        hvf::balloon_reclaim_range(gpa, host_addr as u64, len, hvf::ReclaimBacking::Unowned);
         return true;
     }
     #[cfg(target_os = "linux")]
@@ -798,19 +801,23 @@ fn clear_hinted_part(mem: &GuestMemoryMmap, gpa: u64, host_addr: *mut u8, len: u
         zero_hinted_private_part(gpa, host_addr, len);
     }
 
-    // MADV_FREE_REUSABLE leaves the old contents readable until macOS takes
-    // the pages back, so zero them first. MADV_ZERO clears resident pages
-    // without faulting in the rest; without it (older macOS) the block just
-    // keeps its contents.
+    // With reclaim on, releasing the range already leaves it reading as zeros:
+    // an owned RAM file is punched, and anything else (anonymous RAM, or the
+    // private file view every restored and branched machine runs on, where
+    // MADV_ZERO fails with EPERM) is replaced with fresh anonymous pages.
+    // Without reclaim, MADV_FREE_REUSABLE leaves the old contents readable
+    // until macOS takes the pages back, so zero them first; MADV_ZERO clears
+    // resident pages without faulting in the rest.
     #[cfg(target_os = "macos")]
     {
-        if unsafe {
-            libc::madvise(
-                host_addr as *mut libc::c_void,
-                len as usize,
-                libc::MADV_ZERO,
-            )
-        } != 0
+        if !hvf::balloon_reclaim_enabled()
+            && unsafe {
+                libc::madvise(
+                    host_addr as *mut libc::c_void,
+                    len as usize,
+                    libc::MADV_ZERO,
+                )
+            } != 0
         {
             debug!(
                 "balloon: MADV_ZERO unavailable: {}",
