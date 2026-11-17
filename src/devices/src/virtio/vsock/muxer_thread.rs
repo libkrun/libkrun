@@ -4,10 +4,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use super::super::Queue as VirtQueue;
-use super::muxer::{MuxerRx, ProxyMap, push_packet};
+use super::muxer::{MuxerRx, ProxyHandle, ProxyMap, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::polling::update_live_polling;
-use super::proxy::{NewProxyType, Proxy, ProxyRawHandle, ProxyRemoval, ProxyUpdate};
+use super::proxy::{NewProxyType, Proxy, ProxyRawHandle, ProxyUpdate};
+use super::reaper::{ReapRequest, apply_removal};
 use super::snapshot_gate::SnapshotGate;
 use super::tsi_stream::TsiStreamProxy;
 
@@ -27,7 +28,7 @@ pub struct MuxerThread {
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
-    reaper_sender: Sender<u64>,
+    reaper_sender: Sender<ReapRequest>,
     /// AF_UNIX host-IPC listeners; consumed by `create_lisening_ipc_sockets`.
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
     snapshot_gate: Arc<SnapshotGate>,
@@ -47,7 +48,7 @@ impl MuxerThread {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
-        reaper_sender: Sender<u64>,
+        reaper_sender: Sender<ReapRequest>,
         unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
         snapshot_gate: Arc<SnapshotGate>,
         #[cfg(target_os = "macos")] host_icmp: Option<Arc<super::macos_icmp::MacIcmp>>,
@@ -104,7 +105,12 @@ impl MuxerThread {
         }
     }
 
-    fn process_proxy_update(&self, id: u64, update: ProxyUpdate, thread_rng: &mut ThreadRng) {
+    fn process_proxy_update(
+        &self,
+        id: u64,
+        (source, update): (ProxyHandle, ProxyUpdate),
+        thread_rng: &mut ThreadRng,
+    ) {
         if let Some(polling) = update.polling {
             update_live_polling(
                 &self.proxy_map,
@@ -120,19 +126,13 @@ impl MuxerThread {
             self.send_credit_request(credit_rx);
         }
 
-        match update.remove_proxy {
-            ProxyRemoval::Keep => {}
-            ProxyRemoval::Immediate => {
-                warn!("immediately removing proxy: {id}");
-                self.proxy_map.write().unwrap().remove(&id);
-            }
-            ProxyRemoval::Deferred => {
-                warn!("deferring proxy removal: {id}");
-                if self.reaper_sender.send(id).is_err() {
-                    self.proxy_map.write().unwrap().remove(&id);
-                }
-            }
-        }
+        apply_removal(
+            &self.proxy_map,
+            Some(&self.reaper_sender),
+            id,
+            &source,
+            update.remove_proxy,
+        );
 
         let mut should_signal = update.signal_queue;
 
@@ -173,7 +173,7 @@ impl MuxerThread {
             self.proxy_map
                 .write()
                 .unwrap()
-                .insert(new_id, Mutex::new(new_proxy));
+                .insert(new_id, Arc::new(Mutex::new(new_proxy)));
             debug!("[VSOCK_TIMING] new proxy inserted into proxy_map, calling push_op_request");
             if let Some(proxy) = self.proxy_map.read().unwrap().get(&new_id) {
                 proxy.lock().unwrap().push_op_request();
@@ -225,7 +225,7 @@ impl MuxerThread {
             self.proxy_map
                 .write()
                 .unwrap()
-                .insert(id, Mutex::new(Box::new(proxy)));
+                .insert(id, Arc::new(Mutex::new(Box::new(proxy))));
             if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
                 self.update_polling(id, proxy.lock().unwrap().poll_handle(), EventSet::IN);
             };
@@ -285,12 +285,17 @@ impl MuxerThread {
                         if id == super::macos_udp_router::ROUTER_EVENT {
                             if let Some(router) = &self.host_udp_router {
                                 for recipient in router.take_ready() {
-                                    let update =
-                                        self.proxy_map.read().unwrap().get(&recipient).map(
-                                            |proxy| {
-                                                proxy.lock().unwrap().process_event(EventSet::IN)
-                                            },
-                                        );
+                                    let update = self
+                                        .proxy_map
+                                        .read()
+                                        .unwrap()
+                                        .get(&recipient)
+                                        .map(|proxy| {
+                                            (
+                                                proxy.clone(),
+                                                proxy.lock().unwrap().process_event(EventSet::IN),
+                                            )
+                                        });
                                     if let Some(update) = update {
                                         self.process_proxy_update(
                                             recipient,
@@ -312,7 +317,7 @@ impl MuxerThread {
                                                 .lock()
                                                 .unwrap()
                                                 .receive_host_error(&error)
-                                                .map(|update| (*id, update))
+                                                .map(|update| (*id, (proxy.clone(), update)))
                                         },
                                     );
                                     if let Some((id, update)) = update {
@@ -324,7 +329,7 @@ impl MuxerThread {
                         }
                         let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
                             let mut proxy = proxy_lock.lock().unwrap();
-                            proxy.process_event(evset)
+                            (proxy_lock.clone(), proxy.process_event(evset))
                         });
 
                         if let Some(update) = update {

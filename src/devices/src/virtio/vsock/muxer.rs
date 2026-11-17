@@ -20,10 +20,10 @@ use super::packet::TsiConnectReq;
 use super::packet::{TsiGetnameRsp, VsockPacket};
 use super::polling::update_live_polling;
 use super::proxy::ProxyRawHandle;
-use super::proxy::{
-    ListenerDesc, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, StreamIntercept,
-};
-use super::reaper::ReaperThread;
+#[cfg(test)]
+use super::proxy::ProxyRemoval;
+use super::proxy::{ListenerDesc, Proxy, ProxyError, ProxyStatus, ProxyUpdate, StreamIntercept};
+use super::reaper::{ReapRequest, ReaperThread, apply_removal};
 use super::snapshot_gate::SnapshotGate;
 use super::sys;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -42,7 +42,8 @@ use crate::virtio::InterruptTransport;
 #[path = "host_bind_tests.rs"]
 mod host_bind_tests;
 
-pub type ProxyTable = RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>;
+pub type ProxyHandle = Arc<Mutex<Box<dyn Proxy>>>;
+pub type ProxyTable = RwLock<HashMap<u64, ProxyHandle>>;
 pub type ProxyMap = Arc<ProxyTable>;
 
 /// A muxer RX queue item.
@@ -149,7 +150,7 @@ pub struct VsockMuxer {
     interrupt: Option<InterruptTransport>,
     proxy_map: ProxyMap,
     pending_datagram_rx: Arc<Mutex<HashSet<u64>>>,
-    reaper_sender: Option<Sender<u64>>,
+    reaper_sender: Option<Sender<ReapRequest>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     tsi_flags: TsiFlags,
     /// Optional egress policy (CIDRs + DNS allow-hosts + learned IPs).
@@ -495,14 +496,14 @@ impl VsockMuxer {
             .collect();
         let mut used = false;
         for id in ids {
-            let update = self
-                .proxy_map
-                .read()
-                .unwrap()
-                .get(&id)
-                .map(|proxy| proxy.lock().unwrap().process_event(EventSet::IN));
+            let update = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+                (
+                    proxy.clone(),
+                    proxy.lock().unwrap().process_event(EventSet::IN),
+                )
+            });
             if let Some(update) = update {
-                used |= update.signal_queue;
+                used |= update.1.signal_queue;
                 self.process_proxy_update(id, update);
             }
         }
@@ -577,7 +578,7 @@ impl VsockMuxer {
         let removed = {
             let mut map = self.proxy_map.write().unwrap();
             let before = map.len();
-            map.retain(|_id, proxy| proxy.get_mut().unwrap().is_listener());
+            map.retain(|_id, proxy| proxy.lock().unwrap().is_listener());
             before - map.len()
         };
         self.rxq.lock().unwrap().clear();
@@ -639,7 +640,7 @@ impl VsockMuxer {
                         self.proxy_map
                             .write()
                             .unwrap()
-                            .insert(id, Mutex::new(Box::new(proxy)));
+                            .insert(id, Arc::new(Mutex::new(Box::new(proxy))));
                         self.update_polling(id, fd, EventSet::IN);
                         info!(
                             "restored TSI inbound listener: guest_port={} (id={:#x})",
@@ -669,7 +670,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_proxy_update(&self, id: u64, update: ProxyUpdate) {
+    fn process_proxy_update(&self, id: u64, (source, update): (ProxyHandle, ProxyUpdate)) {
         if let Some(polling) = update.polling {
             update_live_polling(
                 &self.proxy_map,
@@ -680,21 +681,13 @@ impl VsockMuxer {
             );
         }
 
-        match update.remove_proxy {
-            ProxyRemoval::Keep => {}
-            ProxyRemoval::Immediate => {
-                info!("immediately removing proxy: {id}");
-                self.proxy_map.write().unwrap().remove(&id);
-            }
-            ProxyRemoval::Deferred => {
-                info!("deferring proxy removal: {id}");
-                if let Some(reaper_sender) = &self.reaper_sender
-                    && reaper_sender.send(id).is_err()
-                {
-                    self.proxy_map.write().unwrap().remove(&id);
-                }
-            }
-        }
+        apply_removal(
+            &self.proxy_map,
+            self.reaper_sender.as_ref(),
+            id,
+            &source,
+            update.remove_proxy,
+        );
 
         if update.signal_queue
             && let Some(interrupt) = &self.interrupt
@@ -757,7 +750,7 @@ impl VsockMuxer {
                             self.proxy_map
                                 .write()
                                 .unwrap()
-                                .insert(id, Mutex::new(Box::new(proxy)));
+                                .insert(id, Arc::new(Mutex::new(Box::new(proxy))));
                         }
                         Err(e) => {
                             let open = self.proxy_map.read().unwrap().len();
@@ -802,7 +795,7 @@ impl VsockMuxer {
                             self.proxy_map
                                 .write()
                                 .unwrap()
-                                .insert(id, Mutex::new(Box::new(proxy)));
+                                .insert(id, Arc::new(Mutex::new(Box::new(proxy))));
                         }
                         Err(e) => {
                             let open = self.proxy_map.read().unwrap().len();
@@ -821,13 +814,18 @@ impl VsockMuxer {
             let id = ((peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             let (result, update) = if self.tsi_flags.contains(TsiFlags::HOST_BIND) {
                 match self.proxy_map.read().unwrap().get(&id) {
-                    Some(proxy) => proxy.lock().unwrap().disconnect_host_datagram(),
-                    None => (Err(-107), ProxyUpdate::default()), // Linux ENOTCONN.
+                    Some(proxy) => {
+                        let (result, update) = proxy.lock().unwrap().disconnect_host_datagram();
+                        (result, Some((proxy.clone(), update)))
+                    }
+                    None => (Err(-107), None), // Linux ENOTCONN.
                 }
             } else {
-                (Err(-95), ProxyUpdate::default())
+                (Err(-95), None)
             };
-            self.process_proxy_update(id, update);
+            if let Some(update) = update {
+                self.process_proxy_update(id, update);
+            }
             self.push_packet(MuxerRx::ConnResponse {
                 local_port: pkt.dst_port(),
                 peer_port: pkt.src_port(),
@@ -840,6 +838,7 @@ impl VsockMuxer {
             debug!("proxy connect request: id={id}");
             let update = match self.proxy_map.read().unwrap().get(&id) {
                 Some(proxy) => {
+                    let source = proxy.clone();
                     let mut proxy = proxy.lock().unwrap();
                     // A DGRAM connect to a resolver (port 53) is allowed so
                     // it can be intercepted; any other destination must pass
@@ -858,10 +857,11 @@ impl VsockMuxer {
                         !proxy.is_dgram()
                             && req.addr.inet().is_some_and(|a| a.port() == intercept.port)
                     });
-                    match redirected {
+                    let update = match redirected {
                         Some(intercept) => proxy.connect_intercepted(pkt, req, intercept),
                         None => proxy.connect(pkt, req),
-                    }
+                    };
+                    (source, update)
                 }
                 None => {
                     // No proxy: its host socket could not be created (say why),
@@ -938,7 +938,7 @@ impl VsockMuxer {
                 .read()
                 .unwrap()
                 .get(&id)
-                .map(|proxy| proxy.lock().unwrap().sendto_addr(req));
+                .map(|proxy| (proxy.clone(), proxy.lock().unwrap().sendto_addr(req)));
 
             if let Some(update) = update {
                 self.process_proxy_update(id, update);
@@ -1040,7 +1040,7 @@ impl VsockMuxer {
             match map.get(&id) {
                 Some(proxy) => {
                     let (result, update) = proxy.lock().unwrap().close_host_stream(&req);
-                    (result, Some((id, update)))
+                    (result, Some((id, (proxy.clone(), update))))
                 }
                 // The peer may have reset and the closed-proxy grace period
                 // expired while the guest was in a long linger wait.
@@ -1079,6 +1079,7 @@ impl VsockMuxer {
             let map = self.proxy_map.read().unwrap();
             match map.get(&id) {
                 Some(proxy) => {
+                    let source = proxy.clone();
                     let mut proxy = proxy.lock().unwrap();
                     #[cfg(target_os = "macos")]
                     let result = if proxy.is_dgram() {
@@ -1095,10 +1096,13 @@ impl VsockMuxer {
                     if result.is_ok() && proxy.is_dgram() {
                         update = Some((
                             id,
-                            ProxyUpdate {
-                                polling: Some((id, proxy.poll_handle(), EventSet::IN)),
-                                ..Default::default()
-                            },
+                            (
+                                source,
+                                ProxyUpdate {
+                                    polling: Some((id, proxy.poll_handle(), EventSet::IN)),
+                                    ..Default::default()
+                                },
+                            ),
                         ));
                     }
                     result
@@ -1126,12 +1130,12 @@ impl VsockMuxer {
         if let Some(req) = pkt.read_listen_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("DGRAM listen request: id={id}");
-            let update = self
-                .proxy_map
-                .read()
-                .unwrap()
-                .get(&id)
-                .map(|proxy| proxy.lock().unwrap().listen(pkt, req, &self.host_port_map));
+            let update = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+                (
+                    proxy.clone(),
+                    proxy.lock().unwrap().listen(pkt, req, &self.host_port_map),
+                )
+            });
             match update {
                 Some(update) => self.process_proxy_update(id, update),
                 None => self.push_packet(MuxerRx::ListenResponse {
@@ -1153,7 +1157,7 @@ impl VsockMuxer {
                 .read()
                 .unwrap()
                 .get(&id)
-                .map(|proxy| proxy.lock().unwrap().accept(req));
+                .map(|proxy| (proxy.clone(), proxy.lock().unwrap().accept(req)));
             match update {
                 Some(update) => self.process_proxy_update(id, update),
                 None => self.push_packet(MuxerRx::AcceptResponse {
@@ -1174,7 +1178,7 @@ impl VsockMuxer {
                 id, req.local_port, req.peer_port
             );
             let update = if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
-                Some(proxy.lock().unwrap().release())
+                Some((proxy.clone(), proxy.lock().unwrap().release()))
             } else {
                 debug!(
                     "release without proxy: id={}, proxies={}",
@@ -1200,7 +1204,7 @@ impl VsockMuxer {
 
         let update = if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
             debug!("DGRAM allowing OP_RW for {}", pkt.src_port());
-            Some(proxy_lock.lock().unwrap().sendmsg(pkt))
+            Some((proxy_lock.clone(), proxy_lock.lock().unwrap().sendmsg(pkt)))
         } else {
             debug!("DGRAM ignoring OP_RW for {}", pkt.src_port());
             None
@@ -1263,7 +1267,11 @@ impl VsockMuxer {
         let mut proxy_map = self.proxy_map.write().unwrap();
 
         if let Some(proxy) = proxy_map.get(&id) {
-            let update = proxy.lock().unwrap().confirm_connect(pkt);
+            let update = proxy
+                .lock()
+                .unwrap()
+                .confirm_connect(pkt)
+                .map(|update| (proxy.clone(), update));
             // The write guard must be gone before a removal re-takes it.
             drop(proxy_map);
             if let Some(update) = update {
@@ -1337,9 +1345,10 @@ impl VsockMuxer {
                     return;
                 }
                 unix.confirm_connect(pkt);
-                proxy_map.insert(id, Mutex::new(Box::new(unix)));
+                let source: ProxyHandle = Arc::new(Mutex::new(Box::new(unix)));
+                proxy_map.insert(id, source.clone());
                 drop(proxy_map);
-                self.process_proxy_update(id, update);
+                self.process_proxy_update(id, (source, update));
             }
         }
     }
@@ -1353,12 +1362,12 @@ impl VsockMuxer {
             pkt.src_port(),
             pkt.dst_port()
         );
-        let update = self
-            .proxy_map
-            .read()
-            .unwrap()
-            .get(&id)
-            .map(|proxy| proxy.lock().unwrap().process_op_response(pkt));
+        let update = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+            (
+                proxy.clone(),
+                proxy.lock().unwrap().process_op_response(pkt),
+            )
+        });
 
         if update.is_none() {
             debug!(
@@ -1369,7 +1378,7 @@ impl VsockMuxer {
 
         update
             .as_ref()
-            .and_then(|u| u.push_accept)
+            .and_then(|(_, u)| u.push_accept)
             .and_then(|(_id, parent_id)| {
                 self.proxy_map
                     .read()
@@ -1391,7 +1400,7 @@ impl VsockMuxer {
             .read()
             .unwrap()
             .get(&id)
-            .map(|proxy| proxy.lock().unwrap().shutdown(pkt));
+            .map(|proxy| (proxy.clone(), proxy.lock().unwrap().shutdown(pkt)));
         if let Some(update) = update {
             self.process_proxy_update(id, update);
         }
@@ -1404,7 +1413,7 @@ impl VsockMuxer {
             .read()
             .unwrap()
             .get(&id)
-            .map(|proxy| proxy.lock().unwrap().request_credit());
+            .map(|proxy| (proxy.clone(), proxy.lock().unwrap().request_credit()));
         if let Some(update) = update {
             self.process_proxy_update(id, update);
         }
@@ -1418,7 +1427,7 @@ impl VsockMuxer {
             .read()
             .unwrap()
             .get(&id)
-            .map(|proxy| proxy.lock().unwrap().update_peer_credit(pkt));
+            .map(|proxy| (proxy.clone(), proxy.lock().unwrap().update_peer_credit(pkt)));
         if let Some(update) = update {
             self.process_proxy_update(id, update);
         }
@@ -1432,12 +1441,12 @@ impl VsockMuxer {
         // would reset the connection (a guest download dying "unexpected
         // EOF"). On Unix the extra recv attempt just reports WouldBlock when
         // nothing is buffered.
-        let drain = self
-            .proxy_map
-            .read()
-            .unwrap()
-            .get(&id)
-            .map(|proxy| proxy.lock().unwrap().process_event(EventSet::IN));
+        let drain = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+            (
+                proxy.clone(),
+                proxy.lock().unwrap().process_event(EventSet::IN),
+            )
+        });
         if let Some(update) = drain {
             self.process_proxy_update(id, update);
         }
@@ -1452,7 +1461,7 @@ impl VsockMuxer {
                 pkt.src_port(),
                 pkt.dst_port()
             );
-            proxy_lock.lock().unwrap().sendmsg(pkt)
+            (proxy_lock.clone(), proxy_lock.lock().unwrap().sendmsg(pkt))
         });
         if let Some(update) = update {
             self.process_proxy_update(id, update);
@@ -1498,7 +1507,7 @@ impl VsockMuxer {
                 pkt.src_port(),
                 pkt.dst_port()
             );
-            Some(proxy_lock.lock().unwrap().release())
+            Some((proxy_lock.clone(), proxy_lock.lock().unwrap().release()))
         } else {
             debug!("[VSOCK_TIMING] OP_RST: no proxy found for id={:#x}", id);
             None
@@ -1829,7 +1838,7 @@ mod tests {
                     .proxy_map
                     .write()
                     .unwrap()
-                    .insert(id, Mutex::new(Box::new(RemovedOnUpdate)));
+                    .insert(id, Arc::new(Mutex::new(Box::new(RemovedOnUpdate))));
             };
             let tsi_req = |extra: &[u8]| [&GUEST.to_le_bytes()[..], extra].concat();
             let stream_id = ((GUEST as u64) << 32) | 620;

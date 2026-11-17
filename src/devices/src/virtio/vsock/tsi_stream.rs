@@ -6,7 +6,7 @@ use std::num::Wrapping;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use socket2::{Domain, Socket, Type};
 
@@ -36,6 +36,10 @@ use vm_memory::GuestMemoryMmap;
 #[cfg(test)]
 #[path = "tsi_stream_tests.rs"]
 mod tests;
+
+// Once the guest is gone, retain accepted output only while it advances.
+// This portable policy bounds stalled queues without blocking the muxer.
+const DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct TsiStreamProxy {
     id: u64,
@@ -88,9 +92,10 @@ pub struct TsiStreamProxy {
     /// blocks.
     tx_buf: VecDeque<u8>,
     /// The guest has closed, but accepted output still belongs to this flow.
-    /// Keep its bounded queue until the host accepts it or the transport fails.
+    /// Keep its bounded queue while the host accepts output, with an idle deadline.
     /// The closed-proxy grace timer must not silently truncate this output.
     guest_released: bool,
+    drain_progress: Option<Instant>,
     close_watermark: Option<Wrapping<u32>>,
     close_fin_sent: bool,
     buffers: SocketBuffers,
@@ -188,6 +193,7 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             tx_buf: VecDeque::new(),
             guest_released: false,
+            drain_progress: None,
             close_watermark: None,
             close_fin_sent: false,
             buffers: SocketBuffers::default(),
@@ -245,6 +251,7 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             tx_buf: VecDeque::new(),
             guest_released: false,
+            drain_progress: None,
             close_watermark: None,
             close_fin_sent: false,
             buffers,
@@ -753,6 +760,12 @@ impl TsiStreamProxy {
         Some((self.id, raw_handle(&self.sock), self.conn_evset()))
     }
 
+    fn record_drain_progress(&mut self) {
+        if self.guest_released {
+            self.drain_progress = Some(Instant::now());
+        }
+    }
+
     fn output_pending(&self) -> bool {
         !self.tx_buf.is_empty()
             || !self.preamble.is_empty()
@@ -775,6 +788,7 @@ impl TsiStreamProxy {
                 Ok(0) => return Ok(false),
                 Ok(n) => {
                     self.preamble.drain(..n);
+                    self.record_drain_progress();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -794,6 +808,7 @@ impl TsiStreamProxy {
                 Ok(n) => {
                     self.tx_cnt += Wrapping(n as u32);
                     self.tx_buf.drain(..n);
+                    self.record_drain_progress();
                     advanced = true;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -846,6 +861,10 @@ impl TsiStreamProxy {
 }
 
 impl Proxy for TsiStreamProxy {
+    fn drain_deadline(&self) -> Option<Instant> {
+        self.drain_progress.map(|last| last + DRAIN_IDLE_TIMEOUT)
+    }
+
     fn close_host_stream(&mut self, req: &CloseRequest) -> (i32, ProxyUpdate) {
         if req.flags == host_close::ABORT {
             let result = self
@@ -1423,12 +1442,13 @@ impl Proxy for TsiStreamProxy {
             ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
         ) && self.output_pending();
         if draining {
+            self.drain_progress.get_or_insert_with(Instant::now);
             self.guest_released = true;
             self.rx_paused = true;
         }
         ProxyUpdate {
             remove_proxy: if draining {
-                ProxyRemoval::Keep
+                ProxyRemoval::Drain
             } else {
                 ProxyRemoval::Immediate
             },

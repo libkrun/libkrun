@@ -451,7 +451,7 @@ fn release_drains_accepted_output_without_the_closed_proxy_timer() {
             // Release can arrive both on the control port and as a vsock RST.
             for _ in 0..2 {
                 let update = proxy.release();
-                assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+                assert!(matches!(update.remove_proxy, ProxyRemoval::Drain));
                 assert!(update.polling.unwrap().2.contains(EventSet::OUT));
                 assert!(!proxy.conn_evset().contains(EventSet::IN));
             }
@@ -692,7 +692,7 @@ fn close_watermark_preserves_data_that_arrives_after_release() {
             remote.read(&mut [0]).unwrap_err().kind(),
             ErrorKind::WouldBlock
         );
-        assert!(matches!(proxy.release().remove_proxy, ProxyRemoval::Keep));
+        assert!(matches!(proxy.release().remove_proxy, ProxyRemoval::Drain));
         // Reordered shutdown must not put FIN before the missing payload.
         let (_memory, mut pkt) = stream_fixture(ip);
         pkt.set_flags(uapi::VSOCK_FLAGS_SHUTDOWN_SEND);
@@ -789,4 +789,54 @@ fn linger_completion_waits_for_output_and_fin_acknowledgment() {
         drop(proxy);
         assert_eq!(reader.join().unwrap(), payload);
     }
+}
+
+#[test]
+fn released_stream_idle_deadline_requires_forwarding_progress() {
+    let (mut proxy, pkt) = stream_fixture(Ipv4Addr::LOCALHOST.into());
+    proxy.record_drain_progress();
+    assert_eq!(
+        proxy.drain_deadline(),
+        None,
+        "active streams have no drain timer"
+    );
+    proxy.status = ProxyStatus::Connected;
+    // Missing guest bytes count as outstanding output, even with an empty queue.
+    proxy.close_watermark = Some(Wrapping(10));
+    assert!(matches!(proxy.release().remove_proxy, ProxyRemoval::Drain));
+    let first = proxy.drain_progress.unwrap();
+    assert_eq!(proxy.drain_deadline(), Some(first + DRAIN_IDLE_TIMEOUT));
+    proxy.release();
+    proxy.update_peer_credit(&pkt);
+    proxy.process_event(EventSet::OUT);
+    assert_eq!(
+        proxy.drain_progress,
+        Some(first),
+        "control/readiness is not progress"
+    );
+    let progressed = first + Duration::from_secs(119);
+    proxy.drain_progress = Some(progressed);
+    proxy.release();
+    assert_eq!(
+        proxy.drain_deadline(),
+        Some(progressed + DRAIN_IDLE_TIMEOUT)
+    );
+}
+
+#[test]
+fn writes_to_host_extend_only_released_stream_deadlines() {
+    let (mut proxy, listener) = connecting(Ipv4Addr::LOCALHOST.into(), true);
+    proxy.process_event(EventSet::OUT);
+    let (_remote, _) = listener.unwrap().accept().unwrap();
+    proxy.tx_buf.extend(b"first");
+    proxy.flush_tx().unwrap();
+    assert_eq!(proxy.drain_deadline(), None);
+    proxy.close_watermark = Some(proxy.tx_cnt + Wrapping(10));
+    proxy.release();
+    let previous = Instant::now() - Duration::from_secs(119);
+    proxy.drain_progress = Some(previous);
+    proxy.tx_buf.extend(b"second");
+    assert!(proxy.flush_tx().unwrap());
+    assert!(proxy.drain_progress.unwrap() > previous);
+    assert!(proxy.output_pending());
 }

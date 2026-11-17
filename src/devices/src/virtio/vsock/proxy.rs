@@ -4,6 +4,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
+use std::time::Instant;
 
 use socket2::Socket;
 
@@ -124,6 +125,8 @@ pub enum ProxyRemoval {
     Keep,
     Immediate,
     Deferred,
+    /// Guest has closed; drain accepted output with a bounded idle lifetime.
+    Drain,
 }
 
 pub enum NewProxyType {
@@ -190,6 +193,11 @@ impl StreamIntercept {
 }
 
 pub trait Proxy: Send {
+    /// Deadline for a guest-released stream that still owns accepted output.
+    fn drain_deadline(&self) -> Option<Instant> {
+        None
+    }
+
     fn close_host_stream(
         &mut self,
         _request: &super::host_close::CloseRequest,

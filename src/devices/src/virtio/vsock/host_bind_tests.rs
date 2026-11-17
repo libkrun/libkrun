@@ -1279,7 +1279,7 @@ fn accepted_socket_options_target_the_child_not_its_listener() {
             .proxy_map
             .write()
             .unwrap()
-            .insert(id, Mutex::new(Box::new(proxy)));
+            .insert(id, Arc::new(Mutex::new(Box::new(proxy))));
     }
     f.send(
         defs::TSI_HOST_SETSOCKOPT,
