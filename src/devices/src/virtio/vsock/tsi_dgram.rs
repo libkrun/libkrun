@@ -434,7 +434,6 @@ impl Proxy for TsiDgramProxy {
         // exactly as it would without interception, and the guest's resolver
         // and address selection see the same errors.
         let intercept = self.dns_sender.is_some() && sockaddr_port(&req.addr) == Some(DNS_PORT);
-        self.connected_dns = false;
         let addr: std::io::Result<socket2::SockAddr> = match req.addr.inet() {
             _ if !req.addr.suits_family(self.family) => {
                 warn!(
@@ -454,13 +453,15 @@ impl Proxy for TsiDgramProxy {
         };
         let (res, poll_host_socket) = match addr.and_then(|a| self.sock.connect(&a)) {
             Ok(()) => {
+                // A failed reconnect leaves the previous peer and its DNS
+                // interception active; commit the new policy with the socket.
+                self.connected_dns = intercept;
                 self.status = ProxyStatus::Connected;
                 if self.host_rx.is_some() {
                     self.host_peer = req.addr.inet();
                 }
                 if intercept {
                     debug!("connect: intercepting DNS socket");
-                    self.connected_dns = true;
                     (0, false)
                 } else {
                     debug!("connect: Connected");

@@ -629,3 +629,68 @@ fn host_dns_replies_resume_after_refill_and_do_not_reach_reused_sockets() {
         f.release();
     }
 }
+
+#[test]
+fn host_udp_failed_reconnect_keeps_dns_interception() {
+    let mut f = Fixture::new(granted(), None);
+    f.muxer.floor = FloorMode::MetadataOnly;
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    f.muxer.dns_sender = Some(sender);
+    f.create(defs::SOCK_DGRAM, defs::LINUX_AF_INET);
+    let bound = f.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+
+    // A rejected family change leaves the original kernel socket connected.
+    for (destination, succeeds) in [("127.0.0.1:53", true), ("[::1]:53", false)] {
+        let addr = VsockAddr::from(destination.parse::<SocketAddr>().unwrap());
+        f.send(
+            defs::TSI_CONNECT,
+            &[
+                &GUEST.to_le_bytes()[..],
+                &addr.linux_len().to_le_bytes(),
+                &addr.to_linux_bytes(),
+            ]
+            .concat(),
+        );
+        let reply = f.muxer.rxq.lock().unwrap().pop();
+        assert!(
+            matches!(&reply, Some(MuxerRx::ConnResponse { result, .. }) if if succeeds { *result == 0 } else { *result < 0 }),
+            "connect to {destination}: {reply:?}"
+        );
+    }
+    let mut packet = f.packet(defs::TSI_PROXY_PORT, b"query");
+    packet.set_src_port(GUEST);
+    f.muxer.send_dgram_pkt(&packet).unwrap();
+    let request = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(request.query, b"query");
+    assert_eq!(
+        request.host_reply.unwrap().source.inet(),
+        Some("127.0.0.1:53".parse().unwrap())
+    );
+
+    // A successful reconnect away from DNS must clear interception instead.
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let addr = VsockAddr::from(peer.local_addr().unwrap());
+    f.send(
+        defs::TSI_CONNECT,
+        &[
+            &GUEST.to_le_bytes()[..],
+            &addr.linux_len().to_le_bytes(),
+            &addr.to_linux_bytes(),
+        ]
+        .concat(),
+    );
+    assert!(matches!(
+        f.muxer.rxq.lock().unwrap().pop(),
+        Some(MuxerRx::ConnResponse { result: 0, .. })
+    ));
+    let mut packet = f.packet(defs::TSI_PROXY_PORT, b"data");
+    packet.set_src_port(GUEST);
+    f.muxer.send_dgram_pkt(&packet).unwrap();
+    let mut bytes = [0; 16];
+    let (length, source) = peer.recv_from(&mut bytes).unwrap();
+    assert_eq!(&bytes[..length], b"data");
+    assert_eq!(source, bound);
+    assert!(receiver.try_recv().is_err());
+    f.release();
+}
