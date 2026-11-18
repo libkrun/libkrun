@@ -776,6 +776,15 @@ void krun_display_info_builder_physical_size(KrunDisplayInfoBuilder* handle, uin
 typedef void (*krun_display_info_builder_physical_size_fn)(KrunDisplayInfoBuilder* handle, uint16_t width_mm, uint16_t height_mm);
 void krun_display_info_builder_refresh_rate(KrunDisplayInfoBuilder* handle, uint32_t rate);
 typedef void (*krun_display_info_builder_refresh_rate_fn)(KrunDisplayInfoBuilder* handle, uint32_t rate);
+/**
+ * Set the PNP manufacturer ID and product name of the generated EDID.
+ *
+ * `manufacturer` must be exactly 3 ASCII uppercase letters and
+ * `display_name` at most 13 bytes, matching the EDID descriptor limits.
+ * Fails if the EDID was set explicitly with [`DisplayInfoBuilder::edid`].
+ */
+KrunResult krun_display_info_builder_edid_name(KrunDisplayInfoBuilder* handle, KrunStr manufacturer, KrunStr display_name, KrunError* err_out);
+typedef KrunResult (*krun_display_info_builder_edid_name_fn)(KrunDisplayInfoBuilder* handle, KrunStr manufacturer, KrunStr display_name, KrunError* err_out);
 void krun_display_info_builder_destroy(KrunDisplayInfoBuilder handle);
 typedef void (*krun_display_info_builder_destroy_fn)(KrunDisplayInfoBuilder handle);
 #if (defined(__linux__) && !defined(__ANDROID__))

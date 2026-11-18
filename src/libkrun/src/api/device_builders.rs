@@ -1896,6 +1896,26 @@ impl DisplayInfoBuilder {
         }
         self
     }
+
+    /// Set the PNP manufacturer ID and product name of the generated EDID.
+    ///
+    /// `manufacturer` must be exactly 3 ASCII uppercase letters and
+    /// `display_name` at most 13 bytes, matching the EDID descriptor limits.
+    pub fn edid_name(mut self, manufacturer: &str, display_name: &str) -> Result<Self, VmmError> {
+        let DisplayInfoEdid::Generated(params) = &mut self.inner.edid else {
+            return Ok(self);
+        };
+        let mfr = manufacturer.as_bytes();
+        if mfr.len() != 3 || !mfr.iter().all(u8::is_ascii_uppercase) {
+            return Err(VmmError::InvalidParam());
+        }
+        if display_name.is_empty() || display_name.len() > 13 {
+            return Err(VmmError::InvalidParam());
+        }
+        params.manufacturer = [mfr[0], mfr[1], mfr[2]];
+        params.display_name = display_name.to_string();
+        Ok(self)
+    }
 }
 
 /// Wraps the pre-ffier display backend and owns the list of displays.
