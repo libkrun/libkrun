@@ -7,14 +7,13 @@ use std::collections::VecDeque;
 use std::fmt::{self, Display};
 use std::io::{self, Read, Write};
 use std::mem::{MaybeUninit, size_of};
-use std::ops::Deref;
 use std::ptr::copy_nonoverlapping;
 use std::result;
 
 use crate::virtio::queue::DescriptorChain;
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap,
-    GuestMemoryRegion, Le16, Le32, Le64, VolatileMemory, VolatileMemoryError, VolatileSlice,
+    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, Le16,
+    Le32, Le64, VolatileMemoryError, VolatileSlice,
 };
 
 use super::file_traits::{FileReadWriteAtVolatile, FileReadWriteVolatile};
@@ -60,6 +59,35 @@ struct DescriptorChainConsumer<'a> {
 }
 
 impl<'a> DescriptorChainConsumer<'a> {
+    fn new(
+        mem: &'a GuestMemoryMmap,
+        descriptors: impl Iterator<Item = DescriptorChain<'a>>,
+    ) -> Result<Self> {
+        let mut total_len = 0usize;
+        let mut buffers = VecDeque::new();
+        for desc in descriptors {
+            total_len = total_len
+                .checked_add(desc.len as usize)
+                .ok_or(Error::DescriptorChainOverflow)?;
+            if desc.len == 0 {
+                buffers.push_back(
+                    mem.get_slice(desc.addr, 0)
+                        .map_err(Error::GuestMemoryError)?,
+                );
+                continue;
+            }
+            // A contiguous guest buffer can span independently mapped host regions.
+            // Keep every slice and propagate errors for real gaps in guest memory.
+            for slice in mem.get_slices(desc.addr, desc.len as usize) {
+                buffers.push_back(slice.map_err(Error::GuestMemoryError)?);
+            }
+        }
+        Ok(Self {
+            buffers,
+            bytes_consumed: 0,
+        })
+    }
+
     fn available_bytes(&self) -> usize {
         // This is guaranteed not to overflow because the total length of the chain
         // is checked during all creations of `DescriptorChainConsumer` (see
@@ -190,34 +218,8 @@ pub struct Reader<'a> {
 impl<'a> Reader<'a> {
     /// Construct a new Reader wrapper over `desc_chain`.
     pub fn new(mem: &'a GuestMemoryMmap, chain: DescriptorChain<'a>) -> Result<Reader<'a>> {
-        let mut total_len: usize = 0;
-        let buffers = chain
-            .into_iter()
-            .readable()
-            .map(|desc| {
-                // Verify that summing the descriptor sizes does not overflow.
-                // This can happen if a driver tricks a device into reading more data than
-                // fits in a `usize`.
-                total_len = total_len
-                    .checked_add(desc.len as usize)
-                    .ok_or(Error::DescriptorChainOverflow)?;
-
-                let region = mem.find_region(desc.addr).ok_or(Error::FindMemoryRegion)?;
-                let offset = desc
-                    .addr
-                    .checked_sub(region.start_addr().raw_value())
-                    .unwrap();
-                region
-                    .deref()
-                    .get_slice(offset.raw_value() as usize, desc.len as usize)
-                    .map_err(Error::VolatileMemoryError)
-            })
-            .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
         Ok(Reader {
-            buffer: DescriptorChainConsumer {
-                buffers,
-                bytes_consumed: 0,
-            },
+            buffer: DescriptorChainConsumer::new(mem, chain.into_iter().readable())?,
         })
     }
 
@@ -342,35 +344,8 @@ pub struct Writer<'a> {
 impl<'a> Writer<'a> {
     /// Construct a new Writer wrapper over `desc_chain`.
     pub fn new(mem: &'a GuestMemoryMmap, chain: DescriptorChain<'a>) -> Result<Writer<'a>> {
-        let mut total_len: usize = 0;
-        let buffers = chain
-            .into_iter()
-            .writable()
-            .map(|desc| {
-                // Verify that summing the descriptor sizes does not overflow.
-                // This can happen if a driver tricks a device into writing more data than
-                // fits in a `usize`.
-                total_len = total_len
-                    .checked_add(desc.len as usize)
-                    .ok_or(Error::DescriptorChainOverflow)?;
-
-                let region = mem.find_region(desc.addr).ok_or(Error::FindMemoryRegion)?;
-                let offset = desc
-                    .addr
-                    .checked_sub(region.start_addr().raw_value())
-                    .unwrap();
-                region
-                    .deref()
-                    .get_slice(offset.raw_value() as usize, desc.len as usize)
-                    .map_err(Error::VolatileMemoryError)
-            })
-            .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
-
         Ok(Writer {
-            buffer: DescriptorChainConsumer {
-                buffers,
-                bytes_consumed: 0,
-            },
+            buffer: DescriptorChainConsumer::new(mem, chain.into_iter().writable())?,
         })
     }
 
@@ -548,6 +523,105 @@ pub fn create_descriptor_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_crosses_adjacent_memory_regions() {
+        let memory = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 0x1000),
+            (GuestAddress(0x1000), 0x1000),
+            (GuestAddress(0x2000), 0x1000),
+        ])
+        .unwrap();
+        let payload: Vec<u8> = (0..0x1020).map(|i| (i % 251) as u8).collect();
+        memory.write_slice(&payload, GuestAddress(0xff0)).unwrap();
+        for indirect in [false, true] {
+            let mut chain = create_descriptor_chain(
+                &memory,
+                GuestAddress(0),
+                GuestAddress(0xff0),
+                vec![(DescriptorType::Readable, payload.len() as u32)],
+                0,
+            )
+            .unwrap();
+            if indirect {
+                memory
+                    .write_obj(
+                        virtq_desc {
+                            addr: 0.into(),
+                            len: 16.into(),
+                            flags: 4.into(),
+                            next: 0.into(),
+                        },
+                        GuestAddress(0x100),
+                    )
+                    .unwrap();
+                chain = DescriptorChain::checked_new(&memory, GuestAddress(0x100), 1, 0).unwrap();
+            }
+            let mut reader =
+                Reader::new(&memory, chain).expect("valid buffer crosses adjacent mappings");
+            let mut actual = vec![0; payload.len()];
+            reader.read_exact(&mut actual[..7]).unwrap();
+            reader.read_exact(&mut actual[7..]).unwrap();
+            assert_eq!(actual, payload);
+            assert_eq!(reader.bytes_read(), payload.len());
+            assert_eq!(reader.available_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn writer_crosses_adjacent_memory_regions() {
+        let memory = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 0x1000),
+            (GuestAddress(0x1000), 0x1000),
+            (GuestAddress(0x2000), 0x1000),
+        ])
+        .unwrap();
+        let payload: Vec<u8> = (0..0x1020).map(|i| (i % 251) as u8).collect();
+        memory.write_obj(0xa5u8, GuestAddress(0xfef)).unwrap();
+        memory.write_obj(0x5au8, GuestAddress(0x2010)).unwrap();
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0),
+            GuestAddress(0xff0),
+            vec![(DescriptorType::Writable, payload.len() as u32)],
+            0,
+        )
+        .unwrap();
+        let mut writer =
+            Writer::new(&memory, chain).expect("valid buffer crosses adjacent mappings");
+        let mut tail = writer.split_at(0x1010).unwrap();
+        writer.write_all(&payload[..0x1010]).unwrap();
+        tail.write_all(&payload[0x1010..]).unwrap();
+        let mut actual = vec![0; payload.len()];
+        memory.read_slice(&mut actual, GuestAddress(0xff0)).unwrap();
+        assert_eq!(actual, payload);
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(0xfef)).unwrap(), 0xa5);
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(0x2010)).unwrap(), 0x5a);
+    }
+
+    #[test]
+    fn descriptor_buffers_reject_unmapped_gap() {
+        let memory = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 0x1000),
+            (GuestAddress(0x2000), 0x1000),
+        ])
+        .unwrap();
+        for kind in [DescriptorType::Readable, DescriptorType::Writable] {
+            let chain = create_descriptor_chain(
+                &memory,
+                GuestAddress(0),
+                GuestAddress(0xff0),
+                vec![(kind, 0x1020)],
+                0,
+            )
+            .unwrap();
+            if kind == DescriptorType::Readable {
+                assert!(Reader::new(&memory, chain).is_err());
+            } else {
+                assert!(Writer::new(&memory, chain).is_err());
+            }
+        }
+    }
 
     #[test]
     fn reader_test_simple_chain() {
