@@ -243,9 +243,7 @@ mod tests {
             dummy_device(),
         )
         .unwrap();
-        let (_, mmio_irq) = mmio
-            .register_mmio_device(vm.fd(), transport, 0, "rtc".to_string())
-            .unwrap();
+        let (_, mmio_irq) = mmio.register_mmio_device(vm.fd(), transport, 0).unwrap();
         let first = pci
             .register_virtio_device(vm.fd_shared(), guest_mem.clone(), dummy_device())
             .unwrap();
