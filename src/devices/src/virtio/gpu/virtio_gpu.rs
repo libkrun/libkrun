@@ -739,10 +739,12 @@ impl VirtioGpu {
         Ok(OkNoData)
     }
 
+    #[cfg(target_os = "macos")]
     pub fn has_pending_fences(&self) -> bool {
         !self.fence_state.lock().unwrap().descs.is_empty()
     }
 
+    #[cfg(target_os = "macos")]
     /// Lets virglrenderer retire fences whose GPU work has finished; must run on the thread that
     /// owns the renderer's GL contexts.
     pub fn event_poll(&self) {

@@ -1,11 +1,14 @@
 use std::io::Read;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+#[cfg(target_os = "macos")]
+use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use utils::eventfd::EventFd;
 
+#[cfg(target_os = "macos")]
 const FENCE_POLL_INTERVAL_US: i64 = 100;
 
 #[cfg(target_os = "macos")]
@@ -103,8 +106,9 @@ impl Worker {
         );
 
         loop {
-            // Without eventfd (macOS) virglrenderer has no sync thread, so pending fences only
-            // retire when we poll the renderer; keep polling until they have all signaled.
+            // macOS has no eventfd, so virglrenderer runs no fence sync thread and pending fences
+            // only retire when we poll the renderer; keep polling until they have all signaled.
+            #[cfg(target_os = "macos")]
             if virtio_gpu.has_pending_fences() {
                 let ready = wait_readable(self.control_evt.as_raw_fd(), FENCE_POLL_INTERVAL_US);
                 virtio_gpu.event_poll();
@@ -472,6 +476,7 @@ impl Worker {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// Waits until `fd` is readable or `timeout_us` has passed; returns whether it became readable.
 fn wait_readable(fd: RawFd, timeout_us: i64) -> bool {
     // SAFETY: fd_set is plain data; FD_ZERO/FD_SET initialise it for a valid fd below FD_SETSIZE.
@@ -497,7 +502,7 @@ fn wait_readable(fd: RawFd, timeout_us: i64) -> bool {
     ret > 0
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use std::os::fd::AsRawFd;
     use std::time::{Duration, Instant};
