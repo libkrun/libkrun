@@ -343,7 +343,18 @@ impl UnixProxy {
     }
 
     fn conn_evset(&self) -> EventSet {
-        connected_event_set(self.rx_paused, !self.tx_buf.is_empty())
+        let events = connected_event_set(self.rx_paused, !self.tx_buf.is_empty());
+        if events.is_empty() {
+            // Credit exhaustion and stdin EOF must not hide a later full close.
+            // Linux reports HUP without read/write interest. kqueue needs a
+            // write filter to observe full closure; edge triggering avoids
+            // repeatedly waking on an otherwise writable, idle socket.
+            #[cfg(target_os = "macos")]
+            return EventSet::OUT | EventSet::EDGE_TRIGGERED;
+            #[cfg(not(target_os = "macos"))]
+            return EventSet::HANG_UP;
+        }
+        events
     }
 
     fn repoll(&self) -> Option<(u64, ProxyRawHandle, EventSet)> {
@@ -773,7 +784,8 @@ impl Proxy for UnixProxy {
             } else if matches!(
                 self.status,
                 ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
-            ) {
+            ) && !self.tx_buf.is_empty()
+            {
                 // Waiting for host->guest credit must not block the opposite
                 // direction: the guest may need to drain output before reading.
                 // Host socket drained: flush buffered guest->host bytes and
@@ -1085,6 +1097,76 @@ mod tests {
         let mut received = [0u8; 8192];
         let n = peer.read(&mut received).unwrap();
         assert_eq!(n, 10, "sent the whole descriptor instead of the packet");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn paused_input_observes_disconnect_without_spinning_or_losing_output() {
+        use utils::epoll::{ControlOperation, Epoll, EpollEvent};
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
+        let (tx, rx) = (
+            TestQueue::new(GuestAddress(0x1000), &mem, 8),
+            TestQueue::new(GuestAddress(0x4000), &mem, 8),
+        );
+        let (mut proxy, mut peer) = proxy_with_peer(&mem, &rx);
+        peer.set_nonblocking(true).unwrap();
+        proxy.status = ProxyStatus::WaitingCreditUpdate;
+        proxy.rx_paused = true;
+        // Keep unread input present throughout: read readiness must stay paused.
+        assert_eq!(peer.send(&[0x5a; 4096]).unwrap(), 4096);
+        let mut epoll = Epoll::new().unwrap();
+        let (_, fd, interest) = proxy.repoll().unwrap();
+        // Match the muxer: an empty interest removes this descriptor entirely.
+        if !interest.is_empty() {
+            epoll
+                .ctl(ControlOperation::Add, fd, &EpollEvent::new(interest, 1))
+                .unwrap();
+        }
+        let mut events: [EpollEvent; 4] = std::array::from_fn(|_| EpollEvent::default());
+        // A kqueue edge-triggered write watch may report initial readiness.
+        let ready = epoll.wait(4, 0, &mut events).unwrap();
+        for event in &events[..ready] {
+            let update = proxy.process_event(event.event_set());
+            assert!(
+                update.polling.is_none(),
+                "idle readiness must not rearm itself"
+            );
+            assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+        }
+        assert_eq!(epoll.wait(4, 20, &mut events).unwrap(), 0);
+
+        // Closing only stdin must not kill the session or its returning output.
+        peer.shutdown(Shutdown::Write).unwrap();
+        let ready = epoll.wait(4, 20, &mut events).unwrap();
+        for event in &events[..ready] {
+            let update = proxy.process_event(event.event_set());
+            assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+            assert!(update.polling.is_none());
+        }
+        assert_eq!(proxy.status, ProxyStatus::WaitingCreditUpdate);
+        assert_eq!(epoll.wait(4, 20, &mut events).unwrap(), 0);
+        mem.write_slice(b"output!", GuestAddress(DATA)).unwrap();
+        proxy.sendmsg(&tx_packet(&mem, &tx, 7, 7));
+        let mut output = [0; 7];
+        peer.read_exact(&mut output).unwrap();
+        assert_eq!(&output, b"output!");
+
+        drop(peer);
+        let ready = epoll.wait(4, 500, &mut events).unwrap();
+        assert!(
+            ready > 0,
+            "full close was lost while waiting for guest credit"
+        );
+        let event = events[..ready]
+            .iter()
+            .find(|event| event.event_set().contains(EventSet::HANG_UP))
+            .expect("full close must surface as a hangup");
+        let update = proxy.process_event(event.event_set());
+        assert_eq!(proxy.status, ProxyStatus::Closed);
+        assert!(update.signal_queue);
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Deferred));
+        assert!(update.polling.unwrap().2.is_empty());
     }
 
     #[test]
