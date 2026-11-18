@@ -396,6 +396,22 @@ int32_t krun_add_virtiofs4(uint32_t ctx_id,
                            bool read_only,
                            uint32_t flags);
 
+/**
+ * Serves the files of the virtio-fs share "c_tag" that record no owner of
+ * their own as owned by uid:gid, so a host directory mounted for a guest user
+ * belongs to that user without a chown and keeps that owner when the host
+ * replaces a file. The guest's chown still records an owner per file. Call
+ * after adding the share. On Linux it takes effect with
+ * KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT, where owners are virtualized.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_virtiofs_owner(uint32_t ctx_id,
+                                const char *c_tag,
+                                uint32_t uid,
+                                uint32_t gid);
+
 /* Send the VFKIT magic after establishing the connection,
    as required by gvproxy in vfkit mode. */
 #define NET_FLAG_VFKIT (1 << 0)

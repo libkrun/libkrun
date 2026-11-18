@@ -3667,6 +3667,10 @@ fn attach_fs_devices(
                 config.live,
                 config.virtual_entries.clone(),
             )
+            .map(|mut fs| {
+                fs.set_default_owner(config.default_owner);
+                fs
+            })
             .unwrap(),
         ));
 

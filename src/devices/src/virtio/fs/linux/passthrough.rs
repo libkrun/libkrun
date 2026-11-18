@@ -439,6 +439,12 @@ pub struct Config {
     /// is opt-in per share.
     pub override_stat: bool,
 
+    /// With `override_stat`, the owner a file is served as when it records
+    /// none of its own: a
+    /// mount whose files should belong to a guest user, not to root or to the
+    /// host's account. The guest's chown still records an owner per file.
+    pub default_owner: Option<(u32, u32)>,
+
     /// Optional file descriptor for /proc/self/fd. Callers can obtain a file descriptor and pass it
     /// here, so there's no need to open it in PassthroughFs::new(). This is specially useful for
     /// sandboxing.
@@ -463,6 +469,7 @@ impl Default for Config {
             root_dir: String::from("/"),
             xattr: true,
             override_stat: false,
+            default_owner: None,
             proc_sfd_rawfd: None,
             export_fsid: 0,
             export_table: None,
@@ -1370,6 +1377,8 @@ impl PassthroughFs {
             (st.st_uid, st.st_gid) = symlink_owner(fd);
         } else if let Some(recorded) = read_override(fd) {
             apply_override(st, recorded);
+        } else if let Some((uid, gid)) = self.cfg.default_owner {
+            (st.st_uid, st.st_gid) = (uid, gid);
         }
     }
 
@@ -2225,12 +2234,18 @@ impl FileSystem for PassthroughFs {
                 let uid = if valid.contains(SetattrValid::UID) {
                     attr.st_uid
                 } else {
-                    current.0.unwrap_or(host.st_uid)
+                    current
+                        .0
+                        .or(self.cfg.default_owner.map(|o| o.0))
+                        .unwrap_or(host.st_uid)
                 };
                 let gid = if valid.contains(SetattrValid::GID) {
                     attr.st_gid
                 } else {
-                    current.1.unwrap_or(host.st_gid)
+                    current
+                        .1
+                        .or(self.cfg.default_owner.map(|o| o.1))
+                        .unwrap_or(host.st_gid)
                 };
                 let mode = if valid.contains(SetattrValid::MODE) {
                     attr.st_mode & 0o7777
@@ -3573,6 +3588,45 @@ mod tests {
         assert!(update_symlink_owners(&records, b"b", (0, 0)).is_empty());
         // A truncated record yields what it can and never panics.
         assert_eq!(find_symlink_owner(b"a\x001:2\x00b", b"b"), None);
+    }
+
+    #[test]
+    fn a_file_with_no_recorded_owner_is_served_as_the_shares_owner() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("krun-default-owner-{nonce}"));
+        fs::create_dir(&root).unwrap();
+        // written by the host: it records no owner of its own
+        fs::write(root.join("settings.json"), b"{}").unwrap();
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                override_stat: true,
+                default_owner: Some((1000, 1001)),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::empty()).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let name = CString::new("settings.json").unwrap();
+        let entry = FileSystem::lookup(&filesystem, ctx, fuse::ROOT_ID, &name).unwrap();
+        assert_eq!((entry.attr.st_uid, entry.attr.st_gid), (1000, 1001));
+        // The guest's chown of the uid alone records it; the gid stays the share's.
+        let mut attr = entry.attr;
+        attr.st_uid = 2000;
+        let (st, _) =
+            FileSystem::setattr(&filesystem, ctx, entry.inode, attr, None, SetattrValid::UID)
+                .unwrap();
+        assert_eq!((st.st_uid, st.st_gid), (2000, 1001));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

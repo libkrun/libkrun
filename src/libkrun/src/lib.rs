@@ -2938,6 +2938,7 @@ pub unsafe extern "C" fn krun_add_virtiofs4(
                     override_stat,
                     negative_entries,
                     live,
+                    default_owner: None,
                     virtual_entries,
                 });
             }
@@ -2945,6 +2946,47 @@ pub unsafe extern "C" fn krun_add_virtiofs4(
         }
 
         KRUN_SUCCESS
+    }
+}
+
+/// Serve the files of the share `c_tag` that record no owner of their own as
+/// owned by `uid`:`gid`, so a host directory mounted for a guest user belongs to
+/// that user without a chown, and keeps that owner when the host replaces a
+/// file. Call after adding the share. On Linux it takes effect with
+/// KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT, where owners are virtualized.
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub unsafe extern "C" fn krun_set_virtiofs_owner(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    uid: u32,
+    gid: u32,
+) -> i32 {
+    if c_tag.is_null() {
+        return -libc::EINVAL;
+    }
+    let tag = match unsafe { CStr::from_ptr(c_tag) }.to_str() {
+        Ok(tag) => tag,
+        Err(_) => return -libc::EINVAL,
+    };
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            match ctx_cfg
+                .get_mut()
+                .vmr
+                .fs
+                .iter_mut()
+                .find(|fs| fs.fs_id == tag)
+            {
+                Some(fs) => {
+                    fs.default_owner = Some((uid, gid));
+                    KRUN_SUCCESS
+                }
+                None => -libc::ENOENT,
+            }
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
     }
 }
 
@@ -5147,6 +5189,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                     override_stat: false,
                     negative_entries: false,
                     live: false,
+                    default_owner: None,
                     virtual_entries,
                 });
 

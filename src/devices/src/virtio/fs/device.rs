@@ -269,6 +269,14 @@ impl Fs {
         server.replay_dax_maps(shm.host_addr, shm.size as u64);
     }
 
+    /// Serve files that record no owner as `owner` (passthrough
+    /// `Config::default_owner`). A NullFs-backed device has none to serve.
+    pub fn set_default_owner(&mut self, owner: Option<(u32, u32)>) {
+        if let Some(cfg) = self.passthrough_cfg.as_mut() {
+            cfg.default_owner = owner;
+        }
+    }
+
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
         self.shm_region = Some(shm_region);
     }

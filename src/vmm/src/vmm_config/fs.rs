@@ -18,6 +18,9 @@ pub struct FsDeviceConfig {
     /// Serve host directories attached and detached at runtime (see
     /// `devices::virtio::fs::live_fs`) instead of one fixed directory.
     pub live: bool,
+    /// The owner a file is served as when it records none of its own (see the
+    /// passthrough `Config::default_owner`).
+    pub default_owner: Option<(u32, u32)>,
     #[cfg(not(feature = "aws-nitro"))]
     pub virtual_entries: Vec<VirtualDirEntry>,
 }

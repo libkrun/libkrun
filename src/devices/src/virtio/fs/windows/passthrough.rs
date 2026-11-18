@@ -274,6 +274,11 @@ pub struct Config {
     /// presents ownership from the override xattr.
     pub override_stat: bool,
 
+    /// The owner a file is served as when it records none of its own: a
+    /// mount whose files should belong to a guest user, not to root or to the
+    /// host's account. The guest's chown still records an owner per file.
+    pub default_owner: Option<(u32, u32)>,
+
     /// ID of this filesystem to uniquely identify exports.
     pub export_fsid: u64,
     /// Table of exported FDs to share with other subsystems.
@@ -291,6 +296,7 @@ impl Default for Config {
             root_dir: String::from("C:\\"),
             xattr: true,
             override_stat: false,
+            default_owner: None,
             export_fsid: 0,
             export_table: None,
         }
@@ -501,7 +507,13 @@ fn get_reparse_tag(path: &Path) -> u32 {
 }
 
 /// Build a `stat64` from Windows `Metadata`, applying override_stat xattr when available.
-fn metadata_to_stat64(meta: &fs::Metadata, ino: u64, path: &Path, n_link: u32) -> stat64 {
+fn metadata_to_stat64(
+    meta: &fs::Metadata,
+    ino: u64,
+    path: &Path,
+    n_link: u32,
+    (owner_uid, owner_gid): (u32, u32),
+) -> stat64 {
     let file_attributes = meta.file_attributes();
 
     let is_directory = (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -544,8 +556,8 @@ fn metadata_to_stat64(meta: &fs::Metadata, ino: u64, path: &Path, n_link: u32) -
         st_ino: ino,
         st_nlink: nlink,
         st_mode: base_mode as u32,
-        st_uid: 0,
-        st_gid: 0,
+        st_uid: owner_uid,
+        st_gid: owner_gid,
         st_rdev: 0,
         st_size: size,
         st_atime: filetime_to_unix_secs(access),
@@ -1521,7 +1533,13 @@ impl PassthroughFs {
         };
 
         let meta = fs::symlink_metadata(&child_path).map_err(win_err_to_linux)?;
-        let st = metadata_to_stat64(&meta, inode, &child_path, file_info.n_number_of_links);
+        let st = metadata_to_stat64(
+            &meta,
+            inode,
+            &child_path,
+            file_info.n_number_of_links,
+            self.cfg.default_owner.unwrap_or((0, 0)),
+        );
 
         let mut attr_flags = 0u32;
         if st.st_mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32
@@ -1561,7 +1579,13 @@ impl PassthroughFs {
                                 n_link = info.nNumberOfLinks;
                             }
                         }
-                        let st = metadata_to_stat64(&meta, inode, &path, n_link);
+                        let st = metadata_to_stat64(
+                            &meta,
+                            inode,
+                            &path,
+                            n_link,
+                            self.cfg.default_owner.unwrap_or((0, 0)),
+                        );
                         return Ok((st, self.cfg.attr_timeout));
                     }
                 }
@@ -1570,7 +1594,13 @@ impl PassthroughFs {
 
         let meta = fs::symlink_metadata(&*path).map_err(win_err_to_linux)?;
         let file_info = get_file_info(&path).map_err(win_err_to_linux)?;
-        let st = metadata_to_stat64(&meta, inode, &path, file_info.n_number_of_links);
+        let st = metadata_to_stat64(
+            &meta,
+            inode,
+            &path,
+            file_info.n_number_of_links,
+            self.cfg.default_owner.unwrap_or((0, 0)),
+        );
         Ok((st, self.cfg.attr_timeout))
     }
 

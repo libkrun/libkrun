@@ -742,6 +742,11 @@ pub struct Config {
     /// flag, chmod also mirrors ordinary permission bits onto the host.
     pub override_stat: bool,
 
+    /// The owner a file is served as when it records none of its own: a
+    /// mount whose files should belong to a guest user, not to root or to the
+    /// host's account. The guest's chown still records an owner per file.
+    pub default_owner: Option<(u32, u32)>,
+
     /// Optional file descriptor for /proc/self/fd. Callers can obtain a file descriptor and pass it
     /// here, so there's no need to open it in PassthroughFs::new(). This is specially useful for
     /// sandboxing.
@@ -770,6 +775,7 @@ impl Default for Config {
             root_dir: String::from("/"),
             xattr: true,
             override_stat: false,
+            default_owner: None,
             proc_sfd_rawfd: None,
             export_fsid: 0,
             export_table: None,
@@ -1115,7 +1121,7 @@ impl PassthroughFs {
         let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| einval())?;
         let st = lstat(&c_path, true)?;
         let over = get_xattr_lstat(&c_path, st)?;
-        let st = stat_common(st, over.0, over.1, over.2, false)?;
+        let st = self.view(st, over)?;
         self.register_lookup(st, root_dev, over)
     }
 
@@ -1781,7 +1787,20 @@ impl PassthroughFs {
     ) -> io::Result<bindings::stat64> {
         let st = istat(ihandle, true)?;
         let over = self.override_for(ihandle, &st, data)?;
-        stat_common(st, over.0, over.1, over.2, false)
+        self.view(st, over)
+    }
+
+    /// The host stat as the guest sees it: the recorded owner and mode, else
+    /// the share's default owner.
+    fn view(&self, st: bindings::stat64, over: Override) -> io::Result<bindings::stat64> {
+        let owner = self.cfg.default_owner;
+        stat_common(
+            st,
+            over.0.or(owner.map(|o| o.0)),
+            over.1.or(owner.map(|o| o.1)),
+            over.2,
+            false,
+        )
     }
 
     /// Look a name up. `known` is the override xattr a caller has just
@@ -1833,7 +1852,7 @@ impl PassthroughFs {
                 self.override_for(&InodeHandle::Path(c_path.clone()), &st, existing.as_deref())?
             }
         };
-        let view = stat_common(st, over.0, over.1, over.2, false)?;
+        let view = self.view(st, over)?;
         self.register_lookup(view, parent_data.dev, over)
     }
 
@@ -4844,6 +4863,46 @@ mod tests {
             // The permission bits reach the host; setuid stays in the xattr.
             assert_eq!(host & 0o7777, mode & 0o777, "{name}: host mode");
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_file_with_no_recorded_owner_is_served_as_the_shares_owner() {
+        let root = std::env::temp_dir().join(format!("krun-default-owner-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        // written by the host: it records no owner of its own
+        fs::write(root.join("settings.json"), b"{}").unwrap();
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                default_owner: Some((1000, 1001)),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::ZERO_MESSAGE_OPEN).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let name = CString::new("settings.json").unwrap();
+        let entry = FileSystem::lookup(&filesystem, ctx, fuse::ROOT_ID, &name).unwrap();
+        assert_eq!((entry.attr.st_uid, entry.attr.st_gid), (1000, 1001));
+        // The guest's chown of the uid alone records it; the gid stays the share's.
+        let mut attr = entry.attr;
+        attr.st_uid = 2000;
+        let (st, _) =
+            FileSystem::setattr(&filesystem, ctx, entry.inode, attr, None, SetattrValid::UID)
+                .unwrap();
+        assert_eq!((st.st_uid, st.st_gid), (2000, 1001));
+        // The host replacing the file drops what was recorded: the share's owner again.
+        fs::remove_file(root.join("settings.json")).unwrap();
+        fs::write(root.join("settings.json"), b"{\"v\": 2}").unwrap();
+        FileSystem::forget(&filesystem, ctx, entry.inode, 1);
+        let entry = FileSystem::lookup(&filesystem, ctx, fuse::ROOT_ID, &name).unwrap();
+        assert_eq!((entry.attr.st_uid, entry.attr.st_gid), (1000, 1001));
         fs::remove_dir_all(root).unwrap();
     }
 
