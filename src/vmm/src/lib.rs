@@ -25,6 +25,8 @@ pub use host_network::ABI_VERSION as HOST_NETWORK_ABI_VERSION;
 pub mod demand_paging;
 pub(crate) mod device_manager;
 #[cfg(target_os = "linux")]
+mod fork_barrier;
+#[cfg(target_os = "linux")]
 pub mod generation_guardian;
 #[cfg(target_os = "linux")]
 pub mod layered_restore;
@@ -468,6 +470,9 @@ pub struct Vmm {
     layered_exports: Vec<retained_fds::RetainedFiles>,
     #[cfg(target_os = "linux")]
     ram_remap_failure: Option<String>,
+    /// An in-place restore has changed RAM/state but has not completed. Never
+    /// resume that mixed state; a successful retry clears this guard.
+    restore_incomplete: bool,
     guest_memory: GuestMemoryMmap,
     arch_memory_info: ArchMemoryInfo,
 
@@ -642,6 +647,7 @@ fn paused_vm_with_failed_ram_mapping_cannot_capture_or_rearm() {
         layered_device_regions: Vec::new(),
         layered_exports: Vec::new(),
         ram_remap_failure: Some("partial mapping installation".into()),
+        restore_incomplete: false,
         guest_memory: GuestMemoryMmap::from_ranges(&[(vm_memory::GuestAddress(0), 4096)]).unwrap(),
         arch_memory_info: ArchMemoryInfo::default(),
         kernel_cmdline: KernelCmdline::new(arch::CMDLINE_MAX_SIZE),
@@ -1169,7 +1175,7 @@ impl Vmm {
     }
 
     /// Restore device state (captured by [`Self::snapshot_devices`]) onto the
-    /// freshly-rebuilt, not-yet-activated devices during VM restore.
+    /// existing quiesced devices during in-place VM restore.
     pub fn restore_devices(
         &self,
         state: &devices::virtio::persist::VmDevicesState,
@@ -1256,6 +1262,9 @@ impl Vmm {
 
     /// Re-arm device workers quiesced by [`Self::quiesce_devices`].
     pub fn rearm_devices(&mut self) {
+        if self.restore_incomplete {
+            return;
+        }
         // Capture error cleanup can call this before attempting resume. Keep
         // device writers stopped too when RAM installation failed partway.
         #[cfg(target_os = "linux")]
@@ -1369,6 +1378,7 @@ impl Vmm {
 
     /// Sends a resume command to the vcpus.
     pub fn resume_vcpus(&mut self, paused_duration: Duration) -> Result<()> {
+        self.ensure_restore_complete()?;
         let paused_ns = Self::paused_duration_ns(paused_duration);
         for handle in self.vcpus_handles.iter() {
             handle
@@ -1393,6 +1403,7 @@ impl Vmm {
     /// in vCPU-index order.
     #[cfg(snapshot_supported)]
     pub fn save_vcpu_states(&mut self) -> Result<Vec<vstate::VcpuState>> {
+        self.ensure_restore_complete()?;
         #[cfg(all(
             any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64"),
@@ -1830,7 +1841,7 @@ impl Vmm {
     }
 
     /// Restore a VM from a [`VmCheckpoint`] and its guest-memory image onto this
-    /// (freshly-built, vCPU-paused) `Vmm`: load guest RAM, restore VM-level and
+    /// existing, vCPU-paused `Vmm`: load guest RAM, restore VM-level and
     /// device state, then load every vCPU's registers. The caller resumes the
     /// vCPUs afterwards (e.g. via [`Self::resume`]).
     ///
@@ -1854,6 +1865,7 @@ impl Vmm {
         // Drain + reclaim worker-owned queues so restored indices can be applied
         // to them (and so they match the rewound guest rings).
         self.quiesce_devices()?;
+        self.restore_incomplete = true;
         snapshot::read_guest_memory_into(&self.guest_memory, mem_descs, mem_in)
             .map_err(|e| Error::Snapshot(format!("guest-memory load: {e}")))?;
         self.vm
@@ -1872,7 +1884,10 @@ impl Vmm {
         self.restore_devices(&checkpoint.devices)
             .map_err(Error::Snapshot)?;
         self.restore_vcpu_states(checkpoint.vcpu_states)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.mmio_device_manager.replay_restored_interrupts();
         // Re-arm workers from the restored queue indices.
+        self.restore_incomplete = false;
         self.rearm_devices();
         // Register restore may clear a previously injected one-shot PIT IRQ.
         #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
@@ -1937,6 +1952,7 @@ impl Vmm {
             ));
         }
         self.quiesce_devices()?;
+        self.restore_incomplete = true;
         snapshot::copy_guest_memory(mem_clone, &self.guest_memory)
             .map_err(|e| Error::Snapshot(format!("guest-memory restore copy: {e}")))?;
         self.vm
@@ -1948,6 +1964,8 @@ impl Vmm {
         self.restore_devices(&checkpoint.devices)
             .map_err(Error::Snapshot)?;
         self.restore_vcpu_states(checkpoint.vcpu_states)?;
+        self.mmio_device_manager.replay_restored_interrupts();
+        self.restore_incomplete = false;
         self.rearm_devices();
         Ok(())
     }
@@ -2471,7 +2489,10 @@ impl Vmm {
             #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
             let _ = ioapic;
             self.restore_devices(&devices).map_err(Error::Snapshot)?;
-            self.restore_vcpu_states(vcpu_states)
+            self.restore_vcpu_states(vcpu_states)?;
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            self.mmio_device_manager.replay_restored_interrupts();
+            Ok(())
         })();
 
         // Attempt both halves even if state restoration fails, so recoverable
@@ -2525,8 +2546,18 @@ impl Vmm {
         }
     }
 
+    fn ensure_restore_complete(&self) -> Result<()> {
+        if self.restore_incomplete {
+            return Err(Error::Snapshot(
+                "in-place restore is incomplete; restore a valid checkpoint before resuming".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Resume the microVM.
     pub fn resume(&mut self) -> Result<()> {
+        self.ensure_restore_complete()?;
         #[cfg(target_os = "linux")]
         self.ensure_ram_mapping_valid()?;
         // A held save reads RAM in place: once the guest runs, that RAM is no

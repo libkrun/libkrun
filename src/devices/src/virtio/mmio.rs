@@ -262,6 +262,17 @@ impl MmioTransport {
         self.restored_interrupt_status = status;
     }
 
+    /// Replace the live interrupt status when rewinding an existing transport.
+    /// Call with the guest and workers stopped, before restoring the device:
+    /// old status belongs to the discarded timeline, while interrupts raised
+    /// by device restoration must survive until replay after vCPU restoration.
+    pub fn rewind_interrupt_status(&mut self, status: u32) {
+        self.interrupt
+            .status()
+            .store(status as usize, Ordering::SeqCst);
+        self.set_restored_interrupt_status(status);
+    }
+
     /// Raise the interrupt a restored device had pending when it was checkpointed.
     ///
     /// The status register is not guest memory: a fresh transport starts with
@@ -1199,6 +1210,29 @@ pub(crate) mod tests {
         // the line is raised again all the same.
         d.replay_restored_interrupt();
         assert_eq!(d.interrupt_status(), VIRTIO_MMIO_INT_VRING);
+        assert_eq!(d.interrupt_evt().read().unwrap(), 1);
+    }
+
+    #[test]
+    fn rewind_discards_old_status_and_keeps_interrupts_from_device_restore() {
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut d = MmioTransport::new(
+            m,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(DummyDevice::new())),
+        )
+        .unwrap();
+        d.interrupt.signal_used_queue();
+        assert_eq!(d.interrupt_evt().read().unwrap(), 1);
+        d.rewind_interrupt_status(0);
+        assert_eq!(d.interrupt_status(), 0);
+
+        // The restored device reports a new configuration change. Restoring
+        // vCPU state can discard its IRQ, but must not discard its status.
+        d.interrupt.signal_config_change();
+        assert_eq!(d.interrupt_evt().read().unwrap(), 1);
+        d.replay_restored_interrupt();
+        assert_eq!(d.interrupt_status(), VIRTIO_MMIO_INT_CONFIG);
         assert_eq!(d.interrupt_evt().read().unwrap(), 1);
     }
 

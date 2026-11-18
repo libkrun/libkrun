@@ -68,12 +68,7 @@ pub struct Vsock {
     /// A transport reset was posted; RX is held until the guest refills the
     /// event queue, which its driver does right after handling the event.
     pub(crate) awaiting_transport_reset_ack: bool,
-    /// Listener metadata captured before RX producers are gated for a snapshot.
-    ///
-    /// A producer can hold a proxy mutex while waiting to enter the snapshot
-    /// gate. Walking the proxy map after closing that gate would then deadlock
-    /// against the producer, so `quiesce_for_snapshot` captures this stable
-    /// metadata first while the guest vCPUs are already paused.
+    /// Listener metadata captured after host handlers and RX producers stop.
     quiesced_listeners: Option<Vec<ListenerDesc>>,
 }
 
@@ -185,6 +180,12 @@ impl Vsock {
     /// them. Return `true` if descriptors have been added to the used ring, and `false` otherwise.
     pub fn process_stream_tx(&mut self) -> bool {
         debug!("process_stream_tx()");
+        // A TX reply can enter the held RX gate. Blocking here would prevent
+        // this same event loop from handling the guest's reset acknowledgement.
+        // Keep descriptors queued; the acknowledgement explicitly drains them.
+        if self.muxer.rx_held_for_transport_reset() {
+            return false;
+        }
         let mem = match self.device_state {
             DeviceState::Activated(ref mem, _) => mem,
             // This should never happen, it's been already validated in the event handler.
@@ -265,11 +266,27 @@ pub struct VsockState {
     /// those restore without the announcement.
     #[serde(default)]
     pub queue_ev: Option<QueueState>,
+    /// Negotiated protocol of the booted guest, absent for legacy networking.
+    #[serde(default)]
+    pub host_network_abi: Option<u32>,
     /// Live TSI inbound-port-forward listeners at snapshot time, re-established
     /// on a fork clone against its own host port map (see [`ListenerDesc`]).
     /// `#[serde(default)]` keeps older snapshots (without this field) loadable.
     #[serde(default)]
     pub listeners: Vec<ListenerDesc>,
+}
+
+impl VsockState {
+    pub fn validate_host_network(&self, host_network: bool) -> Result<(), String> {
+        let expected = host_network.then_some(super::HOST_NETWORK_ABI_VERSION);
+        if self.host_network_abi != expected {
+            return Err(format!(
+                "checkpoint host-network ABI {:?} does not match requested {:?}",
+                self.host_network_abi, expected
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Vsock {
@@ -285,6 +302,10 @@ impl Vsock {
             queue_rx: q(&self.queue_rx),
             queue_tx: q(&self.queue_tx),
             queue_ev: q(&self.queue_ev),
+            host_network_abi: self
+                .muxer
+                .host_network_enabled()
+                .then_some(super::HOST_NETWORK_ABI_VERSION),
             listeners: self
                 .quiesced_listeners
                 .clone()
@@ -292,10 +313,10 @@ impl Vsock {
         }
     }
 
-    /// Restore runtime state onto a freshly-constructed, not-yet-activated
-    /// vsock device. Connections are NOT restored (see [`VsockState`]); the
-    /// muxer's `proxy_map` stays empty and the guest reconnects.
+    /// Restore a fresh device or rewind an activated, quiesced one. Host-backed
+    /// connections are reset; saved TSI listeners are recreated before resume.
     pub fn restore_state(&mut self, state: &VsockState) -> Result<(), String> {
+        state.validate_host_network(self.muxer.host_network_enabled())?;
         self.acked_features = state.acked_features;
         // `cid` left as constructed (fresh on fork, matching on restore).
         if let (Some(m), Some(qs)) = (self.queue_rx.as_ref(), state.queue_rx.as_ref()) {
@@ -304,9 +325,9 @@ impl Vsock {
         if let (Some(m), Some(qs)) = (self.queue_tx.as_ref(), state.queue_tx.as_ref()) {
             m.lock().unwrap().restore_state(qs)?;
         }
-        // Tear down all live host-backed connections (agent + TSI egress) so the
-        // host side matches the rewound guest, which has no live connections at
-        // the checkpoint. Listeners are kept; the host reconnects on demand.
+        // Tear down host-backed streams and TSI listeners; host IPC acceptors
+        // remain so the agent can reconnect. TSI listeners are rebuilt below
+        // from the saved set, including ports closed since the checkpoint.
         // This is the in-process-rewind counterpart to the "reset-and-reconnect"
         // model — for a fresh-device restore the proxy_map is already empty, so
         // this is a no-op there.
@@ -317,17 +338,22 @@ impl Vsock {
         // Stash inbound listeners; they are re-established in
         // `finish_restore_activation`, after the muxer worker/epoll is live.
         self.pending_restore_listeners = state.listeners.clone();
-        // A fresh device restored from a snapshot: the guest's view still has
-        // every connection that was open when the snapshot was taken, but their
+        // The restored guest still has every connection that was open when
+        // the snapshot was taken, but their
         // host ends are gone. Without being told, it keeps them established
         // forever, and whatever serves them (e.g. an agent with a bounded number
         // of connection handlers) waits on them indefinitely. Nothing may reach
         // the guest until it has handled the reset (see
         // `hold_rx_for_transport_reset`).
-        if !self.is_activated() && state.queue_ev.is_some() {
+        if state.queue_ev.is_some() {
             self.pending_transport_reset = true;
-            self.muxer
-                .hold_rx_for_transport_reset(TRANSPORT_RESET_ACK_TIMEOUT);
+            self.muxer.hold_rx_for_transport_reset();
+        }
+        // In-process rewind has live queues/workers and never runs fresh-VM
+        // activation. Recreate listeners and announce the reset now, while
+        // host event handlers and vCPUs are still stopped.
+        if self.is_activated() {
+            self.finish_restore_activation()?;
         }
         Ok(())
     }
@@ -371,13 +397,8 @@ impl Vsock {
 
 impl VirtioDevice for Vsock {
     fn quiesce_for_snapshot(&mut self) {
-        // vCPUs are already paused, so no guest request can add or remove a
-        // listener while this metadata is captured. Do this before pausing RX
-        // producers: a producer may be holding its proxy mutex when it reaches
-        // the gate, and save_state must not wait on that mutex after the gate
-        // has closed.
-        self.quiesced_listeners = Some(self.muxer.snapshot_listeners());
         self.muxer.quiesce_for_snapshot();
+        self.quiesced_listeners = Some(self.muxer.snapshot_listeners());
     }
 
     fn rearm_after_snapshot(&mut self) {
@@ -392,19 +413,24 @@ impl VirtioDevice for Vsock {
     /// Fork-clone restore: the muxer worker + epoll are live now, so rebuild the
     /// inbound-port-forward listeners staged by `restore_state` against this
     /// clone's own host port map. A no-op for a normal boot (none staged).
-    fn finish_restore_activation(&mut self) {
+    fn finish_restore_activation(&mut self) -> Result<(), String> {
         if !self.pending_restore_listeners.is_empty() {
             let listeners = std::mem::take(&mut self.pending_restore_listeners);
-            self.muxer.restore_listeners(listeners);
+            self.muxer.restore_listeners(listeners)?;
         }
         if std::mem::take(&mut self.pending_transport_reset) {
             if self.send_transport_reset() {
                 self.awaiting_transport_reset_ack = true;
+                self.muxer.arm_transport_reset_timeout(
+                    TRANSPORT_RESET_ACK_TIMEOUT,
+                    self.queue_events[TXQ_INDEX].clone(),
+                );
                 self.device_state.signal_used_queue();
             } else {
                 self.muxer.release_rx_after_transport_reset();
             }
         }
+        Ok(())
     }
 
     fn acked_features(&self) -> u64 {
@@ -512,6 +538,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn restore_requires_matching_recorded_host_network_protocol() {
+        for abi in [
+            None,
+            Some(7),
+            Some(super::super::HOST_NETWORK_ABI_VERSION),
+            Some(9),
+        ] {
+            let state = VsockState {
+                host_network_abi: abi,
+                ..Default::default()
+            };
+            assert_eq!(
+                state.validate_host_network(true).is_ok(),
+                abi == Some(super::super::HOST_NETWORK_ABI_VERSION)
+            );
+            assert_eq!(state.validate_host_network(false).is_ok(), abi.is_none());
+        }
+    }
+
+    #[test]
     fn save_state_uses_listener_metadata_captured_before_quiesce() {
         let mut vsock = Vsock::new(
             3,
@@ -531,6 +577,8 @@ mod tests {
             control_port: 42,
             guest_port: 8080,
             backlog: 128,
+            socket: None,
+            accept_pending: false,
         };
         vsock.quiesced_listeners = Some(vec![listener.clone()]);
 

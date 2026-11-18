@@ -653,11 +653,6 @@ pub fn build_microvm(
     // a cloned RestoreCtx until vCPU restore would otherwise keep the complete
     // inherited mapping resident alongside the promoted copy (2x guest RAM).
     let restoring = restore.is_some();
-    if restoring && vm_resources.vsock.tsi_flags().contains(TsiFlags::HOST_BIND) {
-        return Err(StartMicrovmError::HostNetwork(
-            "checkpoint restore has no negotiated host-network protocol",
-        ));
-    }
     #[cfg(target_os = "linux")]
     let (
         restore_mem,
@@ -722,6 +717,27 @@ pub fn build_microvm(
         .map(|bytes| super::VmCheckpoint::deserialize(&bytes))
         .transpose()
         .map_err(StartMicrovmError::GuestMemoryMmap)?;
+    #[cfg(snapshot_supported)]
+    if let Some(checkpoint) = &restore_checkpoint {
+        use devices::virtio::persist::DeviceSnapshot;
+        let host_network = vm_resources.vsock.tsi_flags().contains(TsiFlags::HOST_BIND);
+        let mut count = 0;
+        for device in &checkpoint.devices.devices {
+            if let DeviceSnapshot::Vsock(state) = device {
+                count += 1;
+                state.validate_host_network(host_network).map_err(|_| {
+                    StartMicrovmError::HostNetwork(
+                        "checkpoint networking mode or ABI does not match",
+                    )
+                })?;
+            }
+        }
+        if host_network && count != 1 {
+            return Err(StartMicrovmError::HostNetwork(
+                "checkpoint lacks one negotiated host-network device",
+            ));
+        }
+    }
 
     // A machine first booted on macOS keeps the board macOS gave it: the GIC
     // and the legacy devices are recreated at the addresses and interrupts
@@ -1509,6 +1525,7 @@ pub fn build_microvm(
             .collect(),
         #[cfg(target_os = "linux")]
         ram_remap_failure: None,
+        restore_incomplete: false,
         guest_memory,
         arch_memory_info,
         kernel_cmdline,

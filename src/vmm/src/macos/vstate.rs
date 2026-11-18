@@ -165,10 +165,8 @@ impl Vm {
     /// clone's fresh vGIC (GICD_CTLR enabled last). No-op if empty.
     #[cfg(target_arch = "aarch64")]
     pub fn restore_state(&self, state: &VmState) -> Result<()> {
-        if !state.gic_distributor.is_empty()
-            && let Err(e) = hvf::gic_restore_distributor(&state.gic_distributor)
-        {
-            error!("failed to restore GIC distributor state: {e:?}");
+        if !state.gic_distributor.is_empty() {
+            hvf::gic_restore_distributor(&state.gic_distributor).map_err(Error::VmSetup)?;
         }
         Ok(())
     }
@@ -583,13 +581,13 @@ impl Vcpu {
         // register state is loaded BEFORE the guest executes. set_initial_state
         // above still ran to program the VMM-managed EL2/HCR state (which is not
         // part of the snapshot); the restore overwrites PC/CPSR/EL1/GP/SIMD.
-        if self.start_paused && !self.run_paused_loop(hvf_vcpuid) {
+        if self.start_paused && !self.run_paused_loop(&mut hvf_vcpu) {
             self.exit(FC_EXIT_CODE_GENERIC_ERROR);
             return;
         }
 
         loop {
-            if !self.handle_pending_event(false, hvf_vcpuid) {
+            if !self.handle_pending_event(false, &mut hvf_vcpu) {
                 self.exit(FC_EXIT_CODE_GENERIC_ERROR);
                 break;
             }
@@ -599,7 +597,7 @@ impl Vcpu {
                 Ok(VcpuEmulation::Handled) => (),
                 // Emulation was interrupted by a breakpoint.
                 Ok(VcpuEmulation::Interrupted) => {
-                    if !self.handle_pending_event(false, hvf_vcpuid) {
+                    if !self.handle_pending_event(false, &mut hvf_vcpu) {
                         self.exit(FC_EXIT_CODE_GENERIC_ERROR);
                         break;
                     }
@@ -651,7 +649,8 @@ impl Vcpu {
     /// return `true` on Resume (caller proceeds to run the guest) or `false` on
     /// error / channel close (caller exits). Shared by the `Pause` event handler
     /// and the restore-into-a-clone paused start (see [`Vcpu::start_paused`]).
-    fn run_paused_loop(&mut self, hvf_vcpuid: u64) -> bool {
+    fn run_paused_loop(&mut self, hvf_vcpu: &mut HvfVcpu) -> bool {
+        let hvf_vcpuid = hvf_vcpu.id();
         loop {
             match self.event_receiver.recv() {
                 Ok(VcpuEvent::Resume { paused_ns }) => {
@@ -671,7 +670,7 @@ impl Vcpu {
                 // Checkpoint: capture register state while paused (the safe
                 // boundary). Stays paused afterwards.
                 #[cfg(target_arch = "aarch64")]
-                Ok(VcpuEvent::SaveState) => match hvf::vcpu_save_state(hvf_vcpuid) {
+                Ok(VcpuEvent::SaveState) => match hvf_vcpu.save_state() {
                     Ok(state) => self
                         .response_sender
                         .send(VcpuResponse::SavedState(Box::new(state)))
@@ -684,7 +683,7 @@ impl Vcpu {
                 // Restore: load captured register state onto the paused vCPU.
                 #[cfg(target_arch = "aarch64")]
                 Ok(VcpuEvent::RestoreState(state)) => {
-                    if let Err(e) = hvf::vcpu_restore_state(hvf_vcpuid, &state) {
+                    if let Err(e) = hvf_vcpu.restore_state(&state) {
                         let message = format!("{e:?}");
                         error!("failed to restore HVF vcpu state: {message}");
                         let _ = self
@@ -701,7 +700,8 @@ impl Vcpu {
         }
     }
 
-    fn handle_pending_event(&mut self, block: bool, hvf_vcpuid: u64) -> bool {
+    fn handle_pending_event(&mut self, block: bool, hvf_vcpu: &mut HvfVcpu) -> bool {
+        let hvf_vcpuid = hvf_vcpu.id();
         let event = if block {
             match self.event_receiver.recv() {
                 Ok(event) => Some(event),
@@ -720,7 +720,7 @@ impl Vcpu {
                 self.response_sender
                     .send(VcpuResponse::Paused)
                     .expect("failed to send pause status");
-                self.run_paused_loop(hvf_vcpuid)
+                self.run_paused_loop(hvf_vcpu)
             }
             Some(VcpuEvent::Resume { paused_ns }) => {
                 if hvf::vcpu_adjust_vtimer_offset(hvf_vcpuid, paused_ns).is_err() {

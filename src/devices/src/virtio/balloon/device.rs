@@ -8,7 +8,7 @@ use utils::eventfd::EventFd;
 use vm_memory::{Address, ByteValued, Bytes, GuestMemory, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, BalloonError, DeviceQueue, DeviceState, QueueConfig,
+    ActivateError, ActivateResult, BalloonError, DeviceQueue, DeviceState, Queue, QueueConfig,
     VirtioDevice,
 };
 use super::{BalloonStats, defs, defs::uapi};
@@ -203,12 +203,41 @@ impl Balloon {
         }
     }
 
-    /// Restore negotiated features + config onto a freshly-built,
-    /// not-yet-activated Balloon; the queues are re-applied when the device is
-    /// re-activated (`restore_and_activate`). Without this the restored guest
-    /// keeps submitting free-page reports to a device that was never
-    /// activated in the clone, so nothing is ever reclaimed.
+    /// Restore configuration and any live, quiesced queues. A fresh device
+    /// receives its queues later through `restore_and_activate`.
     pub fn restore_state(&mut self, state: &BalloonState) -> Result<(), String> {
+        if self.is_activated() && !self.snapshot_quiesced {
+            return Err("balloon must be quiesced before restoring live queues".into());
+        }
+        if let Some(queues) = &mut self.queues {
+            if state.queues.len() != queues.len() {
+                return Err("balloon checkpoint queue count does not match the device".into());
+            }
+            // Validate every queue before changing any of the live state.
+            let restored = queues
+                .iter()
+                .zip(&state.queues)
+                .map(|(live, saved)| {
+                    let saved = saved
+                        .as_ref()
+                        .ok_or("balloon checkpoint is missing a live queue")?;
+                    let mut queue = Queue::new(live.queue.max_size);
+                    queue.restore_state(saved)?;
+                    if let DeviceState::Activated(mem, _) = &self.device_state
+                        && queue.ready
+                        && (!queue.is_valid(mem) || queue.len(mem) > queue.actual_size())
+                    {
+                        return Err(
+                            "balloon checkpoint queue does not match restored memory".into()
+                        );
+                    }
+                    Ok(queue)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            for (live, restored) in queues.iter_mut().zip(restored) {
+                live.queue = restored;
+            }
+        }
         self.acked_features = state.acked_features;
         self.config.num_pages = state.num_pages;
         self.config.actual = state.actual;
@@ -216,10 +245,29 @@ impl Balloon {
         // record it may still come from a guest that ran one: starting over
         // would reissue that id, which the guest ignores, and every hint would
         // wait out its timeout having discarded nothing. Start anywhere else.
-        self.hint.cmd_id = match state.free_page_hint_cmd_id {
-            0 => rand::random(),
-            id => id,
+        self.hint = FreePageHint {
+            cmd_id: match state.free_page_hint_cmd_id {
+                0 => rand::random(),
+                id => id,
+            },
+            ..FreePageHint::default()
         };
+        self.stats = None;
+        self.stats_pending_ack = None;
+        self.stats_last_request = None;
+        self.last_reclaim = None;
+        self.deferred_target_pages = None;
+        self.deferred_stats_request = false;
+        self.deferred_events = 0;
+        self.config.free_page_report_cmd_id = uapi::VIRTIO_BALLOON_CMD_ID_DONE;
+        if self.is_activated() {
+            // Saved available reports need service even if their original
+            // eventfd notification was consumed on the discarded timeline.
+            self.deferred_events = (1 << defs::NUM_QUEUES) - 1;
+            if self.acked_features & (1 << uapi::VIRTIO_BALLOON_F_FREE_PAGE_HINT) != 0 {
+                self.finish_free_page_hint();
+            }
+        }
         Ok(())
     }
 
@@ -348,7 +396,10 @@ impl Balloon {
             .expect("queues should exist when activated");
         let mut have_used = false;
 
-        while let Some(head) = queues[FRQ_INDEX].queue.pop(mem) {
+        // Reclaim can require expensive host mapping changes. Complete one
+        // report before yielding to the reactor so socket and control events
+        // are not held behind the entire free-memory backlog.
+        if let Some(head) = queues[FRQ_INDEX].queue.pop(mem) {
             let index = head.index;
             // A reclaim pulse (inflate then deflate) makes the guest free and
             // re-report its idle memory; give that back whatever the host's
@@ -367,6 +418,15 @@ impl Balloon {
             if let Err(e) = queues[FRQ_INDEX].queue.add_used(mem, index, 0) {
                 error!("failed to add used elements to the queue: {e:?}");
             }
+        }
+
+        // The original kick may cover several reports. Keep the remaining
+        // work runnable without requiring another guest notification.
+        if have_used
+            && !queues[FRQ_INDEX].queue.is_empty(mem)
+            && let Err(error) = queues[FRQ_INDEX].event.write(1)
+        {
+            error!("failed to rearm free-page reporting: {error:?}");
         }
 
         have_used
@@ -911,7 +971,7 @@ impl VirtioDevice for Balloon {
         }
     }
 
-    fn finish_restore_activation(&mut self) {
+    fn finish_restore_activation(&mut self) -> Result<(), String> {
         // Eventfd notifications do not survive a portable restore. The saved
         // available ring can still contain reports awaiting acknowledgment.
         self.notify_pending_queues(
@@ -927,6 +987,7 @@ impl VirtioDevice for Balloon {
         if self.acked_features & (1 << uapi::VIRTIO_BALLOON_F_FREE_PAGE_HINT) != 0 {
             self.finish_free_page_hint();
         }
+        Ok(())
     }
 
     fn avail_features(&self) -> u64 {
@@ -1227,6 +1288,82 @@ mod checkpoint_quiescence_tests {
     }
 
     #[test]
+    fn rewind_rejects_invalid_last_queue_without_changing_earlier_queues() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let (mut balloon, _) = active_balloon(&memory);
+        balloon.hint.cmd_id = 7;
+        balloon.quiesce_for_snapshot();
+        let before = balloon.save_state();
+        let mut invalid = before.clone();
+        invalid.acked_features = 123;
+        invalid.queues[0].as_mut().unwrap().num_added = 7;
+        invalid.queues[FRQ_INDEX].as_mut().unwrap().size = 9;
+        assert!(balloon.restore_state(&invalid).is_err());
+        assert_eq!(balloon.save_state(), before);
+    }
+
+    #[test]
+    fn rewind_restores_live_queues_and_discards_later_host_bookkeeping() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let (mut balloon, rings) = active_balloon(&memory);
+        balloon.hint.cmd_id = 7;
+        balloon.quiesce_for_snapshot();
+        let checkpoint = balloon.save_state();
+        balloon.rearm_after_snapshot();
+        rings[FRQ_INDEX].dtable[0].addr.set(0x10000);
+        rings[FRQ_INDEX].dtable[0].len.set(4096);
+        rings[FRQ_INDEX].avail.ring[0].set(0);
+        rings[FRQ_INDEX].avail.idx.set(1);
+        assert!(balloon.process_frq());
+        balloon.quiesce_for_snapshot();
+        // The memory image is restored before device state. The live host
+        // counter must rewind too, or 0 - 1 appears to be 65,535 new reports.
+        rings[FRQ_INDEX].avail.idx.set(0);
+        rings[FRQ_INDEX].used.idx.set(0);
+        balloon.stats_pending_ack = Some(6);
+        balloon.deferred_target_pages = Some(900);
+        balloon.hint.finished = true;
+        balloon.hint.bytes = 1234;
+        balloon.restore_state(&checkpoint).unwrap();
+        assert_eq!(balloon.save_state(), checkpoint);
+        assert!(balloon.stats_pending_ack.is_none());
+        assert!(balloon.deferred_target_pages.is_none());
+        assert!(!balloon.hint.finished);
+        assert_eq!(balloon.hint.bytes, 0);
+        balloon.rearm_after_snapshot();
+        assert!(!balloon.process_frq());
+        assert_eq!(rings[FRQ_INDEX].used.idx.get(), 0);
+    }
+
+    #[test]
+    fn free_page_reports_yield_between_chains_and_rearm_pending_work() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let (mut balloon, rings) = active_balloon(&memory);
+        let event = Arc::clone(&balloon.queues.as_ref().unwrap()[FRQ_INDEX].event);
+        for i in 0..3 {
+            rings[FRQ_INDEX].dtable[i]
+                .addr
+                .set(0x10000 + i as u64 * 0x1000);
+            rings[FRQ_INDEX].dtable[i].len.set(4096);
+            rings[FRQ_INDEX].avail.ring[i].set(i as u16);
+        }
+        rings[FRQ_INDEX].avail.idx.set(3);
+        event.write(1).unwrap();
+        for completed in 1..=3 {
+            balloon.handle_frq_event(&EpollEvent::new(EventSet::IN, event.as_raw_fd() as u64));
+            assert_eq!(
+                rings[FRQ_INDEX].used.idx.get(),
+                completed,
+                "memory reclaim must yield so the reactor can service socket queues"
+            );
+        }
+        assert_eq!(
+            event.read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
     fn a_pending_free_page_callback_cannot_advance_a_quiesced_snapshot() {
         let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
         let (mut balloon, rings) = active_balloon(&memory);
@@ -1300,7 +1437,7 @@ mod checkpoint_quiescence_tests {
         rings[FRQ_INDEX].dtable[0].len.set(4096);
         rings[FRQ_INDEX].avail.ring[0].set(0);
         rings[FRQ_INDEX].avail.idx.set(1);
-        balloon.finish_restore_activation();
+        balloon.finish_restore_activation().unwrap();
         balloon.handle_frq_event(&EpollEvent::new(EventSet::IN, event.as_raw_fd() as u64));
         assert_eq!(rings[FRQ_INDEX].used.idx.get(), 1);
     }

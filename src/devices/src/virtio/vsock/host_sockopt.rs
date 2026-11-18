@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Linux integer socket options applied to the actual host socket.
+use serde::{Deserialize, Serialize};
 use socket2::Socket;
+use std::time::Duration;
 
 #[cfg(unix)]
 use libc as socket_sys;
@@ -84,12 +86,88 @@ pub fn copy_tcp_options(source: &Socket, destination: &Socket) -> io::Result<()>
     destination.set_keepalive(source.keepalive()?)
 }
 
+/// Portable socket settings retained across a listener replacement or restore.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenerOptions {
+    keepalive: bool,
+    nodelay: bool,
+    keep_idle: i32,
+    keep_interval: i32,
+    keep_count: i32,
+    reuse_address: bool,
+    reuse_port: bool,
+    broadcast: bool,
+    linger: Option<Duration>,
+    only_v6: Option<bool>,
+    hops: u32,
+}
+
+impl ListenerOptions {
+    pub fn capture(socket: &Socket, ipv6: bool) -> io::Result<Self> {
+        Ok(Self {
+            keepalive: socket.keepalive()?,
+            nodelay: socket.nodelay()?,
+            keep_idle: tcp_integer(socket, keepalive_option(4))?,
+            keep_interval: tcp_integer(socket, keepalive_option(5))?,
+            keep_count: tcp_integer(socket, keepalive_option(6))?,
+            reuse_address: socket.reuse_address()?,
+            #[cfg(unix)]
+            reuse_port: socket.reuse_port()?,
+            #[cfg(windows)]
+            reuse_port: false,
+            broadcast: socket.broadcast()?,
+            linger: socket.linger()?,
+            only_v6: if ipv6 { Some(socket.only_v6()?) } else { None },
+            hops: if ipv6 {
+                socket.unicast_hops_v6()?
+            } else {
+                socket.ttl()?
+            },
+        })
+    }
+
+    pub fn apply(&self, socket: &Socket) -> io::Result<()> {
+        for (option, value) in [
+            (4, self.keep_idle),
+            (5, self.keep_interval),
+            (6, self.keep_count),
+        ] {
+            set_tcp_integer(socket, keepalive_option(option), value)?;
+        }
+        socket.set_nodelay(self.nodelay)?;
+        socket.set_keepalive(self.keepalive)?;
+        socket.set_reuse_address(self.reuse_address)?;
+        #[cfg(unix)]
+        socket.set_reuse_port(self.reuse_port)?;
+        #[cfg(windows)]
+        if self.reuse_port {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "SO_REUSEPORT is unavailable",
+            ));
+        }
+        socket.set_broadcast(self.broadcast)?;
+        socket.set_linger(self.linger)?;
+        if let Some(only_v6) = self.only_v6 {
+            socket.set_only_v6(only_v6)?;
+            socket.set_unicast_hops_v6(self.hops)
+        } else {
+            socket.set_ttl(self.hops)
+        }
+    }
+}
+
+/// Retain application options when replacing a stopped listener's host socket.
+pub fn copy_listener_options(source: &Socket, destination: &Socket, ipv6: bool) -> io::Result<()> {
+    ListenerOptions::capture(source, ipv6)?.apply(destination)
+}
+
 /// Explicit transport budgets, capped by the native socket allocation. Guest
 /// readback retains Linux's canonical bookkeeping value; a forced guest request
 /// does not grant the VMM host privileges or an unbounded forwarding queue.
 /// Keeping only explicit settings avoids disabling host TCP autotuning when an
 /// interceptor replaces an otherwise untuned socket.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SocketBuffers {
     pub send: Option<usize>,
     pub receive: Option<usize>,

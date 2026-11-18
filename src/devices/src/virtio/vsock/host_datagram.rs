@@ -121,7 +121,7 @@ pub(super) fn wait_readable(fd: super::proxy::ProxyRawHandle) {
     assert_eq!(
         poll.wait(1, 2000, &mut events).unwrap(),
         1,
-        "UDP receive readiness timed out"
+        "socket receive readiness timed out"
     );
 }
 

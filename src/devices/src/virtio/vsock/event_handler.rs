@@ -102,7 +102,10 @@ impl Vsock {
         // kick means a posted transport reset has been handled.
         if std::mem::take(&mut self.awaiting_transport_reset_ack) {
             self.muxer.release_rx_after_transport_reset();
-            return self.process_stream_rx();
+            // The TX kick may already have been consumed while reset held RX.
+            // Drain both directions without waiting for another guest packet.
+            let tx_used = self.process_stream_tx();
+            return self.process_stream_rx() | tx_used;
         }
         false
     }

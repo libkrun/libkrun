@@ -966,7 +966,7 @@ impl Proxy for TsiDgramProxy {
         ProxyUpdate::default()
     }
 
-    fn accept(&mut self, _req: TsiAcceptReq) -> ProxyUpdate {
+    fn accept(&mut self, _control_port: u32, _req: TsiAcceptReq) -> ProxyUpdate {
         ProxyUpdate::default()
     }
 

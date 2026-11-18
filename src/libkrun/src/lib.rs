@@ -493,7 +493,9 @@ static GUEST_RAM: Lazy<Mutex<HashMap<u32, Vec<GuestRamRegion>>>> =
 /// serializing to disk (the same in-memory model the fork fast-path uses).
 #[cfg(snapshot_supported)]
 struct StashedCheckpoint {
-    checkpoint: vmm::VmCheckpoint,
+    // Keep encoded control state so a failed restore can retry without copying
+    // the much larger RAM image or consuming the only checkpoint.
+    checkpoint: Vec<u8>,
     // Eager byte image + region layout. NOTE: the in-process rewind (RESTORE
     // into the same, *resuming* VM) requires an eager copy of guest RAM taken at
     // checkpoint time — a CoW (`MAP_PRIVATE`) clone is NOT valid here, because
@@ -608,7 +610,7 @@ fn handle_checkpoint(vmm: &Arc<Mutex<vmm::Vmm>>, id: &str) -> String {
     CHECKPOINTS.lock().unwrap().insert(
         id.to_string(),
         StashedCheckpoint {
-            checkpoint,
+            checkpoint: checkpoint.serialize(),
             mem_descs,
             memory,
         },
@@ -625,20 +627,23 @@ fn handle_restore(vmm: &Arc<Mutex<vmm::Vmm>>, id: &str) -> String {
         Some(s) => s,
         None => return format!("ERR ENOENT no checkpoint '{id}'\n"),
     };
-    // Requires the VM to be paused; loads guest RAM + VM/device/vCPU state and
-    // re-arms device workers. The VM stays paused — the caller sends RESUME.
-    let StashedCheckpoint {
-        checkpoint,
-        mem_descs,
-        memory,
-    } = stash;
-    match vmm
-        .lock()
-        .unwrap()
-        .restore(checkpoint, &mem_descs, &mut memory.as_slice())
-    {
+    // Keep the checkpoint's RAM allocation intact until restore succeeds. A
+    // port conflict can be corrected and the same checkpoint retried without
+    // resuming a VM whose RAM and devices are only partially restored.
+    let outcome = match vmm::VmCheckpoint::deserialize(&stash.checkpoint) {
+        Ok(checkpoint) => vmm
+            .lock()
+            .unwrap()
+            .restore(checkpoint, &stash.mem_descs, &mut stash.memory.as_slice())
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    match outcome {
         Ok(()) => format!("OK restored {id} (paused)\n"),
-        Err(e) => format!("ERR EIO restore failed: {e}\n"),
+        Err(error) => {
+            CHECKPOINTS.lock().unwrap().insert(id.to_string(), stash);
+            format!("ERR EIO restore failed: {error}\n")
+        }
     }
 }
 
@@ -3190,7 +3195,13 @@ pub unsafe extern "C" fn krun_add_disk4(
             match devices::virtio::block::prepare_async_io(disk_path, !read_only) {
                 Ok(prepared) => Some(prepared),
                 Err(error) => {
-                    let errno = error.raw_os_error().unwrap_or(libc::EIO);
+                    let errno = error.raw_os_error().unwrap_or_else(|| {
+                        if error.kind() == std::io::ErrorKind::Unsupported {
+                            libc::ENOTSUP
+                        } else {
+                            libc::EIO
+                        }
+                    });
                     error!("Error preparing async block I/O for {disk_path}: {error}");
                     set_last_error(format!(
                         "prepare restricted async block I/O for {disk_path}: {error}"
@@ -6359,7 +6370,7 @@ mod block_io_engine_tests {
     }
 
     #[test]
-    fn async_raw_disk_prepares_its_restricted_ring_before_start() {
+    fn async_raw_disk_preparation_reports_platform_support() {
         let backing = utils::tempfile::TempFile::new().unwrap();
         backing.as_file().set_len(1024 * 1024).unwrap();
         let path = std::ffi::CString::new(backing.as_path().to_str().unwrap()).unwrap();
@@ -6376,12 +6387,28 @@ mod block_io_engine_tests {
                 1,
             )
         };
-        assert_eq!(result, KRUN_SUCCESS);
-        assert!(
-            CTX_MAP.lock().unwrap().get(&ctx).unwrap().block_cfgs[0]
-                .prepared_async
-                .is_some()
-        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(result, KRUN_SUCCESS);
+            assert!(
+                CTX_MAP.lock().unwrap().get(&ctx).unwrap().block_cfgs[0]
+                    .prepared_async
+                    .is_some()
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(result, -libc::ENOTSUP);
+            assert!(
+                CTX_MAP
+                    .lock()
+                    .unwrap()
+                    .get(&ctx)
+                    .unwrap()
+                    .block_cfgs
+                    .is_empty()
+            );
+        }
         assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
     }
 }

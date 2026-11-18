@@ -513,7 +513,7 @@ impl VirtioDevice for Console {
         self.replay_deferred_events();
     }
 
-    fn finish_restore_activation(&mut self) {
+    fn finish_restore_activation(&mut self) -> Result<(), String> {
         self.start_ports_after_restore();
         if self.is_activated() {
             // Guest queue state survives restore, host eventfd counters do not.
@@ -527,6 +527,7 @@ impl VirtioDevice for Console {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -648,7 +649,7 @@ mod checkpoint_boundary_tests {
 
         let (mut restored, rings) = active_console(&memory);
         restored.restore_state(&decoded).unwrap();
-        restored.finish_restore_activation();
+        restored.finish_restore_activation().unwrap();
         let mut manager = EventManager::new().unwrap();
         let event = EpollEvent::new(
             EventSet::IN,
@@ -699,7 +700,7 @@ mod checkpoint_boundary_tests {
             .set(size_of::<VirtioConsoleControl>() as u32);
         ring.avail.ring[0].set(0);
         ring.avail.idx.set(1);
-        console.finish_restore_activation();
+        console.finish_restore_activation().unwrap();
         assert!(console.ports[0].is_active());
         let event = EpollEvent::new(
             EventSet::IN,

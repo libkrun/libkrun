@@ -11,20 +11,21 @@ use std::time::{Duration, Instant};
 use socket2::{Domain, Socket, Type};
 
 use super::super::Queue as VirtQueue;
-use super::super::linux_errno::{LINUX_EADDRINUSE, LINUX_EAGAIN, LINUX_ECONNREFUSED};
+use super::super::linux_errno::{LINUX_EAGAIN, LINUX_ECONNREFUSED};
 use super::defs;
 use super::defs::uapi;
 use super::host_bind::{BindRequest, bind_inet};
 use super::host_close::{self, CloseRequest};
-use super::host_sockopt::SocketBuffers;
+use super::host_sockopt::{ListenerOptions, SocketBuffers};
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
     TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TsiSendtoAddr, VsockPacket,
 };
 use super::proxy::{
-    Family, ListenerDesc, NewProxyType, Proxy, ProxyError, ProxyRawHandle, ProxyRemoval,
-    ProxyStatus, ProxyUpdate, RecvPkt, StreamIntercept, connected_event_set, raw_handle,
+    Family, ListenerDesc, ListenerSocketState, NewProxyType, Proxy, ProxyError, ProxyRawHandle,
+    ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt, StreamIntercept, connected_event_set,
+    raw_handle,
 };
 use super::snapshot_gate::SnapshotGate;
 use super::sys;
@@ -69,6 +70,9 @@ pub struct TsiStreamProxy {
     /// can re-establish the host-side listener. 0 = not a listener.
     listen_guest_port: u16,
     host_bound: Option<SocketAddr>,
+    host_network: bool,
+    listener_bind: Option<SocketAddr>,
+    stopped_listener_addr: Option<SocketAddr>,
     /// A cross-family interceptor uses a separate transport socket. Retain
     /// the guest's explicitly bound socket so its address remains reserved.
     intercept_reservation: Option<Socket>,
@@ -206,6 +210,9 @@ impl TsiStreamProxy {
             unixsock_path: None,
             listen_guest_port: 0,
             host_bound: None,
+            host_network,
+            listener_bind: None,
+            stopped_listener_addr: None,
             intercept_reservation: None,
             listen_backlog: 0,
             local_read_shutdown: false,
@@ -264,6 +271,9 @@ impl TsiStreamProxy {
             unixsock_path: None,
             listen_guest_port: 0,
             host_bound: None,
+            host_network: false,
+            listener_bind: None,
+            stopped_listener_addr: None,
             intercept_reservation: None,
             listen_backlog: 0,
             local_read_shutdown: false,
@@ -288,7 +298,14 @@ impl TsiStreamProxy {
 
     fn try_listen(&mut self, req: &TsiListenReq, host_port_map: &Option<HashMap<u16, u16>>) -> i32 {
         if self.status == ProxyStatus::Listening || self.status == ProxyStatus::WaitingOnAccept {
-            return 0;
+            let backlog = req.backlog.clamp(0, sys::SOMAXCONN);
+            return match self.sock.listen(backlog) {
+                Ok(()) => {
+                    self.listen_backlog = backlog;
+                    0
+                }
+                Err(error) => -sys::to_linux_errno(&error),
+            };
         }
         if !req.addr.suits_family(self.family) {
             warn!(
@@ -323,6 +340,12 @@ impl TsiStreamProxy {
             None => None, // AF_UNIX (Linux) handled below
         };
 
+        let mapped = if self.stopped_listener_addr.is_some() {
+            self.listener_bind.or(mapped)
+        } else {
+            mapped
+        };
+
         // Remember the guest listen port (the host_port_map key) so this listener
         // can be re-established on a fork clone (see ListenerDesc).
         let guest_listen_port = req.addr.inet().map(|s| s.port()).unwrap_or(0);
@@ -348,6 +371,11 @@ impl TsiStreamProxy {
                         debug!("proxy: id={}", self.id);
                         self.listen_guest_port = guest_listen_port;
                         self.listen_backlog = clamped_backlog;
+                        self.listener_bind = self.listener_bind.or(mapped);
+                        if self.stopped_listener_addr.take().is_some() {
+                            self.host_bound =
+                                self.sock.local_addr().ok().and_then(|a| a.as_socket());
+                        }
                         0
                     }
                     Err(e) => {
@@ -612,6 +640,9 @@ impl TsiStreamProxy {
     }
 
     fn guest_local_addr(&self) -> std::io::Result<socket2::SockAddr> {
+        if let Some(address) = self.stopped_listener_addr {
+            return Ok(address.into());
+        }
         let local = self.sock.local_addr()?;
         if self.intercept_peer.is_none() {
             return Ok(local);
@@ -706,44 +737,86 @@ impl TsiStreamProxy {
         update
     }
 
-    /// Re-establish this freshly-constructed proxy as a host-side inbound
-    /// listener for a fork clone, using the clone's own `host_port_map` (see
-    /// [`ListenerDesc`]). Mirrors `try_listen`'s bind+listen but is driven by the
-    /// snapshot rather than a guest `TSI_LISTEN`. Returns 0 on success, a
-    /// negative errno otherwise.
+    /// Restore a listener's binding and socket settings. Host networking keeps
+    /// its exact address; legacy publishing applies the destination port map.
+    /// Older descriptors require a map because they did not save the address.
     pub fn relisten(
         &mut self,
-        guest_port: u16,
-        backlog: i32,
+        desc: &ListenerDesc,
         host_port_map: &Option<HashMap<u16, u16>>,
-    ) -> i32 {
-        let host_port = match host_port_map.as_ref().and_then(|m| m.get(&guest_port)) {
-            Some(p) => *p,
-            None => return -libc::EPERM,
+    ) -> Result<(), String> {
+        let saved = desc
+            .socket
+            .as_ref()
+            .map(Result::as_ref)
+            .transpose()
+            .map_err(Clone::clone)?;
+        let mut address = if let Some(saved) = saved {
+            if saved.host_network != self.host_network {
+                return Err("listener network mode differs from the snapshot".into());
+            }
+            saved.address
+        } else {
+            match self.family {
+                Family::Inet => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, desc.guest_port).into(),
+                Family::Inet6 => {
+                    SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, desc.guest_port, 0, 0).into()
+                }
+                #[cfg(unix)]
+                Family::Unix => {
+                    return Err("cannot restore an INET listener as a Unix socket".into());
+                }
+            }
         };
-        let addr: SocketAddr = match self.family {
-            Family::Inet => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, host_port).into(),
-            Family::Inet6 => SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, host_port, 0, 0).into(),
-            #[cfg(unix)]
-            Family::Unix => return -libc::EINVAL,
+        if !VsockAddr::from(address).suits_family(self.family) || address.port() == 0 {
+            return Err("invalid saved listener address".into());
+        }
+        if self.host_network {
+            if saved.is_none() || host_port_map.is_some() {
+                return Err("host-network listener requires saved binding and no port map".into());
+            }
+        } else if let Some(map) = host_port_map {
+            let port = map
+                .get(&desc.guest_port)
+                .ok_or_else(|| format!("no host mapping for guest listener {}", desc.guest_port))?;
+            if *port == 0 {
+                return Err("restored host mapping cannot select an ephemeral port".into());
+            }
+            address.set_port(*port);
+        } else if saved.is_none() {
+            return Err("older listener snapshot requires an explicit port map".into());
+        }
+        if let Some(saved) = saved {
+            saved
+                .options
+                .apply(&self.sock)
+                .map_err(|e| format!("restore listener options: {e}"))?;
+            saved
+                .buffers
+                .copy_to(&self.sock, false)
+                .map_err(|e| format!("restore listener buffers: {e}"))?;
+            self.buffers = saved.buffers;
+        }
+        self.sock
+            .bind(&address.into())
+            .map_err(|e| format!("restore listener {address}: {e}"))?;
+        self.sock
+            .listen(desc.backlog.clamp(0, sys::SOMAXCONN))
+            .map_err(|e| format!("listen on restored {address}: {e}"))?;
+        self.host_bound = Some(address);
+        self.listener_bind = if self.host_network {
+            saved.and_then(|s| s.requested_bind).or(Some(address))
+        } else {
+            Some(address)
         };
-        if let Err(e) = self.sock.bind(&addr.into()) {
-            warn!("relisten bind id={} err={e}", self.id);
-            return -LINUX_EADDRINUSE;
-        }
-        let clamped = backlog.clamp(0, sys::SOMAXCONN);
-        if let Err(e) = self.sock.listen(clamped) {
-            warn!("relisten listen id={} err={e}", self.id);
-            return -libc::EINVAL;
-        }
-        self.status = ProxyStatus::Listening;
-        self.listen_guest_port = guest_port;
-        self.listen_backlog = clamped;
-        debug!(
-            "relisten: id={} guest_port={} host_port={}",
-            self.id, guest_port, host_port
-        );
-        0
+        self.status = if desc.accept_pending {
+            ProxyStatus::WaitingOnAccept
+        } else {
+            ProxyStatus::Listening
+        };
+        self.listen_guest_port = desc.guest_port;
+        self.listen_backlog = desc.backlog.clamp(0, sys::SOMAXCONN);
+        Ok(())
     }
     /// Host-socket epoll interest for a connected data stream: read (IN) unless
     /// RX is paused for credit/half-close, plus write (OUT) whenever there are
@@ -952,6 +1025,7 @@ impl Proxy for TsiStreamProxy {
         }
         let addr = bind_inet(&self.sock, self.family, req)?;
         self.host_bound = Some(addr);
+        self.listener_bind = req.addr.inet();
         Ok(addr.into())
     }
 
@@ -983,6 +1057,26 @@ impl Proxy for TsiStreamProxy {
                 control_port: self.control_port,
                 guest_port: self.listen_guest_port,
                 backlog: self.listen_backlog,
+                socket: Some(
+                    (|| -> std::io::Result<ListenerSocketState> {
+                        Ok(ListenerSocketState {
+                            address: self
+                                .sock
+                                .local_addr()?
+                                .as_socket()
+                                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?,
+                            requested_bind: self.listener_bind,
+                            host_network: self.host_network,
+                            options: ListenerOptions::capture(
+                                &self.sock,
+                                self.family == Family::Inet6,
+                            )?,
+                            buffers: self.buffers,
+                        })
+                    })()
+                    .map_err(|e| e.to_string()),
+                ),
+                accept_pending: self.status == ProxyStatus::WaitingOnAccept,
             })
         } else {
             None
@@ -1261,17 +1355,32 @@ impl Proxy for TsiStreamProxy {
 
         if result == 0 {
             self.peer_port = req.vm_port;
-            self.status = ProxyStatus::Listening;
+            // Changing the backlog must not forget an accept already waiting
+            // for its child connection to complete the guest handshake.
+            if self.status != ProxyStatus::WaitingOnAccept {
+                self.status = ProxyStatus::Listening;
+            }
             update.polling = Some((self.id, raw_handle(&self.sock), EventSet::IN));
         }
 
         update
     }
 
-    fn accept(&mut self, req: TsiAcceptReq) -> ProxyUpdate {
+    fn accept(&mut self, control_port: u32, req: TsiAcceptReq) -> ProxyUpdate {
         debug!("accept: id={} flags={}", req.peer_port, req.flags);
+        // Accept may wait indefinitely. Its reply socket must be independent
+        // of synchronous listener metadata and lifecycle operations.
+        self.control_port = control_port;
 
         let mut update = ProxyUpdate::default();
+        if !matches!(
+            self.status,
+            ProxyStatus::Listening | ProxyStatus::WaitingOnAccept
+        ) {
+            self.push_accept_rsp(-22);
+            update.signal_queue = true;
+            return update;
+        }
 
         if self.pending_accepts > 0 {
             self.pending_accepts -= 1;
@@ -1357,7 +1466,7 @@ impl Proxy for TsiStreamProxy {
         if self.status == ProxyStatus::WaitingOnAccept {
             self.status = ProxyStatus::Listening;
             self.push_accept_rsp(0);
-        } else {
+        } else if self.status == ProxyStatus::Listening {
             self.pending_accepts += 1;
         }
     }
@@ -1382,6 +1491,76 @@ impl Proxy for TsiStreamProxy {
             &self.mem,
             &self.snapshot_gate,
         );
+    }
+
+    fn shutdown_listener(&mut self, mode: u32) -> (i32, ProxyUpdate) {
+        if mode > 2 {
+            return (-22, ProxyUpdate::default());
+        }
+        if !matches!(
+            self.status,
+            ProxyStatus::Listening | ProxyStatus::WaitingOnAccept
+        ) {
+            return (-107, ProxyUpdate::default());
+        }
+        if mode == 1 {
+            return (0, ProxyUpdate::default());
+        }
+        let domain = match self.family {
+            Family::Inet => Domain::IPV4,
+            Family::Inet6 => Domain::IPV6,
+            #[cfg(unix)]
+            Family::Unix => return (-95, ProxyUpdate::default()),
+        };
+        // Prepare the replacement before closing anything: allocation or option
+        // errors must leave the original listener and pending accept usable.
+        let replacement = (|| -> std::io::Result<Socket> {
+            let socket = Socket::new(domain, Type::STREAM, None)?;
+            socket.set_nonblocking(true)?;
+            super::host_sockopt::copy_listener_options(
+                &self.sock,
+                &socket,
+                self.family == Family::Inet6,
+            )?;
+            self.buffers.copy_to(&socket, false)?;
+            Ok(socket)
+        })();
+        let replacement = match replacement {
+            Ok(socket) => socket,
+            Err(error) => return (-sys::to_linux_errno(&error), ProxyUpdate::default()),
+        };
+        let address = match self.guest_local_addr().and_then(|a| {
+            a.as_socket()
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))
+        }) {
+            Ok(address) => address,
+            Err(error) => return (-sys::to_linux_errno(&error), ProxyUpdate::default()),
+        };
+        let waiting = self.status == ProxyStatus::WaitingOnAccept;
+        drop(std::mem::replace(&mut self.sock, replacement));
+        self.status = ProxyStatus::Idle;
+        self.stopped_listener_addr = Some(address);
+        self.pending_accepts = 0;
+        self.host_bound = None;
+        // An explicitly selected port remains reserved for a subsequent listen.
+        // If another host process wins the close/rebind race, listen retries the
+        // requested bind and reports the real conflict instead of picking a port.
+        if let Some(bind) = self.listener_bind.filter(|a| a.port() != 0)
+            && self.sock.bind(&bind.into()).is_ok()
+        {
+            self.host_bound = Some(bind);
+        }
+        if waiting {
+            self.push_accept_rsp(-22);
+        }
+        (
+            0,
+            ProxyUpdate {
+                signal_queue: waiting,
+                polling: Some((self.id, raw_handle(&self.sock), EventSet::empty())),
+                ..Default::default()
+            },
+        )
     }
 
     fn shutdown(&mut self, pkt: &VsockPacket) -> ProxyUpdate {

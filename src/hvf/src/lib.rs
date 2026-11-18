@@ -9,6 +9,9 @@
 #[allow(deref_nullptr)]
 pub mod bindings;
 
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod checkpoint_tests;
+
 #[macro_use]
 extern crate log;
 
@@ -683,8 +686,18 @@ pub fn vcpu_restore_state(vcpuid: u64, state: &HvfVcpuState) -> Result<(), Error
             return Err(Error::VcpuSetRegister);
         }
     }
-    // Per-vCPU GIC state. The captured order is config-before-enable (redist
-    // ISENABLER0 last; ICC SRE first, IGRPEN last), so replay in order.
+    // The HVF register API retains the GIC's write-one-to-set semantics.
+    // A rewind restores onto a live controller, so remove later enable,
+    // pending and active bits before installing the captured state.
+    for &(reg, _) in &state.gic_redist {
+        if let Some(clear) = gic_clear_alias(reg) {
+            let ret = unsafe { (GIC_REGS.set_redist)(vcpuid, clear, u64::from(u32::MAX)) };
+            if ret != HV_SUCCESS {
+                return Err(Error::VcpuSetSystemRegister(0, u64::from(clear)));
+            }
+        }
+    }
+    // Per-vCPU GIC state. Replay configuration before enabling interrupts.
     for &(reg, val) in &state.gic_redist {
         let ret = unsafe { (GIC_REGS.set_redist)(vcpuid, reg, val) };
         if ret != HV_SUCCESS {
@@ -756,6 +769,14 @@ pub fn gic_save_distributor() -> Result<Vec<(u32, u64)>, Error> {
 /// the distributor is only enabled once its configuration is in place.
 #[cfg(target_arch = "aarch64")]
 pub fn gic_restore_distributor(regs: &[(u32, u64)]) -> Result<(), Error> {
+    for &(reg, _) in regs {
+        if let Some(clear) = gic_clear_alias(reg) {
+            let ret = unsafe { (GIC_REGS.set_dist)(clear as u16, u64::from(u32::MAX)) };
+            if ret != HV_SUCCESS {
+                return Err(Error::VcpuSetSystemRegister(0, u64::from(clear)));
+            }
+        }
+    }
     for &(reg, val) in regs.iter().filter(|(r, _)| *r != 0) {
         let ret = unsafe { (GIC_REGS.set_dist)(reg as u16, val) };
         if ret != HV_SUCCESS {
@@ -776,11 +797,23 @@ pub fn gic_restore_distributor(regs: &[(u32, u64)]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Clear aliases for the distributor's SPI banks and the redistributor's
+/// SGI/PPI bank. Writing zero to a set register cannot remove a newer bit.
+#[cfg(target_arch = "aarch64")]
+fn gic_clear_alias(reg: u32) -> Option<u32> {
+    match reg {
+        0x100..=0x17c | 0x200..=0x27c | 0x300..=0x37c | 0x10100 | 0x10200 | 0x10300 => {
+            Some(reg + 0x80)
+        }
+        _ => None,
+    }
+}
+
 /// GIC distributor register offsets to snapshot (offset == `hv_gic_distributor_reg_t`),
 /// bounded to the `num_irqs` the GIC implements (per-IRQ ranges past that fault):
 /// GICD_CTLR, IGROUPR, IPRIORITYR, ICFGR, IROUTER (64-bit SPI routing, SPIs 32+),
-/// ISENABLER, ISPENDR, and ISACTIVER. The set variants are replayed onto a reset
-/// GIC so the saved state is installed exactly; this is required when a vCPU is
+/// ISENABLER, ISPENDR, and ISACTIVER. Restore clears their banks before replaying
+/// the saved bits; this is required when a vCPU is
 /// checkpointed inside an interrupt handler and later resumes by writing EOIR.
 /// Read-only (TYPER/PIDR2) and clear registers (IC*) are excluded.
 #[cfg(target_arch = "aarch64")]
@@ -1385,9 +1418,8 @@ impl HvfVcpu<'_> {
         }
     }
 
-    pub fn run(&mut self, vcpu_list: Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
-        let pending_irq = vcpu_list.has_pending_irq(self.vcpuid);
-
+    /// Complete the instruction whose device access was handled by the VMM.
+    fn complete_pending_exit(&mut self) -> Result<(), Error> {
         if let Some(mmio_read) = self.pending_mmio_read.take()
             && mmio_read.srt < 31
         {
@@ -1410,6 +1442,37 @@ impl HvfVcpu<'_> {
             self.write_reg(hv_reg_t_HV_REG_PC, pc + 4)?;
             self.pending_advance_pc = false;
         }
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn save_state(&mut self) -> Result<HvfVcpuState, Error> {
+        // Device effects have already happened, but their read result and PC
+        // update normally wait until run(). Capture a completed instruction so
+        // restoring it cannot replay the device access or lose its result.
+        self.complete_pending_exit()?;
+        vcpu_save_state(self.vcpuid)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_state(&mut self, state: &HvfVcpuState) -> Result<(), Error> {
+        vcpu_restore_state(self.vcpuid, state)?;
+        // These belong to the discarded execution, not the restored registers.
+        self.pending_mmio_read = None;
+        self.pending_advance_pc = false;
+        // HVF masks timer exits after reporting VTIMER_ACTIVATED. That host
+        // delivery mask is separate from the restored CNTV_CTL/CVAL registers;
+        // retaining a later mask can leave the restored guest without a timer.
+        vcpu_set_vtimer_mask(self.vcpuid, false)?;
+        self.vtimer_masked = false;
+        Ok(())
+    }
+
+    pub fn run(&mut self, vcpu_list: Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
+        let pending_irq = vcpu_list.has_pending_irq(self.vcpuid);
+
+        self.complete_pending_exit()?;
 
         if pending_irq {
             vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, true)?;

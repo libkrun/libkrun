@@ -8,13 +8,13 @@ use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, Gues
 
 use crate::builder::StartMicrovmError;
 
-pub const ABI_VERSION: u32 = 7;
-const MARKER: &[u8] = b"KRUN_TSI_HOST_NETWORK_ABI_7\0";
+pub const ABI_VERSION: u32 = devices::virtio::vsock::HOST_NETWORK_ABI_VERSION;
+const MARKER: &[u8] = b"KRUN_TSI_HOST_NETWORK_ABI_8\0";
 #[cfg(target_arch = "x86_64")]
 const CHUNK_SIZE: usize = 64 * 1024;
 
 fn unsupported() -> StartMicrovmError {
-    StartMicrovmError::HostNetwork("the loaded kernel does not support host-network ABI 7")
+    StartMicrovmError::HostNetwork("the loaded kernel does not support host-network ABI 8")
 }
 
 pub(crate) fn require_image(image: &[u8]) -> Result<(), StartMicrovmError> {
@@ -83,6 +83,7 @@ mod tests {
             &b"KRUN_TSI_HOST_NETWORK_ABI_4\0"[..],
             &b"KRUN_TSI_HOST_NETWORK_ABI_5\0"[..],
             &b"KRUN_TSI_HOST_NETWORK_ABI_6\0"[..],
+            &b"KRUN_TSI_HOST_NETWORK_ABI_7\0"[..],
             &b"KRUN_TSI_HOST_NETWORK_ABI_10\0"[..],
             &MARKER[..MARKER.len() - 1],
         ] {

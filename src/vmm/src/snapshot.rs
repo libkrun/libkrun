@@ -2809,12 +2809,7 @@ pub fn start_fork_generation_copy_with_windows(
     // aarch64 Linux has no `fork` syscall at all; `clone` with SIGCHLD and no
     // new stack is the same operation, and keeps the property this relies on:
     // no libc wrapper, so no registered atfork handler runs.
-    #[cfg(target_arch = "x86_64")]
-    let child_pid = unsafe { libc::syscall(libc::SYS_fork) as libc::pid_t };
-    #[cfg(not(target_arch = "x86_64"))]
-    let child_pid = unsafe {
-        libc::syscall(libc::SYS_clone, libc::SIGCHLD as libc::c_ulong, 0, 0, 0, 0) as libc::pid_t
-    };
+    let child_pid = unsafe { crate::fork_barrier::raw_fork() };
     if child_pid < 0 {
         let error = io::Error::last_os_error();
         unsafe {

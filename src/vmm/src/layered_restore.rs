@@ -1016,6 +1016,9 @@ fn copy_into_delta(
         .get_host_address(GuestAddress(gpa))
         .map_err(|error| io::Error::other(format!("read private RAM: {error:?}")))?
         as usize;
+    // MADV_DONTFORK alone leaves a fork window after mmap: an inherited
+    // writable view would prevent F_SEAL_WRITE even after our view is gone.
+    let mapping_setup = crate::fork_barrier::exclude_forks()?;
     // SAFETY: a new shared mapping of the whole delta, written only by the
     // workers below and unmapped before this returns.
     let target = unsafe {
@@ -1041,6 +1044,7 @@ fn copy_into_delta(
         unsafe { libc::munmap(target, len) };
         return Err(error);
     }
+    drop(mapping_setup);
     let target = target as usize;
     let chunks: Vec<(usize, usize)> = ranges
         .iter()
@@ -1493,6 +1497,16 @@ fn zero_check_sees_one_set_byte_anywhere() {
 
 #[test]
 fn a_delta_copied_while_a_child_lives_can_still_be_sealed() {
+    assert_delta_sealable_during_fork(false);
+}
+
+#[test]
+fn a_delta_copied_while_a_libc_child_lives_can_still_be_sealed() {
+    assert_delta_sealable_during_fork(true);
+}
+
+#[cfg(test)]
+fn assert_delta_sealable_during_fork(libc_fork: bool) {
     use crate::snapshot::MemoryRegionDesc;
     let page = host_page_size();
     let size = 64 << 20;
@@ -1508,6 +1522,8 @@ fn a_delta_copied_while_a_child_lives_can_still_be_sealed() {
     let memory = generation.restore().unwrap();
     memory.write_slice(&vec![7; size], GuestAddress(0)).unwrap();
     let delta = crate::builder::create_guest_ram_memfd(size).unwrap();
+    // Install the libc fork handlers before the competing thread can fork.
+    drop(crate::fork_barrier::exclude_forks().unwrap());
     // A child forked mid-copy outlives it: one-page chunks keep the 64 MiB
     // copy running for tens of milliseconds, and the fork lands 2 ms in.
     let (ready_read, ready_write) = {
@@ -1520,7 +1536,13 @@ fn a_delta_copied_while_a_child_lives_can_still_be_sealed() {
             let mut byte = 0_u8;
             unsafe { libc::read(ready_read, (&mut byte as *mut u8).cast(), 1) };
             thread::sleep(std::time::Duration::from_millis(2));
-            let pid = unsafe { libc::syscall(libc::SYS_fork) as libc::pid_t };
+            let pid = unsafe {
+                if libc_fork {
+                    libc::fork()
+                } else {
+                    crate::fork_barrier::raw_fork()
+                }
+            };
             if pid == 0 {
                 unsafe {
                     libc::sleep(5);
@@ -1533,6 +1555,7 @@ fn a_delta_copied_while_a_child_lives_can_still_be_sealed() {
         copy_into_delta(&memory, 0, &delta, &[(0, size)], page).unwrap();
         forker.join().unwrap()
     });
+    assert!(child > 0, "fork failed: {}", io::Error::last_os_error());
     let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
     let sealed = unsafe { libc::fcntl(delta.as_raw_fd(), libc::F_ADD_SEALS, seals) };
     unsafe {

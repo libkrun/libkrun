@@ -315,20 +315,7 @@ impl MMIODeviceManager {
 
     /// Restore device runtime state captured by [`Self::snapshot_devices`].
     pub fn restore_devices(&self, state: &VmDevicesState) -> std::result::Result<(), String> {
-        for snap in &state.devices {
-            let mut applied = false;
-            for dev in &self.virtio_devices {
-                let mut guard = dev.lock().expect("poisoned virtio device lock");
-                if restore_device(&mut *guard, snap).is_ok() {
-                    applied = true;
-                    break;
-                }
-            }
-            if !applied {
-                return Err(format!("no matching device to restore snapshot {snap:?}"));
-            }
-        }
-        Ok(())
+        crate::device_manager::restore_devices_in_place(&self.mmio_transports, state)
     }
 
     /// Re-activate devices on a freshly-built clone from a checkpoint: for each
@@ -365,7 +352,7 @@ impl MMIODeviceManager {
                 // Devices that defer worker startup past `activate` (the console
                 // starts each port's worker only on the guest's PORT_OPEN, which
                 // a restored guest never re-sends) restart their workers here.
-                t.locked_device().finish_restore_activation();
+                t.locked_device().finish_restore_activation()?;
                 used[i] = true;
                 applied = true;
                 break;

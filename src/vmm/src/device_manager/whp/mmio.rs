@@ -283,7 +283,7 @@ impl MMIODeviceManager {
                 t.set_restored_interrupt_status(
                     state.interrupt_status.get(index).copied().unwrap_or(0),
                 );
-                t.locked_device().finish_restore_activation();
+                t.locked_device().finish_restore_activation()?;
                 used[i] = true;
                 applied = true;
                 break;
@@ -338,22 +338,9 @@ impl MMIODeviceManager {
         }
     }
 
-    /// Restore device runtime state onto freshly-constructed devices.
+    /// Restore runtime state onto the existing quiesced devices.
     pub fn restore_devices(&self, state: &VmDevicesState) -> std::result::Result<(), String> {
-        for snap in &state.devices {
-            let mut applied = false;
-            for dev in &self.virtio_devices {
-                let mut guard = dev.lock().expect("poisoned virtio device lock");
-                if restore_device(&mut *guard, snap).is_ok() {
-                    applied = true;
-                    break;
-                }
-            }
-            if !applied {
-                return Err(format!("no matching device to restore snapshot {snap:?}"));
-            }
-        }
-        Ok(())
+        crate::device_manager::restore_devices_in_place(&self.mmio_transports, state)
     }
 }
 

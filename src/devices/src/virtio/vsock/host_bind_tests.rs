@@ -216,6 +216,276 @@ fn host_bound_stream_listens_on_its_reserved_port() {
     f.release();
 }
 
+fn listener_fixture(family: u16, ip: std::net::IpAddr) -> (Fixture, Vec<u8>) {
+    let mut f = Fixture::new(granted(), None);
+    f.create(defs::SOCK_STREAM, family);
+    let addr = VsockAddr::from(f.bind((ip, 0).into()).unwrap());
+    let listen = [
+        &GUEST.to_le_bytes()[..],
+        &GUEST.to_le_bytes(),
+        &4u32.to_le_bytes(),
+        &addr.linux_len().to_le_bytes(),
+        &addr.to_linux_bytes(),
+    ]
+    .concat();
+    f.send(defs::TSI_LISTEN, &listen);
+    assert!(matches!(
+        f.muxer.rxq.lock().unwrap().pop(),
+        Some(MuxerRx::ListenResponse { result: 0, .. })
+    ));
+    (f, listen)
+}
+
+#[test]
+fn host_listener_snapshot_restores_without_a_publishing_map() {
+    // Isolate port release assertions from unrelated tests spawning processes.
+    const CHILD: &str = "LIBKRUN_LISTENER_RESTORE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "virtio::vsock::muxer::host_bind_tests::host_listener_snapshot_restores_without_a_publishing_map", "--nocapture"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    use std::io::{Read, Write};
+    for (family, ip) in [
+        (defs::LINUX_AF_INET, Ipv4Addr::LOCALHOST.into()),
+        (defs::LINUX_AF_INET6, Ipv6Addr::LOCALHOST.into()),
+    ] {
+        let (mut source, listen) = listener_fixture(family, ip);
+        let bound = VsockAddr::parse_linux(
+            &listen[16..],
+            u32::from_le_bytes(listen[12..16].try_into().unwrap()),
+        )
+        .unwrap()
+        .inet()
+        .unwrap();
+        for (level, option, value) in [
+            (1u32, 2u32, 0u32),
+            (1, 9, 1),
+            (6, 1, 1),
+            (6, 4, 42),
+            (1, 8, 16384),
+        ] {
+            source.send(
+                defs::TSI_HOST_SETSOCKOPT,
+                &[GUEST, defs::TSI_PROXY_PORT, level, option, value]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            );
+            let response = source.muxer.rxq.lock().unwrap().pop().unwrap();
+            let MuxerRx::BindResponse { data, .. } = response else {
+                panic!("{response:?}")
+            };
+            let mut bytes = [0; 136];
+            data.write(&mut bytes);
+            assert_eq!(i32::from_le_bytes(bytes[..4].try_into().unwrap()), 0);
+        }
+        let saved = source.muxer.snapshot_listeners();
+        assert!(saved[0].socket.as_ref().unwrap().is_ok());
+        let encoded = serde_json::to_vec(&saved).unwrap();
+        let decoded = serde_json::from_slice(&encoded).unwrap();
+        // An occupied source must fail restore, never disappear silently.
+        let conflict = Fixture::new(granted(), None);
+        let error = conflict.muxer.restore_listeners(saved.clone()).unwrap_err();
+        assert!(error.contains(&bound.to_string()), "{error}");
+        assert!(conflict.muxer.proxy_map.read().unwrap().is_empty());
+        source.release();
+        let mut restored = Fixture::new(granted(), None);
+        restored.muxer.restore_listeners(decoded).unwrap();
+        assert_eq!(
+            restored.muxer.snapshot_listeners(),
+            saved,
+            "restore changed binding/options"
+        );
+        let mut client = TcpStream::connect_timeout(&bound, Duration::from_secs(2)).unwrap();
+        client.write_all(b"restored").unwrap();
+        let id = ((GUEST as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+        let accepted = restored.muxer.proxy_map.read().unwrap()[&id]
+            .lock()
+            .unwrap()
+            .process_event(EventSet::IN)
+            .new_proxy
+            .unwrap()
+            .1;
+        let mut accepted = TcpStream::from(accepted);
+        accepted.set_nonblocking(false).unwrap();
+        accepted
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut bytes = [0; 8];
+        accepted.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"restored");
+        // The next assertion checks ownership release, not TCP TIME_WAIT.
+        socket2::SockRef::from(&accepted)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(accepted);
+        drop(client);
+        restored.release();
+
+        // Bind failures late in a batch roll back every prepared listener.
+        let occupied = std::net::TcpListener::bind((ip, 0)).unwrap();
+        let mut batch = saved.clone();
+        let mut second = saved[0].clone();
+        second.peer_port += 1;
+        second.socket.as_mut().unwrap().as_mut().unwrap().address = occupied.local_addr().unwrap();
+        batch.push(second);
+        let rolled_back = Fixture::new(granted(), None);
+        assert!(rolled_back.muxer.restore_listeners(batch).is_err());
+        assert!(rolled_back.muxer.proxy_map.read().unwrap().is_empty());
+        let released = std::net::TcpListener::bind(bound).unwrap();
+        drop(released);
+
+        // Old records remain readable through explicit port mappings.
+        let mut value = serde_json::to_value(&saved[0]).unwrap();
+        value.as_object_mut().unwrap().remove("socket");
+        value.as_object_mut().unwrap().remove("accept_pending");
+        let old: ListenerDesc = serde_json::from_value(value).unwrap();
+        let mut legacy = Fixture::new(
+            TsiFlags::HIJACK_INET,
+            Some(HashMap::from([(old.guest_port, bound.port())])),
+        );
+        legacy.muxer.restore_listeners(vec![old]).unwrap();
+        let _client = TcpStream::connect_timeout(&bound, Duration::from_secs(2)).unwrap();
+        legacy.release();
+    }
+}
+
+#[test]
+fn paused_host_accept_leaves_proxy_table_available_for_restore() {
+    use crate::legacy::DummyIrqChip;
+    use std::sync::mpsc;
+    use std::thread;
+
+    let (f, _) = listener_fixture(defs::LINUX_AF_INET, Ipv4Addr::LOCALHOST.into());
+    let saved = f.muxer.snapshot_listeners();
+    let address = saved[0].socket.as_ref().unwrap().as_ref().unwrap().address;
+    let (sender, _receiver) = unbounded();
+    let worker = MuxerThread::new(
+        3,
+        f.muxer.epoll.clone(),
+        f.muxer.rxq.clone(),
+        f.muxer.proxy_map.clone(),
+        f.mem.clone(),
+        f.muxer.queue.as_ref().unwrap().clone(),
+        InterruptTransport::new(DummyIrqChip::new().into(), "paused accept test".into()).unwrap(),
+        sender,
+        HashMap::new(),
+        f.muxer.snapshot_gate.clone(),
+        f.muxer.host_event_gate.clone(),
+        #[cfg(target_os = "macos")]
+        None,
+        #[cfg(target_os = "macos")]
+        None,
+    );
+    f.muxer.quiesce_for_snapshot();
+    let _client = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let id = ((GUEST as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+    let handler = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        worker.process_host_event(id, EventSet::IN, &mut rand::rng());
+        finished_tx.send(()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let held = finished_rx.recv_timeout(Duration::from_millis(50)).is_err();
+    // Before the fix the handler accepted the socket, installed its child and
+    // blocked inside push_op_request while retaining the table's read lock.
+    let table_available = f.muxer.proxy_map.try_write().is_ok();
+    // Always release the worker before asserting, including on the old code.
+    f.muxer.rearm_after_snapshot();
+    finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    handler.join().unwrap();
+    assert!(held, "host handler ran while snapshot was paused");
+    assert!(
+        table_available,
+        "paused host handler retained proxy table lock"
+    );
+    assert_eq!(f.muxer.snapshot_listeners(), saved);
+    assert!(f.muxer.proxy_map.read().unwrap().len() > 1);
+}
+
+#[test]
+fn listener_accept_replies_follow_the_request_channel() {
+    for (family, ip) in [
+        (defs::LINUX_AF_INET, Ipv4Addr::LOCALHOST.into()),
+        (defs::LINUX_AF_INET6, Ipv6Addr::LOCALHOST.into()),
+    ] {
+        for flags in [0u32, defs::LINUX_O_NONBLOCK] {
+            let (mut f, _) = listener_fixture(family, ip);
+            let mut request = f.packet(
+                defs::TSI_ACCEPT,
+                &[&GUEST.to_le_bytes()[..], &flags.to_le_bytes()].concat(),
+            );
+            request.set_src_port(CONTROL + 1);
+            f.muxer.send_dgram_pkt(&request).unwrap();
+            if flags == 0 {
+                assert!(f.muxer.rxq.lock().unwrap().is_empty());
+                let id = ((GUEST as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+                // Complete the pending guest accept, as a connected child does.
+                f.muxer.proxy_map.read().unwrap()[&id]
+                    .lock()
+                    .unwrap()
+                    .enqueue_accept();
+            }
+            let response = f.muxer.rxq.lock().unwrap().pop().unwrap();
+            assert!(
+                matches!(response, MuxerRx::AcceptResponse {
+                peer_port, result, ..
+            } if peer_port == CONTROL + 1 && result == if flags == 0 { 0 } else { -11 }),
+                "wrong accept reply: {response:?}"
+            );
+            f.release();
+        }
+    }
+}
+
+#[test]
+fn listener_backlog_update_preserves_a_pending_accept() {
+    for (family, ip) in [
+        (defs::LINUX_AF_INET, Ipv4Addr::LOCALHOST.into()),
+        (defs::LINUX_AF_INET6, Ipv6Addr::LOCALHOST.into()),
+    ] {
+        let (mut f, mut listen) = listener_fixture(family, ip);
+        f.send(
+            defs::TSI_ACCEPT,
+            &[&GUEST.to_le_bytes()[..], &0u32.to_le_bytes()].concat(),
+        );
+        assert!(f.muxer.rxq.lock().unwrap().is_empty());
+        listen[8..12].copy_from_slice(&32u32.to_le_bytes());
+        f.send(defs::TSI_LISTEN, &listen);
+        assert!(matches!(
+            f.muxer.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::ListenResponse { result: 0, .. })
+        ));
+        let id = ((GUEST as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+        {
+            let map = f.muxer.proxy_map.read().unwrap();
+            let mut listener = map[&id].lock().unwrap();
+            assert_eq!(listener.status(), ProxyStatus::WaitingOnAccept);
+            assert_eq!(listener.listener_desc().unwrap().backlog, 32);
+            listener.enqueue_accept();
+        }
+        assert!(matches!(
+            f.muxer.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::AcceptResponse {
+                result: 0,
+                peer_port: CONTROL,
+                ..
+            })
+        ));
+        f.release();
+    }
+}
+
 #[test]
 fn host_udp_preserves_datagrams_across_queue_refills_and_replies_to_each_sender() {
     use super::super::host_datagram::FRAME_HEADER;
@@ -1519,4 +1789,228 @@ fn only_waiting_closes_receive_status_and_repeated_close_is_complete() {
             }
         }
     }
+}
+
+#[test]
+fn listener_shutdown_closes_only_the_listener_and_can_listen_again() {
+    use std::io::{Read, Write};
+    for (family, ip) in [
+        (defs::LINUX_AF_INET, Ipv4Addr::LOCALHOST.into()),
+        (defs::LINUX_AF_INET6, Ipv6Addr::LOCALHOST.into()),
+    ] {
+        for mode in [0u32, 1, 2] {
+            let (mut f, listen) = listener_fixture(family, ip);
+            let address = VsockAddr::parse_linux(
+                &listen[16..],
+                u32::from_le_bytes(listen[12..16].try_into().unwrap()),
+            )
+            .unwrap()
+            .inet()
+            .unwrap();
+            let mut client = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let id = ((GUEST as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+            let update = {
+                let proxies = f.muxer.proxy_map.read().unwrap();
+                let mut listener = proxies[&id].lock().unwrap();
+                // connect() can return before the nonblocking listener is
+                // readable on macOS. Deliver an actual readiness event, as
+                // the production muxer does, before attempting accept().
+                super::super::host_datagram::wait_readable(listener.poll_handle());
+                listener.process_event(EventSet::IN)
+            };
+            let (_, child, _, _) = update.new_proxy.unwrap();
+            let mut child = TcpStream::from(child);
+            let mut request = f.packet(
+                defs::TSI_ACCEPT,
+                &[&GUEST.to_le_bytes()[..], &0u32.to_le_bytes()].concat(),
+            );
+            request.set_src_port(CONTROL + 1);
+            f.muxer.send_dgram_pkt(&request).unwrap();
+            f.send(
+                defs::TSI_LISTENER_SHUTDOWN,
+                &[&GUEST.to_le_bytes()[..], &mode.to_le_bytes()].concat(),
+            );
+            if mode != 1 {
+                assert!(
+                    matches!(f.muxer.rxq.lock().unwrap().pop(), Some(MuxerRx::AcceptResponse { result: -22, peer_port, .. }) if peer_port == CONTROL + 1)
+                );
+            }
+            let response = f.muxer.rxq.lock().unwrap().pop().unwrap();
+            let MuxerRx::BindResponse {
+                local_port,
+                peer_port,
+                data,
+            } = response
+            else {
+                panic!("wrong shutdown response: {response:?}")
+            };
+            assert_eq!(local_port, defs::TSI_LISTENER_SHUTDOWN);
+            assert_eq!(peer_port, CONTROL);
+            let mut wire = [0; 136];
+            data.write(&mut wire);
+            assert_eq!(i32::from_le_bytes(wire[..4].try_into().unwrap()), 0);
+            assert!(f.muxer.rxq.lock().unwrap().is_empty());
+            child.write_all(b"alive").unwrap();
+            let mut bytes = [0; 5];
+            client.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"alive");
+            if mode != 1 {
+                assert!(TcpStream::connect_timeout(&address, Duration::from_secs(2)).is_err());
+            } else {
+                assert_eq!(
+                    f.muxer.proxy_map.read().unwrap()[&id]
+                        .lock()
+                        .unwrap()
+                        .status(),
+                    ProxyStatus::WaitingOnAccept
+                );
+            }
+            f.send(defs::TSI_LISTEN, &listen);
+            assert!(matches!(
+                f.muxer.rxq.lock().unwrap().pop(),
+                Some(MuxerRx::ListenResponse { result: 0, .. })
+            ));
+            f.send(
+                defs::TSI_GETNAME,
+                &[
+                    &GUEST.to_le_bytes()[..],
+                    &defs::TSI_PROXY_PORT.to_le_bytes(),
+                    &0u32.to_le_bytes(),
+                ]
+                .concat(),
+            );
+            let address = match f.muxer.rxq.lock().unwrap().pop().unwrap() {
+                MuxerRx::GetnameResponse { data, .. } => {
+                    assert_eq!(data.result, 0);
+                    data.addr.inet().unwrap()
+                }
+                response => panic!("wrong local address response: {response:?}"),
+            };
+            let _next = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+            f.release();
+        }
+    }
+}
+
+#[test]
+fn transport_reset_ack_is_not_blocked_by_a_guest_tx_reply() {
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::DeviceState;
+    use polly::event_manager::{EventManager, Subscriber};
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd;
+    use std::sync::mpsc;
+    use std::thread;
+    use utils::eventfd::EventFd;
+    #[cfg(windows)]
+    use utils::windows::AsRawFd;
+
+    let f = Fixture::new(TsiFlags::empty(), None);
+    let tx = TestQueue::new(GuestAddress(0x1000), &f.mem, 8);
+    let tx_queue = tx.create_queue();
+    // A restored guest can send on an obsolete stream before processing its
+    // reset event. That packet requires an RST response through the RX gate.
+    let mut packet = f.packet(12345, &[]);
+    packet.set_type(uapi::VSOCK_TYPE_STREAM);
+    let gate = f.muxer.snapshot_gate.clone();
+    gate.hold_for_transport_reset();
+    let mut device = super::super::device::Vsock::new(
+        3,
+        None,
+        None,
+        TsiFlags::empty(),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    device.queue_rx = f.muxer.queue.clone();
+    device.queue_tx = Some(Arc::new(Mutex::new(tx_queue)));
+    device.queue_events = (0..3)
+        .map(|_| Arc::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap()))
+        .collect();
+    device.device_state = DeviceState::Activated(
+        f.mem.clone(),
+        InterruptTransport::new(
+            DummyIrqChip::new().into(),
+            "reset acknowledgement test".into(),
+        )
+        .unwrap(),
+    );
+    device.muxer = f.muxer;
+    device.awaiting_transport_reset_ack = true;
+    let (finished, ready) = mpsc::channel();
+    let (acknowledge, acknowledged) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let used = device.process_stream_tx();
+        finished.send(used).unwrap();
+        acknowledged.recv().unwrap();
+        let event = device.queue_events[super::super::device::EVQ_INDEX].clone();
+        event.write(1).unwrap();
+        device.process(
+            &EpollEvent::new(EventSet::IN, event.as_raw_fd() as u64),
+            &mut EventManager::new().unwrap(),
+        );
+        device
+    });
+    let returned_before_ack = ready.recv_timeout(Duration::from_secs(1));
+    let used_before_ack = tx.used.idx.get();
+    // Always release a broken implementation too, so regression failure does
+    // not strand a thread blocked in the very deadlock this test reproduces.
+    if returned_before_ack.is_err() {
+        gate.release_transport_reset();
+    }
+    acknowledge.send(()).unwrap();
+    let device = worker.join().unwrap();
+    assert!(
+        !returned_before_ack.unwrap(),
+        "TX must wait without blocking the event loop"
+    );
+    assert_eq!(used_before_ack, 0);
+    assert_eq!(
+        tx.used.idx.get(),
+        1,
+        "acknowledgement must drain the held TX without another guest kick"
+    );
+    assert!(!gate.is_held_for_transport_reset());
+    assert!(matches!(
+        device.muxer.rxq.lock().unwrap().pop(),
+        Some(MuxerRx::Reset {
+            peer_port: CONTROL,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn reset_ack_timeout_wakes_tx_after_releasing_the_matching_hold() {
+    use std::time::Instant;
+    use utils::eventfd::EventFd;
+
+    let f = Fixture::new(TsiFlags::empty(), None);
+    let event = Arc::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
+    f.muxer.hold_rx_for_transport_reset();
+    f.muxer
+        .arm_transport_reset_timeout(Duration::from_millis(1), event.clone());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match event.read() {
+            Ok(value) => {
+                assert_eq!(value, 1);
+                break;
+            }
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "reset timeout did not wake the device loop"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!f.muxer.rx_held_for_transport_reset());
 }

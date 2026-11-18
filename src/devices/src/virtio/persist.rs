@@ -290,6 +290,7 @@ mod tests {
                     queue_rx: Some(qs.clone()),
                     queue_tx: Some(qs.clone()),
                     queue_ev: Some(qs),
+                    host_network_abi: None,
                     listeners: Vec::new(),
                 }),
             ],

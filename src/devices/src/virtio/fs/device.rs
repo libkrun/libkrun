@@ -313,14 +313,50 @@ impl Fs {
         }
     }
 
-    /// Restore runtime state onto a freshly-constructed, not-yet-activated Fs.
-    /// Only negotiated features are applied here; the virtqueue indices are
-    /// re-applied when the device is re-activated (cross-process fork uses
-    /// `restore_and_activate`, which rebuilds the queues from the saved indices
-    /// and starts a fresh worker). The host-side FUSE server is recreated fresh.
+    /// Restore a fresh device or rewind stopped workers in the existing VM.
+    /// Workers must use the same queue positions and FUSE identities as the
+    /// restored guest; rearming their newer state would consume stale requests.
     pub fn restore_state(&mut self, state: &FsState) -> std::result::Result<(), String> {
+        if self.is_activated() {
+            if !self.worker_threads.is_empty() || self.quiesced_workers.is_empty() {
+                return Err("filesystem workers must be quiesced before restore".into());
+            }
+            if let Some(error) = &self.snapshot_error {
+                return Err(error.clone());
+            }
+            if state.queues.len() != defs::NUM_QUEUES {
+                return Err("filesystem checkpoint has the wrong queue count".into());
+            }
+            if self.passthrough_cfg.is_some() && state.fuse.is_none() {
+                return Err("filesystem checkpoint is missing FUSE state".into());
+            }
+            let queues = self
+                .quiesced_workers
+                .iter()
+                .map(|worker| worker.prepare_rewind(&state.queues))
+                .collect::<Result<Vec<_>, _>>()?;
+            let server = FsWorker::new_server(
+                self.shm_region.clone(),
+                self.passthrough_cfg.clone(),
+                self.read_only,
+                self.live_tag.as_deref(),
+                self.virtual_entries.clone(),
+                state.fuse.clone(),
+            )
+            .map_err(|error| format!("restore filesystem server: {error}"))?;
+            for (worker, queues) in self.quiesced_workers.iter_mut().zip(queues) {
+                worker.apply_rewind(queues, server.clone());
+            }
+            #[cfg(target_os = "linux")]
+            {
+                self.server = Some(server);
+            }
+            self.pending_fuse = None;
+        } else {
+            // Fresh-clone activation reconstructs queues in the transport.
+            self.pending_fuse = state.fuse.clone();
+        }
         self.acked_features = state.acked_features;
-        self.pending_fuse = state.fuse.clone();
         Ok(())
     }
 
@@ -360,60 +396,6 @@ impl Fs {
         for worker in self.quiesced_workers.drain(..) {
             self.worker_threads.push(worker.run());
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn checkpoint_drains_all_failed_workers_and_remembers_failure() {
-        let mut fs = Fs::new(
-            "test".into(),
-            None,
-            Arc::new(AtomicI32::new(0)),
-            false,
-            false,
-            false,
-            Vec::new(),
-        )
-        .unwrap();
-        let joined = Arc::new(AtomicI32::new(0));
-        for _ in 0..2 {
-            let joined = joined.clone();
-            fs.worker_threads.push(std::thread::spawn(move || {
-                joined.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                panic!("simulated filesystem worker failure");
-            }));
-        }
-        fs.quiesce_for_snapshot();
-        assert_eq!(joined.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert!(fs.worker_threads.is_empty());
-        assert!(fs.snapshot_error().is_some());
-        fs.quiesce_for_snapshot();
-        fs.rearm_after_snapshot();
-        assert!(fs.snapshot_error().is_some());
-        fs.reset();
-        assert!(fs.snapshot_error().is_none());
-    }
-
-    #[test]
-    fn advertises_two_request_queues() {
-        let fs = Fs::new(
-            "test".to_owned(),
-            None,
-            Arc::new(AtomicI32::new(0)),
-            false,
-            false,
-            false,
-            Vec::new(),
-        )
-        .unwrap();
-
-        let num_request_queues = fs.config.num_request_queues;
-        assert_eq!(num_request_queues, 2);
-        assert_eq!(fs.queue_config().len(), 3);
     }
 }
 
@@ -566,5 +548,162 @@ impl VirtioDevice for Fs {
 
     fn rearm_after_snapshot(&mut self) {
         self.rearm_worker();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quiesced_fs() -> Fs {
+        use crate::{legacy::DummyIrqChip, virtio::Queue};
+        use vm_memory::GuestAddress;
+
+        let mut fs = Fs::new(
+            "rewind-test".into(),
+            None,
+            Arc::new(AtomicI32::new(0)),
+            false,
+            false,
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "fs rewind".into()).unwrap();
+        let server = FsWorker::new_server(None, None, false, None, Vec::new(), None).unwrap();
+        let queues = (0..defs::NUM_QUEUES)
+            .map(|index| {
+                let mut queue = Queue::new(256);
+                queue.size = 256;
+                queue.ready = true;
+                queue.desc_table = GuestAddress(index as u64 * 0x10000);
+                queue.avail_ring = GuestAddress(index as u64 * 0x10000 + 0x2000);
+                queue.used_ring = GuestAddress(index as u64 * 0x10000 + 0x4000);
+                queue.next_avail = std::num::Wrapping(17 + index as u16);
+                queue.next_used = queue.next_avail;
+                WorkerQueue {
+                    index,
+                    queue,
+                    event: Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+                }
+            })
+            .collect();
+        fs.quiesced_workers.push(FsWorker::new(
+            queues,
+            interrupt.clone(),
+            mem.clone(),
+            None,
+            server,
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            fs.exit_code.clone(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+        ));
+        fs.device_state = DeviceState::Activated(mem, interrupt);
+        fs
+    }
+
+    #[test]
+    fn in_process_rewind_restores_every_filesystem_queue() {
+        let mut fs = quiesced_fs();
+        let mut checkpoint = fs.save_state();
+        for queue in checkpoint.queues.iter_mut().flatten() {
+            queue.next_avail = 0;
+            queue.next_used = 0;
+        }
+        fs.restore_state(&checkpoint).unwrap();
+        assert_eq!(fs.save_state(), checkpoint);
+    }
+
+    #[test]
+    fn malformed_filesystem_rewind_leaves_all_workers_unchanged() {
+        let mut fs = quiesced_fs();
+        let before = fs.save_state();
+        let mut checkpoint = before.clone();
+        checkpoint.queues[0].as_mut().unwrap().next_avail = 0;
+        checkpoint.queues[2] = None;
+        assert!(fs.restore_state(&checkpoint).is_err());
+        assert_eq!(fs.save_state(), before);
+    }
+
+    #[test]
+    fn in_process_rewind_restores_filesystem_server_state() {
+        let mut fs = quiesced_fs();
+        fs.passthrough_cfg = Some(passthrough::Config {
+            root_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        let mut checkpoint = fs.save_state();
+        checkpoint.fuse = Some(FuseServerState {
+            next_inode: 37,
+            next_handle: 19,
+            zero_message_opendir: true,
+            zero_message_open: true,
+            ..Default::default()
+        });
+        fs.restore_state(&checkpoint).unwrap();
+        let restored = fs.save_state().fuse.unwrap();
+        assert_eq!(restored.next_inode, 37);
+        assert_eq!(restored.next_handle, 19);
+        assert!(restored.zero_message_open && restored.zero_message_opendir);
+        assert!(fs.pending_fuse.is_none());
+
+        checkpoint.fuse.as_mut().unwrap().next_handle = 23;
+        fs.restore_state(&checkpoint).unwrap();
+        assert_eq!(fs.save_state().fuse.unwrap().next_handle, 23);
+        checkpoint.fuse = None;
+        assert!(fs.restore_state(&checkpoint).is_err());
+        assert_eq!(fs.save_state().fuse.unwrap().next_handle, 23);
+    }
+
+    #[test]
+    fn checkpoint_drains_all_failed_workers_and_remembers_failure() {
+        let mut fs = Fs::new(
+            "test".into(),
+            None,
+            Arc::new(AtomicI32::new(0)),
+            false,
+            false,
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+        let joined = Arc::new(AtomicI32::new(0));
+        for _ in 0..2 {
+            let joined = joined.clone();
+            fs.worker_threads.push(std::thread::spawn(move || {
+                joined.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                panic!("simulated filesystem worker failure");
+            }));
+        }
+        fs.quiesce_for_snapshot();
+        assert_eq!(joined.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(fs.worker_threads.is_empty());
+        assert!(fs.snapshot_error().is_some());
+        fs.quiesce_for_snapshot();
+        fs.rearm_after_snapshot();
+        assert!(fs.snapshot_error().is_some());
+        fs.reset();
+        assert!(fs.snapshot_error().is_none());
+    }
+
+    #[test]
+    fn advertises_two_request_queues() {
+        let fs = Fs::new(
+            "test".to_owned(),
+            None,
+            Arc::new(AtomicI32::new(0)),
+            false,
+            false,
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let num_request_queues = fs.config.num_request_queues;
+        assert_eq!(num_request_queues, 2);
+        assert_eq!(fs.queue_config().len(), 3);
     }
 }

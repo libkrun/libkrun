@@ -543,7 +543,7 @@ impl Proxy for UnixProxy {
         todo!();
     }
 
-    fn accept(&mut self, _req: TsiAcceptReq) -> ProxyUpdate {
+    fn accept(&mut self, _control_port: u32, _req: TsiAcceptReq) -> ProxyUpdate {
         todo!();
     }
 
@@ -880,7 +880,7 @@ impl Proxy for UnixAcceptorProxy {
     ) -> ProxyUpdate {
         unreachable!()
     }
-    fn accept(&mut self, _: TsiAcceptReq) -> ProxyUpdate {
+    fn accept(&mut self, _: u32, _: TsiAcceptReq) -> ProxyUpdate {
         unreachable!()
     }
     fn update_peer_credit(&mut self, _: &VsockPacket) -> ProxyUpdate {

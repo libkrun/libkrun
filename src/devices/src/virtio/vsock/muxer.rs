@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use super::super::Queue as VirtQueue;
 use super::TsiFlags;
@@ -34,6 +35,7 @@ use super::unix::UnixProxy;
 use super::vsock_addr::VsockAddr;
 use crossbeam_channel::{Sender, unbounded};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
 
 use crate::virtio::InterruptTransport;
@@ -165,6 +167,8 @@ pub struct VsockMuxer {
     /// Host DNS forwarder that answers every guest UDP DNS query, if set.
     dns_forwarder: Option<std::net::SocketAddr>,
     snapshot_gate: Arc<SnapshotGate>,
+    /// Stop host event handlers before pausing their nested guest-RX writes.
+    host_event_gate: Arc<SnapshotGate>,
     /// Redirect guest stream connects to one destination port through a host
     /// interceptor (see `krun_set_stream_intercept`). Applied after the egress
     /// policy admitted the real destination.
@@ -286,6 +290,7 @@ impl VsockMuxer {
             dns_sender: None,
             dns_forwarder,
             snapshot_gate: Arc::new(SnapshotGate::default()),
+            host_event_gate: Arc::new(SnapshotGate::default()),
             stream_intercept,
             failed_creates: Mutex::new(FailedCreates::default()),
         }
@@ -409,6 +414,7 @@ impl VsockMuxer {
             sender.clone(),
             self.unix_ipc_port_map.clone().unwrap_or_default(),
             self.snapshot_gate.clone(),
+            self.host_event_gate.clone(),
             #[cfg(target_os = "macos")]
             self.host_icmp
                 .as_ref()
@@ -435,6 +441,11 @@ impl VsockMuxer {
     }
 
     pub(crate) fn quiesce_for_snapshot(&self) {
+        // A handler can hold a proxy/table lock while entering the RX gate.
+        // Drain whole handlers first so restore can safely inspect or replace
+        // proxies after RX has stopped. These gates must not be nested in the
+        // opposite order, or pause would wait on its own blocked producer.
+        self.host_event_gate.pause();
         self.snapshot_gate.pause();
         // A producer normally signals just after releasing the RX queue. If
         // snapshot quiescing lands in that small gap, make the already-written
@@ -448,6 +459,7 @@ impl VsockMuxer {
 
     pub(crate) fn rearm_after_snapshot(&self) {
         self.snapshot_gate.resume();
+        self.host_event_gate.resume();
     }
 
     /// Deliver nothing to the guest until it has handled a transport reset.
@@ -455,18 +467,28 @@ impl VsockMuxer {
     /// The guest handles the reset event asynchronously and resets every
     /// connected socket it has at that moment, without telling the peer. A
     /// host connection delivered before that would be reset too, and its host
-    /// end would wait forever. `fallback` bounds the hold for a guest that
-    /// never acknowledges the event.
-    pub(crate) fn hold_rx_for_transport_reset(&self, fallback: std::time::Duration) {
+    /// end would wait forever. The fallback is armed after activation, once
+    /// the device's TX event is available to wake held requests.
+    pub(crate) fn hold_rx_for_transport_reset(&self) {
         self.snapshot_gate.hold_for_transport_reset();
+    }
+
+    pub(crate) fn arm_transport_reset_timeout(&self, fallback: Duration, tx_event: Arc<EventFd>) {
         let gate = self.snapshot_gate.clone();
+        let Some(generation) = gate.transport_reset_generation() else {
+            return;
+        };
         std::thread::Builder::new()
             .name("vsock-reset-hold".into())
             .spawn(move || {
                 std::thread::sleep(fallback);
-                if gate.is_held_for_transport_reset() {
+                if gate.expire_transport_reset(generation) {
                     warn!("vsock: guest did not acknowledge the transport reset; releasing RX");
-                    gate.release_transport_reset();
+                    // A TX event may have been consumed while RX was held.
+                    // Wake the device loop to drain it even without a guest ACK.
+                    if let Err(error) = tx_event.write(1) {
+                        error!("vsock: failed to wake TX after reset timeout: {error}");
+                    }
                 }
             })
             .map(drop)
@@ -565,11 +587,9 @@ impl VsockMuxer {
     /// Drops every active connection proxy — agent unix-IPC connections *and*
     /// TSI network-egress sockets — which closes their host fds (also removing
     /// them from the shared epoll, since closing an fd evicts it) and clears the
-    /// pending RX queue. **Listener/acceptor proxies are preserved** so the
-    /// muxer keeps accepting new connections on the configured unix-IPC ports
-    /// (e.g. the agent channel). The guest, rewound to the checkpoint, has no
-    /// live connections either, so both sides start clean and the host
-    /// reconnects on its next request.
+    /// pending RX queue. Host IPC acceptors are preserved (e.g. the agent
+    /// channel); TSI listeners are dropped and rebuilt from the checkpoint.
+    /// The guest receives a transport reset so its old streams reconnect too.
     ///
     /// Safe to call concurrently with the `MuxerThread`: the proxy_map/rxq are
     /// the same `RwLock`/`Mutex`-guarded structures it uses, and it tolerates a
@@ -582,12 +602,18 @@ impl VsockMuxer {
             before - map.len()
         };
         self.rxq.lock().unwrap().clear();
+        self.pending_datagram_rx.lock().unwrap().clear();
+        self.failed_creates.lock().unwrap().errnos.clear();
         info!("vsock muxer reset on restore: dropped {removed} connection proxy(ies)");
     }
 
     /// Capture every live TSI inbound-port-forward listener for VM checkpoint/fork
     /// (see [`ListenerDesc`]). The muxer's `proxy_map` is otherwise not part of the
     /// device snapshot, so without this a fork clone loses all inbound forwards.
+    pub(crate) fn host_network_enabled(&self) -> bool {
+        self.tsi_flags.contains(TsiFlags::HOST_BIND)
+    }
+
     pub(crate) fn snapshot_listeners(&self) -> Vec<ListenerDesc> {
         self.proxy_map
             .read()
@@ -603,24 +629,26 @@ impl VsockMuxer {
     /// so the host side must be rebuilt here. Must run after [`Self::activate`]
     /// (needs `mem`/`queue`). Preserves each listener's `peer_port`/`control_port`
     /// so host-accepted connections route to the guest's existing socket.
-    pub(crate) fn restore_listeners(&self, descs: Vec<ListenerDesc>) {
-        let mem = match self.mem.as_ref() {
-            Some(m) => m.clone(),
-            None => {
-                warn!(
-                    "restore_listeners before activation; skipping {} listener(s)",
-                    descs.len()
-                );
-                return;
-            }
-        };
-        let queue = match self.queue.as_ref() {
-            Some(q) => q.clone(),
-            None => return,
-        };
+    pub(crate) fn restore_listeners(&self, descs: Vec<ListenerDesc>) -> Result<(), String> {
+        let mem = self
+            .mem
+            .as_ref()
+            .ok_or("restore listeners before memory activation")?;
+        let queue = self
+            .queue
+            .as_ref()
+            .ok_or("restore listeners before queue activation")?;
+        // Prepare every socket before installing any. A conflict must return
+        // an error and leave no partially restored listeners in the muxer.
+        let mut prepared = Vec::with_capacity(descs.len());
         for d in descs {
             let id = ((d.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-            match TsiStreamProxy::new(
+            if self.proxy_map.read().unwrap().contains_key(&id)
+                || prepared.iter().any(|(other, _)| *other == id)
+            {
+                return Err(format!("duplicate restored listener {id:#x}"));
+            }
+            let mut proxy = TsiStreamProxy::new(
                 id,
                 self.cid,
                 d.family,
@@ -632,30 +660,20 @@ impl VsockMuxer {
                 self.rxq.clone(),
                 self.snapshot_gate.clone(),
                 self.tsi_flags.contains(TsiFlags::HOST_BIND),
-            ) {
-                Ok(mut proxy) => {
-                    let rc = proxy.relisten(d.guest_port, d.backlog, &self.host_port_map);
-                    if rc == 0 {
-                        let fd = proxy.poll_handle();
-                        self.proxy_map
-                            .write()
-                            .unwrap()
-                            .insert(id, Arc::new(Mutex::new(Box::new(proxy))));
-                        self.update_polling(id, fd, EventSet::IN);
-                        info!(
-                            "restored TSI inbound listener: guest_port={} (id={:#x})",
-                            d.guest_port, id
-                        );
-                    } else {
-                        warn!(
-                            "failed to restore TSI listener guest_port={}: errno {}",
-                            d.guest_port, -rc
-                        );
-                    }
-                }
-                Err(e) => warn!("failed to recreate TSI listener proxy: {e}"),
-            }
+            )
+            .map_err(|e| format!("recreate listener {}: {e}", d.guest_port))?;
+            proxy.relisten(&d, &self.host_port_map)?;
+            prepared.push((id, proxy));
         }
+        for (id, proxy) in prepared {
+            let fd = proxy.poll_handle();
+            self.proxy_map
+                .write()
+                .unwrap()
+                .insert(id, Arc::new(Mutex::new(Box::new(proxy))));
+            self.update_polling(id, fd, EventSet::IN);
+        }
+        Ok(())
     }
 
     pub fn update_polling(&self, id: u64, fd: ProxyRawHandle, evset: EventSet) {
@@ -1064,6 +1082,32 @@ impl VsockMuxer {
         });
     }
 
+    fn process_listener_shutdown(&self, pkt: &VsockPacket) {
+        let data = pkt.data().filter(|data| data.len() == 8);
+        let (result, update) = if let Some(data) = data {
+            let peer = u32::from_le_bytes(data[..4].try_into().unwrap());
+            let mode = u32::from_le_bytes(data[4..].try_into().unwrap());
+            let id = ((peer as u64) << 32) | defs::TSI_PROXY_PORT as u64;
+            match self.proxy_map.read().unwrap().get(&id) {
+                Some(proxy) => {
+                    let (result, update) = proxy.lock().unwrap().shutdown_listener(mode);
+                    (result, Some((id, (proxy.clone(), update))))
+                }
+                None => (-9, None),
+            }
+        } else {
+            (-22, None)
+        };
+        if let Some((id, update)) = update {
+            self.process_proxy_update(id, update);
+        }
+        self.push_packet(MuxerRx::BindResponse {
+            local_port: pkt.dst_port(),
+            peer_port: pkt.src_port(),
+            data: BindResponse::status(if result == 0 { Ok(()) } else { Err(result) }),
+        });
+    }
+
     fn process_bind_request(&self, pkt: &VsockPacket) {
         // This is a new capability, not a way around the legacy publishing
         // allow-list. Even an empty map deliberately forbids direct host binds.
@@ -1152,12 +1196,12 @@ impl VsockMuxer {
         if let Some(req) = pkt.read_accept_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
             debug!("DGRAM accept request: id={id}");
-            let update = self
-                .proxy_map
-                .read()
-                .unwrap()
-                .get(&id)
-                .map(|proxy| (proxy.clone(), proxy.lock().unwrap().accept(req)));
+            let update = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+                (
+                    proxy.clone(),
+                    proxy.lock().unwrap().accept(pkt.src_port(), req),
+                )
+            });
             match update {
                 Some(update) => self.process_proxy_update(id, update),
                 None => self.push_packet(MuxerRx::AcceptResponse {
@@ -1237,6 +1281,9 @@ impl VsockMuxer {
             defs::TSI_BIND => self.process_bind_request(pkt),
             defs::TSI_HOST_SETSOCKOPT => self.process_host_setsockopt(pkt),
             defs::TSI_HOST_STREAM_CLOSE => self.process_host_stream_close(pkt),
+            defs::TSI_LISTENER_SHUTDOWN if self.tsi_flags.tsi_enabled() => {
+                self.process_listener_shutdown(pkt)
+            }
             defs::TSI_HOST_SENDTO_ADDR => self.process_host_sendto_addr(pkt),
             defs::TSI_LISTEN if self.tsi_flags.tsi_enabled() => self.process_listen_request(pkt),
             defs::TSI_ACCEPT if self.tsi_flags.tsi_enabled() => self.process_accept_request(pkt),
@@ -1755,7 +1802,7 @@ mod tests {
         ) -> ProxyUpdate {
             removal()
         }
-        fn accept(&mut self, _: super::super::packet::TsiAcceptReq) -> ProxyUpdate {
+        fn accept(&mut self, _: u32, _: super::super::packet::TsiAcceptReq) -> ProxyUpdate {
             removal()
         }
         fn update_peer_credit(&mut self, _: &VsockPacket) -> ProxyUpdate {

@@ -38,6 +38,8 @@ mod tsi_stream;
 mod unix;
 mod vsock_addr;
 
+pub const HOST_NETWORK_ABI_VERSION: u32 = 8;
+
 pub use self::defs::TsiFlags;
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
 pub use self::device::{Vsock, VsockState};
@@ -114,6 +116,7 @@ mod defs {
     pub const TSI_HOST_SENDTO_ADDR: u32 = 1033;
     pub const TSI_HOST_SETSOCKOPT: u32 = 1034;
     pub const TSI_HOST_STREAM_CLOSE: u32 = 1035;
+    pub const TSI_LISTENER_SHUTDOWN: u32 = 1036;
 
     // Linux definitions that we need for cross-platform compatibility.
     // AF_UNIX over TSI is Linux-only; the constant is unused on macOS/Windows.

@@ -5,6 +5,7 @@ struct GateState {
     paused: bool,
     /// RX is held until a restored guest has handled a transport reset.
     transport_reset: bool,
+    reset_generation: u64,
     active: usize,
 }
 
@@ -56,7 +57,9 @@ impl SnapshotGate {
     /// Unlike [`pause`](Self::pause) this does not wait for active producers:
     /// it is set before the restored guest runs, when none can be mid-packet.
     pub(super) fn hold_for_transport_reset(&self) {
-        self.state.lock().unwrap().transport_reset = true;
+        let mut state = self.state.lock().unwrap();
+        state.reset_generation = state.reset_generation.wrapping_add(1);
+        state.transport_reset = true;
     }
 
     pub(super) fn release_transport_reset(&self) {
@@ -65,6 +68,22 @@ impl SnapshotGate {
             state.transport_reset = false;
             self.changed.notify_all();
         }
+    }
+
+    pub(super) fn transport_reset_generation(&self) -> Option<u64> {
+        let state = self.state.lock().unwrap();
+        state.transport_reset.then_some(state.reset_generation)
+    }
+
+    /// A timer from a previous restore must not release a later restore's gate.
+    pub(super) fn expire_transport_reset(&self, generation: u64) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !state.transport_reset || state.reset_generation != generation {
+            return false;
+        }
+        state.transport_reset = false;
+        self.changed.notify_all();
+        true
     }
 
     pub(super) fn is_held_for_transport_reset(&self) -> bool {
@@ -99,6 +118,21 @@ mod tests {
     use std::time::Duration;
 
     use super::SnapshotGate;
+
+    #[test]
+    fn an_old_reset_timeout_cannot_release_a_later_restore() {
+        let gate = SnapshotGate::default();
+        gate.hold_for_transport_reset();
+        let old = gate.transport_reset_generation().unwrap();
+        gate.release_transport_reset();
+        gate.hold_for_transport_reset();
+        let current = gate.transport_reset_generation().unwrap();
+        assert!(!gate.expire_transport_reset(old));
+        assert!(gate.is_held_for_transport_reset());
+        assert!(gate.expire_transport_reset(current));
+        assert!(!gate.expire_transport_reset(current));
+        assert!(!gate.is_held_for_transport_reset());
+    }
 
     #[test]
     fn a_producer_holding_other_locks_never_waits_at_a_closed_gate() {

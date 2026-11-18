@@ -195,7 +195,9 @@ pub trait VirtioDevice: AsAny + Send {
     /// guest has already completed that handshake and will not re-send it — so
     /// the console must restart its port workers here, or the guest hard-spins
     /// writing console output to a queue nobody drains. Default: no-op.
-    fn finish_restore_activation(&mut self) {}
+    fn finish_restore_activation(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub trait VmmExitObserver: Send {

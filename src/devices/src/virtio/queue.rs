@@ -527,7 +527,15 @@ impl Queue {
 
     /// Pop the first available descriptor chain from the avail ring.
     pub fn pop<'b>(&mut self, mem: &'b GuestMemoryMmap) -> Option<DescriptorChain<'b>> {
-        if self.len(mem) == 0 || self.actual_size() == 0 {
+        let pending = self.len(mem);
+        if pending == 0 || self.actual_size() == 0 {
+            return None;
+        }
+        if pending > self.actual_size() {
+            error!(
+                "invalid available ring index: {pending} entries exceed queue capacity {}",
+                self.actual_size()
+            );
             return None;
         }
 
@@ -1033,6 +1041,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pop_rejects_impossible_backlogs_but_accepts_counter_wrap() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0), &mem, 8);
+        ring.dtable[0].addr.set(0x1000);
+        ring.dtable[0].len.set(4);
+        let mut queue = ring.create_queue();
+        for (consumer, producer) in [(1, 0), (0, 9)] {
+            queue.next_avail = Wrapping(consumer);
+            ring.avail.idx.set(producer);
+            let before = queue.save_state();
+            assert!(queue.pop(&mem).is_none());
+            assert_eq!(queue.save_state(), before);
+        }
+        queue.next_avail = Wrapping(u16::MAX);
+        ring.avail.idx.set(0);
+        ring.avail.ring[7].set(0);
+        assert_eq!(queue.pop(&mem).unwrap().index, 0);
+        assert_eq!(queue.next_avail, Wrapping(0));
+    }
+
+    #[test]
     fn test_queue_state_save_restore_roundtrip() {
         // A queue caught mid-stream: event-idx negotiated, 42 avail consumed,
         // 40 used produced (2 chains in flight). All of this must survive a
@@ -1255,8 +1284,8 @@ pub(crate) mod tests {
 
         // Let's create two simple descriptor chains.
 
-        for j in 0..5 {
-            vq.dtable[j].set(
+        for (j, descriptor) in vq.dtable.iter().enumerate().take(5) {
+            descriptor.set(
                 0x1000 * (j + 1) as u64,
                 0x1000,
                 VIRTQ_DESC_F_NEXT,

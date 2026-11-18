@@ -116,7 +116,7 @@ impl GenerationGuardian {
         if unsafe { libc::pipe2(status_pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        let child_pid = unsafe { raw_fork() };
+        let child_pid = unsafe { crate::fork_barrier::raw_fork() };
         if child_pid < 0 {
             let error = io::Error::last_os_error();
             unsafe {
@@ -547,6 +547,8 @@ unsafe fn guardian_loop(
             continue;
         }
         let guardian_pid = unsafe { libc::getpid() };
+        // This guardian is single-threaded and creates no transient mappings;
+        // only its original VMM fork needs the mapping-setup barrier.
         let worker = unsafe { raw_fork() };
         if worker == 0 {
             unsafe {

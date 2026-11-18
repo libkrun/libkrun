@@ -10,7 +10,7 @@ use socket2::Socket;
 
 use super::host_bind::BindRequest;
 use super::host_send::PendingHostSend;
-use super::host_sockopt::SocketBuffers;
+use super::host_sockopt::{ListenerOptions, SocketBuffers};
 use super::muxer::MuxerRx;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
 use super::vsock_addr::VsockAddr;
@@ -73,8 +73,8 @@ pub enum Family {
 /// intercepted by TSI and only ever issued once, so a snapshot-restored clone
 /// (whose app is already past `listen()`) never re-arms the host-side listener —
 /// the muxer's `proxy_map` is not part of the device snapshot. On restore the
-/// muxer rebuilds each listener from this descriptor using the *clone's* own
-/// host port map, so its remapped inbound port works. `peer_port`/`control_port`
+/// muxer rebuilds each listener from this descriptor, retaining host-network
+/// bindings or applying the clone's explicit publishing map. `peer_port`/`control_port`
 /// are the guest socket's TSI ports (preserved verbatim so host-accepted
 /// connections route to the guest's still-listening, CoW-restored socket).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,12 +83,27 @@ pub struct ListenerDesc {
     pub family: u16,
     /// Guest socket's TSI port (the `id` high word).
     pub peer_port: u32,
-    /// Guest control port for this proxy (`pkt.src_port()` at create time).
+    /// Reply port for creation or the latest legacy accept request.
     pub control_port: u32,
     /// Guest listen port — the key into the host port map.
     pub guest_port: u16,
     /// Listen backlog the guest requested.
     pub backlog: i32,
+    /// Absent in older snapshots, which restore through explicit port maps.
+    /// Capture errors remain explicit rather than silently losing a listener.
+    #[serde(default)]
+    pub socket: Option<Result<ListenerSocketState, String>>,
+    #[serde(default)]
+    pub accept_pending: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenerSocketState {
+    pub address: SocketAddr,
+    pub requested_bind: Option<SocketAddr>,
+    pub host_network: bool,
+    pub options: ListenerOptions,
+    pub buffers: SocketBuffers,
 }
 
 #[derive(Debug)]
@@ -270,7 +285,7 @@ pub trait Proxy: Send {
         req: TsiListenReq,
         host_port_map: &Option<HashMap<u16, u16>>,
     ) -> ProxyUpdate;
-    fn accept(&mut self, req: TsiAcceptReq) -> ProxyUpdate;
+    fn accept(&mut self, control_port: u32, req: TsiAcceptReq) -> ProxyUpdate;
     fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
     fn request_credit(&mut self) -> ProxyUpdate {
         ProxyUpdate::default()
@@ -281,6 +296,9 @@ pub trait Proxy: Send {
     fn push_accept_rsp(&self, _result: i32) {}
     fn shutdown(&mut self, _pkt: &VsockPacket) -> ProxyUpdate {
         ProxyUpdate::default()
+    }
+    fn shutdown_listener(&mut self, _mode: u32) -> (i32, ProxyUpdate) {
+        (-95, ProxyUpdate::default())
     }
     fn release(&mut self) -> ProxyUpdate;
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate;

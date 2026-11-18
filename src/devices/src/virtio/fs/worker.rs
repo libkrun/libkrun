@@ -305,6 +305,49 @@ impl FsWorker {
             .collect()
     }
 
+    /// Validate all replacement queues before changing any stopped worker.
+    pub(super) fn prepare_rewind(
+        &self,
+        states: &[Option<crate::virtio::queue::QueueState>],
+    ) -> Result<Vec<Queue>, String> {
+        self.queues
+            .iter()
+            .map(|current| {
+                let state = states
+                    .get(current.index)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| {
+                        format!("missing filesystem queue {} in checkpoint", current.index)
+                    })?;
+                let mut queue = Queue::new(current.queue.get_max_size());
+                queue.restore_state(state)?;
+                if queue.ready && !queue.is_valid(&self.mem) {
+                    return Err(format!(
+                        "invalid filesystem queue {} in checkpoint",
+                        current.index
+                    ));
+                }
+                Ok(queue)
+            })
+            .collect()
+    }
+
+    pub(super) fn apply_rewind(&mut self, queues: Vec<Queue>, server: Arc<FsServer>) {
+        for (current, restored) in self.queues.iter_mut().zip(queues) {
+            current.queue = restored;
+            // The old eventfd is not checkpointed. Ensure restored pending work
+            // is examined when this worker is rearmed, even without a guest kick.
+            if let Err(error) = current.event.write(1) {
+                error!("failed to wake restored filesystem queue: {error}");
+            }
+        }
+        self.server = server;
+        #[cfg(target_os = "linux")]
+        {
+            self.request_poll_after = Instant::now();
+        }
+    }
+
     /// Snapshot the FUSE passthrough server's logical state (inode/handle maps as
     /// host paths) for checkpoint/fork. Call only while the worker is stopped.
     pub(super) fn save_fuse_state(&self) -> Option<FuseServerState> {

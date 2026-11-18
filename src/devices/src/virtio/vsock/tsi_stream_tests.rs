@@ -284,13 +284,13 @@ fn redirected_connections_keep_guest_address_family_and_explicit_reservations() 
                 drop(epoll);
                 drop(proxy);
                 drop(remote);
-                if guest_ip.is_ipv4() != endpoint_ip.is_ipv4() {
-                    if let Some(bound) = bound {
-                        Socket::new(domain, Type::STREAM, None)
-                            .unwrap()
-                            .bind(&bound.into())
-                            .unwrap();
-                    }
+                if guest_ip.is_ipv4() != endpoint_ip.is_ipv4()
+                    && let Some(bound) = bound
+                {
+                    Socket::new(domain, Type::STREAM, None)
+                        .unwrap()
+                        .bind(&bound.into())
+                        .unwrap();
                 }
             }
         }

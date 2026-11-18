@@ -230,8 +230,9 @@ impl VirtioDevice for MemoryDevice {
         self.quiesced = false;
         self.kick();
     }
-    fn finish_restore_activation(&mut self) {
+    fn finish_restore_activation(&mut self) -> Result<(), String> {
         self.kick();
+        Ok(())
     }
     // Do not claim reset support until the event registrations and plugged
     // memory lifecycle can both be reset safely.

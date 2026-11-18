@@ -3,7 +3,8 @@ use utils::eventfd::EventFd;
 use vm_memory::{Bytes, GuestMemory, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, RngError, VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, Queue, QueueConfig, RngError,
+    VirtioDevice,
 };
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
@@ -53,12 +54,28 @@ impl Rng {
         }
     }
 
-    /// Restore negotiated features onto a freshly-built, not-yet-activated Rng.
-    /// The request-queue indices are re-applied when the device is re-activated
-    /// (cross-process fork uses `restore_and_activate`), and a fresh host
-    /// entropy source is wired up there.
+    /// Restore a fresh entropy device or its live, quiesced request queue.
     pub fn restore_state(&mut self, state: &RngState) -> Result<(), String> {
+        if self.is_activated() && !self.snapshot_quiesced {
+            return Err("entropy device must be quiesced before restoring its live queue".into());
+        }
+        if let Some(queues) = &mut self.queues {
+            let saved = state
+                .queue
+                .as_ref()
+                .ok_or("entropy checkpoint is missing its live queue")?;
+            let mut queue = Queue::new(queues[REQ_INDEX].queue.max_size);
+            queue.restore_state(saved)?;
+            if let DeviceState::Activated(mem, _) = &self.device_state
+                && queue.ready
+                && (!queue.is_valid(mem) || queue.len(mem) > queue.actual_size())
+            {
+                return Err("entropy checkpoint queue does not match restored memory".into());
+            }
+            queues[REQ_INDEX].queue = queue;
+        }
         self.acked_features = state.acked_features;
+        self.deferred_request = self.is_activated();
         Ok(())
     }
 }
@@ -150,10 +167,11 @@ impl VirtioDevice for Rng {
         }
     }
 
-    fn finish_restore_activation(&mut self) {
+    fn finish_restore_activation(&mut self) -> Result<(), String> {
         // Queue indices survive restore; the host eventfd counter does not.
         // Check the restored queue even when no new guest kick arrives.
         self.notify_pending_request();
+        Ok(())
     }
 
     fn avail_features(&self) -> u64 {
@@ -316,6 +334,45 @@ mod checkpoint_tests {
     }
 
     #[test]
+    fn live_entropy_rewind_restores_and_rearms_the_saved_request() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0x1000), &memory, 8);
+        let event = Arc::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
+        let mut rng = Rng::new().unwrap();
+        rng.activate(
+            memory.clone(),
+            InterruptTransport::new(DummyIrqChip::new().into(), "rewind test".into()).unwrap(),
+            vec![DeviceQueue::new(ring.create_queue(), Arc::clone(&event))],
+        )
+        .unwrap();
+        ring.dtable[0].addr.set(0x10000);
+        ring.dtable[0].len.set(64);
+        ring.dtable[0].flags.set(2);
+        ring.avail.ring[0].set(0);
+        ring.avail.idx.set(1);
+        rng.quiesce_for_snapshot();
+        let checkpoint = rng.save_state();
+        rng.rearm_after_snapshot();
+        assert!(rng.process_req());
+        rng.quiesce_for_snapshot();
+        ring.used.idx.set(0);
+        rng.restore_state(&checkpoint).unwrap();
+        assert_eq!(rng.save_state(), checkpoint);
+        let mut invalid = checkpoint.clone();
+        invalid.acked_features = 123;
+        invalid.queue.as_mut().unwrap().size = 9;
+        assert!(rng.restore_state(&invalid).is_err());
+        assert_eq!(rng.save_state(), checkpoint);
+        rng.rearm_after_snapshot();
+        rng.handle_req_event(&EpollEvent::new(EventSet::IN, event.as_raw_fd() as u64));
+        assert_eq!(ring.used.idx.get(), 1);
+        assert!(
+            rng.restore_state(&checkpoint).is_err(),
+            "live restore requires quiescence"
+        );
+    }
+
+    #[test]
     fn restored_entropy_request_does_not_need_a_new_guest_kick() {
         let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
         let ring = VirtQueue::new(GuestAddress(0x1000), &memory, 8);
@@ -337,7 +394,7 @@ mod checkpoint_tests {
             event.read().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
-        rng.finish_restore_activation();
+        rng.finish_restore_activation().unwrap();
         rng.handle_req_event(&EpollEvent::new(EventSet::IN, event.as_raw_fd() as u64));
         assert_eq!(ring.used.idx.get(), 1);
     }
@@ -349,7 +406,7 @@ mod checkpoint_tests {
         assert!(!rng.process_req());
         rng.rearm_after_snapshot();
         rng.rearm_after_snapshot();
-        rng.finish_restore_activation();
+        rng.finish_restore_activation().unwrap();
         rng.quiesce_for_snapshot();
         assert!(rng.reset());
         assert!(!rng.snapshot_quiesced);

@@ -32,6 +32,7 @@ pub struct MuxerThread {
     /// AF_UNIX host-IPC listeners; consumed by `create_lisening_ipc_sockets`.
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
     snapshot_gate: Arc<SnapshotGate>,
+    host_event_gate: Arc<SnapshotGate>,
     #[cfg(target_os = "macos")]
     host_icmp: Option<Arc<super::macos_icmp::MacIcmp>>,
     #[cfg(target_os = "macos")]
@@ -51,6 +52,7 @@ impl MuxerThread {
         reaper_sender: Sender<ReapRequest>,
         unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
         snapshot_gate: Arc<SnapshotGate>,
+        host_event_gate: Arc<SnapshotGate>,
         #[cfg(target_os = "macos")] host_icmp: Option<Arc<super::macos_icmp::MacIcmp>>,
         #[cfg(target_os = "macos")] host_udp_router: Option<
             Arc<super::macos_udp_router::DatagramRouter>,
@@ -67,6 +69,7 @@ impl MuxerThread {
             reaper_sender,
             unix_ipc_port_map,
             snapshot_gate,
+            host_event_gate,
             #[cfg(target_os = "macos")]
             host_icmp,
             #[cfg(target_os = "macos")]
@@ -238,12 +241,68 @@ impl MuxerThread {
         );
     }
 
+    pub(super) fn process_host_event(&self, id: u64, evset: EventSet, thread_rng: &mut ThreadRng) {
+        // Wait before acquiring any proxy/table lock or accepting a host socket.
+        let _activity = self.host_event_gate.enter();
+        #[cfg(target_os = "macos")]
+        if id == super::macos_udp_router::ROUTER_EVENT {
+            if let Some(router) = &self.host_udp_router {
+                for recipient in router.take_ready() {
+                    let update = self.proxy_map.read().unwrap().get(&recipient).map(|proxy| {
+                        (
+                            proxy.clone(),
+                            proxy.lock().unwrap().process_event(EventSet::IN),
+                        )
+                    });
+                    if let Some(update) = update {
+                        self.process_proxy_update(recipient, update, thread_rng);
+                    }
+                }
+            }
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if super::macos_icmp::MacIcmp::owns_event(id) {
+            if let Some(collector) = &self.host_icmp {
+                for error in collector.receive(id) {
+                    let update = self
+                        .proxy_map
+                        .read()
+                        .unwrap()
+                        .iter()
+                        .find_map(|(id, proxy)| {
+                            proxy
+                                .lock()
+                                .unwrap()
+                                .receive_host_error(&error)
+                                .map(|update| (*id, (proxy.clone(), update)))
+                        });
+                    if let Some((id, update)) = update {
+                        self.process_proxy_update(id, update, thread_rng);
+                    }
+                }
+            }
+            return;
+        }
+        let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
+            let mut proxy = proxy_lock.lock().unwrap();
+            (proxy_lock.clone(), proxy.process_event(evset))
+        });
+
+        if let Some(update) = update {
+            self.process_proxy_update(id, update, thread_rng);
+        }
+    }
+
     fn work(mut self) {
         let work_start = std::time::Instant::now();
         debug!("[VSOCK_TIMING] MuxerThread work() started");
 
         let mut thread_rng = rng();
-        self.create_lisening_ipc_sockets();
+        {
+            let _activity = self.host_event_gate.enter();
+            self.create_lisening_ipc_sockets();
+        }
 
         debug!(
             "[VSOCK_TIMING] MuxerThread entering epoll loop after {:?}",
@@ -281,60 +340,7 @@ impl MuxerThread {
                             );
                         }
 
-                        #[cfg(target_os = "macos")]
-                        if id == super::macos_udp_router::ROUTER_EVENT {
-                            if let Some(router) = &self.host_udp_router {
-                                for recipient in router.take_ready() {
-                                    let update = self
-                                        .proxy_map
-                                        .read()
-                                        .unwrap()
-                                        .get(&recipient)
-                                        .map(|proxy| {
-                                            (
-                                                proxy.clone(),
-                                                proxy.lock().unwrap().process_event(EventSet::IN),
-                                            )
-                                        });
-                                    if let Some(update) = update {
-                                        self.process_proxy_update(
-                                            recipient,
-                                            update,
-                                            &mut thread_rng,
-                                        );
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                        #[cfg(target_os = "macos")]
-                        if super::macos_icmp::MacIcmp::owns_event(id) {
-                            if let Some(collector) = &self.host_icmp {
-                                for error in collector.receive(id) {
-                                    let update = self.proxy_map.read().unwrap().iter().find_map(
-                                        |(id, proxy)| {
-                                            proxy
-                                                .lock()
-                                                .unwrap()
-                                                .receive_host_error(&error)
-                                                .map(|update| (*id, (proxy.clone(), update)))
-                                        },
-                                    );
-                                    if let Some((id, update)) = update {
-                                        self.process_proxy_update(id, update, &mut thread_rng);
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                        let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
-                            let mut proxy = proxy_lock.lock().unwrap();
-                            (proxy_lock.clone(), proxy.process_event(evset))
-                        });
-
-                        if let Some(update) = update {
-                            self.process_proxy_update(id, update, &mut thread_rng);
-                        }
+                        self.process_host_event(id, evset, &mut thread_rng);
                     }
                 }
                 Err(e) => {
