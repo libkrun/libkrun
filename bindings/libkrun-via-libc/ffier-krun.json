@@ -2896,6 +2896,39 @@
             "type": "Self"
           },
           "ffi_name": "krun_display_info_builder_refresh_rate"
+        },
+        {
+          "name": "edid_name",
+          "doc": [
+            " Set the PNP manufacturer ID and product name of the generated EDID.",
+            "",
+            " `manufacturer` must be exactly 3 ASCII uppercase letters and",
+            " `display_name` at most 13 bytes, matching the EDID descriptor limits."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "manufacturer",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "display_name",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_display_info_builder_edid_name"
         }
       ],
       "cfg": {
