@@ -113,6 +113,10 @@ pub fn test_cases() -> Vec<TestCase> {
         #[cfg(target_os = "linux")]
         TestCase::new("tsi-unix-host-close", Box::new(TestTsiUnixHostClose)),
         TestCase::new("net-passt", Box::new(TestNet::new_passt())),
+        TestCase::new(
+            "net-passt-off-subnet-gateway",
+            Box::new(TestNet::new_passt_off_subnet_gateway()),
+        ),
         TestCase::new("net-tap", Box::new(TestNet::new_tap())),
         TestCase::new("net-gvproxy", Box::new(TestNet::new_gvproxy())),
         TestCase::new(

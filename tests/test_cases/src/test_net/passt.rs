@@ -31,7 +31,7 @@ fn passt_available() -> bool {
         .unwrap_or(false)
 }
 
-fn start_passt() -> std::io::Result<RawFd> {
+fn start_passt(args: &[&str]) -> std::io::Result<RawFd> {
     use std::os::unix::process::CommandExt;
 
     let mut fds = [0 as libc::c_int; 2];
@@ -42,6 +42,7 @@ fn start_passt() -> std::io::Result<RawFd> {
 
     let mut cmd = Command::new("passt");
     cmd.args(["-f", "--fd", &child_fd.to_string()])
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null());
 
@@ -88,7 +89,29 @@ pub(crate) fn should_run() -> ShouldRun {
 }
 
 pub(crate) fn setup_backend(ctx: u32, _test_setup: &TestSetup) -> anyhow::Result<()> {
-    let passt_fd = start_passt()?;
+    setup_backend_with_passt_args(ctx, &[])
+}
+
+pub(crate) fn setup_backend_off_subnet_gateway(
+    ctx: u32,
+    _test_setup: &TestSetup,
+) -> anyhow::Result<()> {
+    setup_backend_with_passt_args(
+        ctx,
+        &[
+            "--ipv4-only",
+            "--address",
+            "192.0.2.2",
+            "--netmask",
+            "32",
+            "--gateway",
+            "192.0.2.1",
+        ],
+    )
+}
+
+fn setup_backend_with_passt_args(ctx: u32, args: &[&str]) -> anyhow::Result<()> {
+    let passt_fd = start_passt(args)?;
     let mut mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
 
     unsafe {
