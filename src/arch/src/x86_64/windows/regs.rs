@@ -176,14 +176,14 @@ mod tests {
     const GUEST_MEM_SIZE: usize = 0x10000;
 
     fn create_vm_and_vcpu(vcpu_count: u32) -> (Arc<WhpVm>, WhpVcpu) {
-        let vm = Arc::new(WhpVm::new(vcpu_count).unwrap());
+        let vm = Arc::new(WhpVm::new(vcpu_count, false).unwrap());
         let vcpu = WhpVcpu::new(vm.clone(), 0).unwrap();
         (vm, vcpu)
     }
 
     fn create_vm_with_memory() -> (Arc<WhpVm>, WhpVcpu, GuestMemoryMmap) {
         let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), GUEST_MEM_SIZE)]).unwrap();
-        let vm = Arc::new(WhpVm::new(1).unwrap());
+        let vm = Arc::new(WhpVm::new(1, false).unwrap());
 
         let host_addr = gm.get_host_address(GuestAddress(0)).unwrap();
         unsafe {
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn test_ap_starts_suspended() {
-        let vm = Arc::new(WhpVm::new(2).unwrap());
+        let vm = Arc::new(WhpVm::new(2, false).unwrap());
         let _bsp = WhpVcpu::new(vm.clone(), 0).unwrap();
         let ap = WhpVcpu::new(vm.clone(), 1).unwrap();
 
