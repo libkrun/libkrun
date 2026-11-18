@@ -25,7 +25,7 @@ use windows_sys::Wdk::Storage::FileSystem::FILE_NON_DIRECTORY_FILE;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_ACCESS_INFORMATION, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_INFORMATION,
     FILE_ID_BOTH_DIR_INFORMATION, FILE_OPEN, FILE_OPEN_BY_FILE_ID, FILE_OPEN_IF,
-    FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE, FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT,
+    FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT,
     FileAccessInformation, FileDispositionInformation, FileIdBothDirectoryInformation,
     NtCreateFile, NtQueryDirectoryFile, NtQueryInformationFile, NtSetInformationFile, NtWriteFile,
     RtlNtStatusToDosErrorNoTeb,
@@ -899,13 +899,12 @@ fn parse_linux_open_flags(linux_flags: i32, writeback: bool) -> OpenFlags {
     if flags & LINUX_O_CREAT != 0 {
         if flags & LINUX_O_EXCL != 0 {
             disposition = FILE_CREATE;
-        } else if flags & LINUX_O_TRUNC != 0 {
-            disposition = FILE_OVERWRITE_IF;
         } else {
             disposition = FILE_OPEN_IF;
         }
-    } else if flags & LINUX_O_TRUNC != 0 {
-        disposition = FILE_OVERWRITE;
+    }
+    // The caller truncates through the handle (`truncate_handle`).
+    if flags & LINUX_O_TRUNC != 0 {
         access |= GENERIC_WRITE;
     }
 
@@ -924,6 +923,13 @@ fn parse_linux_open_flags(linux_flags: i32, writeback: bool) -> OpenFlags {
         create_disposition: disposition,
         create_options: options,
     }
+}
+
+/// Empty an opened file's data. FILE_OVERWRITE(_IF) would also delete its
+/// named streams, which hold the Linux owner, mode and xattrs.
+fn truncate_handle(handle: HANDLE) -> io::Result<()> {
+    let file = mem::ManuallyDrop::new(unsafe { File::from_raw_handle(handle as RawHandle) });
+    file.set_len(0)
 }
 
 /// Open a file via NtCreateFile with case-sensitive semantics.
@@ -1615,6 +1621,12 @@ impl PassthroughFs {
         let h = open_by_id(root_h, data.file_index, &oflags)
             .or_else(|_| open_handle(&data.get_path(), &oflags))
             .map_err(win_err_to_linux)?;
+        if linux_flags as i32 & LINUX_O_TRUNC != 0
+            && let Err(e) = truncate_handle(h)
+        {
+            unsafe { CloseHandle(h) };
+            return Err(win_err_to_linux(e));
+        }
 
         if kill_priv {
             let path = data.get_path();
@@ -2519,6 +2531,12 @@ impl FileSystem for PassthroughFs {
         let wb = self.writeback.load(Ordering::Relaxed);
         let oflags = parse_linux_open_flags(flags as i32 | LINUX_O_CREAT, wb);
         let h = open_handle(&child_path, &oflags).map_err(win_err_to_linux)?;
+        if flags as i32 & LINUX_O_TRUNC != 0
+            && let Err(e) = truncate_handle(h)
+        {
+            unsafe { CloseHandle(h) };
+            return Err(win_err_to_linux(e));
+        }
 
         if let Some(secctx) = extensions.secctx {
             let stream_name = format!(":{}", secctx.name.to_string_lossy());
@@ -3108,5 +3126,89 @@ impl FileSystem for PassthroughFs {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // The Linux owner, mode and xattrs live in named streams, so a guest
+    // `printf v2 > file` must empty the data and leave them in place.
+    #[test]
+    fn a_truncating_open_keeps_the_owner_and_xattrs() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-truncate-streams-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::empty()).unwrap();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let xattr = c"user.kept";
+
+        for (name, creating) in [("open", false), ("create", true)] {
+            let path = root.join(name);
+            fs::write(&path, b"old data").unwrap();
+            write_override_stat(&path, Some((1000, 1000)), Some(S_IFREG as u32 | 0o640)).unwrap();
+            let c = CString::new(name).unwrap();
+            let inode = FileSystem::lookup(&filesystem, context, fuse::ROOT_ID, &c)
+                .unwrap()
+                .inode;
+            FileSystem::setxattr(&filesystem, context, inode, xattr, b"value", 0).unwrap();
+
+            let flags = (1 | LINUX_O_TRUNC) as u32; // O_WRONLY | O_TRUNC
+            if creating {
+                FileSystem::create(
+                    &filesystem,
+                    context,
+                    fuse::ROOT_ID,
+                    &c,
+                    0o640,
+                    false,
+                    flags | LINUX_O_CREAT as u32,
+                    0,
+                    Extensions::default(),
+                )
+                .unwrap();
+            } else {
+                FileSystem::open(&filesystem, context, inode, false, flags).unwrap();
+            }
+
+            assert_eq!(fs::read(&path).unwrap(), b"", "{name}: data emptied");
+            // `create` writes the caller's owner itself.
+            if !creating {
+                assert_eq!(
+                    read_override_stat(&path).unwrap(),
+                    (Some(1000), Some(1000), Some(S_IFREG as u32 | 0o640)),
+                    "{name}: owner and mode kept"
+                );
+            }
+            assert_eq!(
+                fs::read(ads_xattr_path(&path, xattr)).unwrap(),
+                b"value",
+                "{name}: xattr kept"
+            );
+        }
+        drop(filesystem);
+        fs::remove_dir_all(root).unwrap();
     }
 }
