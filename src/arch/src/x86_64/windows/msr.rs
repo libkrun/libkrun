@@ -40,7 +40,8 @@ mod tests {
             eprintln!("WHP hypervisor not available, skipping");
             return;
         }
-        let vm = std::sync::Arc::new(whp::WhpVm::new(1).expect("failed to create WHP partition"));
+        let vm =
+            std::sync::Arc::new(whp::WhpVm::new(1, false).expect("failed to create WHP partition"));
         let vcpu = whp::WhpVcpu::new(vm, 0).expect("failed to create vCPU");
         setup_msrs(&vcpu).expect("setup_msrs failed");
         let actual = vcpu
