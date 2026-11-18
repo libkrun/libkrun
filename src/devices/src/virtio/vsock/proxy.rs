@@ -222,6 +222,12 @@ pub trait Proxy: Send {
     /// Raw handle the muxer registers with the epoll layer for this proxy's host
     /// socket. Cross-platform replacement for the former `AsRawFd` supertrait.
     fn poll_handle(&self) -> ProxyRawHandle;
+    /// Recompute stream readiness while holding the proxy lock. An update may
+    /// have been produced before another thread changed its buffered output.
+    fn current_poll_interest(&self, requested: EventSet) -> EventSet {
+        requested
+    }
+
     fn id(&self) -> u64;
     #[allow(dead_code)]
     fn status(&self) -> ProxyStatus;

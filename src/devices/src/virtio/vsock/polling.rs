@@ -24,6 +24,10 @@ pub(super) fn update_live_polling(
     if proxy.poll_handle() != fd {
         return;
     }
+    // Ownership alone is insufficient: another thread may have queued or
+    // drained output after this update was produced. Apply the current stream
+    // interest under the same lock that protects those buffers.
+    let events = proxy.current_poll_interest(events);
     // Keep both guards until the complete delete/add pair has finished:
     // removal needs the map write lock, and peer updates need the proxy lock.
     let _ = epoll.ctl(ControlOperation::Delete, fd, &EpollEvent::default());

@@ -413,6 +413,14 @@ impl Proxy for UnixProxy {
         raw_handle(&self.sock)
     }
 
+    fn current_poll_interest(&self, requested: EventSet) -> EventSet {
+        match self.status {
+            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate => self.conn_evset(),
+            ProxyStatus::Closed | ProxyStatus::PeerClosed => EventSet::empty(),
+            _ => requested,
+        }
+    }
+
     fn id(&self) -> u64 {
         self.id
     }
@@ -1167,6 +1175,50 @@ mod tests {
         assert!(update.signal_queue);
         assert!(matches!(update.remove_proxy, ProxyRemoval::Deferred));
         assert!(update.polling.unwrap().2.is_empty());
+    }
+
+    #[test]
+    fn delayed_poll_updates_preserve_pending_output_and_idle_interest() {
+        use super::super::{muxer::ProxyMap, polling::update_live_polling};
+        use std::sync::RwLock;
+        use utils::epoll::{Epoll, EpollEvent};
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
+        let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+        let (mut proxy, mut peer) = proxy_with_peer(&mem, &rx);
+        proxy.status = ProxyStatus::Connected;
+        let (id, fd, old_interest) = proxy.repoll().unwrap();
+        // A host-read callback finishes before another thread queues output,
+        // but applies its IN-only update after that thread's IN|OUT update.
+        proxy.tx_buf.extend(b"pending response");
+        let new_interest = proxy.conn_evset();
+        let proxies: ProxyMap = Arc::new(RwLock::new(HashMap::from([(
+            id,
+            Arc::new(Mutex::new(Box::new(proxy) as Box<dyn Proxy>)),
+        )])));
+        let mut epoll = Epoll::new().unwrap();
+        update_live_polling(&proxies, &epoll, id, fd, new_interest);
+        update_live_polling(&proxies, &epoll, id, fd, old_interest);
+        let mut events: [EpollEvent; 2] = std::array::from_fn(|_| EpollEvent::default());
+        let ready = epoll.wait(2, 100, &mut events).unwrap();
+        assert!(
+            events[..ready]
+                .iter()
+                .any(|e| e.event_set().contains(EventSet::OUT)),
+            "delayed read interest lost the buffered response's write notification"
+        );
+
+        let update = proxies.read().unwrap()[&id]
+            .lock()
+            .unwrap()
+            .process_event(EventSet::OUT);
+        update_live_polling(&proxies, &epoll, id, fd, update.polling.unwrap().2);
+        // Conversely, an old write update must not leave an idle socket spinning.
+        update_live_polling(&proxies, &epoll, id, fd, new_interest);
+        assert_eq!(epoll.wait(2, 0, &mut events).unwrap(), 0);
+        let mut received = [0; 16];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"pending response");
     }
 
     #[test]
