@@ -837,8 +837,8 @@ impl PassthroughFs {
         inode: Inode,
         kill_priv: bool,
         flags: u32,
+        directory: bool,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        let directory = flags as i32 & libc::O_DIRECTORY != 0;
         let flags = self.parse_open_flags(flags as i32);
 
         let file = self.open_file(inode, flags, directory)?;
@@ -876,18 +876,11 @@ impl PassthroughFs {
 
         self.handles.write().unwrap().insert(handle, Arc::new(data));
 
-        let mut opts = OpenOptions::empty();
-        match self.cfg.cache_policy {
-            // We only set the direct I/O option on files.
-            CachePolicy::Never => opts.set(OpenOptions::DIRECT_IO, flags & libc::O_DIRECTORY == 0),
-            CachePolicy::Always => {
-                if flags & libc::O_DIRECTORY == 0 {
-                    opts |= OpenOptions::KEEP_CACHE;
-                } else {
-                    opts |= OpenOptions::CACHE_DIR;
-                }
-            }
-            _ => {}
+        let opts = match self.cfg.cache_policy {
+            CachePolicy::Never if !directory => OpenOptions::DIRECT_IO,
+            CachePolicy::Always if directory => OpenOptions::CACHE_DIR,
+            CachePolicy::Always => OpenOptions::KEEP_CACHE,
+            _ => OpenOptions::empty(),
         };
 
         Ok((Some(handle), opts))
@@ -1527,7 +1520,7 @@ impl FileSystem for PassthroughFs {
         inode: Inode,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        self.do_open(&ctx, inode, false, flags | libc::O_DIRECTORY as u32)
+        self.do_open(&ctx, inode, false, flags, true)
     }
 
     fn releasedir(
@@ -1648,7 +1641,7 @@ impl FileSystem for PassthroughFs {
         kill_priv: bool,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        self.do_open(&ctx, inode, kill_priv, flags)
+        self.do_open(&ctx, inode, kill_priv, flags, false)
     }
 
     fn release(
@@ -2887,6 +2880,7 @@ mod tests {
         gid: 0,
         pid: 0,
     };
+    const LINUX_ARM64_O_DIRECT: i32 = 1 << 16;
 
     struct Share {
         dir: PathBuf,
@@ -2895,12 +2889,17 @@ mod tests {
 
     impl Share {
         fn with_file(name: &str) -> Self {
+            Self::with_file_and_policy(name, CachePolicy::default())
+        }
+
+        fn with_file_and_policy(name: &str, cache_policy: CachePolicy) -> Self {
             let dir = std::env::temp_dir()
                 .join(format!("libkrun-passthrough-{}-{name}", std::process::id()));
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join(name), b"contents").unwrap();
             let cfg = Config {
                 root_dir: dir.to_str().unwrap().to_string(),
+                cache_policy,
                 ..Default::default()
             };
             let fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
@@ -2953,9 +2952,14 @@ mod tests {
         let inode = share.inode("flags");
 
         let plain = share.open(inode, libc::O_RDONLY);
-        let nonblocking = share.open(inode, libc::O_RDONLY | bindings::LINUX_O_NONBLOCK);
-
-        assert_eq!(share.fd(plain), share.fd(nonblocking));
+        for flags in [
+            bindings::LINUX_O_NONBLOCK,
+            bindings::LINUX_O_SYNC,
+            LINUX_ARM64_O_DIRECT,
+        ] {
+            let handle = share.open(inode, libc::O_RDONLY | flags);
+            assert_eq!(share.fd(plain), share.fd(handle), "flags {flags:#x}");
+        }
     }
 
     #[test]
@@ -2988,6 +2992,36 @@ mod tests {
             .unwrap();
 
         assert_ne!(share.fd(first), share.fd(second));
+    }
+
+    #[test]
+    fn cache_policy_applies_file_and_directory_options() {
+        for (name, policy, file_options, directory_options) in [
+            (
+                "uncached",
+                CachePolicy::Never,
+                OpenOptions::DIRECT_IO,
+                OpenOptions::empty(),
+            ),
+            (
+                "cached",
+                CachePolicy::Always,
+                OpenOptions::KEEP_CACHE,
+                OpenOptions::CACHE_DIR,
+            ),
+        ] {
+            let share = Share::with_file_and_policy(name, policy);
+            let inode = share.inode(name);
+            let flags = (libc::O_RDONLY | LINUX_ARM64_O_DIRECT) as u32;
+            let (_, options) = share.fs.open(CTX, inode, false, flags).unwrap();
+            assert_eq!(options, file_options, "{policy:?} file");
+
+            let (_, options) = share
+                .fs
+                .opendir(CTX, fuse::ROOT_ID, libc::O_RDONLY as u32)
+                .unwrap();
+            assert_eq!(options, directory_options, "{policy:?} directory");
+        }
     }
 
     #[test]
