@@ -770,7 +770,12 @@ impl Proxy for UnixProxy {
                 self.push_connect_rsp(0);
                 update.signal_queue = true;
                 update.polling = Some((self.id(), raw_handle(&self.sock), EventSet::IN));
-            } else if self.status == ProxyStatus::Connected {
+            } else if matches!(
+                self.status,
+                ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+            ) {
+                // Waiting for host->guest credit must not block the opposite
+                // direction: the guest may need to drain output before reading.
                 // Host socket drained: flush buffered guest->host bytes and
                 // re-open the guest's credit window without blocking (#1093).
                 match self.flush_tx() {
@@ -1080,6 +1085,66 @@ mod tests {
         let mut received = [0u8; 8192];
         let n = peer.read(&mut received).unwrap();
         assert_eq!(n, 10, "sent the whole descriptor instead of the packet");
+    }
+
+    #[test]
+    fn output_drains_while_input_waits_for_guest_credit() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
+        let (tx, rx) = (
+            TestQueue::new(GuestAddress(0x1000), &mem, 8),
+            TestQueue::new(GuestAddress(0x4000), &mem, 8),
+        );
+        let (mut proxy, mut peer) = proxy_with_peer(&mem, &rx);
+        proxy.sock.set_send_buffer_size(4096).unwrap();
+        peer.set_recv_buffer_size(4096).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        proxy.status = ProxyStatus::Connected;
+        let payload: Vec<u8> = (0..defs::MAX_PKT_BUF_SIZE)
+            .map(|n| (n % 251) as u8)
+            .collect();
+        mem.write_slice(&payload, GuestAddress(DATA)).unwrap();
+        proxy.sendmsg(&tx_packet(
+            &mem,
+            &tx,
+            payload.len() as u32,
+            payload.len() as u32,
+        ));
+        assert!(
+            !proxy.tx_buf.is_empty(),
+            "fixture must backpressure host output"
+        );
+
+        // Input has filled the guest's receive window while the guest is
+        // writing output: those independent directions must still progress.
+        proxy.status = ProxyStatus::WaitingCreditUpdate;
+        proxy.rx_paused = true;
+        let mut received = Vec::new();
+        let mut buf = [0; 8192];
+        for _ in 0..128 {
+            loop {
+                match peer.read(&mut buf) {
+                    Ok(0) => panic!("proxy closed before draining output"),
+                    Ok(n) => received.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("host read failed: {e}"),
+                }
+            }
+            if proxy.tx_buf.is_empty() {
+                break;
+            }
+            let pending = proxy.tx_buf.len();
+            let update = proxy.process_event(EventSet::OUT);
+            assert!(
+                proxy.tx_buf.len() < pending,
+                "writable output stopped behind input credit"
+            );
+            assert_eq!(proxy.status, ProxyStatus::WaitingCreditUpdate);
+            assert!(proxy.rx_paused);
+            assert!(!update.polling.unwrap().2.contains(EventSet::IN));
+        }
+        assert!(proxy.tx_buf.is_empty());
+        assert_eq!(received, payload);
+        assert_eq!(proxy.tx_cnt.0 as usize, payload.len());
     }
 
     #[test]
