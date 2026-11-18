@@ -979,6 +979,7 @@ pub struct Vcpu {
     // The receiving end of the responses channel which will be given to the handler.
     response_receiver: Option<Receiver<VcpuResponse>>,
     // The transmitting end of the responses channel owned by the vcpu side.
+    #[cfg_attr(test, allow(dead_code))]
     response_sender: Sender<VcpuResponse>,
 
     #[cfg(feature = "tee")]
@@ -1655,99 +1656,86 @@ impl Vcpu {
 
     // This is the main loop of the `Running` state.
     fn running(&mut self) -> StateMachine<Self> {
-        // This loop is here just for optimizing the emulation path.
-        // No point in ticking the state machine if there are no external events.
         loop {
-            match self.run_emulation() {
-                // Emulation ran successfully, continue.
-                Ok(VcpuEmulation::Handled) => (),
-                // Emulation was interrupted, check external events.
-                Ok(VcpuEmulation::Interrupted) => break,
-                // If the guest was rebooted or halted:
-                // - vCPU0 will always exit out of `KVM_RUN` with KVM_EXIT_SHUTDOWN or
-                //   KVM_EXIT_HLT.
-                // - the other vCPUs won't ever exit out of `KVM_RUN`, but they won't consume CPU.
-                // Moreover if we allow the vCPU0 thread to finish execution, this might generate a
-                // seccomp failure because musl calls `sigprocmask` as part of `pthread_exit`.
-                // So we pause vCPU0 and send a signal to the emulation thread to stop the VMM.
-                Ok(VcpuEmulation::Stopped) => {
-                    return self.exit(VcpuResponse::Exited(FC_EXIT_CODE_OK));
+            // Several queued requests can share one KVM kick.
+            match self.event_receiver.try_recv() {
+                Ok(VcpuEvent::Pause(reply)) => {
+                    let _ = reply.send(self.pause_response());
+                    return StateMachine::next(Self::paused);
                 }
-                Ok(VcpuEmulation::Reset) => return self.exit(VcpuResponse::Reset),
-                // Emulation errors lead to vCPU exit.
-                Err(_) => return self.exit(VcpuResponse::Exited(FC_EXIT_CODE_GENERIC_ERROR)),
+                Ok(VcpuEvent::Resume(reply)) => {
+                    let _ = reply.send(());
+                    continue;
+                }
+                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+                Ok(VcpuEvent::RestoreCounter { reply, .. }) => {
+                    let _ = reply.send(Err(format!(
+                        "vcpu {}: cannot restore the guest's counter while running",
+                        self.id
+                    )));
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    return self.exit(VcpuResponse::Exited(FC_EXIT_CODE_GENERIC_ERROR));
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+
+            // This loop is here just for optimizing the emulation path.
+            // No point in ticking the state machine if there are no external events.
+            loop {
+                match self.run_emulation() {
+                    // Emulation ran successfully, continue.
+                    Ok(VcpuEmulation::Handled) => (),
+                    // Emulation was interrupted, check external events.
+                    Ok(VcpuEmulation::Interrupted) => break,
+                    // If the guest was rebooted or halted:
+                    // - vCPU0 will always exit out of `KVM_RUN` with KVM_EXIT_SHUTDOWN or
+                    //   KVM_EXIT_HLT.
+                    // - the other vCPUs won't ever exit out of `KVM_RUN`, but they won't consume CPU.
+                    // Moreover if we allow the vCPU0 thread to finish execution, this might generate a
+                    // seccomp failure because musl calls `sigprocmask` as part of `pthread_exit`.
+                    // So we pause vCPU0 and send a signal to the emulation thread to stop the VMM.
+                    Ok(VcpuEmulation::Stopped) => {
+                        return self.exit(VcpuResponse::Exited(FC_EXIT_CODE_OK));
+                    }
+                    Ok(VcpuEmulation::Reset) => return self.exit(VcpuResponse::Reset),
+                    // Emulation errors lead to vCPU exit.
+                    Err(_) => return self.exit(VcpuResponse::Exited(FC_EXIT_CODE_GENERIC_ERROR)),
+                }
             }
         }
-
-        // By default don't change state.
-        let mut state = StateMachine::next(Self::running);
-
-        // Break this emulation loop on any transition request/external event.
-        match self.event_receiver.try_recv() {
-            // Running ---- Pause ----> Paused
-            Ok(VcpuEvent::Pause) => {
-                self.response_sender
-                    .send(self.pause_response())
-                    .expect("failed to send pause status");
-
-                // Move to 'paused' state.
-                state = StateMachine::next(Self::paused);
-            }
-            Ok(VcpuEvent::Resume) => {
-                self.response_sender
-                    .send(VcpuResponse::Resumed)
-                    .expect("failed to send resume status");
-            }
-            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-            Ok(VcpuEvent::RestoreCounter { reply, .. }) => {
-                let _ = reply.send(Err(format!(
-                    "vcpu {}: cannot restore the guest's counter while running",
-                    self.id
-                )));
-            }
-            // Unhandled exit of the other end.
-            Err(TryRecvError::Disconnected) => {
-                // Move to 'exited' state.
-                state = self.exit(VcpuResponse::Exited(FC_EXIT_CODE_GENERIC_ERROR));
-            }
-            // All other events or lack thereof have no effect on current 'running' state.
-            Err(TryRecvError::Empty) => (),
-        }
-
-        state
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn pause_response(&self) -> VcpuResponse {
+    fn pause_response(&self) -> result::Result<Option<u64>, String> {
         // Keeps the guest's soft lockup watchdog quiet on resume. Fails when the
         // guest doesn't use kvmclock.
         if let Err(e) = self.fd.kvmclock_ctrl() {
             debug!("KVM_KVMCLOCK_CTRL: {e}");
         }
-        VcpuResponse::Paused
+        Ok(None)
     }
 
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    fn pause_response(&self) -> VcpuResponse {
-        match read_counter(&self.fd) {
-            Ok(counter) => VcpuResponse::PausedAt(counter),
-            Err(e) => VcpuResponse::PauseFailed(format!(
+    fn pause_response(&self) -> result::Result<Option<u64>, String> {
+        read_counter(&self.fd).map(Some).map_err(|e| {
+            format!(
                 "vcpu {}: failed to read the guest's counter: {e:?}",
                 self.id
-            )),
-        }
+            )
+        })
     }
 
     // This is the main loop of the `Paused` state.
     fn paused(&mut self) -> StateMachine<Self> {
         match self.event_receiver.recv() {
-            // Paused ---- Resume ----> Running
-            Ok(VcpuEvent::Resume) => {
-                // Nothing special to do.
-                self.response_sender
-                    .send(VcpuResponse::Resumed)
-                    .expect("failed to send resume status");
-                // Move to 'running' state.
+            Ok(VcpuEvent::Pause(reply)) => {
+                let _ = reply.send(self.pause_response());
+                StateMachine::next(Self::paused)
+            }
+            Ok(VcpuEvent::Resume(reply)) => {
+                let _ = reply.send(());
                 StateMachine::next(Self::running)
             }
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -1761,8 +1749,6 @@ impl Vcpu {
                 let _ = reply.send(result);
                 StateMachine::next(Self::paused)
             }
-            // All other events have no effect on current 'paused' state.
-            Ok(_) => StateMachine::next(Self::paused),
             // Unhandled exit of the other end.
             Err(_) => {
                 // Move to 'exited' state.
@@ -1834,15 +1820,13 @@ pub struct VcpuState {
     xsave: kvm_xsave,
 }
 
-// Allow currently unused Pause and Exit events. These will be used by the vmm later on.
-#[allow(unused)]
 #[derive(Debug)]
 /// List of events that the Vcpu can receive.
 pub enum VcpuEvent {
     /// Pause the Vcpu.
-    Pause,
+    Pause(Sender<result::Result<Option<u64>, String>>),
     /// Event that should resume the Vcpu.
-    Resume,
+    Resume(Sender<()>),
     /// Set the guest's counter while paused.
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     RestoreCounter {
@@ -1855,16 +1839,6 @@ pub enum VcpuEvent {
 #[allow(dead_code)]
 /// List of responses that the Vcpu reports.
 pub enum VcpuResponse {
-    /// Vcpu is paused.
-    Paused,
-    /// Vcpu is paused, with the guest's counter at the given value.
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    PausedAt(u64),
-    /// The vCPU stopped but its counter could not be read.
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    PauseFailed(String),
-    /// Vcpu is resumed.
-    Resumed,
     /// Vcpu is stopped.
     Exited(u8),
     /// The guest asked for a reset.
@@ -1922,7 +1896,7 @@ enum VcpuEmulation {
 
 #[cfg(test)]
 mod tests {
-    use crossbeam_channel::unbounded;
+    use crossbeam_channel::{bounded, unbounded};
     use std::sync::{Arc, Barrier};
 
     use super::*;
@@ -1940,7 +1914,8 @@ mod tests {
     impl Drop for VcpuHandle {
         fn drop(&mut self) {
             // Make sure the Vcpu is out of KVM_RUN.
-            self.send_event(VcpuEvent::Pause).unwrap();
+            let (reply, _) = bounded(1);
+            self.send_event(VcpuEvent::Pause(reply)).unwrap();
             // Close the original channel so that the Vcpu thread errors and goes to exit state.
             let (event_sender, _event_receiver) = unbounded();
             self.event_sender = event_sender;
@@ -2190,5 +2165,26 @@ mod tests {
     #[test]
     fn test_vcpu_rtsig_offset() {
         assert!(validate_signal_num(sigrtmin() + VCPU_RTSIG_OFFSET).is_ok());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_queued_pause_retries() {
+        let (_vm, mut vcpu, _mem) = setup_vcpu(0x1000);
+        let requests = vcpu.event_sender.take().unwrap();
+        let (timed_out_pause, _) = bounded(1);
+        let (pause_retry, pause_reply) = bounded(1);
+        let (timed_out_resume, _) = bounded(1);
+        let (next_pause, next_pause_reply) = bounded(1);
+
+        requests.send(VcpuEvent::Pause(timed_out_pause)).unwrap();
+        requests.send(VcpuEvent::Pause(pause_retry)).unwrap();
+        requests.send(VcpuEvent::Resume(timed_out_resume)).unwrap();
+        requests.send(VcpuEvent::Pause(next_pause)).unwrap();
+        drop(requests);
+        vcpu.run();
+
+        assert_eq!(pause_reply.try_recv(), Ok(Ok(None)));
+        assert_eq!(next_pause_reply.try_recv(), Ok(Ok(None)));
     }
 }

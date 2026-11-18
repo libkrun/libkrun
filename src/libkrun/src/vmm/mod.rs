@@ -64,13 +64,10 @@ use crate::vmm::vstate::Vm;
 use crate::vmm::vstate::{Vcpu, VcpuHandle, VcpuResponse};
 
 use arch::{ArchMemoryInfo, InitrdConfig};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crossbeam_channel::Sender;
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "aarch64", target_arch = "riscv64")
-))]
-use crossbeam_channel::bounded;
+#[cfg(target_os = "linux")]
+use crossbeam_channel::{RecvTimeoutError, bounded};
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::fdt;
 use devices::legacy::IrqChip;
@@ -121,6 +118,8 @@ pub enum Error {
     Vcpu(vstate::Error),
     /// Cannot send event to vCPU.
     VcpuEvent(vstate::Error),
+    #[cfg(target_os = "linux")]
+    VcpuReply(RecvTimeoutError),
     /// Cannot create a vCPU handle.
     VcpuHandle(vstate::Error),
     /// vCPU resume failed.
@@ -146,6 +145,8 @@ impl Display for Error {
             SetupFDT(e) => write!(f, "Error generating or writing FDT: {e:?}"),
             Vcpu(e) => write!(f, "Vcpu error: {e}"),
             VcpuEvent(e) => write!(f, "Cannot send event to vCPU. {e:?}"),
+            #[cfg(target_os = "linux")]
+            VcpuReply(e) => write!(f, "Cannot receive vCPU reply: {e}"),
             VcpuHandle(e) => write!(f, "Cannot create a vCPU handle. {e}"),
             VcpuResume => write!(f, "vCPUs resume failed."),
             Vm(e) => write!(f, "Vm error: {e}"),
@@ -192,8 +193,10 @@ pub struct Vmm {
     pub(crate) vm_ctl_tx: PollableChannelSender<VmCtl>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) vm_ctl_rx: PollableChannelReciever<VmCtl>,
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     pub(crate) paused: bool,
+    #[cfg(target_os = "linux")]
+    vcpu_run_state: VcpuRunState,
     #[cfg(target_os = "macos")]
     pub(crate) paused_at: u64,
     /// Whether guest RAM is mapped in blocks, see `map_guest_ram_in_blocks()`.
@@ -210,6 +213,15 @@ pub struct Vmm {
 
 #[cfg(target_os = "linux")]
 const VCPU_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "linux")]
+#[derive(PartialEq, Eq)]
+enum VcpuRunState {
+    Running,
+    // Either command can retry until every vCPU has acknowledged the transition.
+    Transitioning,
+    Paused,
+}
 
 /// Out-of-band request to the running VM's event loop.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -244,21 +256,7 @@ impl Vmm {
     /// Sends a resume command to the vcpus.
     #[cfg(target_os = "linux")]
     pub fn resume_vcpus(&mut self) -> Result<()> {
-        for handle in self.vcpus_handles.iter() {
-            handle
-                .send_event(VcpuEvent::Resume)
-                .map_err(Error::VcpuEvent)?;
-        }
-        for handle in self.vcpus_handles.iter() {
-            match handle
-                .response_receiver()
-                .recv_timeout(Duration::from_millis(1000))
-            {
-                Ok(VcpuResponse::Resumed) => (),
-                _ => return Err(Error::VcpuResume),
-            }
-        }
-        Ok(())
+        self.request_vcpus(VcpuEvent::Resume).map(|_| ())
     }
 
     #[cfg(target_os = "macos")]
@@ -353,29 +351,17 @@ impl Vmm {
 
     #[cfg(target_os = "linux")]
     pub fn pause(&mut self) -> std::result::Result<(), String> {
-        if self.paused {
+        if self.vcpu_run_state == VcpuRunState::Paused {
             return Ok(());
         }
-        self.drain_vcpu_responses();
-        // Set first, so a resume wakes the vCPUs that paused even if others fail.
-        self.paused = true;
-        for h in &self.vcpus_handles {
-            h.send_event(VcpuEvent::Pause)
-                .map_err(|e| format!("vcpu pause event: {e:?}"))?;
-        }
-        // Resume from the latest reading, so the guest's clock never goes back.
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        let mut counter = None;
-        for i in 0..self.vcpus_handles.len() {
-            match self.vcpu_response(i)? {
-                VcpuResponse::Paused => {}
-                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-                VcpuResponse::PausedAt(c) => counter = counter.max(Some(c)),
-                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-                VcpuResponse::PauseFailed(error) => return Err(error),
-                other => return Err(format!("unexpected vcpu response: {other:?}")),
-            }
-        }
+        self.vcpu_run_state = VcpuRunState::Transitioning;
+        let _latest_counter = self
+            .request_vcpus(VcpuEvent::Pause)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .try_fold(None, |latest, reply| {
+                reply.map(|counter| latest.max(counter))
+            })?;
         #[cfg(target_arch = "x86_64")]
         {
             let mut clock = self
@@ -390,23 +376,25 @@ impl Vmm {
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         {
-            self.paused_counter = counter;
+            // Restore the latest reading so the guest's clock never goes back.
+            self.paused_counter = _latest_counter;
         }
+        self.vcpu_run_state = VcpuRunState::Paused;
         Ok(())
     }
 
     #[cfg(target_os = "linux")]
     pub fn resume(&mut self) -> std::result::Result<(), String> {
-        if !self.paused {
+        if self.vcpu_run_state == VcpuRunState::Running {
             return Ok(());
         }
-        self.drain_vcpu_responses();
         #[cfg(target_arch = "x86_64")]
-        if let Some(clock) = self.paused_clock.take() {
+        if let Some(clock) = self.paused_clock {
             self.vm
                 .fd()
                 .set_clock(&clock)
                 .map_err(|e| format!("set clock: {e}"))?;
+            self.paused_clock = None;
         }
         // The counter is VM-wide, so it is set once, before any vCPU runs.
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -420,48 +408,28 @@ impl Vmm {
             restore_result?;
             self.paused_counter = None;
         }
-        for h in &self.vcpus_handles {
-            h.send_event(VcpuEvent::Resume)
-                .map_err(|e| format!("vcpu resume event: {e:?}"))?;
-        }
-        self.paused = false;
-        for i in 0..self.vcpus_handles.len() {
-            match self.vcpu_response(i)? {
-                VcpuResponse::Resumed => {}
-                other => return Err(format!("unexpected vcpu response: {other:?}")),
-            }
-        }
+        self.vcpu_run_state = VcpuRunState::Transitioning;
+        self.resume_vcpus().map_err(|e| e.to_string())?;
+        self.vcpu_run_state = VcpuRunState::Running;
         Ok(())
     }
 
     #[cfg(target_os = "linux")]
-    fn vcpu_response(&mut self, i: usize) -> std::result::Result<VcpuResponse, String> {
-        match self.vcpus_handles[i]
-            .response_receiver()
-            .recv_timeout(VCPU_RESPONSE_TIMEOUT)
-        {
-            Ok(response) => Ok(self.stop_if_exited(response)),
-            Err(e) => Err(format!("vcpu response: {e}")),
+    fn request_vcpus<T>(&self, event: impl Fn(Sender<T>) -> VcpuEvent) -> Result<Vec<T>> {
+        let mut responses = Vec::with_capacity(self.vcpus_handles.len());
+        for handle in &self.vcpus_handles {
+            let (reply, response) = bounded(1);
+            handle.send_event(event(reply)).map_err(Error::VcpuEvent)?;
+            responses.push(response);
         }
-    }
-
-    /// Drop replies left over from a pause or resume that timed out.
-    #[cfg(target_os = "linux")]
-    fn drain_vcpu_responses(&mut self) {
-        for i in 0..self.vcpus_handles.len() {
-            while let Ok(response) = self.vcpus_handles[i].response_receiver().try_recv() {
-                self.stop_if_exited(response);
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn stop_if_exited(&mut self, response: VcpuResponse) -> VcpuResponse {
-        match response {
-            VcpuResponse::Reset => self.stop_guest(self.reset_exit_code.unwrap_or(FC_EXIT_CODE_OK)),
-            VcpuResponse::Exited(code) => self.stop_guest(code),
-            response => response,
-        }
+        responses
+            .into_iter()
+            .map(|response| {
+                response
+                    .recv_timeout(VCPU_RESPONSE_TIMEOUT)
+                    .map_err(Error::VcpuReply)
+            })
+            .collect()
     }
 
     /// Configures the system for boot.
@@ -652,6 +620,8 @@ impl Subscriber for Vmm {
                 };
                 if let Err(e) = res {
                     error!("vm {req:?} failed: {e}");
+                    #[cfg(target_os = "linux")]
+                    return;
                 }
             }
             return;
@@ -666,18 +636,21 @@ impl Subscriber for Vmm {
 
         if source == self.exit_evt.as_raw_fd() && event_set == EventSet::IN {
             let _ = self.exit_evt.read();
-            // A terminal response may be queued behind a late pause or resume reply.
-            // The ACPI PM device can signal exit without a vCPU response.
-            let vcpu_exit_code = self
+            let mut responses = self
                 .vcpus_handles
                 .iter()
-                .flat_map(|handle| handle.response_receiver().try_iter())
-                .find_map(|response| match response {
-                    VcpuResponse::Exited(exit_code) => Some(exit_code),
-                    VcpuResponse::Reset => Some(self.reset_exit_code.unwrap_or(FC_EXIT_CODE_OK)),
-                    _ => None,
-                })
-                .unwrap_or(FC_EXIT_CODE_OK);
+                .flat_map(|handle| handle.response_receiver().try_iter());
+            #[cfg(target_os = "linux")]
+            let terminal_response = responses.next();
+            #[cfg(not(target_os = "linux"))]
+            let terminal_response = responses
+                .find(|response| matches!(response, VcpuResponse::Exited(_) | VcpuResponse::Reset));
+            let vcpu_exit_code = match terminal_response {
+                Some(VcpuResponse::Exited(code)) => code,
+                Some(VcpuResponse::Reset) => self.reset_exit_code.unwrap_or(FC_EXIT_CODE_OK),
+                // The ACPI PM device can signal exit without a vCPU response.
+                _ => FC_EXIT_CODE_OK,
+            };
             self.stop_guest(vcpu_exit_code);
         } else {
             error!("Spurious EventManager event for handler: Vmm");

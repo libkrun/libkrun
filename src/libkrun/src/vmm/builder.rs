@@ -29,6 +29,8 @@ use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 
+#[cfg(target_os = "linux")]
+use super::VcpuRunState;
 use super::{Error, Vmm};
 
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
@@ -1408,8 +1410,10 @@ pub fn build_microvm(
         vm_ctl_tx,
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         vm_ctl_rx,
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         paused: false,
+        #[cfg(target_os = "linux")]
+        vcpu_run_state: VcpuRunState::Running,
         #[cfg(target_os = "macos")]
         paused_at: 0,
         #[cfg(target_os = "macos")]
