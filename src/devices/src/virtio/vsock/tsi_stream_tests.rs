@@ -112,6 +112,73 @@ fn check_connect_result(events: EventSet, listening: bool) {
 }
 
 #[test]
+fn receive_window_cannot_suppress_send_credit() {
+    for receive_window in [0, 32 * 1024 * 1024] {
+        let (mut proxy, _) = stream_fixture(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        proxy.peer_buf_alloc = receive_window;
+        proxy.tx_cnt = Wrapping(defs::CONN_TX_BUF_SIZE as u32);
+        assert!(
+            proxy.maybe_send_credit_update(),
+            "guest exhausted its send window without an acknowledgement"
+        );
+        assert!(
+            matches!(proxy.rxq.lock().unwrap().pop(), Some(MuxerRx::CreditUpdate { fwd_cnt, .. }) if fwd_cnt == proxy.tx_cnt.0)
+        );
+    }
+}
+
+#[test]
+fn queued_credit_precedes_tcp_data_carrying_newer_credit() {
+    let (mut proxy, listener) = connecting(Ipv4Addr::LOCALHOST.into(), true);
+    proxy.process_event(EventSet::OUT);
+    let (peer, _) = listener.unwrap().accept().unwrap();
+    proxy.rxq.lock().unwrap().clear();
+    proxy.peer_buf_alloc = 4096;
+    proxy.tx_cnt = Wrapping(4096);
+    let mem = proxy.mem.clone();
+    let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+    proxy.queue = Arc::new(Mutex::new(rx.create_queue()));
+    proxy.rxq.lock().unwrap().push(MuxerRx::CreditUpdate {
+        local_port: proxy.local_port,
+        peer_port: proxy.peer_port,
+        fwd_cnt: 1024,
+    });
+    for i in 0..2 {
+        rx.dtable[i].set(0x8000 + i as u64 * 0x1000, 108, 2, 0);
+        rx.avail.ring[i].set(i as u16);
+    }
+    rx.avail.idx.set(2);
+    assert_eq!(peer.send(b"ok").unwrap(), 2);
+    let mut epoll = Epoll::new().unwrap();
+    epoll
+        .ctl(
+            ControlOperation::Add,
+            raw_handle(&proxy.sock),
+            &EpollEvent::new(EventSet::IN, 1),
+        )
+        .unwrap();
+    let mut events = [EpollEvent::default()];
+    assert_eq!(epoll.wait(1, 2000, &mut events).unwrap(), 1);
+
+    assert!(proxy.process_event(EventSet::IN).signal_queue);
+
+    assert_eq!(rx.used.idx.get(), 2);
+    assert_eq!(
+        mem.read_obj::<u32>(GuestAddress(0x8000 + 40)).unwrap(),
+        1024
+    );
+    assert_eq!(
+        mem.read_obj::<u32>(GuestAddress(0x9000 + 40)).unwrap(),
+        4096
+    );
+    let mut bytes = [0; 2];
+    mem.read_slice(&mut bytes, GuestAddress(0x9000 + 44))
+        .unwrap();
+    assert_eq!(&bytes, b"ok");
+    assert!(proxy.rxq.lock().unwrap().is_empty());
+}
+
+#[test]
 fn writable_connect_reports_pending_socket_error() {
     check_connect_result(EventSet::OUT, false);
 }

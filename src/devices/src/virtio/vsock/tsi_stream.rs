@@ -17,7 +17,7 @@ use super::defs::uapi;
 use super::host_bind::{BindRequest, bind_inet};
 use super::host_close::{self, CloseRequest};
 use super::host_sockopt::{ListenerOptions, SocketBuffers};
-use super::muxer::{MuxerRx, push_packet};
+use super::muxer::{MuxerRx, drain_pending_packets, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
     TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TsiSendtoAddr, VsockPacket,
@@ -462,10 +462,10 @@ impl TsiStreamProxy {
         if self.local_read_shutdown {
             return (false, false);
         }
-        let mut have_used = false;
         let mut wait_credit = false;
         let _snapshot_activity = self.snapshot_gate.enter();
         let mut queue = self.queue.lock().unwrap();
+        let mut have_used = drain_pending_packets(self.cid, &self.rxq, &mut queue, &self.mem);
 
         while let Some(head) = queue.pop(&self.mem) {
             let len = match VsockPacket::from_rx_virtq_head(&head) {
@@ -919,11 +919,17 @@ impl TsiStreamProxy {
         );
     }
 
-    /// Return credit before a small explicit send budget can be exhausted.
+    /// Return credit before our advertised window or an explicit send budget
+    /// can be exhausted, regardless of the opposite direction's receive window.
     fn maybe_send_credit_update(&mut self) -> bool {
-        let window = self.buffers.send.map_or(self.peer_buf_alloc, |capacity| {
-            self.peer_buf_alloc.min(capacity as u32)
-        });
+        let mut window = defs::CONN_TX_BUF_SIZE as u32;
+        if self.peer_buf_alloc != 0 {
+            window = window.min(self.peer_buf_alloc);
+        }
+        let window = self
+            .buffers
+            .send
+            .map_or(window, |capacity| window.min(capacity as u32));
         if window != 0 && (self.tx_cnt - self.last_tx_cnt_sent).0 >= (window / 2).max(1) {
             self.send_credit_update();
             true
@@ -1729,7 +1735,17 @@ impl Proxy for TsiStreamProxy {
                         peer_port: self.peer_port,
                         fwd_cnt: self.tx_cnt.0,
                     };
-                    update.push_credit_req = Some(rx);
+                    // Keep request publication ordered with this proxy's data
+                    // and credit updates, then notify even without a data packet.
+                    push_packet(
+                        self.cid,
+                        rx,
+                        &self.rxq,
+                        &self.queue,
+                        &self.mem,
+                        &self.snapshot_gate,
+                    );
+                    update.signal_queue = true;
                 }
 
                 if self.status == ProxyStatus::PeerClosed {

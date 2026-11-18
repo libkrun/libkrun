@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use socket2::{Domain, SockAddr, Socket, Type};
 
 use super::super::Queue as VirtQueue;
-use super::muxer::{MuxerRx, push_packet};
+use super::muxer::{MuxerRx, drain_pending_packets, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
 use super::proxy::{
@@ -276,10 +276,10 @@ impl UnixProxy {
     }
 
     fn recv_pkt(&mut self) -> (bool, bool) {
-        let mut have_used = false;
         let mut wait_credit = false;
         let _snapshot_activity = self.snapshot_gate.enter();
         let mut queue = self.queue.lock().unwrap();
+        let mut have_used = drain_pending_packets(self.cid, &self.rxq, &mut queue, &self.mem);
 
         while let Some(head) = queue.pop(&self.mem) {
             let len = match VsockPacket::from_rx_virtq_head(&head) {
@@ -383,24 +383,32 @@ impl UnixProxy {
         Ok(advanced)
     }
 
+    fn send_credit_update(&mut self) {
+        self.last_tx_cnt_sent = self.tx_cnt;
+        let rx = MuxerRx::CreditUpdate {
+            local_port: self.local_port,
+            peer_port: self.peer_port,
+            fwd_cnt: self.tx_cnt.0,
+        };
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+            &self.snapshot_gate,
+        );
+    }
+
     fn maybe_send_credit_update(&mut self) -> bool {
-        if self.peer_buf_alloc != 0
-            && (self.tx_cnt - self.last_tx_cnt_sent).0 >= self.peer_buf_alloc / 2
-        {
-            self.last_tx_cnt_sent = self.tx_cnt;
-            let rx = MuxerRx::CreditUpdate {
-                local_port: self.local_port,
-                peer_port: self.peer_port,
-                fwd_cnt: self.tx_cnt.0,
-            };
-            push_packet(
-                self.cid,
-                rx,
-                &self.rxq,
-                &self.queue,
-                &self.mem,
-                &self.snapshot_gate,
-            );
+        // Our advertised window limits guest writes, independently of the
+        // guest's receive window for traffic in the opposite direction.
+        let mut window = defs::CONN_TX_BUF_SIZE as u32;
+        if self.peer_buf_alloc != 0 {
+            window = window.min(self.peer_buf_alloc);
+        }
+        if (self.tx_cnt - self.last_tx_cnt_sent).0 >= (window / 2).max(1) {
+            self.send_credit_update();
             true
         } else {
             false
@@ -585,6 +593,23 @@ impl Proxy for UnixProxy {
         }
     }
 
+    fn request_credit(&mut self) -> ProxyUpdate {
+        if !matches!(
+            self.status,
+            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+        ) {
+            return ProxyUpdate::default();
+        }
+        // The guest may exhaust its send window before our periodic update
+        // threshold. Reply even while the opposite direction is credit-paused,
+        // and acknowledge only bytes actually delivered to the host socket.
+        self.send_credit_update();
+        ProxyUpdate {
+            signal_queue: true,
+            ..Default::default()
+        }
+    }
+
     fn push_op_request(&self) {
         debug!(
             "[VSOCK_TIMING] push_op_request: id={:#x} local_port={} peer_port={} (expecting RESPONSE with src_port={} dst_port={})",
@@ -746,7 +771,17 @@ impl Proxy for UnixProxy {
                         peer_port: self.peer_port,
                         fwd_cnt: self.tx_cnt.0,
                     };
-                    update.push_credit_req = Some(rx);
+                    // Publish while this proxy still owns its credit counters;
+                    // a deferred request could carry older credit after a reply.
+                    push_packet(
+                        self.cid,
+                        rx,
+                        &self.rxq,
+                        &self.queue,
+                        &self.mem,
+                        &self.snapshot_gate,
+                    );
+                    update.signal_queue = true;
                 }
 
                 if self.status == ProxyStatus::PeerClosed {
@@ -1075,6 +1110,119 @@ mod tests {
             Arc::new(SnapshotGate::default()),
         );
         (proxy, peer)
+    }
+
+    #[test]
+    fn a_credit_request_is_published_and_signaled_without_data() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+        let (mut proxy, peer) = proxy_with_peer(&mem, &rx);
+        proxy.status = ProxyStatus::Connected;
+        proxy.tx_cnt = Wrapping(4096);
+        rx.dtable[0].set(HDR, (VSOCK_PKT_HDR_SIZE + 64) as u32, 2, 0);
+        rx.avail.ring[0].set(0);
+        rx.avail.idx.set(1);
+        assert_eq!(peer.send(b"x").unwrap(), 1);
+
+        let update = proxy.process_event(EventSet::IN);
+
+        assert!(update.signal_queue);
+        assert!(
+            update.push_credit_req.is_none(),
+            "request publication was deferred"
+        );
+        assert_eq!(rx.used.idx.get(), 1);
+        assert_eq!(
+            mem.read_obj::<u16>(GuestAddress(HDR + 30)).unwrap(),
+            uapi::VSOCK_OP_CREDIT_REQUEST
+        );
+        assert_eq!(mem.read_obj::<u32>(GuestAddress(HDR + 40)).unwrap(), 4096);
+        assert_eq!(proxy.status, ProxyStatus::WaitingCreditUpdate);
+    }
+
+    #[test]
+    fn queued_credit_precedes_data_carrying_newer_credit() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+        let (mut proxy, peer) = proxy_with_peer(&mem, &rx);
+        proxy.status = ProxyStatus::Connected;
+        proxy.peer_buf_alloc = 4096;
+        proxy.tx_cnt = Wrapping(4096);
+        proxy.rxq.lock().unwrap().push(MuxerRx::CreditUpdate {
+            local_port: 1024,
+            peer_port: 2048,
+            fwd_cnt: 1024,
+        });
+        for (i, address) in [HDR, DATA].into_iter().enumerate() {
+            rx.dtable[i].set(address, (VSOCK_PKT_HDR_SIZE + 64) as u32, 2, 0);
+            rx.avail.ring[i].set(i as u16);
+        }
+        rx.avail.idx.set(2);
+        assert_eq!(peer.send(b"ok").unwrap(), 2);
+
+        assert!(proxy.process_event(EventSet::IN).signal_queue);
+
+        assert_eq!(rx.used.idx.get(), 2);
+        assert_eq!(mem.read_obj::<u32>(GuestAddress(HDR + 40)).unwrap(), 1024);
+        assert_eq!(mem.read_obj::<u32>(GuestAddress(DATA + 40)).unwrap(), 4096);
+        let mut received = [0; 2];
+        mem.read_slice(
+            &mut received,
+            GuestAddress(DATA + VSOCK_PKT_HDR_SIZE as u64),
+        )
+        .unwrap();
+        assert_eq!(&received, b"ok");
+        assert!(proxy.rxq.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn receive_window_cannot_suppress_send_credit() {
+        for receive_window in [0, 32 * 1024 * 1024] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+            let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+            let (mut proxy, _peer) = proxy_with_peer(&mem, &rx);
+            proxy.peer_buf_alloc = receive_window;
+            proxy.tx_cnt = Wrapping(defs::CONN_TX_BUF_SIZE as u32);
+            assert!(
+                proxy.maybe_send_credit_update(),
+                "guest exhausted its send window without an acknowledgement"
+            );
+            assert!(
+                matches!(proxy.rxq.lock().unwrap().pop(), Some(MuxerRx::CreditUpdate { fwd_cnt, .. }) if fwd_cnt == proxy.tx_cnt.0)
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_credit_requests_report_only_delivered_output() {
+        for status in [ProxyStatus::Connected, ProxyStatus::WaitingCreditUpdate] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+            let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+            let (mut proxy, _peer) = proxy_with_peer(&mem, &rx);
+            proxy.status = status;
+            // The receive capacity advertised by the guest need not match
+            // our send-credit window; a request still needs a current reply.
+            proxy.peer_buf_alloc = 32 * 1024 * 1024;
+            proxy.tx_cnt = Wrapping(defs::CONN_TX_BUF_SIZE as u32);
+            proxy.tx_buf.extend([1, 2, 3]);
+
+            let update = proxy.request_credit();
+
+            assert!(update.signal_queue, "guest credit request was ignored");
+            assert!(matches!(proxy.rxq.lock().unwrap().pop(),
+                Some(MuxerRx::CreditUpdate { local_port: 1024, peer_port: 2048, fwd_cnt })
+                    if fwd_cnt == defs::CONN_TX_BUF_SIZE as u32));
+            assert_eq!(
+                proxy.tx_buf.len(),
+                3,
+                "queued bytes are not delivered credit"
+            );
+            assert!(proxy.rxq.lock().unwrap().is_empty());
+
+            proxy.status = ProxyStatus::Closed;
+            assert!(!proxy.request_credit().signal_queue);
+            assert!(proxy.rxq.lock().unwrap().is_empty());
+        }
     }
 
     /// A TX packet whose header claims `len` bytes in a `desc_len`-byte data descriptor.

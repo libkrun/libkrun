@@ -118,6 +118,13 @@ pub enum MuxerRx {
     },
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PENDING_PACKET: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 pub fn push_packet(
     cid: u64,
     rx: MuxerRx,
@@ -128,6 +135,7 @@ pub fn push_packet(
 ) {
     let _snapshot_activity = snapshot_gate.enter();
     let mut queue = queue_mutex.lock().unwrap();
+    drain_pending_packets(cid, rxq_mutex, &mut queue, mem);
     if let Some(head) = queue.pop(mem) {
         if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
             rx_to_pkt(cid, rx, &mut pkt);
@@ -137,9 +145,48 @@ pub fn push_packet(
         }
     } else {
         error!("couldn't push pkt to queue, adding it to rxq");
-        drop(queue);
+        // Publish the pending packet before releasing the RX queue. Otherwise
+        // the guest's final refill kick can observe an empty pending list in
+        // this gap, leaving credit stranded until unrelated traffic arrives.
+        // RX servicing takes these locks in the same queue -> pending order.
+        #[cfg(test)]
+        BEFORE_PENDING_PACKET.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         rxq_mutex.lock().unwrap().push(rx);
     }
+}
+
+/// Deliver older control packets before a producer writes newer credit into RX.
+/// The caller holds the RX queue lock and an active snapshot guard.
+pub(super) fn drain_pending_packets(
+    cid: u64,
+    pending: &Mutex<MuxerRxQ>,
+    queue: &mut VirtQueue,
+    mem: &GuestMemoryMmap,
+) -> bool {
+    let mut pending = pending.lock().unwrap();
+    let mut used = false;
+    while !pending.is_empty() {
+        let Some(head) = queue.pop(mem) else { break };
+        let len = match VsockPacket::from_rx_virtq_head(&head) {
+            Ok(mut packet) => {
+                rx_to_pkt(cid, pending.pop().unwrap(), &mut packet);
+                packet.hdr().len() as u32 + packet.len()
+            }
+            Err(error) => {
+                warn!("RX queue error while delivering pending packet: {error:?}");
+                0
+            }
+        };
+        if let Err(error) = queue.add_used(mem, head.index, len) {
+            error!("failed to return pending packet RX buffer: {error:?}");
+        }
+        used = true;
+    }
+    used
 }
 
 pub struct VsockMuxer {
@@ -565,21 +612,14 @@ impl VsockMuxer {
             }
         };
 
-        let _snapshot_activity = self.snapshot_gate.enter();
-        let mut queue = queue_mutex.lock().unwrap();
-        if let Some(head) = queue.pop(mem) {
-            if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-                rx_to_pkt(self.cid, rx, &mut pkt);
-                if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
-                {
-                    error!("failed to add used elements to the queue: {e:?}");
-                }
-            }
-        } else {
-            error!("couldn't push pkt to queue, adding it to rxq");
-            drop(queue);
-            self.rxq.lock().unwrap().push(rx);
-        }
+        push_packet(
+            self.cid,
+            rx,
+            &self.rxq,
+            queue_mutex,
+            mem,
+            &self.snapshot_gate,
+        );
     }
 
     /// Reset all live host-backed connections for a VM restore/rewind.
@@ -1622,6 +1662,132 @@ impl VsockMuxer {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+    #[test]
+    fn queued_credit_cannot_arrive_after_newer_credit() {
+        use super::super::packet::VSOCK_PKT_HDR_SIZE;
+        use crate::virtio::queue::tests::VirtQueue as TestQueue;
+        use vm_memory::{Bytes, GuestAddress};
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+        let queue = Arc::new(Mutex::new(rx.create_queue()));
+        let pending = Arc::new(Mutex::new(MuxerRxQ::new()));
+        let gate = SnapshotGate::default();
+        let credit = |fwd_cnt| MuxerRx::CreditUpdate {
+            local_port: 1024,
+            peer_port: 2048,
+            fwd_cnt,
+        };
+        push_packet(3, credit(1024), &pending, &queue, &mem, &gate);
+        assert_eq!(pending.lock().unwrap().len(), 1);
+
+        // Refill arrives before the device services its kick, then another
+        // producer has a newer reply. The guest must never see credit regress.
+        for i in 0..2 {
+            rx.dtable[i].set(
+                0x10000 + i as u64 * 0x1000,
+                (VSOCK_PKT_HDR_SIZE + 64) as u32,
+                2,
+                0,
+            );
+            rx.avail.ring[i].set(i as u16);
+        }
+        rx.avail.idx.set(2);
+        push_packet(3, credit(4096), &pending, &queue, &mem, &gate);
+        loop {
+            let next = pending.lock().unwrap().pop();
+            let Some(packet) = next else { break };
+            push_packet(3, packet, &pending, &queue, &mem, &gate);
+        }
+
+        assert_eq!(rx.used.idx.get(), 2);
+        assert_eq!(
+            mem.read_obj::<u32>(GuestAddress(0x10000 + 40)).unwrap(),
+            1024
+        );
+        assert_eq!(
+            mem.read_obj::<u32>(GuestAddress(0x11000 + 40)).unwrap(),
+            4096
+        );
+    }
+
+    #[test]
+    fn a_control_packet_cannot_miss_the_final_rx_refill() {
+        use super::super::packet::VSOCK_PKT_HDR_SIZE;
+        use crate::virtio::queue::tests::VirtQueue as TestQueue;
+        use std::sync::{TryLockError, mpsc};
+        use std::time::Duration;
+        use vm_memory::GuestAddress;
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rx = TestQueue::new(GuestAddress(0x4000), &mem, 8);
+        let queue = Arc::new(Mutex::new(rx.create_queue()));
+        let pending = Arc::new(Mutex::new(MuxerRxQ::new()));
+        let (empty_tx, empty_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let producer = {
+            let (mem, queue, pending) = (mem.clone(), queue.clone(), pending.clone());
+            std::thread::spawn(move || {
+                BEFORE_PENDING_PACKET.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        empty_tx.send(()).unwrap();
+                        resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }));
+                });
+                push_packet(
+                    3,
+                    MuxerRx::CreditUpdate {
+                        local_port: 1024,
+                        peer_port: 2048,
+                        fwd_cnt: 4096,
+                    },
+                    &pending,
+                    &queue,
+                    &mem,
+                    &SnapshotGate::default(),
+                );
+            })
+        };
+        empty_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // The guest refills RX and kicks once while the host is about to
+        // enqueue credit. Service that kick as soon as the queue lock permits.
+        rx.dtable[0].set(0x10000, (VSOCK_PKT_HDR_SIZE + 64) as u32, 2, 0);
+        rx.avail.ring[0].set(0);
+        rx.avail.idx.set(1);
+        let drain = |queue: &mut VirtQueue| {
+            let head = queue.pop(&mem).unwrap();
+            if let Some(packet) = pending.lock().unwrap().pop() {
+                let mut packet_buf = VsockPacket::from_rx_virtq_head(&head).unwrap();
+                rx_to_pkt(3, packet, &mut packet_buf);
+                queue
+                    .add_used(&mem, head.index, VSOCK_PKT_HDR_SIZE as u32)
+                    .unwrap();
+            } else {
+                queue.undo_pop();
+            }
+        };
+        let kick_waiting = match queue.try_lock() {
+            Ok(mut queue) => {
+                drain(&mut queue);
+                false
+            }
+            Err(TryLockError::WouldBlock) => true,
+            Err(error) => panic!("RX queue poisoned: {error}"),
+        };
+        resume_tx.send(()).unwrap();
+        producer.join().unwrap();
+        if kick_waiting {
+            drain(&mut queue.lock().unwrap());
+        }
+        assert_eq!(
+            rx.used.idx.get(),
+            1,
+            "credit stranded after the last RX kick"
+        );
+        assert!(pending.lock().unwrap().is_empty());
+    }
 
     /// Helper: create a VsockAddr from an IPv4 address.
     fn sockaddr_v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> VsockAddr {
