@@ -314,6 +314,80 @@ fn cstr_to_path(name: &CStr) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(name.to_bytes()).as_ref())
 }
 
+/// Whether the guest may use `name` for one entry in a directory. Windows
+/// reads '\\' as a separator and ':' as a stream marker, so a name holding
+/// either (or '/', '.', '..') would reach outside the directory it names.
+fn is_entry_name(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name != b"."
+        && name != b".."
+        && !name.iter().any(|c| matches!(c, b'/' | b'\\' | b':'))
+}
+
+/// `name` as one path component, or EINVAL when it is not a single entry.
+fn entry_name(name: &CStr) -> io::Result<PathBuf> {
+    if is_entry_name(name.to_bytes()) {
+        Ok(cstr_to_path(name))
+    } else {
+        Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)))
+    }
+}
+
+/// Whether a guest symlink target may be stored as a native Windows link.
+/// Windows follows native links itself, so only a relative target that stays
+/// beneath the link's own directory is safe; anything else is stored as a
+/// WSL-style link, which Windows never follows.
+fn is_contained_target(target: &[u8]) -> bool {
+    !target.is_empty()
+        && target[0] != b'/'
+        && !target.iter().any(|c| matches!(c, b'\\' | b':'))
+        && target.split(|c| *c == b'/').all(|part| part != b"..")
+}
+
+/// The components of a host path, without the verbatim prefix.
+fn host_components(path: &Path) -> Vec<String> {
+    let text = path.to_string_lossy();
+    let text = text
+        .strip_prefix(r"\\?\")
+        .or_else(|| text.strip_prefix(r"\??\"))
+        .unwrap_or(&text);
+    text.split(['\\', '/'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A host link's absolute target as the guest should see it: relative to the
+/// link when it lands inside the share, otherwise `None`.
+fn target_in_share(root: &Path, link: &Path, target: &Path) -> Option<String> {
+    let root = host_components(root);
+    let dir = host_components(link.parent()?);
+    let target = host_components(target);
+    let within = |path: &[String]| {
+        path.len() >= root.len()
+            && path
+                .iter()
+                .zip(&root)
+                .all(|(a, b)| a.to_lowercase() == b.to_lowercase())
+    };
+    if !within(&dir) || !within(&target) || target.iter().any(|part| part == "..") {
+        return None;
+    }
+    let mut parts = vec!["..".to_owned(); dir.len() - root.len()];
+    parts.extend(target[root.len()..].iter().cloned());
+    Some(if parts.is_empty() {
+        ".".to_owned()
+    } else {
+        parts.join("/")
+    })
+}
+
+/// Whether a mount-point reparse target names a volume rather than a directory.
+fn is_volume_target(target: &Path) -> bool {
+    let text = target.to_string_lossy().to_lowercase();
+    text.starts_with(r"\\?\volume{") || text.starts_with(r"\??\volume{")
+}
+
 const FILETIME_UNIX_EPOCH_DIFF: i64 = 116_444_736_000_000_000;
 const FILETIME_TICKS_PER_SEC: i64 = 10_000_000;
 const FILETIME_NSEC_PER_TICK: i64 = 100;
@@ -449,10 +523,20 @@ fn create_lx_symlink(link_path: &Path, target: &[u8]) -> io::Result<()> {
 }
 
 /// A symlink's target as the guest sees it: Windows separators turned into
-/// '/', or the raw bytes of a WSL-style link.
-fn read_symlink_target(path: &Path) -> io::Result<Vec<u8>> {
+/// '/', or the raw bytes of a WSL-style link. A native link or junction that
+/// points at an absolute host path inside the share reads back relative, so
+/// the guest resolves it within the share; one pointing outside reads back as
+/// the bare host path, which names nothing in the guest.
+fn read_symlink_target(root: &Path, path: &Path) -> io::Result<Vec<u8>> {
     match fs::read_link(path) {
-        Ok(target) => Ok(target.to_string_lossy().replace('\\', "/").into_bytes()),
+        Ok(target) => {
+            if (target.is_absolute() || target.has_root())
+                && let Some(relative) = target_in_share(root, path, &target)
+            {
+                return Ok(relative.into_bytes());
+            }
+            Ok(target.to_string_lossy().replace('\\', "/").into_bytes())
+        }
         // A WSL-style link, which std does not parse.
         Err(native) => read_lx_symlink(path).map_err(|_| native),
     }
@@ -510,6 +594,7 @@ fn get_reparse_tag(path: &Path) -> u32 {
 fn metadata_to_stat64(
     meta: &fs::Metadata,
     ino: u64,
+    root: &Path,
     path: &Path,
     n_link: u32,
     (owner_uid, owner_gid): (u32, u32),
@@ -518,11 +603,15 @@ fn metadata_to_stat64(
 
     let is_directory = (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     let mut is_symlink = meta.file_type().is_symlink();
-    if is_symlink && (file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0) {
-        let tag = get_reparse_tag(path);
-        if tag == IO_REPARSE_TAG_MOUNT_POINT {
-            is_symlink = false; // It's a Volume Mount! Force it to be a native directory.
-        }
+    // A junction is a link Windows follows on its own, so it is shown as one;
+    // presenting it as a directory let the guest walk through it to whatever
+    // host path it names. A mounted volume stays a directory (a submount).
+    if is_symlink
+        && (file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+        && get_reparse_tag(path) == IO_REPARSE_TAG_MOUNT_POINT
+        && fs::read_link(path).is_ok_and(|target| is_volume_target(&target))
+    {
+        is_symlink = false;
     }
     let (base_mode, nlink) = if is_symlink {
         (S_IFLNK | 0o777, 1)
@@ -542,7 +631,7 @@ fn metadata_to_stat64(
     // lstat on a symlink reports the length of its target; git reads a
     // zero-sized link as empty and then sees every symlink as modified.
     let size = if is_symlink {
-        read_symlink_target(path).map_or(0, |target| target.len() as i64)
+        read_symlink_target(root, path).map_or(0, |target| target.len() as i64)
     } else {
         meta.len() as i64
     };
@@ -1037,7 +1126,7 @@ fn open_by_id(root_handle: HANDLE, file_index: u64, flags: &OpenFlags) -> io::Re
 
 /// Open a child entry relative to a parent handle by name.
 fn open_relative(parent_handle: HANDLE, name: &CStr, flags: &OpenFlags) -> io::Result<HANDLE> {
-    let name_path = cstr_to_path(name);
+    let name_path = entry_name(name)?;
     let mut wide: Vec<u16> = name_path.as_os_str().encode_wide().collect();
     wide.push(0);
     let byte_len = (wide.len() - 1) * 2;
@@ -1484,6 +1573,9 @@ impl PassthroughFs {
 
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
         let parent_data = self.inode_data(parent)?;
+        if !is_entry_name(name.to_bytes()) {
+            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::ENOENT)));
+        }
         let child_name = cstr_to_path(name);
         let child_path = parent_data.get_path().join(&child_name);
 
@@ -1536,6 +1628,7 @@ impl PassthroughFs {
         let st = metadata_to_stat64(
             &meta,
             inode,
+            Path::new(&self.cfg.root_dir),
             &child_path,
             file_info.n_number_of_links,
             self.cfg.default_owner.unwrap_or((0, 0)),
@@ -1582,6 +1675,7 @@ impl PassthroughFs {
                         let st = metadata_to_stat64(
                             &meta,
                             inode,
+                            Path::new(&self.cfg.root_dir),
                             &path,
                             n_link,
                             self.cfg.default_owner.unwrap_or((0, 0)),
@@ -1597,6 +1691,7 @@ impl PassthroughFs {
         let st = metadata_to_stat64(
             &meta,
             inode,
+            Path::new(&self.cfg.root_dir),
             &path,
             file_info.n_number_of_links,
             self.cfg.default_owner.unwrap_or((0, 0)),
@@ -1963,10 +2058,7 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        // Colon is used to define a stream name in the ADS, so we need to prevent it from being used in the filename
-        if name.to_bytes().contains(&b':') {
-            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
-        }
+        entry_name(name)?;
 
         let parent_data = self.inode_data(parent)?;
         let root_h = *self.root_handle.read().unwrap();
@@ -2007,6 +2099,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn rmdir(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        entry_name(name)?;
         let parent_data = self.inode_data(parent)?;
         let root_h = *self.root_handle.read().unwrap();
         let parent_g = HandleGuard(
@@ -2280,7 +2373,8 @@ impl FileSystem for PassthroughFs {
 
         let path = data.get_path();
 
-        let mut buf = read_symlink_target(&path).map_err(win_err_to_linux)?;
+        let mut buf =
+            read_symlink_target(Path::new(&self.cfg.root_dir), &path).map_err(win_err_to_linux)?;
 
         // Cap to PATH_MAX (4096) to match Linux parity exactly.
         // While Windows NT paths can be 32k, FUSE/Linux expects a max of 4096 bytes.
@@ -2308,13 +2402,10 @@ impl FileSystem for PassthroughFs {
         name: &CStr,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        // Colon is used to define a stream name in the ADS, so we need to prevent it from being used in the filename
-        if name.to_bytes().contains(&b':') {
-            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
-        }
+        entry_name(name)?;
 
         let parent_path = self.inode_path(parent)?;
-        let link_path = parent_path.join(cstr_to_path(name));
+        let link_path = parent_path.join(entry_name(name)?);
         let target = cstr_to_path(linkname);
 
         // Windows requires knowing if a symlink target is a file or a directory.
@@ -2323,8 +2414,7 @@ impl FileSystem for PassthroughFs {
         // A native link keeps the target usable from Windows, but cannot hold an
         // absolute Linux path and needs Developer Mode or elevation. Fall back
         // to a WSL-style link for those.
-        let absolute = linkname.to_bytes().first() == Some(&b'/');
-        let native = if absolute {
+        let native = if !is_contained_target(linkname.to_bytes()) {
             Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)))
         } else {
             std::os::windows::fs::symlink_file(&target, &link_path)
@@ -2358,10 +2448,7 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        // Colon is used to define a stream name in the ADS, so we need to prevent it from being used in the filename
-        if name.to_bytes().contains(&b':') {
-            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
-        }
+        entry_name(name)?;
 
         let parent_data = self.inode_data(parent)?;
         let root_h = *self.root_handle.read().unwrap();
@@ -2415,6 +2502,7 @@ impl FileSystem for PassthroughFs {
     // Linux does not care if the file itself is read-only; Linux unlink succeeds as long as the parent directory has write permissions
     // This means that a Linux guest attempting to unlink a readonly file will fail with Access Denied, even if the parent directory is writable
     fn unlink(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        entry_name(name)?;
         let parent_data = self.inode_data(parent)?;
         let root_h = *self.root_handle.read().unwrap();
         let parent_g = HandleGuard(
@@ -2457,8 +2545,8 @@ impl FileSystem for PassthroughFs {
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
-        let old_path = self.inode_path(olddir)?.join(cstr_to_path(oldname));
-        let new_path = self.inode_path(newdir)?.join(cstr_to_path(newname));
+        let old_path = self.inode_path(olddir)?.join(entry_name(oldname)?);
+        let new_path = self.inode_path(newdir)?.join(entry_name(newname)?);
 
         // RENAME_EXCHANGE (Swap two files)
         if (flags as i32 & LINUX_RENAME_EXCHANGE) != 0 {
@@ -2506,7 +2594,7 @@ impl FileSystem for PassthroughFs {
         newname: &CStr,
     ) -> io::Result<Entry> {
         let existing = self.inode_path(inode)?;
-        let new_path = self.inode_path(newparent)?.join(cstr_to_path(newname));
+        let new_path = self.inode_path(newparent)?.join(entry_name(newname)?);
 
         // Note: fs::hard_link wraps CreateHardLinkW. If the target already exists,
         // it fails with an error that win_err_to_linux perfectly maps to EEXIST.
@@ -2550,13 +2638,10 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
-        // Colon is used to define a stream name in the ADS, so we need to prevent it from being used in the filename
-        if name.to_bytes().contains(&b':') {
-            return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
-        }
+        entry_name(name)?;
 
         let parent_path = self.inode_path(parent)?;
-        let child_path = parent_path.join(cstr_to_path(name));
+        let child_path = parent_path.join(entry_name(name)?);
 
         let wb = self.writeback.load(Ordering::Relaxed);
         let oflags = parse_linux_open_flags(flags as i32 | LINUX_O_CREAT, wb);
@@ -3240,5 +3325,158 @@ mod tests {
         }
         drop(filesystem);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // A share must not reach host files outside it: not through a junction
+    // shown as a directory, not through a name Windows reads as a path, and
+    // not through a guest link Windows would follow.
+    #[test]
+    fn the_guest_stays_inside_the_share() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "libkrun-share-escape-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = base.join("share");
+        let outside = base.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret"), b"host").unwrap();
+        let made = std::process::Command::new("cmd")
+            .arg("/c")
+            .arg("mklink")
+            .arg("/J")
+            .arg(root.join("out"))
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J: {made:?}");
+        let made = std::process::Command::new("cmd")
+            .arg("/c")
+            .arg("mklink")
+            .arg("/J")
+            .arg(root.join("sub").join("in"))
+            .arg(&root)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J: {made:?}");
+
+        let filesystem = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        FileSystem::init(&filesystem, FsOptions::empty()).unwrap();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let errno = |e: io::Error| e.raw_os_error().unwrap();
+
+        // A junction is a link, never a directory to walk into.
+        let out = FileSystem::lookup(&filesystem, context, fuse::ROOT_ID, c"out").unwrap();
+        assert_eq!(out.attr.st_mode & libc::S_IFMT as u32, S_IFLNK as u32);
+        let sub = FileSystem::lookup(&filesystem, context, fuse::ROOT_ID, c"sub").unwrap();
+        let inside = FileSystem::lookup(&filesystem, context, sub.inode, c"in").unwrap();
+        assert_eq!(
+            FileSystem::readlink(&filesystem, context, inside.inode).unwrap(),
+            b"..",
+            "a junction inside the share reads back relative"
+        );
+
+        // A name holding a separator or stream marker is never one entry.
+        for name in [c"out\\secret", c"..\\outside\\secret", c"x:y", c".."] {
+            assert_eq!(
+                FileSystem::lookup(&filesystem, context, fuse::ROOT_ID, name)
+                    .map(|_| ())
+                    .map_err(errno),
+                Err(linux_errno_raw(libc::ENOENT)),
+                "lookup {name:?}"
+            );
+            assert_eq!(
+                FileSystem::unlink(&filesystem, context, fuse::ROOT_ID, name).map_err(errno),
+                Err(linux_errno_raw(libc::EINVAL)),
+                "unlink {name:?}"
+            );
+            assert_eq!(
+                FileSystem::rename(
+                    &filesystem,
+                    context,
+                    fuse::ROOT_ID,
+                    c"sub",
+                    fuse::ROOT_ID,
+                    name,
+                    0
+                )
+                .map_err(errno),
+                Err(linux_errno_raw(libc::EINVAL)),
+                "rename to {name:?}"
+            );
+        }
+        assert!(
+            FileSystem::create(
+                &filesystem,
+                context,
+                fuse::ROOT_ID,
+                c"..\\outside\\planted",
+                0o644,
+                false,
+                (1 | LINUX_O_CREAT) as u32,
+                0,
+                Extensions::default(),
+            )
+            .is_err()
+        );
+        assert!(outside.join("secret").exists());
+        assert!(!outside.join("planted").exists());
+
+        // A guest link that leaves its directory is one Windows never follows.
+        let link = FileSystem::symlink(
+            &filesystem,
+            context,
+            c"../outside/secret",
+            fuse::ROOT_ID,
+            c"up",
+            Extensions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            FileSystem::readlink(&filesystem, context, link.inode).unwrap(),
+            b"../outside/secret"
+        );
+        assert!(
+            fs::read(root.join("up")).is_err(),
+            "Windows must not follow it"
+        );
+
+        drop(filesystem);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn link_targets_are_judged_by_where_they_land() {
+        assert!(is_contained_target(b"a/b"));
+        assert!(is_contained_target(b"./a"));
+        for target in [&b"../a"[..], b"a/../../b", b"/etc", b"a\\b", b"C:x", b""] {
+            assert!(!is_contained_target(target), "{target:?}");
+        }
+        let root = Path::new(r"\\?\C:\Share");
+        let link = Path::new(r"\\?\C:\Share\a\b\link");
+        let at = |t: &str| target_in_share(root, link, Path::new(t));
+        assert_eq!(at(r"\\?\c:\share\x\y").as_deref(), Some("../../x/y"));
+        assert_eq!(at(r"C:\Share").as_deref(), Some("../.."));
+        assert_eq!(at(r"C:\Shared\x"), None);
+        assert_eq!(at(r"C:\Windows"), None);
+        assert_eq!(at(r"C:\Share\..\Windows"), None);
+        assert!(is_volume_target(Path::new(r"\\?\Volume{0b1c}\")));
+        assert!(!is_volume_target(Path::new(r"\\?\C:\Volume{0b1c}")));
     }
 }
