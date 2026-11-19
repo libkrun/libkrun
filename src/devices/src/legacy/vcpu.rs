@@ -22,6 +22,9 @@ struct PerCPUInterruptControllerState {
     vcpuid: u64,
     status: VcpuStatus,
     pending_irqs: VecDeque<u32>,
+    /// An interrupt was injected outside `pending_irqs` (by the in-kernel GIC)
+    /// while the vCPU was not parked yet: it must not park on its next WFI.
+    pending_wake: bool,
     wfe_sender: Option<Sender<u32>>,
 }
 
@@ -48,7 +51,25 @@ impl PerCPUInterruptControllerState {
         }
     }
 
+    /// Wakes the vCPU if it is parked, or makes its next `should_wait` return
+    /// false otherwise. The vCPU may have trapped WFI but not have reached
+    /// `should_wait` yet, and it would then park and miss this interrupt.
+    fn wake(&mut self) {
+        match self.status {
+            VcpuStatus::Waiting => {
+                if let Some(sender) = self.wfe_sender.as_ref() {
+                    let _ = sender.send(self.vcpuid as u32);
+                }
+                self.status = VcpuStatus::Running;
+            }
+            VcpuStatus::Running => self.pending_wake = true,
+        }
+    }
+
     fn should_wait(&mut self) -> bool {
+        if std::mem::take(&mut self.pending_wake) {
+            return false;
+        }
         if self.pending_irqs.is_empty() {
             self.status = VcpuStatus::Waiting;
             return true;
@@ -78,6 +99,7 @@ impl VcpuList {
                 vcpuid,
                 status: VcpuStatus::Running,
                 pending_irqs: VecDeque::new(),
+                pending_wake: false,
                 wfe_sender: None,
             }));
         }
@@ -104,6 +126,15 @@ impl VcpuList {
             .lock()
             .unwrap()
             .set_irq_common(irq);
+    }
+
+    /// Wakes every vCPU parked waiting for an interrupt, and keeps the others
+    /// from parking on their next WFI. Used by the in-kernel GIC, which injects
+    /// interrupts without going through `pending_irqs`.
+    pub fn wake_waiting(&self) {
+        for vcpu in &self.vcpus {
+            vcpu.lock().unwrap().wake();
+        }
     }
 
     pub fn register(&self, vcpuid: u64, wfe_sender: Sender<u32>) {
@@ -252,5 +283,28 @@ impl Vcpus for VcpuList {
             | SYSREG_OSDLR_EL1 => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wake_before_parking_is_not_lost() {
+        let list = VcpuList::new(1);
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        list.register(0, sender);
+
+        // The SPI arrives after the WFI trap but before `should_wait`.
+        list.wake_waiting();
+        assert!(!list.should_wait(0));
+        assert!(receiver.try_recv().is_err());
+
+        // The pending wake is consumed: the next WFI parks.
+        assert!(list.should_wait(0));
+        list.wake_waiting();
+        assert_eq!(receiver.try_recv(), Ok(0));
+        assert!(list.should_wait(0));
     }
 }

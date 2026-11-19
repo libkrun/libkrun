@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use crate::Error as DeviceError;
 use crate::bus::BusDevice;
+use crate::legacy::VcpuList;
 use crate::legacy::gic::GICDevice;
 use crate::legacy::irqchip::IrqChipT;
 
@@ -39,6 +40,9 @@ pub struct HvfGicV3 {
 
     /// Number of CPUs handled by the device
     vcpu_count: u64,
+
+    /// Used to wake vCPUs parked on WFI when an SPI is raised
+    vcpu_list: Arc<VcpuList>,
 }
 
 static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
@@ -49,7 +53,8 @@ static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
 });
 
 impl HvfGicV3 {
-    pub fn new(vcpu_count: u64) -> Result<Self, Error> {
+    pub fn new(vcpu_list: Arc<VcpuList>) -> Result<Self, Error> {
+        let vcpu_count = vcpu_list.get_cpu_count();
         let bindings = unsafe {
             HvfGicBindings {
                 hv_gic_create: HVF.get(b"hv_gic_create").map_err(Error::FindSymbol)?,
@@ -114,6 +119,7 @@ impl HvfGicV3 {
             bindings,
             properties: [dist_addr, dist_size, redists_addr, redists_size],
             vcpu_count,
+            vcpu_list,
         })
     }
 }
@@ -135,12 +141,15 @@ impl IrqChipT for HvfGicV3 {
         if let Some(irq_line) = irq_line {
             let ret = unsafe { (self.bindings.hv_gic_set_spi)(irq_line, true) };
             if ret != HV_SUCCESS {
-                Err(DeviceError::FailedSignalingUsedQueue(
+                return Err(DeviceError::FailedSignalingUsedQueue(
                     std::io::Error::other("HVF returned error when setting SPI"),
-                ))
-            } else {
-                Ok(())
+                ));
             }
+            // HVF delivers the SPI to a running vCPU, but a vCPU parked in
+            // `wait_for_event` after trapping WFI would only notice it at its next
+            // vtimer deadline, adding up to a timer period to every completion.
+            self.vcpu_list.wake_waiting();
+            Ok(())
         } else {
             Err(DeviceError::FailedSignalingUsedQueue(io::Error::new(
                 io::ErrorKind::InvalidData,
