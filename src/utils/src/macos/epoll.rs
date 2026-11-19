@@ -261,16 +261,19 @@ impl Epoll {
                         ));
                     }
                 }
-                let _ = unsafe {
-                    libc::kevent(
-                        self.queue,
-                        kevs.as_ptr() as *const libc::kevent,
-                        kevs.len() as i32,
-                        ptr::null_mut(),
-                        0,
-                        ptr::null(),
-                    )
-                };
+                // A missing filter must not prevent deleting the other one.
+                for kev in &kevs {
+                    let _ = unsafe {
+                        libc::kevent(
+                            self.queue,
+                            (kev as *const Kevent).cast(),
+                            1,
+                            ptr::null_mut(),
+                            0,
+                            ptr::null(),
+                        )
+                    };
+                }
             }
         }
         Ok(())
