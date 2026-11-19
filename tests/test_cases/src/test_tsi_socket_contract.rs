@@ -20,6 +20,13 @@ const INCOMING_UDP: u16 = 45001;
 const INCOMING_TCP: u16 = 45002;
 const MAPPED_PUBLICATION: u16 = 45003;
 
+fn backpressure_payload() -> Vec<u8> {
+    // Exceed the 8 MiB stream credit window with a pattern spanning packet boundaries.
+    (0..9 * 1024 * 1024)
+        .map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8)
+        .collect()
+}
+
 #[host]
 mod host {
     use super::*;
@@ -29,17 +36,40 @@ mod host {
     #[cfg(feature = "dynamic-linking")]
     use krun::{DeviceManager, ffi::Symbol};
     use nix::sys::socket::{
-        AddressFamily, SockFlag, SockType, SockaddrStorage, bind, getsockname, socket,
+        AddressFamily, SockFlag, SockType, SockaddrStorage, bind, getsockname, setsockopt, socket,
+        sockopt,
     };
     use std::env;
     use std::fs;
     use std::io::{self, Read, Write};
+    use std::net::Shutdown;
     use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::path::Path;
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    fn read_backpressured_stream(stream: &mut TcpStream, ready: &Path) -> anyhow::Result<Vec<u8>> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            ensure!(
+                Instant::now() < deadline,
+                "timed out waiting for {}",
+                ready.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut data = Vec::new();
+        stream.read_to_end(&mut data)?;
+        ensure!(
+            data == backpressure_payload(),
+            "received {} bytes before EOF, payload mismatch",
+            data.len()
+        );
+        Ok(data)
+    }
 
     fn bound_tcp_socket(ip: IpAddr) -> anyhow::Result<(OwnedFd, u16)> {
         let family = if ip.is_ipv6() {
@@ -138,6 +168,7 @@ mod host {
             let udp = Arc::new(UdpSocket::bind((ip, 0))?);
             let other = Arc::new(UdpSocket::bind((ip, 0))?);
             let tcp = TcpListener::bind((ip, 0))?;
+            setsockopt(&tcp, sockopt::RcvBuf, &65536)?;
             let conflict = TcpListener::bind((ip, 0))?;
             let conflict_port = conflict.local_addr()?.port();
             let mapped_conflict = TcpListener::bind((ip, 0))?;
@@ -175,20 +206,13 @@ mod host {
                     }
                 });
             }
-            thread::spawn(move || {
-                for stream in tcp.incoming() {
-                    let mut stream = stream.unwrap();
-                    thread::spawn(move || {
-                        stream
-                            .set_read_timeout(Some(Duration::from_secs(5)))
-                            .unwrap();
-                        let mut data = Vec::new();
-                        stream.read_to_end(&mut data).unwrap();
-                        stream.write_all(&data).unwrap();
-                    });
-                }
-            });
             let directory = setup.tmp_dir.join("rootfs");
+            let outgoing_ready = directory.join("outgoing-tcp-drain");
+            thread::spawn(move || {
+                let (mut stream, _) = tcp.accept().unwrap();
+                let data = read_backpressured_stream(&mut stream, &outgoing_ready).unwrap();
+                stream.write_all(&data).unwrap();
+            });
             publication_fixture(&directory, conflict, conflict_port);
             publication_fixture(&directory, mapped_conflict, MAPPED_PUBLICATION);
             thread::spawn(move || {
@@ -206,10 +230,13 @@ mod host {
                     ensure!(&data[..count] == b"incoming UDP", "UDP reply");
                     ensure!(peer.port() == udp_port, "mapped UDP reply source");
                     let mut stream = TcpStream::connect((ip, tcp_port))?;
+                    setsockopt(&stream, sockopt::RcvBuf, &65536)?;
                     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
                     stream.write_all(b"incoming TCP")?;
                     stream.read_exact(&mut data[..12])?;
                     ensure!(&data[..12] == b"incoming TCP", "TCP reply");
+                    stream.shutdown(Shutdown::Write)?;
+                    read_backpressured_stream(&mut stream, &directory.join("incoming-tcp-drain"))?;
                     Ok(())
                 })();
                 publish_result(&directory, "incoming-result", result);
@@ -473,12 +500,15 @@ mod guest {
                 .unwrap();
             assert_eq!(stream.peer_addr().unwrap(), address);
             assert_eq!(stream.local_addr().unwrap().ip(), self.loopback());
-            let payload = vec![0xa7; 256 * 1024];
-            stream.write_all(&payload).unwrap();
-            stream.shutdown(Shutdown::Write).unwrap();
+            let payload = backpressure_payload();
+            self.send_backpressured(&mut stream, &payload, "/outgoing-tcp-drain");
             let mut reply = Vec::new();
             stream.read_to_end(&mut reply).unwrap();
-            assert_eq!(reply, payload);
+            assert!(
+                reply == payload,
+                "TCP echo payload mismatch, received {} bytes",
+                reply.len()
+            );
             assert_eq!(stream.local_addr().unwrap().ip(), self.loopback());
             if let Some(pending) = pending {
                 let udp = self.udp();
@@ -529,6 +559,44 @@ mod guest {
             println!(
                 "PASS TCP nonblocking connect/refusal, option replay, names after shutdown, bulk transfer and half-close"
             );
+        }
+
+        fn send_backpressured(&self, stream: &mut TcpStream, payload: &[u8], ready: &str) {
+            option(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                Some(4096),
+            );
+            stream.set_nonblocking(true).unwrap();
+            let mut offset = 0;
+            while offset < payload.len() {
+                match stream.write(&payload[offset..]) {
+                    Ok(0) => panic!("zero-length TCP write"),
+                    Ok(count) => offset += count,
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(err) => panic!("TCP write before reader starts: {err}"),
+                }
+            }
+            assert!(
+                offset > 0 && offset < payload.len(),
+                "expected TCP backpressure, sent {offset} bytes"
+            );
+
+            let udp = self.udp();
+            udp.send_to(b"progress", (self.loopback(), port("TSI_UDP")))
+                .unwrap();
+            let mut reply = [0; 8];
+            assert_eq!(udp.recv(&mut reply).unwrap(), reply.len());
+            assert_eq!(&reply, b"progress");
+
+            fs::write(ready, b"ready").unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream.write_all(&payload[offset..]).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
         }
 
         fn incoming(&self) {
@@ -648,6 +716,7 @@ mod guest {
                 .unwrap();
             stream.read_exact(&mut data[..12]).unwrap();
             stream.write_all(&data[..12]).unwrap();
+            self.send_backpressured(&mut stream, &backpressure_payload(), "/incoming-tcp-drain");
             let deadline = Instant::now() + Duration::from_secs(5);
             while !Path::new("/incoming-result").exists() {
                 assert!(Instant::now() < deadline, "incoming fixture timed out");

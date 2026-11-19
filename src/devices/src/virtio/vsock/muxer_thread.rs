@@ -72,20 +72,19 @@ impl MuxerThread {
         let mut rxq = self.rxq.lock().unwrap();
         let mut drained = false;
 
-        while let Some(rx) = rxq.pop() {
-            if let Some(head) = queue.pop(&self.mem) {
-                if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-                    rx_to_pkt(self.cid, rx, &mut pkt);
-                    if let Err(e) =
-                        queue.add_used(&self.mem, head.index, pkt.finish_rx().unwrap_or(0))
-                    {
-                        error!("failed to add used elements to the queue: {e:?}");
-                    }
-                    drained = true;
-                }
-            } else {
-                rxq.push(rx);
+        while !rxq.is_empty() {
+            let Some(head) = queue.pop(&self.mem) else {
                 break;
+            };
+            let used_len = if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
+                rx_to_pkt(self.cid, rxq.pop().unwrap(), &mut pkt);
+                pkt.finish_rx().unwrap_or(0)
+            } else {
+                0
+            };
+            match queue.add_used(&self.mem, head.index, used_len) {
+                Ok(()) => drained = true,
+                Err(e) => error!("failed to add used elements to the queue: {e:?}"),
             }
         }
 
@@ -125,10 +124,6 @@ impl MuxerThread {
     }
 
     fn process_proxy_update(&self, id: u64, update: ProxyUpdate, thread_rng: &mut ThreadRng) {
-        if let Some(polling) = update.polling {
-            self.update_polling(polling.0, polling.1, polling.2);
-        }
-
         if let Some(credit_rx) = update.push_credit_req {
             debug!("send_credit_request");
             self.send_credit_request(credit_rx);
