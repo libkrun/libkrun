@@ -15,12 +15,18 @@
 /// connection pool to find it.  This walk is performed here, as part of building an RX queue from
 /// the connection pool. When an out-of-sync is drained, the muxer will discard it, and attempt to
 /// rebuild a synced one.
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use super::defs;
 use super::defs::uapi;
 use super::muxer::MuxerRx;
 use super::packet::{TsiAcceptRsp, TsiConnectRsp, TsiListenRsp, VsockPacket};
+
+#[derive(Default)]
+struct StreamCredit {
+    fwd_cnt: u32,
+    request_peer_credit: bool,
+}
 
 /// The muxer RX queue.
 pub struct MuxerRxQ {
@@ -28,6 +34,7 @@ pub struct MuxerRxQ {
     q: VecDeque<MuxerRx>,
     /// The RX queue sync status.
     synced: bool,
+    stream_credit: BTreeMap<u64, StreamCredit>,
     #[cfg(feature = "tsi-fault-injection")]
     pub(super) faults: super::tsi_control_faults::Injector,
 }
@@ -40,9 +47,31 @@ impl MuxerRxQ {
         Self {
             q: VecDeque::with_capacity(Self::SIZE),
             synced: true,
+            stream_credit: BTreeMap::new(),
             #[cfg(feature = "tsi-fault-injection")]
             faults: super::tsi_control_faults::Injector::default(),
         }
+    }
+
+    // Keep the latest counter even if the guest has supplied no RX buffers.
+    pub fn stage_stream_credit(&mut self, id: u64, fwd_cnt: u32, request: bool) {
+        let pending = self.stream_credit.entry(id).or_default();
+        pending.fwd_cnt = fwd_cnt;
+        pending.request_peer_credit |= request;
+    }
+
+    pub fn stream_credit_piggybacked(&mut self, id: u64, fwd_cnt: u32) {
+        if let Some(pending) = self.stream_credit.get_mut(&id) {
+            if pending.request_peer_credit {
+                pending.fwd_cnt = fwd_cnt;
+            } else {
+                self.stream_credit.remove(&id);
+            }
+        }
+    }
+
+    pub fn clear_stream_credit(&mut self, id: u64) {
+        self.stream_credit.remove(&id);
     }
 
     /// Push a new RX item to the queue.
@@ -70,7 +99,25 @@ impl MuxerRxQ {
 
     /// Pop an RX item from the front of the queue.
     pub fn pop(&mut self) -> Option<MuxerRx> {
-        self.q.pop_front()
+        self.q.pop_front().or_else(|| {
+            let (id, credit) = self.stream_credit.pop_first()?;
+            let local_port = id as u32;
+            let peer_port = (id >> 32) as u32;
+            let fwd_cnt = credit.fwd_cnt;
+            Some(if credit.request_peer_credit {
+                MuxerRx::CreditRequest {
+                    local_port,
+                    peer_port,
+                    fwd_cnt,
+                }
+            } else {
+                MuxerRx::CreditUpdate {
+                    local_port,
+                    peer_port,
+                    fwd_cnt,
+                }
+            })
+        })
     }
 
     /// Check if the RX queue is synchronized with the connection pool.
@@ -78,19 +125,50 @@ impl MuxerRxQ {
         self.synced
     }
 
-    /// Get the total number of items in the queue.
-    pub fn len(&self) -> usize {
-        self.q.len()
-    }
-
     /// Check if the queue is empty.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.q.is_empty() && self.stream_credit.is_empty()
     }
 
     /// Check if the queue is full.
     pub fn is_full(&self) -> bool {
-        self.len() == Self::SIZE
+        self.q.len() == Self::SIZE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalesces_stream_credit_until_an_rx_buffer_is_available() {
+        let mut rxq = MuxerRxQ::new();
+        let id = 1024 << 32 | 620;
+        rxq.stage_stream_credit(id, u32::MAX, false);
+        rxq.stage_stream_credit(id, 10, false);
+        assert!(!rxq.is_empty());
+        assert!(matches!(
+            rxq.pop(),
+            Some(MuxerRx::CreditUpdate {
+                local_port: 620,
+                peer_port: 1024,
+                fwd_cnt: 10,
+            })
+        ));
+        assert!(rxq.is_empty());
+
+        rxq.stage_stream_credit(id, 20, false);
+        rxq.stream_credit_piggybacked(id, 20);
+        assert!(rxq.is_empty());
+
+        rxq.stage_stream_credit(id, 30, true);
+        rxq.stage_stream_credit(id, 40, false);
+        rxq.stream_credit_piggybacked(id, 50);
+        assert!(matches!(
+            rxq.pop(),
+            Some(MuxerRx::CreditRequest { fwd_cnt: 50, .. })
+        ));
+        assert!(rxq.is_empty());
     }
 }
 

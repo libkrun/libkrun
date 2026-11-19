@@ -73,6 +73,7 @@ impl ProxyError {
 pub enum ProxyStatus {
     Idle,
     Connecting,
+    AwaitingRequest,
     Connected,
     Listening,
     Closed,
@@ -173,6 +174,9 @@ pub trait Proxy: Send + AsRawFd {
         ProxyUpdate::default()
     }
     fn release(&mut self) -> ProxyUpdate;
+    fn reset(&mut self) -> ProxyUpdate {
+        self.release()
+    }
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate;
 }
 

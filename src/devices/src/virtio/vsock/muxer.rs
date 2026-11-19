@@ -241,14 +241,8 @@ impl VsockMuxer {
 
     pub(crate) fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> super::Result<()> {
         debug!("recv_stream_pkt");
-        if self.rxq.lock().unwrap().is_empty() {
-            return Err(VsockError::NoData);
-        }
-
-        if let Some(rx) = self.rxq.lock().unwrap().pop() {
-            rx_to_pkt(self.cid, rx, pkt);
-        }
-
+        let rx = self.rxq.lock().unwrap().pop().ok_or(VsockError::NoData)?;
+        rx_to_pkt(self.cid, rx, pkt);
         Ok(())
     }
 
@@ -298,11 +292,19 @@ impl VsockMuxer {
         }
     }
 
+    /// Apply a proxy's polling mask while its lock is still held, so the
+    /// event thread cannot install a stale interest for the same fd in
+    /// between.
+    fn apply_polling_under_lock(&self, update: &mut ProxyUpdate) {
+        if let Some((id, fd, events)) = update.polling.take() {
+            self.update_polling(id, fd, events);
+        }
+    }
+
     fn process_proxy_update(&self, id: u64, update: ProxyUpdate) {
         if let Some(polling) = update.polling {
             self.update_polling(polling.0, polling.1, polling.2);
         }
-
         match update.remove_proxy {
             ProxyRemoval::Keep => {}
             ProxyRemoval::Immediate => {
@@ -496,7 +498,9 @@ impl VsockMuxer {
                 if address_family(&req.addr) != Some(family) {
                     return Err(-tsi_wire::EAFNOSUPPORT);
                 }
-                Ok(proxy.connect(pkt, req))
+                let mut update = proxy.connect(pkt, req);
+                self.apply_polling_under_lock(&mut update);
+                Ok(update)
             });
             match update.unwrap_or(Err(-tsi_wire::ECONNREFUSED)) {
                 Ok(update) => self.process_proxy_update(id, update),
@@ -756,7 +760,11 @@ impl VsockMuxer {
                 .filter(|_| !self.is_host_listener_id(id))
                 .and_then(|proxy| {
                     let mut proxy = proxy.lock().unwrap();
-                    proxy.is_tsi().then(|| proxy.release())
+                    proxy.is_tsi().then(|| {
+                        let mut update = proxy.release();
+                        self.apply_polling_under_lock(&mut update);
+                        update
+                    })
                 });
 
             if let Some(update) = update {
@@ -996,12 +1004,12 @@ impl VsockMuxer {
     fn process_op_response(&self, pkt: &VsockPacket) {
         debug!("OP_RESPONSE");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        let update = self
-            .proxy_map
-            .read()
-            .unwrap()
-            .get(&id)
-            .map(|proxy| proxy.lock().unwrap().process_op_response(pkt));
+        let update = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+            let mut proxy = proxy.lock().unwrap();
+            let mut update = proxy.process_op_response(pkt);
+            self.apply_polling_under_lock(&mut update);
+            update
+        });
         update
             .as_ref()
             .and_then(|u| u.push_accept)
@@ -1021,12 +1029,12 @@ impl VsockMuxer {
     fn process_op_shutdown(&self, pkt: &VsockPacket) {
         debug!("OP_SHUTDOWN");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        let update = self
-            .proxy_map
-            .read()
-            .unwrap()
-            .get(&id)
-            .map(|proxy| proxy.lock().unwrap().shutdown(pkt));
+        let update = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+            let mut proxy = proxy.lock().unwrap();
+            let mut update = proxy.shutdown(pkt);
+            self.apply_polling_under_lock(&mut update);
+            update
+        });
         if let Some(update) = update {
             self.process_proxy_update(id, update);
         }
@@ -1040,9 +1048,7 @@ impl VsockMuxer {
             let mut update = proxy.update_peer_credit(pkt);
             // Apply the polling change under the proxy lock so a later event on
             // the same connection cannot rearm it after we stopped polling.
-            if let Some((id, fd, events)) = update.polling.take() {
-                self.update_polling(id, fd, events);
-            }
+            self.apply_polling_under_lock(&mut update);
             update
         });
         if let Some(update) = update {
@@ -1053,14 +1059,20 @@ impl VsockMuxer {
     fn process_stream_rw(&self, pkt: &VsockPacket) {
         debug!("OP_RW");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
+        let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
             debug!(
                 "allowing OP_RW: src={} dst={}",
                 pkt.src_port(),
                 pkt.dst_port()
             );
             let mut proxy = proxy_lock.lock().unwrap();
-            let update = proxy.sendmsg(pkt);
+            let mut update = proxy.sendmsg(pkt);
+            // Apply the polling mask under the proxy lock so the event
+            // thread cannot rearm a stale interest in between.
+            self.apply_polling_under_lock(&mut update);
+            update
+        });
+        if let Some(update) = update {
             self.process_proxy_update(id, update);
         } else {
             debug!("invalid OP_RW for {}, sending reset", pkt.src_port());
@@ -1098,7 +1110,11 @@ impl VsockMuxer {
                 pkt.src_port(),
                 pkt.dst_port()
             );
-            Some(proxy_lock.lock().unwrap().release())
+            let mut proxy = proxy_lock.lock().unwrap();
+            let mut update = proxy.reset();
+            self.apply_polling_under_lock(&mut update);
+            drop(proxy);
+            Some(update)
         } else {
             debug!("invalid OP_RST for {}", pkt.src_port());
             None
