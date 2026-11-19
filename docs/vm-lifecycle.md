@@ -41,8 +41,10 @@ Create an `MmioDeviceManager` with `MmioDeviceManager::new()` (C API: `krun_mmio
 - **Console**: `ConsoleBuilder` configures standard or multiport virtio-console streams.
 - **Filesystem**: `FsDevice` exposes host directories via virtiofs with optional overlays.
   Call `set_cache_policy()` before attaching it to select `CachePolicy::Auto` (the default),
-  `Never` or `Always`. Use `Never` for files modified outside the guest; reserve `Always`
-  for directories accessed exclusively through this filesystem.
+  `Never`, `Always` or `KeepUnchanged`. Use `Never` for files modified outside the guest; reserve
+  `Always` for directories accessed exclusively through this filesystem. `KeepUnchanged` is `Auto`
+  that keeps cached data while the host file's mtime, ctime and size stay the same, so it misses
+  writes through a host shared mapping until they are flushed.
   `set_cache_timeouts()` sets how long lookups and attributes are cached (5000 ms by
   default); use 0 for directories the host modifies while the guest uses them.
 - **Network**:
