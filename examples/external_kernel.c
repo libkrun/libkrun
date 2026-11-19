@@ -6,6 +6,7 @@
  */
 
 #include <errno.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,6 +61,24 @@ static KrunVtableHandle krun_stderr_writer = KRUN_TEMP_OBJ(KRUN_PUSH_STR_TYPE_TA
         krun_error_destroy(krun_err);                                          \
         return -1;                                                             \
     }
+
+static void *load_fn(const char *fname)
+{
+    const char *err;
+    void *fn;
+
+    fn = dlsym(RTLD_DEFAULT, fname);
+    err = dlerror();
+    if (err != NULL || fn == NULL) {
+        fprintf(stderr, "Could not resolve %s", fname);
+        if (err != NULL) {
+            fprintf(stderr, "Failed to find: %s", err);
+        }
+        fputc('\n', stderr);
+        return NULL;
+    }
+    return fn;
+}
 
 static void print_help(char *const name)
 {
@@ -228,6 +247,9 @@ int main(int argc, char *const argv[])
 {
     KrunError krun_err;
     pthread_t thread;
+    krun_block_device_new_fn blkdev_new = NULL;
+    krun_net_device_new_unixstream_path_fn netpath_fn = NULL;
+    krun_net_device_new_unixstream_fd_fn netfd_fn = NULL;
     struct cmdline cmdline;
 
     if (!parse_cmdline(argc, argv, &cmdline))
@@ -235,6 +257,22 @@ int main(int argc, char *const argv[])
         putchar('\n');
         print_help(argv[0]);
         return -1;
+    }
+
+    if ((krun_build_capability_flags() & KRUN_BUILD_CAPABILITY_FLAGS_BLK) == 0) {
+        fprintf(stderr, "Requires: libkrun to be built with BLK=1\n");
+        return -1;
+    }
+
+    if ((krun_build_capability_flags() & KRUN_BUILD_CAPABILITY_FLAGS_NET) == 0) {
+        fprintf(stderr, "Requires: libkrun to be built with NET=1\n");
+        return -1;
+    }
+
+    if (!(blkdev_new = (krun_block_device_new_fn) load_fn("krun_block_device_new")) ||
+        !(netpath_fn = (krun_net_device_new_unixgram_path_fn) load_fn("krun_net_device_new_unixgram_path")) ||
+        !(netfd_fn = (krun_net_device_new_unixgram_fd_fn) load_fn("krun_net_device_new_unixgram_fd"))) {
+        cmdline.show_help = true;
     }
 
     if (cmdline.show_help)
@@ -259,13 +297,13 @@ int main(int argc, char *const argv[])
 
     if (cmdline.boot_disk)
     {
-        CHECK(KrunBlockDevice blk = krun_block_device_new(KRUN_STR("boot"),
+        CHECK(KrunBlockDevice blk = (blkdev_new)(KRUN_STR("boot"),
             KRUN_STR(cmdline.boot_disk), KRUN_DISK_FORMAT_RAW, &krun_err));
         krun_mmio_device_manager_add(devices, blk);
     }
     if (cmdline.data_disk)
     {
-        CHECK(KrunBlockDevice blk = krun_block_device_new(KRUN_STR("data"),
+        CHECK(KrunBlockDevice blk = (blkdev_new)(KRUN_STR("data"),
             KRUN_STR(cmdline.data_disk), KRUN_DISK_FORMAT_RAW, &krun_err));
         krun_mmio_device_manager_add(devices, blk);
     }
@@ -275,14 +313,14 @@ int main(int argc, char *const argv[])
         uint8_t mac[] = {0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee};
         KrunNetDevice net;
         if (cmdline.passt_socket_path != NULL) {
-            net = krun_net_device_new_unixstream_path(KRUN_STR("net0"),
+            net = (netpath_fn)(KRUN_STR("net0"),
                 KRUN_STR(cmdline.passt_socket_path), KRUN_BYTES(mac), COMPAT_NET_FEATURES, 0, &krun_err);
         } else {
             int passt_fd = start_passt();
             if (passt_fd < 0) {
                 return -1;
             }
-            net = krun_net_device_new_unixstream_fd(KRUN_STR("net0"),
+            net = (netfd_fn)(KRUN_STR("net0"),
                 passt_fd, KRUN_BYTES(mac), COMPAT_NET_FEATURES, 0, &krun_err);
         }
         if (krun_err) {
