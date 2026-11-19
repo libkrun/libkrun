@@ -18,6 +18,7 @@ examples/external_kernel
 examples/nitro
 examples/consoles
 examples/rootfs_fedora
+examples/*.dSYM
 test-prefix
 /linux-sysroot
 /freebsd-sysroot
