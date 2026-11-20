@@ -718,72 +718,75 @@ impl VsockMuxer {
 
     fn process_listen_request(&self, pkt: &VsockPacket) {
         debug!("DGRAM listen request: src={}", pkt.src_port());
-        if let Some(mut req) = pkt.read_listen_req() {
-            req.strict = self
-                .tsi_flags
-                .contains(TsiFlags::FAIL_ON_TCP_PUBLICATION_ERROR);
-            let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-            if self.is_host_listener_id(id) || self.is_protected_unix_path(&req.addr) {
-                warn!("rejecting guest listen on a host-side listening unix socket");
-                self.push_packet(MuxerRx::ListenResponse {
-                    request_id: pkt.control_request_id(),
-                    operation: pkt.control_operation(),
-                    peer_port: pkt.src_port(),
-                    result: -libc::EACCES,
-                    flags: req.response_flags(),
-                });
-                return;
-            }
-            debug!("DGRAM listen request: id={id}");
-            match self.proxy_map.read().unwrap().get(&id) {
+        let Some(mut req) = pkt.read_listen_req() else {
+            self.control_error(pkt, -tsi_wire::EPROTO);
+            return;
+        };
+        req.strict = self
+            .tsi_flags
+            .contains(TsiFlags::FAIL_ON_TCP_PUBLICATION_ERROR);
+        let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+        if self.is_host_listener_id(id) || self.is_protected_unix_path(&req.addr) {
+            warn!("rejecting guest listen on a host-side listening unix socket");
+            self.push_packet(MuxerRx::ListenResponse {
+                request_id: pkt.control_request_id(),
+                operation: pkt.control_operation(),
+                peer_port: pkt.src_port(),
+                result: -libc::EACCES,
+                flags: req.response_flags(),
+            });
+            return;
+        }
+        debug!("DGRAM listen request: id={id}");
+        let response_flags = req.response_flags();
+        // Applying the update re-locks the proxy map when removing, so the
+        // guard must not outlive this lookup.
+        let (update, result) = {
+            let proxies = self.proxy_map.read().unwrap();
+            match proxies.get(&id) {
                 Some(proxy) => {
                     let mut proxy = proxy.lock().unwrap();
-                    let result = match proxy.tsi_socket() {
+                    match proxy.tsi_socket() {
                         Some((defs::SOCK_STREAM, family))
                             if address_family(&req.addr) == Some(family) =>
                         {
-                            self.process_proxy_update(
-                                id,
-                                proxy.listen(pkt, req, &self.host_port_map),
-                            );
-                            return;
+                            let mut update = proxy.listen(pkt, req, &self.host_port_map);
+                            self.apply_polling_under_lock(&mut update);
+                            (Some(update), 0)
                         }
-                        Some((defs::SOCK_STREAM, _)) => -tsi_wire::EAFNOSUPPORT,
-                        _ => -tsi_wire::EOPNOTSUPP,
-                    };
-                    self.push_packet(MuxerRx::ListenResponse {
-                        request_id: pkt.control_request_id(),
-                        operation: pkt.control_operation(),
-                        peer_port: pkt.src_port(),
-                        result,
-                        flags: req.response_flags(),
-                    });
+                        Some((defs::SOCK_STREAM, _)) => (None, -tsi_wire::EAFNOSUPPORT),
+                        _ => (None, -tsi_wire::EOPNOTSUPP),
+                    }
                 }
-                None => self.push_packet(MuxerRx::ListenResponse {
-                    request_id: pkt.control_request_id(),
-                    operation: pkt.control_operation(),
-                    peer_port: pkt.src_port(),
-                    result: -libc::EPERM,
-                    flags: req.response_flags(),
-                }),
-            };
+                None => (None, -libc::EPERM),
+            }
+        };
+        if let Some(update) = update {
+            self.process_proxy_update(id, update);
         } else {
-            self.control_error(pkt, -tsi_wire::EPROTO);
+            self.push_packet(MuxerRx::ListenResponse {
+                request_id: pkt.control_request_id(),
+                operation: pkt.control_operation(),
+                peer_port: pkt.src_port(),
+                result,
+                flags: response_flags,
+            });
         }
     }
 
     fn process_accept_request(&self, pkt: &VsockPacket) {
         debug!("DGRAM accept request: src={}", pkt.src_port());
-        if let Some(req) = pkt.read_accept_req() {
-            let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-            debug!("DGRAM accept request: id={id}");
-            match self
-                .proxy_map
-                .read()
-                .unwrap()
-                .get(&id)
-                .filter(|_| !self.is_host_listener_id(id))
-            {
+        let Some(req) = pkt.read_accept_req() else {
+            self.control_error(pkt, -tsi_wire::EPROTO);
+            return;
+        };
+        let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+        debug!("DGRAM accept request: id={id}");
+        // Applying the update re-locks the proxy map when removing, so the
+        // guard must not outlive this lookup.
+        let update = {
+            let proxies = self.proxy_map.read().unwrap();
+            match proxies.get(&id).filter(|_| !self.is_host_listener_id(id)) {
                 Some(proxy) => {
                     let mut proxy = proxy.lock().unwrap();
                     if !matches!(proxy.tsi_socket(), Some((defs::SOCK_STREAM, _)))
@@ -793,19 +796,26 @@ impl VsockMuxer {
                         )
                     {
                         self.control_error(pkt, -tsi_wire::EOPNOTSUPP);
+                        None
                     } else {
-                        self.process_proxy_update(id, proxy.accept(req));
+                        let mut update = proxy.accept(req);
+                        self.apply_polling_under_lock(&mut update);
+                        Some(update)
                     }
                 }
-                None => self.push_packet(MuxerRx::AcceptResponse {
-                    request_id: pkt.control_request_id(),
-                    operation: pkt.control_operation(),
-                    peer_port: pkt.src_port(),
-                    result: -libc::EINVAL,
-                }),
+                None => {
+                    self.push_packet(MuxerRx::AcceptResponse {
+                        request_id: pkt.control_request_id(),
+                        operation: pkt.control_operation(),
+                        peer_port: pkt.src_port(),
+                        result: -libc::EINVAL,
+                    });
+                    None
+                }
             }
-        } else {
-            self.control_error(pkt, -tsi_wire::EPROTO);
+        };
+        if let Some(update) = update {
+            self.process_proxy_update(id, update);
         }
     }
 
@@ -997,52 +1007,76 @@ impl VsockMuxer {
     fn process_op_request(&mut self, pkt: &VsockPacket) {
         debug!("OP_REQUEST");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        let mut proxy_map = self.proxy_map.write().unwrap();
 
-        if let Some(proxy) = proxy_map.get(&id) {
-            if let Some(update) = proxy.lock().unwrap().confirm_connect(pkt) {
-                self.process_proxy_update(id, update);
-            }
-        } else if let Some(ipc_map) = &mut self.unix_ipc_port_map
-            && let Some((path, listen)) = ipc_map.get(&pkt.dst_port())
-        {
-            if let Some(limit) = self.proxy_limit
-                && proxy_map.len() >= limit
+        // Applying the update re-locks the proxy map when removing, so the
+        // guard must not outlive this block.
+        let update = {
+            let mut proxy_map = self.proxy_map.write().unwrap();
+
+            if let Some(proxy) = proxy_map.get(&id) {
+                let mut proxy = proxy.lock().unwrap();
+                let mut update = proxy.confirm_connect(pkt);
+                if let Some(update) = &mut update {
+                    self.apply_polling_under_lock(update);
+                }
+                update
+            } else if let Some(ipc_map) = &mut self.unix_ipc_port_map
+                && let Some((path, listen)) = ipc_map.get(&pkt.dst_port())
             {
-                warn!("refusing guest connection: proxy limit reached");
-                self.push_packet(MuxerRx::Reset {
-                    local_port: pkt.dst_port(),
-                    peer_port: pkt.src_port(),
-                });
-                return;
-            }
-            let mem = self.mem.as_ref().unwrap();
-            let queue = self.queue.as_ref().unwrap();
-            if *listen {
-                warn!("Attempting to connect a socket that is listening, sending rst");
-                let rx = MuxerRx::Reset {
-                    local_port: pkt.dst_port(),
-                    peer_port: pkt.src_port(),
-                };
-                push_packet(self.cid, rx, &self.rxq, queue, mem);
-                return;
-            }
-            let rxq = self.rxq.clone();
+                if let Some(limit) = self.proxy_limit
+                    && proxy_map.len() >= limit
+                {
+                    warn!("refusing guest connection: proxy limit reached");
+                    self.push_packet(MuxerRx::Reset {
+                        local_port: pkt.dst_port(),
+                        peer_port: pkt.src_port(),
+                    });
+                    return;
+                }
+                let mem = self.mem.as_ref().unwrap();
+                let queue = self.queue.as_ref().unwrap();
+                if *listen {
+                    warn!("Attempting to connect a socket that is listening, sending rst");
+                    let rx = MuxerRx::Reset {
+                        local_port: pkt.dst_port(),
+                        peer_port: pkt.src_port(),
+                    };
+                    push_packet(self.cid, rx, &self.rxq, queue, mem);
+                    return;
+                }
+                let rxq = self.rxq.clone();
 
-            let mut unix = match UnixProxy::new(
-                id,
-                self.cid,
-                pkt.dst_port(),
-                mem.clone(),
-                queue.clone(),
-                rxq,
-                path.to_path_buf(),
-            ) {
-                Ok(unix) => unix,
-                Err(e) => {
+                let mut unix = match UnixProxy::new(
+                    id,
+                    self.cid,
+                    pkt.dst_port(),
+                    mem.clone(),
+                    queue.clone(),
+                    rxq,
+                    path.to_path_buf(),
+                ) {
+                    Ok(unix) => unix,
+                    Err(e) => {
+                        error!(
+                            "error creating unix proxy for port {}, sending rst: {e}",
+                            pkt.dst_port()
+                        );
+                        self.push_packet(MuxerRx::Reset {
+                            local_port: pkt.dst_port(),
+                            peer_port: pkt.src_port(),
+                        });
+                        return;
+                    }
+                };
+                let mut update = unix.connect_mapped(pkt);
+                if !matches!(
+                    unix.status(),
+                    ProxyStatus::Connected | ProxyStatus::Connecting
+                ) {
                     error!(
-                        "error creating unix proxy for port {}, sending rst: {e}",
-                        pkt.dst_port()
+                        "error connecting unix proxy for port {} to {}, sending rst",
+                        pkt.dst_port(),
+                        path.display()
                     );
                     self.push_packet(MuxerRx::Reset {
                         local_port: pkt.dst_port(),
@@ -1050,34 +1084,23 @@ impl VsockMuxer {
                     });
                     return;
                 }
-            };
-            let update = unix.connect_mapped(pkt);
-            if !matches!(
-                unix.status(),
-                ProxyStatus::Connected | ProxyStatus::Connecting
-            ) {
-                error!(
-                    "error connecting unix proxy for port {} to {}, sending rst",
-                    pkt.dst_port(),
-                    path.display()
+                proxy_map.insert(id, Mutex::new(Box::new(unix)));
+                self.apply_polling_under_lock(&mut update);
+                Some(update)
+            } else {
+                debug!(
+                    "no unix socket mapped for port {}, sending rst",
+                    pkt.dst_port()
                 );
                 self.push_packet(MuxerRx::Reset {
                     local_port: pkt.dst_port(),
                     peer_port: pkt.src_port(),
                 });
-                return;
+                None
             }
-            proxy_map.insert(id, Mutex::new(Box::new(unix)));
+        };
+        if let Some(update) = update {
             self.process_proxy_update(id, update);
-        } else {
-            debug!(
-                "no unix socket mapped for port {}, sending rst",
-                pkt.dst_port()
-            );
-            self.push_packet(MuxerRx::Reset {
-                local_port: pkt.dst_port(),
-                peer_port: pkt.src_port(),
-            });
         }
     }
 
@@ -1296,12 +1319,17 @@ fn same_file(a: &Path, b: &Path) -> bool {
 mod protected_path_tests {
     use super::*;
     use crate::virtio::descriptor_utils::{DescriptorType, create_descriptor_chain};
-    use crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE;
+    use crate::virtio::vsock::packet::{
+        TsiAcceptReq, TsiConnectReq, TsiListenReq, VSOCK_PKT_HDR_SIZE,
+    };
+    use crate::virtio::vsock::proxy::AddressFamily;
     use crate::virtio::vsock::unix_proxy::UnixAcceptorProxy;
     use nix::sys::socket::SockaddrLike;
     use std::mem;
+    use std::os::unix::io::{AsRawFd, RawFd};
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use vm_memory::{Bytes, GuestAddress};
 
     fn guest_packet(
@@ -1709,5 +1737,131 @@ mod protected_path_tests {
         std::env::set_current_dir(std::env::temp_dir()).unwrap();
         assert_eq!(muxer.unix_ipc_port_map.as_ref().unwrap()[&1234].0, absolute);
         assert!(muxer.is_protected_unix_path(&guest_unix_addr(absolute.as_os_str().as_bytes())));
+    }
+    struct RemovingProxy {
+        id: u64,
+    }
+
+    impl Proxy for RemovingProxy {
+        fn id(&self) -> u64 {
+            self.id
+        }
+        fn status(&self) -> ProxyStatus {
+            ProxyStatus::Listening
+        }
+        fn tsi_socket(&self) -> Option<(u16, AddressFamily)> {
+            Some((defs::SOCK_STREAM, AddressFamily::Inet))
+        }
+        fn listen(
+            &mut self,
+            _pkt: &VsockPacket,
+            _req: TsiListenReq,
+            _host_port_map: &Option<HashMap<u16, u16>>,
+        ) -> ProxyUpdate {
+            ProxyUpdate {
+                remove_proxy: ProxyRemoval::Immediate,
+                signal_queue: true,
+                ..Default::default()
+            }
+        }
+        fn accept(&mut self, _req: TsiAcceptReq) -> ProxyUpdate {
+            ProxyUpdate {
+                remove_proxy: ProxyRemoval::Immediate,
+                ..Default::default()
+            }
+        }
+        fn confirm_connect(&mut self, _pkt: &VsockPacket) -> Option<ProxyUpdate> {
+            Some(ProxyUpdate {
+                remove_proxy: ProxyRemoval::Immediate,
+                ..Default::default()
+            })
+        }
+        fn connect(
+            &mut self,
+            _pkt: &VsockPacket,
+            _req: TsiConnectReq,
+            #[cfg(windows)] _epoll: &Epoll,
+        ) -> ProxyUpdate {
+            ProxyUpdate::default()
+        }
+        fn update_peer_credit(&mut self, _pkt: &VsockPacket) -> ProxyUpdate {
+            ProxyUpdate::default()
+        }
+        fn process_op_response(&mut self, _pkt: &VsockPacket) -> ProxyUpdate {
+            ProxyUpdate::default()
+        }
+        fn release(&mut self) -> ProxyUpdate {
+            ProxyUpdate::default()
+        }
+        fn process_event(&mut self, _evset: EventSet) -> ProxyUpdate {
+            ProxyUpdate::default()
+        }
+        fn getname(&mut self, _pkt: &VsockPacket, _peer: bool) {}
+    }
+
+    impl AsRawFd for RemovingProxy {
+        fn as_raw_fd(&self) -> RawFd {
+            -1
+        }
+    }
+
+    #[test]
+    fn request_handlers_apply_removals_without_relocking_the_map() {
+        // If a handler re-locked the proxy map while applying a removal,
+        // the dispatches below would deadlock instead of finishing.
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut muxer =
+                VsockMuxer::new(3, None, None, TsiFlags::HIJACK_INET, None, None).unwrap();
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x3000)]).unwrap();
+            muxer.mem = Some(mem.clone());
+            muxer.queue = Some(Arc::new(Mutex::new(VirtQueue::new(256))));
+            let id = (0x1000u64 << 32) | defs::TSI_PROXY_PORT as u64;
+            let insert = |muxer: &VsockMuxer| {
+                muxer.proxy_map.write().unwrap().insert(
+                    id,
+                    Mutex::new(Box::new(RemovingProxy { id }) as Box<dyn Proxy>),
+                );
+            };
+
+            let mut body = [0u8; 144];
+            body[0..4].copy_from_slice(&0x1000u32.to_le_bytes());
+            body[4..8].copy_from_slice(&0x1000u32.to_le_bytes());
+            body[8..12].copy_from_slice(&16u32.to_le_bytes());
+            body[12..16].copy_from_slice(&16u32.to_le_bytes());
+            body[16..18].copy_from_slice(&defs::LINUX_AF_INET.to_le_bytes());
+            body[18..20].copy_from_slice(&80u16.to_be_bytes());
+            body[20..24].copy_from_slice(&[127, 0, 0, 1]);
+            let listen = guest_control_packet(&mem, defs::TSI_OP_LISTEN, &body);
+            insert(&muxer);
+            muxer.send_dgram_pkt(&listen).unwrap();
+            let listen_removed = muxer.proxy_map.read().unwrap().get(&id).is_none();
+
+            let mut body = [0u8; 8];
+            body[0..4].copy_from_slice(&0x1000u32.to_le_bytes());
+            let accept = guest_control_packet(&mem, defs::TSI_OP_ACCEPT, &body);
+            insert(&muxer);
+            muxer.send_dgram_pkt(&accept).unwrap();
+            let accept_removed = muxer.proxy_map.read().unwrap().get(&id).is_none();
+
+            let request = guest_packet(
+                &mem,
+                uapi::VSOCK_TYPE_STREAM,
+                uapi::VSOCK_OP_REQUEST,
+                0x1000,
+                defs::TSI_PROXY_PORT,
+                b"x",
+            );
+            insert(&muxer);
+            muxer.process_op_request(&request);
+            let confirm_removed = muxer.proxy_map.read().unwrap().get(&id).is_none();
+
+            tx.send(listen_removed && accept_removed && confirm_removed)
+                .unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("request handler deadlocked on the proxy map lock")
+        );
     }
 }
