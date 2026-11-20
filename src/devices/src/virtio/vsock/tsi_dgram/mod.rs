@@ -85,6 +85,10 @@ impl TsiDgramProxy {
         let mut queue = self.queue.lock().unwrap();
 
         while let Some(head) = queue.pop(&self.mem) {
+            // A head that cannot hold a packet is returned to the guest empty
+            // instead of being parked at the queue head, where a readable host
+            // socket would trip the event loop forever.
+            let mut bad_buffer = false;
             let len = match VsockPacket::from_rx_virtq_head(&head) {
                 Ok(mut pkt) => match sys::recv_to_pkt(self, &mut pkt) {
                     RecvPkt::WaitForCredit => {
@@ -102,12 +106,26 @@ impl TsiDgramProxy {
                         0
                     }
                     RecvPkt::Error => 0,
+                    RecvPkt::BadBuffer => {
+                        bad_buffer = true;
+                        0
+                    }
                 },
                 Err(e) => {
                     debug!("recv_pkt: RX queue error: {e:?}");
+                    bad_buffer = true;
                     0
                 }
             };
+
+            if bad_buffer {
+                wait_credit = true;
+                have_used = true;
+                if let Err(e) = queue.add_used(&self.mem, head.index, 0) {
+                    error!("failed to add used elements to the queue: {e:?}");
+                }
+                continue;
+            }
 
             if len == 0 {
                 queue.undo_pop();

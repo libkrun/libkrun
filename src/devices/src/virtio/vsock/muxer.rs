@@ -135,10 +135,21 @@ pub fn push_packet(
     for rx in packets {
         let mut queue = queue_mutex.lock().unwrap();
         if let Some(head) = queue.pop(mem) {
-            if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-                rx_to_pkt(cid, rx, &mut pkt);
-                if let Err(e) = queue.add_used(mem, head.index, pkt.finish_rx().unwrap_or(0)) {
-                    error!("failed to add used elements to the queue: {e:?}");
+            match VsockPacket::from_rx_virtq_head(&head) {
+                Ok(mut pkt) => {
+                    rx_to_pkt(cid, rx, &mut pkt);
+                    if let Err(e) = queue.add_used(mem, head.index, pkt.finish_rx().unwrap_or(0)) {
+                        error!("failed to add used elements to the queue: {e:?}");
+                    }
+                }
+                Err(_) => {
+                    // Return the unusable buffer empty and keep the reply for
+                    // the next usable buffer.
+                    if let Err(e) = queue.add_used(mem, head.index, 0) {
+                        error!("failed to add used elements to the queue: {e:?}");
+                    }
+                    drop(queue);
+                    rxq_mutex.lock().unwrap().push(rx);
                 }
             }
         } else {

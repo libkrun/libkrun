@@ -173,7 +173,7 @@ pub(crate) fn recv_to_pkt(
             }
         }
     } else {
-        Ok(RecvPkt::Error)
+        Ok(RecvPkt::BadBuffer)
     }
 }
 
