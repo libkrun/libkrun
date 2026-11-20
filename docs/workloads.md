@@ -81,6 +81,14 @@ The Linux kernel does not support mixed page sizes within a single kernel instan
 
 ---
 
+## Headless GPU Acceleration
+
+For workloads that need GPU compute without any display output (off-screen rendering, EGL surfaceless, machine learning), attach a `GpuDevice` with `DisplayBackend::new_noop()`. The backend exposes no scanouts and rejects all display operations, so the guest can only use the GPU for off-screen rendering.
+
+- **Example**: `examples/chroot_vm.c` (`--gpu` flag).
+
+---
+
 ## Embedded GUI MicroVMs (Display & Input Backends)
 
 `libkrun` does not depend on any specific GUI toolkit. Instead, it exposes low-level display scanout and input event interfaces, allowing embedders to integrate graphical microVMs into their own UI frameworks or window managers. This can run in-process or out-of-process (where the embedder provides their own IPC mechanism to transport scanout buffers and input events).
