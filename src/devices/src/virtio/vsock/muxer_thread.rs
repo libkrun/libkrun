@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 #[cfg(windows)]
-use utils::windows::RawFd;
+use utils::windows::{AsRawFd, RawFd};
 
 use super::super::Queue as VirtQueue;
 use super::muxer::{MuxerRx, ProxyMap, push_packet};
@@ -20,7 +20,13 @@ use crate::virtio::vsock::unix_proxy::{UnixAcceptorProxy, UnixProxy};
 use crossbeam_channel::Sender;
 use rand::{RngExt, rng, rngs::ThreadRng};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
+
+/// Reserved epoll data marking the guest-RX-available notification rather
+/// than a proxy id. No proxy can use it: the low word holds a local port
+/// below `u32::MAX` and guest socket ports never reach `u32::MAX`.
+const RX_AVAILABLE_ID: u64 = u64::MAX;
 
 pub struct MuxerThread {
     cid: u64,
@@ -32,6 +38,8 @@ pub struct MuxerThread {
     interrupt: InterruptTransport,
     reaper_sender: Sender<u64>,
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+    rx_available_evt: EventFd,
+    starved: Mutex<HashSet<u64>>,
 }
 
 impl MuxerThread {
@@ -46,6 +54,7 @@ impl MuxerThread {
         interrupt: InterruptTransport,
         reaper_sender: Sender<u64>,
         unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+        rx_available_evt: EventFd,
     ) -> Self {
         MuxerThread {
             cid,
@@ -57,6 +66,8 @@ impl MuxerThread {
             interrupt,
             reaper_sender,
             unix_ipc_port_map,
+            rx_available_evt,
+            starved: Mutex::new(HashSet::new()),
         }
     }
 
@@ -129,16 +140,22 @@ impl MuxerThread {
             self.send_credit_request(credit_rx);
         }
 
+        if update.rx_starved {
+            self.starved.lock().unwrap().insert(id);
+        }
+
         match update.remove_proxy {
             ProxyRemoval::Keep => {}
             ProxyRemoval::Immediate => {
                 warn!("immediately removing proxy: {id}");
                 self.proxy_map.write().unwrap().remove(&id);
+                self.starved.lock().unwrap().remove(&id);
             }
             ProxyRemoval::Deferred => {
                 warn!("deferring proxy removal: {id}");
                 if self.reaper_sender.send(id).is_err() {
                     self.proxy_map.write().unwrap().remove(&id);
+                    self.starved.lock().unwrap().remove(&id);
                 }
             }
         }
@@ -211,9 +228,32 @@ impl MuxerThread {
         }
     }
 
+    fn resume_starved_proxies(&self) {
+        let starved: Vec<u64> = self.starved.lock().unwrap().drain().collect();
+        let proxies = self.proxy_map.read().unwrap();
+        for id in starved {
+            let Some(proxy) = proxies.get(&id) else {
+                // A proxy removed through the reaper can leave its id behind;
+                // the entry dies here.
+                continue;
+            };
+            let mut proxy = proxy.lock().unwrap();
+            if let Some((id, fd, events)) = proxy.resume_rx() {
+                self.update_polling(id, fd, events);
+            }
+        }
+    }
+
     fn work(mut self) {
         let mut thread_rng = rng();
         self.create_listening_ipc_sockets();
+        if let Err(e) = self.epoll.ctl(
+            ControlOperation::Add,
+            self.rx_available_evt.as_raw_fd(),
+            &EpollEvent::new(EventSet::IN, RX_AVAILABLE_ID),
+        ) {
+            error!("failed to register the rx-available event: {e:?}");
+        }
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
             if self.drain_rxq() {
@@ -229,6 +269,12 @@ impl MuxerThread {
                         debug!("Event: ev.data={} ev.fd={:?}", ev.data(), ev.fd());
                         let evset = EventSet::from_bits(ev.events).unwrap();
                         let id = ev.data();
+
+                        if id == RX_AVAILABLE_ID {
+                            let _ = self.rx_available_evt.read();
+                            self.resume_starved_proxies();
+                            continue;
+                        }
 
                         let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
                             let mut proxy = proxy_lock.lock().unwrap();

@@ -270,6 +270,7 @@ pub(crate) fn create(
         listening: false,
         family: af,
         protocol: req.protocol,
+        rx_starved: false,
         mem,
         queue,
         rxq,
@@ -619,6 +620,13 @@ pub(crate) fn process_event(proxy: &mut super::TsiDgramProxy, evset: EventSet) -
 
         // Suppress incoming event loop reads until credit constraints clear to block a 100% CPU spin-loop
         if proxy.status == ProxyStatus::WaitingCreditUpdate {
+            update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
+        }
+
+        // With no buffers left the level-triggered IN interest would spin
+        // over a readable socket; stop polling until the guest refills.
+        update.rx_starved = proxy.rx_starved;
+        if proxy.rx_starved {
             update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
         }
     }
