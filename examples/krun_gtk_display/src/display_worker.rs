@@ -395,7 +395,6 @@ impl ScanoutWindow {
 
         let scanout_paintable = ScanoutPaintable::new(display_width, display_height);
         let picture = Picture::for_paintable(&scanout_paintable);
-        window.set_titlebar(Some(&header_bar));
         header_bar.pack_end(&fullscreen_btn);
 
         let overlay = build_overlay(window.as_ref());
