@@ -309,6 +309,18 @@ pub struct Config {
     /// The permission semantics to be emulated. See the documentation for `PermissionSemantics` for
     /// more details.
     pub semantics: PermissionSemantics,
+
+    /// The owner that `PermissionSemantics::LinuxSimplifiedFixedOwner` reports for every file.
+    pub fixed_owner: Option<(u32, u32)>,
+}
+
+impl Config {
+    fn reported_owner(&self) -> Option<(u32, u32)> {
+        match self.semantics {
+            PermissionSemantics::LinuxSimplifiedFixedOwner => self.fixed_owner,
+            _ => None,
+        }
+    }
 }
 
 impl Default for Config {
@@ -324,6 +336,7 @@ impl Default for Config {
             export_fsid: 0,
             export_table: None,
             semantics: PermissionSemantics::LinuxComplete,
+            fixed_owner: None,
         }
     }
 }
@@ -702,7 +715,7 @@ impl PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
 
-        let st = stat(&data.file)?;
+        let st = self.report_owner(stat(&data.file)?);
 
         Ok((st, self.cfg.attr_timeout))
     }
@@ -725,11 +738,24 @@ impl PassthroughFs {
         }
     }
 
+    fn report_owner(&self, mut st: libc::stat64) -> libc::stat64 {
+        if let Some((uid, gid)) = self.cfg.reported_owner() {
+            st.st_uid = uid;
+            st.st_gid = gid;
+        }
+        st
+    }
+
     fn set_creds(
         &self,
         uid: libc::uid_t,
         gid: libc::gid_t,
     ) -> io::Result<(Option<ScopedUid>, Option<ScopedGid>)> {
+        // With a fixed owner, every file is created as the user running libkrun.
+        if self.cfg.reported_owner().is_some() {
+            return Ok((None, None));
+        }
+
         // Change the gid first, since once we change the uid we lose the capability to change the gid.
         let scoped_gid = if gid == 0 || self.my_gid == Some(gid) {
             // Always allow "root" accesses even if we don't have root powers.
@@ -960,7 +986,7 @@ impl FileSystem for PassthroughFs {
         Ok(Entry {
             inode,
             generation: 0,
-            attr: st,
+            attr: self.report_owner(st),
             attr_flags,
             attr_timeout: self.cfg.attr_timeout,
             entry_timeout: self.cfg.entry_timeout,
@@ -1300,7 +1326,10 @@ impl FileSystem for PassthroughFs {
             }
         }
 
-        if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
+        // With a fixed owner, an ownership change is accepted and not kept.
+        if valid.intersects(SetattrValid::UID | SetattrValid::GID)
+            && self.cfg.reported_owner().is_none()
+        {
             let uid = if valid.contains(SetattrValid::UID) {
                 attr.st_uid
             } else {
@@ -1657,7 +1686,7 @@ impl FileSystem for PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
 
-        let st = stat(&data.file)?;
+        let st = self.report_owner(stat(&data.file)?);
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
 
         if mode == libc::F_OK {
