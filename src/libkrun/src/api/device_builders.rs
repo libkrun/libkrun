@@ -2057,6 +2057,7 @@ export_bitflags! {
             const THREAD_SYNC        = 0x002;
             const USE_SURFACELESS    = 0x008;
             const VENUS              = 0x040;
+            const NO_VIRGL           = 0x080;
             const USE_ASYNC_FENCE_CB = 0x100;
             const RENDER_SERVER      = 0x200;
         }
