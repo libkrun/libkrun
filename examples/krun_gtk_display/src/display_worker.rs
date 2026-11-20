@@ -201,7 +201,7 @@ impl TouchEventSequencedSender {
     }
 
     // None passed as EventSequence implicitly means finger `0`
-    // returns true fi a deferred sync should be scheduled
+    // returns true if a deferred sync should be scheduled
     fn push_event(
         &mut self,
         seq: Option<EventSequence>,
