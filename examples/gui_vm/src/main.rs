@@ -1,5 +1,6 @@
 use clap::Parser;
 use clap_derive::Parser;
+use gtk::prelude::*;
 use gtk_display::{
     Axis, DisplayBackendHandle, DisplayInputOptions, InputBackendHandle, TouchArea,
     TouchScreenOptions,
@@ -320,11 +321,8 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let (display_backend, input_backends, display_worker) = gtk_display::init(
-        "libkrun examples/gui_vm".to_string(),
-        args.keyboard_input,
-        per_display_inputs,
-    )?;
+    let (display_backend, input_backends, display_worker) =
+        gtk_display::init(args.keyboard_input, per_display_inputs)?;
 
     thread::scope(|s| {
         s.spawn(|| {
@@ -333,7 +331,19 @@ fn main() -> anyhow::Result<()> {
                 exit(1);
             }
         });
-        display_worker.run()
+
+        let app = gtk::Application::builder().build();
+        // Hold the application so it doesn't close when we don't have any windows open. We hold the
+        // app forever, because currently libkrun just exits the process on VM shutdown so there is
+        // no way for us to do anything better here for now.
+        let _app_hold = app.hold();
+        let worker_cell = std::cell::Cell::new(Some(display_worker));
+        app.connect_activate(move |app| {
+            if let Some(display_worker) = worker_cell.take() {
+                display_worker.attach(app, "libkrun examples/gui_vm");
+            }
+        });
+        app.run_with_args::<&str>(&[]);
     });
     unreachable!("Expected libkrun (or error handling) to exit the process");
 }
