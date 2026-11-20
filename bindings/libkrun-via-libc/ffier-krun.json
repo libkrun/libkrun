@@ -3145,6 +3145,23 @@
           "ffi_name": "krun_display_backend_new"
         },
         {
+          "name": "new_noop",
+          "doc": [
+            " Create a display backend without a display, for headless GPU",
+            " acceleration.",
+            "",
+            " No scanouts can be configured: every scanout operation is rejected, so",
+            " the GPU is only usable for off-screen rendering."
+          ],
+          "receiver": "none",
+          "params": [],
+          "ret": {
+            "return_kind": "value",
+            "type": "DisplayBackend"
+          },
+          "ffi_name": "krun_display_backend_new_noop"
+        },
+        {
           "name": "add_display",
           "receiver": "mut",
           "params": [

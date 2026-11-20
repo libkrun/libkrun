@@ -888,6 +888,15 @@ typedef void (*krun_vhost_user_device_destroy_fn)(KrunVhostUserDevice handle);
  */
 KrunDisplayBackend krun_display_backend_new(const void* vtable, size_t vtable_size, KrunError* err_out);
 typedef KrunDisplayBackend (*krun_display_backend_new_fn)(const void* vtable, size_t vtable_size, KrunError* err_out);
+/**
+ * Create a display backend without a display, for headless GPU
+ * acceleration.
+ *
+ * No scanouts can be configured: every scanout operation is rejected, so
+ * the GPU is only usable for off-screen rendering.
+ */
+KrunDisplayBackend krun_display_backend_new_noop();
+typedef KrunDisplayBackend (*krun_display_backend_new_noop_fn)();
 void krun_display_backend_add_display(KrunDisplayBackend handle, KrunDisplayInfoBuilder display);
 typedef void (*krun_display_backend_add_display_fn)(KrunDisplayBackend handle, KrunDisplayInfoBuilder display);
 void krun_display_backend_destroy(KrunDisplayBackend handle);
