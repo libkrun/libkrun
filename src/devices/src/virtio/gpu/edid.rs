@@ -78,23 +78,73 @@ impl EdidInfo {
         (self.height_millimeters / 10) as u8
     }
 
+    /// The pixel clock in 10 kHz steps, rounded to 100 kHz.
+    ///
+    /// The formula for getting refresh rate out of this value is:
+    ///   refresh_rate = clk * 10000 / (htotal * vtotal)
+    /// Solving for clk:
+    ///   clk = (refresh_rate * htotal * vtotal) / 10000
+    ///
+    /// Pseudocode of kernel logic for vrefresh:
+    ///    vtotal := mode->vtotal;
+    ///    calc_val := (clock * 1000) / htotal
+    ///    refresh := (calc_val + vtotal / 2) / vtotal
+    ///    if flags & INTERLACE: refresh *= 2
+    ///    if flags & DBLSCAN: refresh /= 2
+    ///    if vscan > 1: refresh /= vscan
+    fn clock(&self) -> u64 {
+        let htotal = self.width as u64 + self.horizontal_blanking as u64;
+        let vtotal = self.height as u64 + self.vertical_blanking as u64;
+        let pixels = (self.refresh_rate as u64)
+            .saturating_mul(htotal)
+            .saturating_mul(vtotal);
+        (pixels / 10000 + 5) / 10 * 10
+    }
+
     pub fn bytes(self) -> Box<[u8]> {
-        let mut edid_box: Box<[u8]> = vec![0; EDID_DATA_LENGTH].into_boxed_slice();
-        let edid = &mut edid_box[..];
+        // A base-block detailed timing holds a 16-bit clock and 12-bit sizes. A
+        // larger mode goes in a DisplayID extension, whose Type I timing holds
+        // a 24-bit clock and 16-bit sizes, all stored minus one.
+        let clock = self.clock();
+        let in_base_block = self.width < 4096 && self.height < 4096 && clock <= u16::MAX as u64;
+        let in_displayid = (1..=1 << 24).contains(&clock)
+            && (1..=1 << 16).contains(&self.width)
+            && (1..=1 << 16).contains(&self.height);
+        let extensions = if !in_base_block && in_displayid { 1 } else { 0 };
+
+        let mut edid_box: Box<[u8]> =
+            vec![0; (1 + extensions) * EDID_DATA_LENGTH].into_boxed_slice();
+        let (edid, extension) = edid_box.split_at_mut(EDID_DATA_LENGTH);
 
         populate_header(edid);
         populate_edid_version(edid);
         populate_size(edid, &self);
         populate_standard_timings(edid, &self);
 
-        // 4 available descriptor blocks
-        let block0 = &mut edid[54..72];
-        populate_detailed_timing(block0, &self);
+        // 4 available descriptor blocks. EDID 1.4 requires a timing in the
+        // first, so for a guest that doesn't read DisplayID it holds the mode
+        // divided by the smallest whole factor that fits, with its clock capped
+        // (a lower refresh rate). Linux marks it preferred too, but sorts the
+        // DisplayID mode first when the sizes match, and virtio-gpu drops a
+        // preferred mode of another size.
+        let factor = self.width.max(self.height) / 4096 + 1;
+        let fallback = EdidInfo {
+            width: (self.width / factor).max(1),
+            height: (self.height / factor).max(1),
+            ..self
+        };
+        populate_detailed_timing(&mut edid[54..72], &fallback);
 
         let block1 = &mut edid[72..90];
         populate_display_name(block1);
 
+        edid[126] = extensions as u8;
         calculate_checksum(edid);
+
+        if extensions == 1 {
+            populate_displayid(extension, &self);
+            calculate_checksum(extension);
+        }
 
         edid_box
     }
@@ -127,32 +177,7 @@ fn populate_detailed_timing(edid_block: &mut [u8], info: &EdidInfo) {
     let vertical_blanking_msb: u8 = ((info.vertical_blanking >> 8) & 0x0F) as u8;
 
     // The pixel clock is what controls the refresh timing information.
-    //
-    // The formula for getting refresh rate out of this value is:
-    //   refresh_rate = clk * 10000 / (htotal * vtotal)
-    // Solving for clk:
-    //   clk = (refresh_rate * htotal * votal) / 10000
-    //
-    // where:
-    //   clk - The setting here
-    //   vtotal - Total lines
-    //   htotal - Total pixels per line
-    //
-    // Value here is pixel clock + 10,000, in 10khz steps.
-    //
-    // Pseudocode of kernel logic for vrefresh:
-    //    vtotal := mode->vtotal;
-    //    calc_val := (clock * 1000) / htotal
-    //    refresh := (calc_val + vtotal / 2) / vtotal
-    //    if flags & INTERLACE: refresh *= 2
-    //    if flags & DBLSCAN: refresh /= 2
-    //    if vscan > 1: refresh /= vscan
-    //
-    let htotal = info.width + (info.horizontal_blanking as u32);
-    let vtotal = info.height + (info.vertical_blanking as u32);
-    let mut clock: u16 = ((info.refresh_rate * htotal * vtotal) / 10000) as u16;
-    // Round to nearest 10khz.
-    clock = ((clock + 5) / 10) * 10;
+    let clock = info.clock().min(u16::MAX as u64) as u16;
     edid_block[0..2].copy_from_slice(&clock.to_le_bytes());
 
     let width_lsb: u8 = (info.width & 0xFF) as u8;
@@ -207,6 +232,45 @@ fn populate_detailed_timing(edid_block: &mut [u8], info: &EdidInfo) {
     edid_block[12] = width_millimeters_lsb;
     edid_block[13] = height_millimeters_lsb;
     edid_block[14] = height_millimeters_msb | (width_millimeters_msb << 4);
+}
+
+// A DisplayID 1.3 extension block with the mode as its one Type I detailed
+// timing, marked preferred.
+fn populate_displayid(extension: &mut [u8], info: &EdidInfo) {
+    const TIMING_LENGTH: u8 = 20;
+    const BLOCK_LENGTH: u8 = 3 + TIMING_LENGTH;
+
+    extension[0] = 0x70; // DisplayID extension
+    let section = &mut extension[1..];
+    section[0] = 0x13; // version 1.3
+    section[1] = BLOCK_LENGTH;
+    section[2] = 0x00; // no product type
+    section[3] = 0; // no further sections
+
+    let block = &mut section[4..4 + BLOCK_LENGTH as usize];
+    block[0] = 0x03; // Type I detailed timing
+    block[1] = 0x00;
+    block[2] = TIMING_LENGTH;
+    let timing = &mut block[3..];
+    timing[0..3].copy_from_slice(&(info.clock() as u32 - 1).to_le_bytes()[..3]);
+    timing[3] = 0x88; // preferred, aspect ratio undefined
+    let fields = [
+        info.width,
+        info.horizontal_blanking as u32,
+        info.horizontal_front as u32,
+        info.horizontal_sync as u32,
+        info.height,
+        info.vertical_blanking as u32,
+        info.vertical_front as u32,
+        info.vertical_sync as u32,
+    ];
+    for (i, field) in fields.into_iter().enumerate() {
+        timing[4 + 2 * i..6 + 2 * i].copy_from_slice(&((field - 1) as u16).to_le_bytes());
+    }
+
+    let end = 4 + BLOCK_LENGTH as usize;
+    let sum = section[..end].iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    section[end] = sum.wrapping_neg();
 }
 
 // The EDID header. This is defined by the EDID spec.
@@ -318,5 +382,130 @@ const fn gcd(x: u32, y: u32) -> u32 {
     match y {
         0 => x,
         _ => gcd(y, x % y),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The base block's detailed timing as (clock in 10 kHz, width, height).
+    fn base_block_mode(edid: &[u8]) -> (u64, u32, u32) {
+        let dtd = &edid[54..72];
+        let clock = u16::from_le_bytes([dtd[0], dtd[1]]);
+        let width = dtd[2] as u32 | ((dtd[4] as u32 >> 4) << 8);
+        let height = dtd[5] as u32 | ((dtd[7] as u32 >> 4) << 8);
+        (clock as u64, width, height)
+    }
+
+    /// The pixel clock in 10 kHz, rounded to 100 kHz, with the default blanking.
+    fn expected_clock(width: u32, height: u32, refresh_rate: u32) -> u64 {
+        let pixels = (width as u64 + DEFAULT_HORIZONTAL_BLANKING as u64)
+            * (height as u64 + DEFAULT_VERTICAL_BLANKING as u64);
+        ((refresh_rate as u64).saturating_mul(pixels) / 10000 + 5) / 10 * 10
+    }
+
+    /// What a guest that doesn't read DisplayID gets: the size divided by the
+    /// smallest whole factor that fits 12 bits, its clock capped at 16 bits.
+    fn expected_base_block(width: u32, height: u32, refresh_rate: u32) -> (u64, u32, u32) {
+        let factor = width.max(height) / 4096 + 1;
+        let (width, height) = ((width / factor).max(1), (height / factor).max(1));
+        let clock = expected_clock(width, height, refresh_rate).min(u16::MAX as u64);
+        (clock, width, height)
+    }
+
+    /// The DisplayID extension's Type I timing as (clock in 10 kHz, width,
+    /// height), or None without an extension.
+    fn displayid_mode(edid: &[u8]) -> Option<(u64, u32, u32)> {
+        if edid[126] == 0 {
+            return None;
+        }
+        assert_eq!(edid[126], 1);
+        let ext = &edid[128..256];
+        assert_eq!(ext[0], 0x70);
+        let section = &ext[1..];
+        let section_length = section[1] as usize;
+        assert_eq!(section_length, 23);
+        let sum = section[..4 + section_length + 1]
+            .iter()
+            .fold(0u8, |a, &b| a.wrapping_add(b));
+        assert_eq!(sum, 0, "DisplayID section checksum");
+        assert_eq!(section[4], 0x03, "Type I timing");
+        let timing = &ext[8..];
+        assert_eq!(timing[3] & 0x80, 0x80, "preferred");
+        let field = |i: usize| u16::from_le_bytes([timing[i], timing[i + 1]]) as u32 + 1;
+        let clock = u32::from_le_bytes([timing[0], timing[1], timing[2], 0]) as u64 + 1;
+        Some((clock, field(4), field(12)))
+    }
+
+    #[test]
+    fn modes_beyond_the_base_block() {
+        for (width, height, refresh_rate) in [
+            (1920, 1080, 60),
+            (2560, 1440, 144),
+            (2392, 1800, 120),
+            (3024, 1964, 120),
+            (3840, 2160, 60),
+            (3840, 2160, 120),
+            (3840, 2160, 144),
+            (4096, 2160, 60),
+            (5120, 2880, 60),
+            (6016, 3384, 60),
+            (7680, 4320, 60),
+            (7680, 4320, 120),
+            (8192, 8192, 60),
+            (8192, 2, 60),
+        ] {
+            let params = EdidParams {
+                refresh_rate,
+                ..EdidParams::default()
+            };
+            let edid = EdidInfo::new(width, height, &params).bytes();
+
+            for block in edid.chunks(EDID_DATA_LENGTH) {
+                let sum = block.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+                assert_eq!(sum, 0, "{width}x{height}@{refresh_rate} checksum");
+            }
+            let mode = (expected_clock(width, height, refresh_rate), width, height);
+            let base_block = base_block_mode(&edid);
+            assert_eq!(
+                displayid_mode(&edid).unwrap_or(base_block),
+                mode,
+                "{width}x{height}@{refresh_rate} preferred mode"
+            );
+            assert_eq!(
+                base_block,
+                expected_base_block(width, height, refresh_rate),
+                "{width}x{height}@{refresh_rate} base block"
+            );
+        }
+    }
+
+    #[test]
+    fn base_block_only_when_the_mode_fits() {
+        let edid = EdidInfo::new(3840, 2160, &EdidParams::default()).bytes();
+        assert_eq!(edid.len(), EDID_DATA_LENGTH);
+        assert_eq!(edid[126], 0);
+    }
+
+    #[test]
+    fn base_block_only_when_the_mode_fits_neither() {
+        for (width, height, refresh_rate) in [
+            (16384, 16384, 610),
+            (65537, 1080, 60),
+            (65536, 65536, u32::MAX),
+        ] {
+            let params = EdidParams {
+                refresh_rate,
+                ..EdidParams::default()
+            };
+            let edid = EdidInfo::new(width, height, &params).bytes();
+            assert_eq!(edid.len(), EDID_DATA_LENGTH);
+            assert_eq!(edid[126], 0);
+            assert_eq!(
+                base_block_mode(&edid),
+                expected_base_block(width, height, refresh_rate)
+            );
+        }
     }
 }
