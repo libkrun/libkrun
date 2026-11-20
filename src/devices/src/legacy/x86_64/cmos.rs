@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cmp::min;
-#[cfg(target_os = "windows")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bus::BusDevice;
@@ -12,12 +11,10 @@ const INDEX_OFFSET: u64 = 0x0;
 const DATA_OFFSET: u64 = 0x1;
 const DATA_LEN: usize = 128;
 
-#[cfg(target_os = "windows")]
 fn bcd(value: u64) -> u8 {
     (((value / 10) << 4) | (value % 10)) as u8
 }
 
-#[cfg(target_os = "windows")]
 fn rtc_data(index: u8, epoch_secs: u64) -> Option<u8> {
     let days = (epoch_secs / 86_400) as i64;
     let seconds_of_day = epoch_secs % 86_400;
@@ -96,18 +93,11 @@ impl BusDevice for Cmos {
             DATA_OFFSET => {
                 debug!("cmos: read data offset from index={:x}", self.index);
                 let index = self.index & INDEX_MASK;
-                #[cfg(target_os = "windows")]
-                {
-                    let epoch_secs = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    rtc_data(index, epoch_secs).unwrap_or(self.data[index as usize])
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    self.data[index as usize]
-                }
+                let epoch_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                rtc_data(index, epoch_secs).unwrap_or(self.data[index as usize])
             }
             _ => {
                 debug!("cmos: unsupported read offset");
@@ -132,7 +122,7 @@ impl BusDevice for Cmos {
     }
 }
 
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -154,5 +144,24 @@ mod tests {
         assert_eq!(rtc_data(0x08, epoch_secs), Some(0x02));
         assert_eq!(rtc_data(0x09, epoch_secs), Some(0x00));
         assert_eq!(rtc_data(0x32, epoch_secs), Some(0x20));
+    }
+
+    fn read(cmos: &mut Cmos, index: u8) -> u8 {
+        cmos.write(0, INDEX_OFFSET, &[index]);
+        let mut data = [0u8];
+        cmos.read(0, DATA_OFFSET, &mut data);
+        data[0]
+    }
+
+    #[test]
+    fn guest_reads_host_clock() {
+        let mut cmos = Cmos::new(0, 0);
+        let epoch_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(Some(read(&mut cmos, 0x09)), rtc_data(0x09, epoch_secs));
+        assert_eq!(Some(read(&mut cmos, 0x32)), rtc_data(0x32, epoch_secs));
+        assert_eq!(read(&mut cmos, 0x0b), 0x02);
     }
 }
