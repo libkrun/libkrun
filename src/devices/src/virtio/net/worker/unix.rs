@@ -56,14 +56,15 @@ impl NetWorker {
             VirtioNetBackend::UnixstreamPath(path) => {
                 Box::new(Unixstream::open(path)?) as Box<dyn NetBackend + Send>
             }
-            VirtioNetBackend::UnixgramFd(fd) => {
+            VirtioNetBackend::UnixgramFd(fd, vnet_hdr) => {
                 // SAFETY: we need to trust that the library user has configured
                 // the backend with a healthy file descriptor.
                 let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-                Box::new(Unixgram::new(owned_fd)) as Box<dyn NetBackend + Send>
+                Box::new(Unixgram::new(owned_fd).with_vnet_hdr(vnet_hdr))
+                    as Box<dyn NetBackend + Send>
             }
-            VirtioNetBackend::UnixgramPath(path, vfkit_magic) => {
-                Box::new(Unixgram::open(path, vfkit_magic)?) as Box<dyn NetBackend + Send>
+            VirtioNetBackend::UnixgramPath(path, vfkit_magic, vnet_hdr) => {
+                Box::new(Unixgram::open(path, vfkit_magic, vnet_hdr)?) as Box<dyn NetBackend + Send>
             }
             #[cfg(target_os = "linux")]
             VirtioNetBackend::Tap(tap_name) => {
