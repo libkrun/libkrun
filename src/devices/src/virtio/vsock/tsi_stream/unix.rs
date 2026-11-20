@@ -339,7 +339,7 @@ pub(crate) fn recv_to_pkt(
         }
     } else {
         debug!("recv_pkt: pkt without buf");
-        Ok(RecvPkt::Error)
+        Ok(RecvPkt::BadBuffer)
     }
 }
 

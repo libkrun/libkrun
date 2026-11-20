@@ -34,6 +34,7 @@ use utils::epoll::{Epoll, EpollEvent};
 
 #[derive(Debug)]
 pub enum RecvPkt {
+    BadBuffer,
     Close,
     Error,
     Read(usize),
