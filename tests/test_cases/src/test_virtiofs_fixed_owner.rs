@@ -8,6 +8,7 @@ const OWNER_UID: u32 = 1234;
 const OWNER_GID: u32 = 5678;
 const HOST_FILE: &str = "host-file";
 const GUEST_FILE: &str = "guest-file";
+const OWNER_FILE: &str = "owner-file";
 
 #[host]
 mod host {
@@ -20,8 +21,8 @@ mod host {
 
     impl Test for TestVirtiofsFixedOwner {
         fn should_run(&self) -> ShouldRun {
-            if !cfg!(target_os = "macos") {
-                return ShouldRun::No("a fixed owner takes effect on macOS hosts only");
+            if !cfg!(any(target_os = "macos", target_os = "linux")) {
+                return ShouldRun::No("a fixed owner takes effect on macOS and Linux hosts only");
             }
             ShouldRun::Yes
         }
@@ -31,13 +32,13 @@ mod host {
             fs::write(root_dir.join(HOST_FILE), b"from the host")?;
 
             let root_path = root_dir.to_str().unwrap();
-            let mut simplified = krun::FsDevice::new("/dev/root", root_path)
+            let mut complete = krun::FsDevice::new("/dev/root", root_path)
                 .map_err(|e| anyhow::anyhow!("FsDevice::new: {e:?}"))?;
-            simplified
-                .set_permission_semantics(krun::PermissionSemantics::LinuxSimplified)
+            complete
+                .set_permission_semantics(krun::PermissionSemantics::LinuxComplete)
                 .map_err(|e| anyhow::anyhow!("set_permission_semantics: {e:?}"))?;
             anyhow::ensure!(
-                simplified.set_fixed_owner(OWNER_UID, OWNER_GID).is_err(),
+                complete.set_fixed_owner(OWNER_UID, OWNER_GID).is_err(),
                 "set_fixed_owner must fail outside LinuxSimplifiedFixedOwner"
             );
 
@@ -70,14 +71,23 @@ mod host {
                     "OK\n", output
                 ));
             }
-            let guest_file = test_setup.tmp_dir.join("rootfs").join(GUEST_FILE);
-            match fs::read(&guest_file) {
-                Ok(contents) if contents == b"from the guest" => TestOutcome::Pass,
-                other => TestOutcome::Fail(format!(
-                    "host: {} should hold the guest's write, got {other:?}",
-                    guest_file.display()
-                )),
+            let rootfs = test_setup.tmp_dir.join("rootfs");
+            for (file, expected) in [
+                (GUEST_FILE, "from the guest"),
+                (OWNER_FILE, "from the owner"),
+            ] {
+                let path = rootfs.join(file);
+                match fs::read(&path) {
+                    Ok(contents) if contents == expected.as_bytes() => {}
+                    other => {
+                        return TestOutcome::Fail(format!(
+                            "host: {} should hold {expected:?}, got {other:?}",
+                            path.display()
+                        ));
+                    }
+                }
             }
+            TestOutcome::Pass
         }
     }
 }
@@ -91,7 +101,7 @@ mod guest {
     use std::os::unix::fs::{MetadataExt, chown, symlink};
 
     use nix::sys::stat::Mode;
-    use nix::unistd::mkfifo;
+    use nix::unistd::{Gid, Uid, mkfifo, setresgid, setresuid};
 
     fn assert_owner(path: &str) {
         let meta = fs::symlink_metadata(path).unwrap_or_else(|e| panic!("stat {path}: {e}"));
@@ -122,6 +132,14 @@ mod guest {
             assert_owner("/guest-fifo");
             symlink(&guest_file, "/guest-link").expect("symlink");
             assert_owner("/guest-link");
+
+            let owner_gid = Gid::from_raw(OWNER_GID);
+            let owner_uid = Uid::from_raw(OWNER_UID);
+            setresgid(owner_gid, owner_gid, owner_gid).expect("become the owner group");
+            setresuid(owner_uid, owner_uid, owner_uid).expect("become the owner");
+            let owner_file = format!("/{OWNER_FILE}");
+            fs::write(&owner_file, b"from the owner").expect("the owner writes a file");
+            assert_owner(&owner_file);
 
             println!("OK");
         }
