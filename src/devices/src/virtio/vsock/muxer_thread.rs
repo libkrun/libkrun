@@ -42,6 +42,20 @@ pub struct MuxerThread {
     starved: Mutex<HashSet<u64>>,
 }
 
+/// Draws a local port for a reverse proxy until its id is free: inserting
+/// over an existing entry would drop the live proxy along with its
+/// connection. Filling the id space would need billions of live proxies,
+/// so the loop is effectively single-pass. The fixed TSI ports live below
+/// 1024 and cannot be drawn.
+fn draw_reverse_port(rng: &mut ThreadRng, occupied: impl Fn(u32) -> bool) -> u32 {
+    loop {
+        let candidate: u32 = rng.random_range(1024..u32::MAX);
+        if !occupied(candidate) {
+            return candidate;
+        }
+    }
+}
+
 impl MuxerThread {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -163,8 +177,11 @@ impl MuxerThread {
         let mut should_signal = update.signal_queue;
 
         if let Some((peer_port, accept_fd, family, proxy_type)) = update.new_proxy {
-            let local_port: u32 = thread_rng.random_range(1024..u32::MAX);
-            let new_id: u64 = ((peer_port as u64) << 32) | (local_port as u64);
+            let mut proxies = self.proxy_map.write().unwrap();
+            let local_port = draw_reverse_port(thread_rng, |candidate| {
+                proxies.contains_key(&(((peer_port as u64) << 32) | u64::from(candidate)))
+            });
+            let new_id = ((peer_port as u64) << 32) | u64::from(local_port);
             let new_proxy: Box<dyn Proxy> = match proxy_type {
                 NewProxyType::Tcp => Box::new(TsiStreamProxy::new_reverse(
                     new_id,
@@ -189,13 +206,10 @@ impl MuxerThread {
                     self.rxq.clone(),
                 )),
             };
-            self.proxy_map
-                .write()
-                .unwrap()
-                .insert(new_id, Mutex::new(new_proxy));
-            if let Some(proxy) = self.proxy_map.read().unwrap().get(&new_id) {
+            proxies.insert(new_id, Mutex::new(new_proxy));
+            if let Some(proxy) = proxies.get(&new_id) {
                 proxy.lock().unwrap().push_op_request();
-            };
+            }
             should_signal = true;
         }
 
@@ -297,5 +311,20 @@ impl MuxerThread {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reverse_port_draw_retries_past_occupied_ids() {
+        let mut rng = rng();
+        let port = draw_reverse_port(&mut rng, |candidate| candidate < 3_000_000_000);
+        assert!(port >= 3_000_000_000);
+
+        let port = draw_reverse_port(&mut rng, |_| false);
+        assert!((1024..u32::MAX).contains(&port));
     }
 }
