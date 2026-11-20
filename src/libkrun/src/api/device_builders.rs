@@ -1559,7 +1559,8 @@ impl<'a> AttachDevice<'a> for VsockDevice {
         ctx.subscribe_events(inner.clone())?;
 
         let id = inner.lock().unwrap().id().to_string();
-        ctx.register(&id, inner)?;
+        ctx.register(&id, inner.clone())?;
+        ctx.push_exit_observer(inner);
 
         if self
             .tsi_flags
