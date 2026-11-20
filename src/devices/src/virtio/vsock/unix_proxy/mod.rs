@@ -147,10 +147,11 @@ impl UnixProxy {
                         0
                     }
                     RecvPkt::Read(cnt) => {
-                        self.rx_cnt += Wrapping(cnt as u32);
                         self.init_data_pkt(&mut pkt);
                         pkt.set_len(cnt as u32);
-                        pkt.hdr().len() + cnt
+                        pkt.finish_rx()
+                            .inspect(|_| self.rx_cnt += Wrapping(cnt as u32))
+                            .unwrap_or(0) as usize
                     }
                     RecvPkt::Close => {
                         self.status = ProxyStatus::Closed;
