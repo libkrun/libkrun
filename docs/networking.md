@@ -51,6 +51,31 @@ Host TCP proxies on Unix enable `SO_REUSEADDR` for rapid restart. Sharing a
 listening port through `SO_REUSEPORT` requires an explicit application request;
 automatic exposure of application-selected ports remains enabled.
 
+### Resource limits
+
+Both caps are opt-in and unbounded by default; existing configurations are
+unaffected. `set_proxy_limit` (C: `krun_vsock_device_set_proxy_limit`) caps the
+number of simultaneously live vsock proxies. Each proxy holds a host file
+descriptor, so an uncooperative guest could otherwise exhaust the descriptors
+of the whole VMM process; beyond the cap, guest socket creation fails with
+`EMFILE`, as it would against a native process limit.
+`set_send_queue_budget` (C: `krun_vsock_device_set_send_queue_budget`) caps the
+aggregate bytes stream connections may buffer towards slow host peers, bounding
+guest-driven memory growth in the VMM; a connection pushing past the budget is
+reset, like one overflowing its own credit window. A value of zero for either
+knob leaves it unbounded.
+
+```rust
+let mut vsock = VsockDevice::new(3, TsiFlags::HIJACK_INET)?;
+vsock.set_proxy_limit(1024);
+vsock.set_send_queue_budget(128 * 1024 * 1024);
+```
+
+```c
+krun_vsock_device_set_proxy_limit(vsock, 1024);
+krun_vsock_device_set_send_queue_budget(vsock, 128ULL * 1024 * 1024);
+```
+
 ### TCP publication failures
 
 Automatic guest fallback is the default when selected host publication errors

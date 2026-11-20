@@ -1512,6 +1512,8 @@ pub struct VsockDevice {
     tsi_flags: devices::virtio::TsiFlags,
     host_port_map: HashMap<u16, u16>,
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+    proxy_limit: Option<usize>,
+    send_queue_budget: Option<usize>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(send))]
@@ -1533,6 +1535,8 @@ impl VsockDevice {
             tsi_flags,
             host_port_map: HashMap::new(),
             unix_ipc_port_map: HashMap::new(),
+            proxy_limit: None,
+            send_queue_budget: None,
         })
     }
 
@@ -1552,6 +1556,31 @@ impl VsockDevice {
         self.unix_ipc_port_map
             .insert(port, (PathBuf::from(path), listen));
     }
+
+    /// Cap the number of simultaneously live vsock proxies.
+    ///
+    /// Every proxy holds a host file descriptor, so an uncooperative guest
+    /// can otherwise exhaust the descriptors of the whole VMM process.
+    /// The limit bounds the proxies the guest creates or requests: when the
+    /// cap is reached, guest socket creation fails with `EMFILE`.
+    /// Connections accepted from host peers on guest-published listeners
+    /// are admitted regardless, as the guest cannot control their number.
+    /// A limit of zero, the default, leaves the count unbounded.
+    pub fn set_proxy_limit(&mut self, limit: u32) {
+        self.proxy_limit = (limit != 0).then_some(limit as usize);
+    }
+
+    /// Cap the aggregate bytes stream connections may buffer towards slow
+    /// host peers, bounding guest-driven memory growth in the VMM.
+    ///
+    /// Each connection may legitimately queue up to its credit window, so
+    /// the cap only bites when many connections are fully backlogged at
+    /// once; a connection refused here is reset, like one overflowing its
+    /// own queue. A budget of zero, the default, leaves it unbounded.
+    pub fn set_send_queue_budget(&mut self, budget: u64) {
+        self.send_queue_budget =
+            (budget != 0).then_some(usize::try_from(budget).unwrap_or(usize::MAX));
+    }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export)]
@@ -1562,9 +1591,15 @@ impl<'a> AttachDevice<'a> for VsockDevice {
         let unix_ipc_port_map =
             (!self.unix_ipc_port_map.is_empty()).then_some(self.unix_ipc_port_map);
 
-        let vsock =
-            devices::virtio::Vsock::new(self.cid, host_port_map, unix_ipc_port_map, self.tsi_flags)
-                .map_err(|e| VmmError::Internal(format!("vsock: {e:?}")))?;
+        let vsock = devices::virtio::Vsock::new(
+            self.cid,
+            host_port_map,
+            unix_ipc_port_map,
+            self.tsi_flags,
+            self.proxy_limit,
+            self.send_queue_budget,
+        )
+        .map_err(|e| VmmError::Internal(format!("vsock: {e:?}")))?;
 
         let inner = Arc::new(Mutex::new(vsock));
         ctx.subscribe_events(inner.clone())?;
