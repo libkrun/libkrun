@@ -315,19 +315,31 @@ struct ScanoutWindow {
     scanout_paintable: ScanoutPaintable,
 }
 
+struct ScanoutWindowParams<'a> {
+    app: &'a Application,
+    title: &'a str,
+    display_width: i32,
+    display_height: i32,
+    width: i32,
+    height: i32,
+    format: MemoryFormat,
+    keyboard_event_tx: Option<EventSender>,
+    per_display_inputs: Vec<(EventSender, DisplayInputOptions)>,
+}
+
 impl ScanoutWindow {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        app: &Application,
-        title: &str,
-        display_width: i32,
-        display_height: i32,
-        width: i32,
-        height: i32,
-        format: MemoryFormat,
-        keyboard_event_tx: Option<EventSender>,
-        per_display_inputs: Vec<(EventSender, DisplayInputOptions)>,
-    ) -> Self {
+    pub fn new(params: ScanoutWindowParams) -> Self {
+        let ScanoutWindowParams {
+            app,
+            title,
+            display_width,
+            display_height,
+            width,
+            height,
+            format,
+            keyboard_event_tx,
+            per_display_inputs,
+        } = params;
         let header_bar = HeaderBar::new();
         let window = ApplicationWindow::builder()
             .application(app)
@@ -702,23 +714,25 @@ impl DisplayWorker {
                         debug!(
                             "Enable scanout {scanout_id} width={width} height={height} format={format:?}"
                         );
-                        scanouts[scanout_id as usize] = Some(ScanoutWindow::new(
-                            &self.app,
-                            &format!(
-                                "{name} - display {scanout_id} ({width}x{height})",
-                                name = self.app_name
-                            ),
-                            display_width as i32,
-                            display_height as i32,
-                            width as i32,
-                            height as i32,
-                            format,
-                            self.keyboard_event_tx.clone(),
-                            self.per_display_inputs
-                                .get(scanout_id as usize)
-                                .cloned()
-                                .unwrap_or_default(),
-                        ));
+                        scanouts[scanout_id as usize] =
+                            Some(ScanoutWindow::new(ScanoutWindowParams {
+                                app: &self.app,
+                                title: &format!(
+                                    "{name} - display {scanout_id} ({width}x{height})",
+                                    name = self.app_name
+                                ),
+                                display_width: display_width as i32,
+                                display_height: display_height as i32,
+                                width: width as i32,
+                                height: height as i32,
+                                format,
+                                keyboard_event_tx: self.keyboard_event_tx.clone(),
+                                per_display_inputs: self
+                                    .per_display_inputs
+                                    .get(scanout_id as usize)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            }));
                     }
                 }
                 DisplayEvent::DisableScanout { scanout_id } => {
