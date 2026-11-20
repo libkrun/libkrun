@@ -725,6 +725,27 @@ typedef KrunResult (*krun_vsock_device_add_port_forward_fn)(KrunVsockDevice hand
 /** Add a Unix socket port mapping. */
 void krun_vsock_device_add_unix_port(KrunVsockDevice handle, uint32_t port, KrunStr path, bool listen);
 typedef void (*krun_vsock_device_add_unix_port_fn)(KrunVsockDevice handle, uint32_t port, KrunStr path, bool listen);
+/**
+ * Cap the number of simultaneously live vsock proxies.
+ *
+ * Every proxy holds a host file descriptor, so an uncooperative guest
+ * can otherwise exhaust the descriptors of the whole VMM process.
+ * When the cap is reached, guest socket creation fails with `EMFILE`.
+ * A limit of zero, the default, leaves the count unbounded.
+ */
+void krun_vsock_device_set_proxy_limit(KrunVsockDevice handle, uint32_t limit);
+typedef void (*krun_vsock_device_set_proxy_limit_fn)(KrunVsockDevice handle, uint32_t limit);
+/**
+ * Cap the aggregate bytes stream connections may buffer towards slow
+ * host peers, bounding guest-driven memory growth in the VMM.
+ *
+ * Each connection may legitimately queue up to its credit window, so
+ * the cap only bites when many connections are fully backlogged at
+ * once; a connection refused here is reset, like one overflowing its
+ * own queue. A budget of zero, the default, leaves it unbounded.
+ */
+void krun_vsock_device_set_send_queue_budget(KrunVsockDevice handle, uint64_t budget);
+typedef void (*krun_vsock_device_set_send_queue_budget_fn)(KrunVsockDevice handle, uint64_t budget);
 void krun_vsock_device_destroy(KrunVsockDevice handle);
 typedef void (*krun_vsock_device_destroy_fn)(KrunVsockDevice handle);
 

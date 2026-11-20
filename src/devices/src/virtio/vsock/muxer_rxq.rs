@@ -16,6 +16,8 @@
 /// the connection pool. When an out-of-sync is drained, the muxer will discard it, and attempt to
 /// rebuild a synced one.
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use super::defs;
 use super::defs::uapi;
@@ -35,6 +37,10 @@ pub struct MuxerRxQ {
     /// The RX queue sync status.
     synced: bool,
     stream_credit: BTreeMap<u64, StreamCredit>,
+    /// Bytes the stream send queues may still claim from the device-wide
+    /// budget. Shared by every proxy through its `rxq` reference. Starts
+    /// unbounded; a configured muxer replaces it with the caller's budget.
+    pub(super) send_budget: Arc<AtomicUsize>,
     #[cfg(feature = "tsi-fault-injection")]
     pub(super) faults: super::tsi_control_faults::Injector,
 }
@@ -48,6 +54,7 @@ impl MuxerRxQ {
             q: VecDeque::with_capacity(Self::SIZE),
             synced: true,
             stream_credit: BTreeMap::new(),
+            send_budget: Arc::new(AtomicUsize::new(usize::MAX)),
             #[cfg(feature = "tsi-fault-injection")]
             faults: super::tsi_control_faults::Injector::default(),
         }

@@ -2405,6 +2405,53 @@
             "return_kind": "void"
           },
           "ffi_name": "krun_vsock_device_add_unix_port"
+        },
+        {
+          "name": "set_proxy_limit",
+          "doc": [
+            " Cap the number of simultaneously live vsock proxies.",
+            "",
+            " Every proxy holds a host file descriptor, so an uncooperative guest",
+            " can otherwise exhaust the descriptors of the whole VMM process.",
+            " When the cap is reached, guest socket creation fails with `EMFILE`.",
+            " A limit of zero, the default, leaves the count unbounded."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "limit",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_vsock_device_set_proxy_limit"
+        },
+        {
+          "name": "set_send_queue_budget",
+          "doc": [
+            " Cap the aggregate bytes stream connections may buffer towards slow",
+            " host peers, bounding guest-driven memory growth in the VMM.",
+            "",
+            " Each connection may legitimately queue up to its credit window, so",
+            " the cap only bites when many connections are fully backlogged at",
+            " once; a connection refused here is reset, like one overflowing its",
+            " own queue. A budget of zero, the default, leaves it unbounded."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "budget",
+              "param_kind": "regular",
+              "type": "u64"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_vsock_device_set_send_queue_budget"
         }
       ]
     },

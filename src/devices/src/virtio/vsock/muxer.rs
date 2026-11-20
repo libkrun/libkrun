@@ -9,6 +9,7 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, RwLock};
 #[cfg(windows)]
 use utils::windows::RawFd;
@@ -174,6 +175,8 @@ pub struct VsockMuxer {
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     tsi_flags: TsiFlags,
     rx_available_evt: EventFd,
+    /// Optional cap on live proxies, guarding the VMM's file descriptors.
+    proxy_limit: Option<usize>,
 }
 
 impl VsockMuxer {
@@ -182,6 +185,8 @@ impl VsockMuxer {
         host_port_map: Option<HashMap<u16, u16>>,
         mut unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
         tsi_flags: TsiFlags,
+        proxy_limit: Option<usize>,
+        send_queue_budget: Option<usize>,
     ) -> super::Result<Self> {
         if let Some(map) = &mut unix_ipc_port_map {
             let needs_cwd = map
@@ -196,12 +201,16 @@ impl VsockMuxer {
                 }
             }
         }
+        let rxq = Arc::new(Mutex::new(MuxerRxQ::new()));
+        if let Some(budget) = send_queue_budget {
+            rxq.lock().unwrap().send_budget = Arc::new(AtomicUsize::new(budget));
+        }
         Ok(VsockMuxer {
             cid,
             host_port_map,
             queue: None,
             mem: None,
-            rxq: Arc::new(Mutex::new(MuxerRxQ::new())),
+            rxq,
             epoll: Epoll::new().unwrap(),
             interrupt: None,
             proxy_map: Arc::new(RwLock::new(HashMap::new())),
@@ -210,6 +219,7 @@ impl VsockMuxer {
             tsi_flags,
             rx_available_evt: EventFd::new(utils::eventfd::EFD_NONBLOCK)
                 .map_err(VsockError::EventFd)?,
+            proxy_limit,
         })
     }
 
@@ -425,6 +435,13 @@ impl VsockMuxer {
         };
         if !self.tsi_flags.contains(flag) {
             return Err(-tsi_wire::EPERM);
+        }
+        // Every proxy holds a host file descriptor; refuse before creating
+        // one so a guest cannot exhaust the VMM's descriptors.
+        if let Some(limit) = self.proxy_limit
+            && self.proxy_map.read().unwrap().len() >= limit
+        {
+            return Err(-libc::EMFILE);
         }
         let mem = self.mem.as_ref().ok_or(-tsi_wire::EIO)?;
         let queue = self.queue.as_ref().ok_or(-tsi_wire::EIO)?;
@@ -960,6 +977,16 @@ impl VsockMuxer {
         } else if let Some(ipc_map) = &mut self.unix_ipc_port_map
             && let Some((path, listen)) = ipc_map.get(&pkt.dst_port())
         {
+            if let Some(limit) = self.proxy_limit
+                && proxy_map.len() >= limit
+            {
+                warn!("refusing guest connection: proxy limit reached");
+                self.push_packet(MuxerRx::Reset {
+                    local_port: pkt.dst_port(),
+                    peer_port: pkt.src_port(),
+                });
+                return;
+            }
             let mem = self.mem.as_ref().unwrap();
             let queue = self.queue.as_ref().unwrap();
             if *listen {
@@ -1338,7 +1365,7 @@ mod protected_path_tests {
                 tsi_wire::SERVICE_INET | tsi_wire::SERVICE_UNIX | tsi_wire::SERVICE_ICMP,
             ),
         ] {
-            let mut muxer = VsockMuxer::new(3, None, None, flags).unwrap();
+            let mut muxer = VsockMuxer::new(3, None, None, flags, None, None).unwrap();
             let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x3000)]).unwrap();
             muxer.mem = Some(mem.clone());
             muxer.queue = Some(Arc::new(Mutex::new(VirtQueue::new(256))));
@@ -1358,7 +1385,7 @@ mod protected_path_tests {
 
     #[test]
     fn unknown_oneway_control_has_no_reply() {
-        let mut muxer = VsockMuxer::new(3, None, None, TsiFlags::HIJACK_INET).unwrap();
+        let mut muxer = VsockMuxer::new(3, None, None, TsiFlags::HIJACK_INET, None, None).unwrap();
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x3000)]).unwrap();
         muxer.mem = Some(mem.clone());
         muxer.queue = Some(Arc::new(Mutex::new(VirtQueue::new(256))));
@@ -1375,6 +1402,76 @@ mod protected_path_tests {
         );
         muxer.send_dgram_pkt(&packet).unwrap();
         assert!(muxer.rxq.lock().unwrap().is_empty());
+    }
+
+    fn create_packet(mem: &GuestMemoryMmap, peer_port: u32) -> VsockPacket {
+        let mut body = [0u8; 12];
+        body[0..4].copy_from_slice(&peer_port.to_le_bytes());
+        body[4..6].copy_from_slice(&defs::LINUX_AF_INET.to_le_bytes());
+        body[6..8].copy_from_slice(&defs::SOCK_DGRAM.to_le_bytes());
+        guest_control_packet(mem, defs::TSI_OP_CREATE, &body)
+    }
+
+    fn create_result(muxer: &mut VsockMuxer) -> Option<i32> {
+        match muxer.rxq.lock().unwrap().pop() {
+            Some(MuxerRx::ConnResponse { result, .. }) => Some(result),
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_reply_reports_emfile_when_proxy_limit_is_reached() {
+        let mut muxer = VsockMuxer::new(3, None, None, TsiFlags::HIJACK_INET, None, None).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x3000)]).unwrap();
+        muxer.mem = Some(mem.clone());
+        muxer.queue = Some(Arc::new(Mutex::new(VirtQueue::new(256))));
+        muxer.proxy_limit = Some(1);
+
+        muxer.send_dgram_pkt(&create_packet(&mem, 0x1000)).unwrap();
+        assert_eq!(create_result(&mut muxer), Some(0));
+        assert_eq!(muxer.proxy_map.read().unwrap().len(), 1);
+
+        muxer.send_dgram_pkt(&create_packet(&mem, 0x1001)).unwrap();
+        assert_eq!(create_result(&mut muxer), Some(-libc::EMFILE));
+        assert_eq!(muxer.proxy_map.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn guest_connection_gets_reset_when_proxy_limit_is_reached() {
+        let mut muxer = VsockMuxer::new(
+            3,
+            None,
+            Some(HashMap::from([(
+                4000u32,
+                (PathBuf::from("/unmapped"), false),
+            )])),
+            TsiFlags::empty(),
+            Some(0),
+            None,
+        )
+        .unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x3000)]).unwrap();
+        muxer.mem = Some(mem.clone());
+        muxer.queue = Some(Arc::new(Mutex::new(VirtQueue::new(256))));
+        muxer.proxy_limit = Some(0);
+
+        let packet = guest_packet(
+            &mem,
+            uapi::VSOCK_TYPE_STREAM,
+            uapi::VSOCK_OP_REQUEST,
+            5000,
+            4000,
+            b"x",
+        );
+        muxer.process_op_request(&packet);
+        assert!(matches!(
+            muxer.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::Reset {
+                local_port: 4000,
+                peer_port: 5000
+            })
+        ));
+        assert!(muxer.proxy_map.read().unwrap().is_empty());
     }
 
     #[test]
@@ -1394,6 +1491,8 @@ mod protected_path_tests {
             None,
             Some(HashMap::from([(port, (path.clone(), false))])),
             TsiFlags::empty(),
+            None,
+            None,
         )
         .unwrap();
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x3000)]).unwrap();
@@ -1451,6 +1550,8 @@ mod protected_path_tests {
             None,
             Some(HashMap::from([(1234, (path.clone(), true))])),
             TsiFlags::HIJACK_UNIX,
+            None,
+            None,
         )
         .unwrap();
         let addr = guest_unix_addr(b"/run/krun-init.sock\0suffix");
@@ -1475,6 +1576,8 @@ mod protected_path_tests {
             None,
             Some(HashMap::from([(port, (path.clone(), true))])),
             TsiFlags::HIJACK_UNIX,
+            None,
+            None,
         )
         .unwrap();
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x3000)]).unwrap();
@@ -1570,6 +1673,8 @@ mod protected_path_tests {
             None,
             Some(HashMap::from([(1234, (path, true))])),
             TsiFlags::HIJACK_UNIX,
+            None,
+            None,
         )
         .unwrap();
         std::env::set_current_dir(std::env::temp_dir()).unwrap();
