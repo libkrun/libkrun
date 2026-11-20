@@ -189,6 +189,33 @@ pub(crate) fn create_socket(
     Ok((fd, family))
 }
 
+/// Applies the host port map to a guest listen address, preserving the
+/// address's ancillary IPv6 fields. Returns the address unchanged when no
+/// mapping applies.
+fn remap_listen_addr(
+    addr: &SockaddrStorage,
+    port_map: &HashMap<u16, u16>,
+) -> Result<SockaddrStorage, i32> {
+    if let Some(sin) = addr.as_sockaddr_in() {
+        debug!("sockaddr is ipv4");
+        if let Some(port) = port_map.get(&sin.port()) {
+            return Ok(SocketAddrV4::new(sin.ip(), *port).into());
+        }
+    } else if let Some(sin6) = addr.as_sockaddr_in6() {
+        debug!("sockaddr is ipv6");
+        if let Some(port) = port_map.get(&sin6.port()) {
+            return Ok(
+                SocketAddrV6::new(sin6.ip(), *port, sin6.flowinfo(), sin6.scope_id()).into(),
+            );
+        }
+    } else if addr.as_unix_addr().is_some() {
+        debug!("sockaddr is unix");
+    } else {
+        return Err(-libc::EINVAL);
+    }
+    Ok(*addr)
+}
+
 fn try_listen(
     proxy: &mut super::TsiStreamProxy,
     req: &TsiListenReq,
@@ -199,25 +226,9 @@ fn try_listen(
     }
 
     let addr: SockaddrStorage = if let Some(port_map) = host_port_map {
-        if let Some(sin) = req.addr.as_sockaddr_in() {
-            debug!("sockaddr is ipv4");
-            if let Some(port) = port_map.get(&sin.port()) {
-                SocketAddrV4::new(sin.ip(), *port).into()
-            } else {
-                req.addr
-            }
-        } else if let Some(sin6) = req.addr.as_sockaddr_in6() {
-            debug!("sockaddr is ipv6");
-            if let Some(port) = port_map.get(&sin6.port()) {
-                SocketAddrV6::new(sin6.ip(), *port, sin6.flowinfo(), sin6.flowinfo()).into()
-            } else {
-                req.addr
-            }
-        } else if req.addr.as_unix_addr().is_some() {
-            debug!("sockaddr is unix");
-            req.addr
-        } else {
-            return -libc::EINVAL;
+        match remap_listen_addr(&req.addr, port_map) {
+            Ok(addr) => addr,
+            Err(e) => return e,
         }
     } else {
         req.addr
@@ -973,5 +984,41 @@ mod tests {
             proxy.rxq.lock().unwrap().pop(),
             Some(MuxerRx::ConnResponse { result: 0, .. })
         ));
+    }
+
+    #[test]
+    fn listen_port_mapping_preserves_the_ipv6_scope() {
+        let addr: SockaddrStorage = SocketAddrV6::new(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            5000,
+            0x1234_5678,
+            7,
+        )
+        .into();
+        let port_map = HashMap::from([(5000u16, 6000u16)]);
+
+        let mapped = remap_listen_addr(&addr, &port_map).unwrap();
+        let sin6 = mapped.as_sockaddr_in6().unwrap();
+        assert_eq!(sin6.port(), 6000);
+        assert_eq!(sin6.flowinfo(), 0x1234_5678);
+        assert_eq!(sin6.scope_id(), 7);
+
+        // Unmapped ports pass the address through untouched.
+        let unmapped = remap_listen_addr(&addr, &HashMap::new()).unwrap();
+        assert_eq!(unmapped.as_sockaddr_in6().unwrap().port(), 5000);
+        assert_eq!(unmapped.as_sockaddr_in6().unwrap().scope_id(), 7);
+
+        // The IPv4 path keeps remapping the port.
+        let v4: SockaddrStorage = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000).into();
+        let mapped = remap_listen_addr(&v4, &port_map).unwrap();
+        assert_eq!(mapped.as_sockaddr_in().unwrap().port(), 6000);
+        assert_eq!(
+            remap_listen_addr(&v4, &HashMap::new())
+                .unwrap()
+                .as_sockaddr_in()
+                .unwrap()
+                .port(),
+            5000
+        );
     }
 }
