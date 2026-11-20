@@ -9,11 +9,11 @@
 pub mod edid;
 pub mod types;
 
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", feature = "vhost-user"))]
 pub mod display_backend;
 
 pub use edid::EdidInfo;
 pub use types::{DisplayInfo, DisplayInfoEdid, EdidParams, MAX_DISPLAYS, PhysicalSize};
 
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", feature = "vhost-user"))]
 pub use display_backend::NoopDisplayBackend;
