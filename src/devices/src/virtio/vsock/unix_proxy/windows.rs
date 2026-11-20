@@ -263,9 +263,10 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
     }
 
     if evset.contains(EventSet::IN) {
-        if proxy.status == ProxyStatus::Connected {
+        if proxy.status == ProxyStatus::Connected && !proxy.rx_starved {
             let (signal_queue, wait_credit) = proxy.recv_pkt();
             update.signal_queue = signal_queue;
+            update.rx_starved = proxy.rx_starved;
 
             if wait_credit && proxy.status != ProxyStatus::WaitingCreditUpdate {
                 proxy.status = ProxyStatus::WaitingCreditUpdate;
@@ -286,7 +287,7 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
                     EventSet::empty(),
                 ));
                 return update;
-            } else if proxy.status == ProxyStatus::WaitingCreditUpdate {
+            } else if proxy.status == ProxyStatus::WaitingCreditUpdate || proxy.rx_starved {
                 update.polling = Some((
                     proxy.id,
                     proxy.fd.as_raw_socket() as RawFd,

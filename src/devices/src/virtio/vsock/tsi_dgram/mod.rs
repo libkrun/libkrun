@@ -51,6 +51,9 @@ pub struct TsiDgramProxy {
     pub(crate) listening: bool,
     pub(crate) family: AddressFamily,
     pub(crate) protocol: u32,
+    /// The guest RX queue ran dry while the host socket may still be
+    /// readable; IN polling stays off until the guest posts new buffers.
+    pub(crate) rx_starved: bool,
     #[cfg(target_os = "macos")]
     icmp: Option<icmp_macos::IcmpSocket>,
     pub(crate) mem: GuestMemoryMmap,
@@ -87,6 +90,7 @@ impl TsiDgramProxy {
     pub(crate) fn recv_pkt(&mut self) -> (bool, bool) {
         let mut have_used = false;
         let mut wait_credit = false;
+        let mut parked = false;
         let mut queue = self.queue.lock().unwrap();
 
         while let Some(head) = queue.pop(&self.mem) {
@@ -134,6 +138,7 @@ impl TsiDgramProxy {
 
             if len == 0 {
                 queue.undo_pop();
+                parked = true;
                 break;
             } else {
                 have_used = true;
@@ -145,6 +150,11 @@ impl TsiDgramProxy {
         }
 
         debug!("recv_pkt: have_used={have_used}");
+        // A buffer parked on an empty socket means the host side is drained
+        // and polling can stay armed. Running out of buffers instead leaves
+        // the level-triggered IN interest armed over a possibly readable
+        // socket, which would spin the event loop until the guest refills.
+        self.rx_starved = !parked;
         (have_used, wait_credit)
     }
 }
@@ -233,6 +243,20 @@ impl Proxy for TsiDgramProxy {
 
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate {
         sys::process_event(self, evset)
+    }
+
+    fn resume_rx(&mut self) -> Option<(u64, RawFd, EventSet)> {
+        if !self.rx_starved || matches!(self.status, ProxyStatus::Closed) {
+            return None;
+        }
+        self.rx_starved = false;
+        // Datagram sockets do not take part in the vsock credit protocol, so
+        // a credit wait can only come from a malformed buffer; the guest
+        // dropping its credit request is recovered here.
+        if self.status == ProxyStatus::WaitingCreditUpdate {
+            self.status = ProxyStatus::Connected;
+        }
+        Some((self.id, self.fd.as_raw_fd(), EventSet::IN))
     }
 }
 

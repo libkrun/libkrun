@@ -38,6 +38,7 @@ struct SendQueue {
     limit: usize,
 }
 
+#[derive(Debug)]
 enum EnqueueError {
     Capacity,
     Alloc,
@@ -115,6 +116,7 @@ pub struct TsiStreamProxy {
     pub(crate) peer_fwd_cnt: Wrapping<u32>,
     pub(crate) peer_shutdown: u32,
     pub(crate) host_read_closed: bool,
+    rx_starved: bool,
     pub(crate) push_cnt: Wrapping<u32>,
     pub(crate) pending_accepts: u64,
     send_queue: SendQueue,
@@ -166,6 +168,7 @@ impl TsiStreamProxy {
             peer_fwd_cnt: Wrapping(0),
             peer_shutdown: 0,
             host_read_closed: false,
+            rx_starved: false,
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             send_queue: SendQueue::new(defs::CONN_TX_BUF_SIZE),
@@ -212,6 +215,7 @@ impl TsiStreamProxy {
             peer_fwd_cnt: Wrapping(0),
             peer_shutdown: 0,
             host_read_closed: false,
+            rx_starved: false,
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             send_queue: SendQueue::new(defs::CONN_TX_BUF_SIZE),
@@ -253,6 +257,7 @@ impl TsiStreamProxy {
         let mut interest = EventSet::empty();
         if self.status == ProxyStatus::Connected
             && !self.host_read_closed
+            && !self.rx_starved
             && self.peer_shutdown & uapi::VSOCK_FLAGS_SHUTDOWN_RCV == 0
         {
             interest |= EventSet::IN | EventSet::READ_HANG_UP;
@@ -387,7 +392,7 @@ impl TsiStreamProxy {
         true
     }
 
-    fn read_host(&mut self, previous: EventSet) -> ProxyUpdate {
+    fn read_host(&mut self) -> ProxyUpdate {
         let (signal_queue, wait_credit) = self.recv_pkt();
         if self.status == ProxyStatus::Closed {
             return self.reset_after_error();
@@ -398,7 +403,7 @@ impl TsiStreamProxy {
         }
         ProxyUpdate {
             signal_queue,
-            polling: self.polling_change(previous),
+            rx_starved: self.rx_starved,
             ..Default::default()
         }
     }
@@ -414,7 +419,7 @@ impl TsiStreamProxy {
         if previous.contains(EventSet::IN)
             && events.intersects(EventSet::IN | EventSet::READ_HANG_UP | hangup)
         {
-            update = self.read_host(previous);
+            update = self.read_host();
         }
         if !self.send_queue.is_empty() && events.intersects(EventSet::OUT | hangup) {
             match self.process_writable() {
@@ -433,6 +438,7 @@ impl TsiStreamProxy {
 
         while !self.host_read_closed {
             let Some(head) = queue.pop(&self.mem) else {
+                self.rx_starved = true;
                 break;
             };
             // A head that cannot hold a packet is returned to the guest empty
@@ -668,7 +674,19 @@ impl Proxy for TsiStreamProxy {
     }
 
     fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
-        sys::update_peer_credit(self, pkt)
+        self.peer_buf_alloc = pkt.buf_alloc();
+        self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
+
+        if self.status != ProxyStatus::WaitingCreditUpdate || self.peer_avail_credit() == 0 {
+            return ProxyUpdate::default();
+        }
+
+        let previous = self.event_interest();
+        self.status = ProxyStatus::Connected;
+        ProxyUpdate {
+            polling: self.polling_change(previous),
+            ..Default::default()
+        }
     }
 
     fn push_op_request(&self) -> bool {
@@ -786,6 +804,12 @@ impl Proxy for TsiStreamProxy {
         } else {
             sys::process_event(self, evset)
         }
+    }
+
+    fn resume_rx(&mut self) -> Option<(u64, RawFd, EventSet)> {
+        let previous = self.event_interest();
+        self.rx_starved = false;
+        self.polling_change(previous)
     }
 
     #[cfg(windows)]
@@ -999,6 +1023,45 @@ mod tests {
     }
 
     #[test]
+    fn empty_rx_queue_pauses_reads_until_refill_without_pausing_writes() {
+        let (mut proxy, mut peer) = stream_pair();
+        let mem = proxy.mem.clone();
+        proxy.update_peer_credit(&credit_packet(&mem));
+        peer.write_all(b"payload").unwrap();
+        proxy.send_queue.push(b"reply").unwrap();
+
+        let update = proxy.process_event(EventSet::IN);
+        assert!(update.rx_starved);
+        assert!(!update.signal_queue);
+        assert_eq!(update.polling.unwrap().2, EventSet::OUT);
+        assert_eq!(proxy.status, ProxyStatus::Connected);
+        let update = proxy.update_peer_credit(&credit_packet(&mem));
+        assert!(update.polling.is_none());
+
+        let update = proxy.process_event(EventSet::OUT);
+        assert_eq!(update.polling.unwrap().2, EventSet::empty());
+        let mut reply = [0; 5];
+        peer.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"reply");
+
+        post_buffer(&mem, 0, 0, 0x4000, VSOCK_PKT_HDR_SIZE as u32 + 256);
+        post_buffer(&mem, 1, 1, 0x4200, VSOCK_PKT_HDR_SIZE as u32 + 256);
+        assert!(proxy.resume_rx().unwrap().2.contains(EventSet::IN));
+        let update = proxy.process_event(EventSet::IN);
+        assert!(update.signal_queue);
+        assert!(!update.rx_starved);
+        assert!(update.polling.is_none());
+        assert_eq!(used_idx(&mem), 1);
+        let mut payload = [0; 7];
+        mem.read_slice(
+            &mut payload,
+            GuestAddress(0x4000 + VSOCK_PKT_HDR_SIZE as u64),
+        )
+        .unwrap();
+        assert_eq!(&payload, b"payload");
+    }
+
+    #[test]
     fn unwritable_rx_chain_is_consumed_and_disarms_polling() {
         let (mut proxy, mut reader) = stream_pair();
         let mem = proxy.mem.clone();
@@ -1012,15 +1075,15 @@ mod tests {
         assert_eq!(used_ring(&mem, 0), (0, 0));
         assert_eq!(used_idx(&mem), 1);
         assert!(update.signal_queue);
+        assert!(update.rx_starved);
         assert_eq!(update.polling.unwrap().2, EventSet::empty());
 
-        // The guest frees its buffers and announces credit: polling resumes.
         let update = proxy.update_peer_credit(&credit_packet(&mem));
         assert_eq!(proxy.status, ProxyStatus::Connected);
-        assert!(update.polling.unwrap().2.contains(EventSet::IN));
+        assert!(update.polling.is_none());
 
-        // A usable buffer now delivers the pending data.
         post_buffer(&mem, 1, 0, 0x4000, VSOCK_PKT_HDR_SIZE as u32 + 256);
+        assert!(proxy.resume_rx().unwrap().2.contains(EventSet::IN));
         let update = proxy.process_event(EventSet::IN);
         assert!(update.signal_queue);
         assert_eq!(

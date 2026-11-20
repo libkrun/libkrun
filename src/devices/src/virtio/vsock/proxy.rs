@@ -108,6 +108,7 @@ pub struct ProxyUpdate {
     pub new_proxy: Option<(u32, OwnedFd, AddressFamily, NewProxyType)>,
     pub push_accept: Option<(u64, u64)>,
     pub push_credit_req: Option<MuxerRx>,
+    pub rx_starved: bool,
 }
 
 impl fmt::Display for ProxyError {
@@ -194,6 +195,12 @@ pub trait Proxy: Send + AsRawFd {
     #[cfg(windows)]
     fn process_windows_event(&mut self, event: &EpollEvent) -> ProxyUpdate {
         self.process_event(event.event_set())
+    }
+    /// Clear the receive starvation state, if any, and return the polling
+    /// interest to resume. Called when the guest has made RX buffers
+    /// available again.
+    fn resume_rx(&mut self) -> Option<(u64, RawFd, EventSet)> {
+        None
     }
 }
 

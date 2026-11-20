@@ -5,7 +5,6 @@ use std::fs;
 use std::io;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
-use std::num::Wrapping;
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -759,31 +758,6 @@ pub(crate) fn do_accept(proxy: &mut super::TsiStreamProxy, req: TsiAcceptReq) ->
     }
 
     update
-}
-
-pub(crate) fn update_peer_credit(
-    proxy: &mut super::TsiStreamProxy,
-    pkt: &VsockPacket,
-) -> ProxyUpdate {
-    debug!(
-        "update_credit: buf_alloc={} rx_cnt={} fwd_cnt={}",
-        pkt.buf_alloc(),
-        proxy.rx_cnt,
-        pkt.fwd_cnt()
-    );
-    proxy.peer_buf_alloc = pkt.buf_alloc();
-    proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
-
-    if proxy.status != ProxyStatus::WaitingCreditUpdate || proxy.peer_avail_credit() == 0 {
-        return ProxyUpdate::default();
-    }
-
-    let previous = proxy.event_interest();
-    proxy.status = ProxyStatus::Connected;
-    ProxyUpdate {
-        polling: proxy.polling_change(previous),
-        ..Default::default()
-    }
 }
 
 pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) -> ProxyUpdate {
