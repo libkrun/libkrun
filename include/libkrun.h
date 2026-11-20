@@ -313,7 +313,7 @@ typedef void (*krun_fs_device_set_dax_window_size_fn)(KrunFsDevice handle, uint6
  * `LinuxSimplifiedFixedOwner` also disables xattrs and idmaps, but keeps attribute
  * caching, and needs an owner from [`set_fixed_owner`](Self::set_fixed_owner).
  * Selecting `LinuxSimplified` on a Linux host, or `LinuxSimplifiedFixedOwner` on a host
- * other than macOS, returns `InvalidParam` without changing the device configuration.
+ * other than macOS or Linux, returns `InvalidParam` without changing the device configuration.
  * Selecting the semantics again clears the fixed owner.
  * A NullFs device has no host permission semantics and returns `InvalidParam`.
  */
