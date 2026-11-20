@@ -28,8 +28,8 @@ use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::sys::socket::{
     AddressFamily, Backlog, MsgFlags, Shutdown, SockFlag, SockType, SockaddrLike, SockaddrStorage,
-    accept, bind, connect, getpeername, getsockname, listen, recv, send, setsockopt, shutdown,
-    socket, sockopt,
+    accept, bind, connect, getpeername, getsockname, getsockopt, listen, recv, send, setsockopt,
+    shutdown, socket, sockopt,
 };
 
 #[cfg(target_os = "macos")]
@@ -424,6 +424,22 @@ fn finish_connect(proxy: &mut super::TsiStreamProxy) -> i32 {
     0
 }
 
+/// The pending error of a completed nonblocking connect, translated for
+/// the guest. Zero means the connection was established. Reading the
+/// option clears the error, so it is only consulted once an event has
+/// decided the connect's fate.
+fn connect_error(proxy: &super::TsiStreamProxy) -> i32 {
+    let error = getsockopt(&proxy.fd, sockopt::SocketError).unwrap_or(ECONNREFUSED);
+    if error == 0 {
+        return 0;
+    }
+    #[cfg(target_os = "macos")]
+    let code = linux_errno_raw(error);
+    #[cfg(target_os = "linux")]
+    let code = error;
+    code
+}
+
 fn get_addr_len(proxy: &super::TsiStreamProxy, addr: &SockaddrStorage) -> Option<u32> {
     let addr_len = match proxy.family {
         AddressFamily::Inet => addr.as_sockaddr_in()?.len(),
@@ -788,13 +804,28 @@ pub(crate) fn update_peer_credit(
 
 pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) -> ProxyUpdate {
     if proxy.status == ProxyStatus::Connecting {
-        let result = if evset.contains(EventSet::HANG_UP) {
+        // A failed nonblocking connect surfaces as a hangup or, on Linux,
+        // an error event; kqueue and Winsock only report writability, so
+        // the outcome is always confirmed through the pending socket
+        // error.
+        let mut failed = evset.contains(EventSet::HANG_UP);
+        #[cfg(target_os = "linux")]
+        {
+            failed |= evset.contains(EventSet::ERROR);
+        }
+        if !failed && !evset.contains(EventSet::OUT) {
+            return ProxyUpdate::default();
+        }
+        let error = connect_error(proxy);
+        let result = if error != 0 {
+            proxy.status = ProxyStatus::Closed;
+            -error
+        } else if failed {
+            // The connect hung up without reporting a pending error.
             proxy.status = ProxyStatus::Closed;
             -ECONNREFUSED
-        } else if evset.contains(EventSet::OUT) {
-            finish_connect(proxy)
         } else {
-            return ProxyUpdate::default();
+            finish_connect(proxy)
         };
         proxy.push_connect_rsp(result);
         let remove_proxy =
@@ -846,8 +877,15 @@ pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix::sys::socket::getsockopt;
+    use nix::poll::{PollFd, PollFlags, poll};
     use std::net::Ipv6Addr;
+    use std::os::fd::AsFd;
+    use std::sync::{Arc, Mutex};
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    use crate::virtio::Queue as VirtQueue;
+    use crate::virtio::vsock::muxer_rxq::MuxerRxQ;
+    use crate::virtio::vsock::tsi_stream::TsiStreamProxy;
 
     fn bound_listener(family: u16, sharing: bool) -> (OwnedFd, SockaddrStorage) {
         let (fd, _) = create_socket(0, family).unwrap();
@@ -892,5 +930,74 @@ mod tests {
             bind(second.as_raw_fd(), &addr).unwrap();
             listen(&second, Backlog::new(8).unwrap()).unwrap();
         }
+    }
+
+    fn connecting_proxy(fd: OwnedFd) -> TsiStreamProxy {
+        let mut proxy = TsiStreamProxy::new_reverse(
+            1024 << 32 | 620,
+            3,
+            1,
+            AddressFamily::Inet,
+            620,
+            1024,
+            fd,
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap(),
+            Arc::new(Mutex::new(VirtQueue::new(8))),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+        );
+        proxy.status = ProxyStatus::Connecting;
+        proxy
+    }
+
+    /// Writability settles a nonblocking connect: afterwards the pending
+    /// socket error holds the final outcome.
+    fn await_connect(fd: &OwnedFd) {
+        let mut pollfd = [PollFd::new(fd.as_fd(), PollFlags::POLLOUT)];
+        poll(&mut pollfd, u16::MAX).unwrap();
+    }
+
+    #[test]
+    fn refused_connect_reports_the_pending_socket_error() {
+        // Bind and drop a listener to get a refused port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let (fd, _) = create_socket(1, defs::LINUX_AF_INET).unwrap();
+        let addr: SockaddrStorage = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into();
+        let _ = connect(fd.as_raw_fd(), &addr);
+        await_connect(&fd);
+
+        let mut proxy = connecting_proxy(fd);
+        // kqueue and Winsock report a failed connect through writability
+        // alone.
+        let update = process_event(&mut proxy, EventSet::OUT);
+        assert_eq!(proxy.status, ProxyStatus::Closed);
+        assert!(update.signal_queue);
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Immediate));
+        assert!(matches!(
+            proxy.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::ConnResponse { result, .. }) if result == -ECONNREFUSED
+        ));
+    }
+
+    #[test]
+    fn completed_connect_confirms_and_awaits_the_guest_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let (fd, _) = create_socket(1, defs::LINUX_AF_INET).unwrap();
+        let addr: SockaddrStorage = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into();
+        let _ = connect(fd.as_raw_fd(), &addr);
+        await_connect(&fd);
+
+        let mut proxy = connecting_proxy(fd);
+        let update = process_event(&mut proxy, EventSet::OUT);
+        assert_eq!(proxy.status, ProxyStatus::AwaitingRequest);
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+        assert!(matches!(
+            proxy.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::ConnResponse { result: 0, .. })
+        ));
     }
 }
