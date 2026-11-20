@@ -410,13 +410,6 @@
       },
       "type_tag": 16777236
     },
-    "VirglRendererFlags": {
-      "kind": {
-        "bitflags": {
-          "alias_of": "u32"
-        }
-      }
-    },
     "Vmm": {
       "kind": {
         "handle": {
@@ -3097,14 +3090,12 @@
       },
       "methods": [
         {
-          "name": "new",
+          "name": "virgl",
+          "doc": [
+            " Creates a GPU device backed by virglrenderer."
+          ],
           "receiver": "none",
           "params": [
-            {
-              "name": "virgl_flags",
-              "param_kind": "regular",
-              "type": "VirglRendererFlags"
-            },
             {
               "name": "backend",
               "param_kind": "regular",
@@ -3115,7 +3106,94 @@
             "return_kind": "value",
             "type": "GpuDevice"
           },
-          "ffi_name": "krun_gpu_device_new"
+          "ffi_name": "krun_gpu_device_virgl"
+        },
+        {
+          "name": "gfxstream",
+          "doc": [
+            " Creates a GPU device backed by gfxstream."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "backend",
+              "param_kind": "regular",
+              "type": "DisplayBackend"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "GpuDevice"
+          },
+          "ffi_name": "krun_gpu_device_gfxstream",
+          "cfg": {
+            "kind": "feature",
+            "value": "gfxstream"
+          }
+        },
+        {
+          "name": "use_egl",
+          "receiver": "value",
+          "params": [
+            {
+              "name": "enable",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_gpu_device_use_egl"
+        },
+        {
+          "name": "use_gles",
+          "receiver": "value",
+          "params": [
+            {
+              "name": "enable",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_gpu_device_use_gles"
+        },
+        {
+          "name": "render_server",
+          "receiver": "value",
+          "params": [
+            {
+              "name": "enable",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_gpu_device_render_server"
+        },
+        {
+          "name": "venus",
+          "receiver": "value",
+          "params": [
+            {
+              "name": "enable",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_gpu_device_venus"
         },
         {
           "name": "shm_size",
@@ -3592,40 +3670,6 @@
           "value": 2
         }
       ]
-    },
-    {
-      "name": "VirglRendererFlags",
-      "variants": [
-        {
-          "name": "USE_EGL",
-          "c_name": "KRUN_VIRGL_RENDERER_FLAGS_USE_EGL",
-          "value": 1
-        },
-        {
-          "name": "THREAD_SYNC",
-          "c_name": "KRUN_VIRGL_RENDERER_FLAGS_THREAD_SYNC",
-          "value": 2
-        },
-        {
-          "name": "VENUS",
-          "c_name": "KRUN_VIRGL_RENDERER_FLAGS_VENUS",
-          "value": 64
-        },
-        {
-          "name": "USE_ASYNC_FENCE_CB",
-          "c_name": "KRUN_VIRGL_RENDERER_FLAGS_USE_ASYNC_FENCE_CB",
-          "value": 256
-        },
-        {
-          "name": "RENDER_SERVER",
-          "c_name": "KRUN_VIRGL_RENDERER_FLAGS_RENDER_SERVER",
-          "value": 512
-        }
-      ],
-      "cfg": {
-        "kind": "feature",
-        "value": "gpu"
-      }
     },
     {
       "name": "NetFlags",
