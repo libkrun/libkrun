@@ -46,6 +46,13 @@
 // Net feature flags
 #define COMPAT_NET_FEATURES ((1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 14))
 
+// Virgl flags for headless GPU acceleration via Venus (Vulkan): the render
+// server serves the device out-of-process and NO_VIRGL drops the OpenGL
+// (virgl) capsets, leaving Vulkan only.
+#define HEADLESS_VIRGL_FLAGS                                                      \
+    (KRUN_VIRGL_RENDERER_FLAGS_NO_VIRGL | KRUN_VIRGL_RENDERER_FLAGS_VENUS |       \
+     KRUN_VIRGL_RENDERER_FLAGS_RENDER_SERVER)
+
 enum net_mode {
     NET_MODE_PASST = 0,
     NET_MODE_TSI,
@@ -67,6 +74,9 @@ static void print_help(char *const name)
         "              --transport=MODE      Select virtio transport (MMIO or PCI)\n"
         "              --net=NET_MODE        Set network mode\n"
         "              --passt-socket=PATH   Instead of starting passt, connect to passt socket at PATH\n"
+        "        -g    --gpu                 Add a virtio-gpu device with virgl 3D acceleration and no\n"
+        "                                     display backend (headless GPU acceleration; requires\n"
+        "                                     libkrun built with GPU=1)\n"
         "              --vhost-user-rng=PATH Use vhost-user RNG backend at socket PATH\n"
         "              --vhost-user-rtc=PATH Use vhost-user RTC backend at socket PATH\n"
         "              --vhost-user-input=PATH Use vhost-user input backend at socket PATH\n"
@@ -78,6 +88,7 @@ static void print_help(char *const name)
         "NET_MODE can be either TSI (default) or PASST\n"
         "PCI transport is only supported on x86_64 Linux; MMIO is the default\n"
         "PCI transport does not currently support vhost-user devices\n"
+        "vhost-user devices are only supported on Linux\n"
         "\n"
         "NEWROOT:      the root directory of the vm\n"
         "COMMAND:      the command you want to execute in the vm\n"
@@ -133,6 +144,7 @@ static const struct option long_options[] = {
     { "color-log", required_argument, NULL, 'C' },
     { "transport", required_argument, NULL, 'T' },
     { "net_mode", required_argument, NULL, 'N' },
+    { "gpu", no_argument, NULL, 'g' },
     { "passt-socket", required_argument, NULL, 'P' },
     { "vhost-user-rng", required_argument, NULL, 'V' },
     { "vhost-user-rtc", required_argument, NULL, 'R' },
@@ -152,6 +164,7 @@ struct cmdline {
     uint32_t log_style;
     enum transport_mode transport_mode;
     enum net_mode net_mode;
+    bool gpu;
     char const *passt_socket_path;
     char const *vhost_user_rng_socket;
     char const *vhost_user_rtc_socket;
@@ -200,6 +213,7 @@ bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
         .show_help = false,
         .transport_mode = TRANSPORT_MODE_MMIO,
         .net_mode = NET_MODE_TSI,
+        .gpu = false,
         .passt_socket_path = NULL,
         .vhost_user_rng_socket = NULL,
         .vhost_user_rtc_socket = NULL,
@@ -219,7 +233,7 @@ bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
     int option_index = 0;
     int c;
     // the '+' in optstring is a GNU extension that disables permutating argv
-    while ((c = getopt_long(argc, argv, "+h", long_options, &option_index)) != -1) {
+    while ((c = getopt_long(argc, argv, "+hg", long_options, &option_index)) != -1) {
         switch (c) {
         case 'h':
             cmdline->show_help = true;
@@ -256,6 +270,9 @@ bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
                 fprintf(stderr, "Unknown mode %s\n", optarg);
                 return false;
             }
+            break;
+        case 'g':
+            cmdline->gpu = true;
             break;
         case 'P':
             cmdline->passt_socket_path = optarg;
@@ -310,6 +327,19 @@ bool parse_cmdline(int argc, char *const argv[], struct cmdline *cmdline)
     }
 
     return false;
+}
+
+static bool any_vhost_user_socket(const struct cmdline *cmdline)
+{
+    return cmdline->vhost_user_rng_socket != NULL ||
+        cmdline->vhost_user_rtc_socket != NULL ||
+        cmdline->vhost_user_input_socket != NULL ||
+        cmdline->vhost_user_gpu_socket != NULL ||
+        cmdline->vhost_user_snd_socket != NULL ||
+        cmdline->vhost_user_vsock_socket != NULL ||
+        cmdline->vhost_user_can_socket != NULL ||
+        cmdline->vhost_user_console_socket != NULL ||
+        cmdline->vhost_user_media_socket != NULL;
 }
 
 int start_passt()
@@ -382,19 +412,17 @@ int main(int argc, char *const argv[])
         return 0;
     }
 
-    if (cmdline.transport_mode == TRANSPORT_MODE_PCI &&
-        (cmdline.vhost_user_rng_socket != NULL ||
-            cmdline.vhost_user_rtc_socket != NULL ||
-            cmdline.vhost_user_input_socket != NULL ||
-            cmdline.vhost_user_gpu_socket != NULL ||
-            cmdline.vhost_user_snd_socket != NULL ||
-            cmdline.vhost_user_vsock_socket != NULL ||
-            cmdline.vhost_user_can_socket != NULL ||
-            cmdline.vhost_user_console_socket != NULL ||
-            cmdline.vhost_user_media_socket != NULL)) {
+    if (cmdline.transport_mode == TRANSPORT_MODE_PCI && any_vhost_user_socket(&cmdline)) {
         fprintf(stderr, "PCI transport does not currently support vhost-user devices\n");
         return -1;
     }
+
+#if !defined(__linux__)
+    if (any_vhost_user_socket(&cmdline)) {
+        fprintf(stderr, "vhost-user devices are only supported on Linux\n");
+        return -1;
+    }
+#endif
 
     // Set the log level to "warn".
     CHECK(krun_init_log(cmdline.log_target, KRUN_LOG_LEVEL_WARN, cmdline.log_style, 0, &krun_err));
@@ -437,6 +465,7 @@ int main(int argc, char *const argv[])
         krun_device_manager_add(devices, console);
     }
 
+#if defined(__linux__)
     // Configure vhost-user RNG if requested
     if (cmdline.vhost_user_rng_socket != NULL) {
         // Auto-detect queue count; use custom queue size of 512
@@ -464,9 +493,7 @@ int main(int argc, char *const argv[])
     }
 
     // Configure vhost-user GPU if requested.
-    // NOTE: The built-in GPU (krun_set_gpu_options) has been removed — v2 requires a
-    // DisplayBackend vtable handle which can't be constructed from C without a display
-    // backend implementation. Use vhost-user GPU as the only GPU path from C.
+    // NOTE: for the built-in GPU device use --gpu instead.
     if (cmdline.vhost_user_gpu_socket != NULL) {
         CHECK(KrunVhostUserDevice gpu = krun_vhost_user_device_new(VIRTIO_DEVICE_GPU,
             KRUN_STR(cmdline.vhost_user_gpu_socket), KRUN_STR(""), 0, NULL, 0, &krun_err));
@@ -514,6 +541,7 @@ int main(int argc, char *const argv[])
         krun_device_manager_add(devices, media);
         printf("Using vhost-user media backend at %s\n", cmdline.vhost_user_media_socket);
     }
+#endif
 
     // Raise RLIMIT_NOFILE to the maximum allowed to create some room for virtio-fs
     getrlimit(RLIMIT_NOFILE, &rlim);
@@ -568,6 +596,17 @@ int main(int argc, char *const argv[])
 
         CHECK(KrunBalloonDevice balloon = krun_balloon_device_new(&krun_err));
         krun_device_manager_add(devices, balloon);
+    }
+
+    // Configure headless GPU acceleration if requested.
+    if (cmdline.gpu) {
+        // A backend without displays: every scanout operation is rejected, so
+        // the GPU is only usable for off-screen rendering.
+        CHECK(KrunDisplayBackend backend = krun_display_backend_new_noop());
+
+        // krun_gpu_device_new takes ownership of the backend handle.
+        CHECK(KrunGpuDevice gpu = krun_gpu_device_new(HEADLESS_VIRGL_FLAGS, backend));
+        krun_device_manager_add(devices, gpu);
     }
 
     // Build the VM.
