@@ -87,7 +87,7 @@ pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> Re
             }
         }
     } else {
-        RecvPkt::Error
+        RecvPkt::BadBuffer
     }
 }
 

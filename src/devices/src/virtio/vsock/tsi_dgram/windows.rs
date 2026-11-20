@@ -303,10 +303,10 @@ pub(crate) fn init_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) {
 
 pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -> RecvPkt {
     let Some(buf) = pkt.buf_mut() else {
-        return RecvPkt::Error;
+        return RecvPkt::BadBuffer;
     };
     if buf.len() < DGRAM_HEADER_LEN {
-        return RecvPkt::Error;
+        return RecvPkt::BadBuffer;
     }
     let capacity = buf.len().min(DGRAM_MAX_SIZE) - DGRAM_HEADER_LEN;
     let mut addr = [0u8; 128];

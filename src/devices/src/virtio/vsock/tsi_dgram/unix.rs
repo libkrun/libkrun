@@ -163,10 +163,10 @@ fn record_socket_error(proxy: &super::TsiDgramProxy, error: Errno) {
 
 pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -> RecvPkt {
     let Some(buf) = pkt.buf_mut() else {
-        return RecvPkt::Error;
+        return RecvPkt::BadBuffer;
     };
     if buf.len() < DGRAM_HEADER_LEN {
-        return RecvPkt::Error;
+        return RecvPkt::BadBuffer;
     }
     let capacity = buf.len().min(DGRAM_MAX_SIZE) - DGRAM_HEADER_LEN;
     #[cfg(target_os = "linux")]
@@ -639,6 +639,7 @@ pub(crate) fn update_peer_credit(
     );
     proxy.peer_buf_alloc = pkt.buf_alloc();
     proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
+    proxy.status = ProxyStatus::Connected;
 
     ProxyUpdate {
         polling: Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::IN)),
@@ -706,4 +707,165 @@ pub(crate) fn process_event(proxy: &mut super::TsiDgramProxy, evset: EventSet) -
     }
 
     update
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+    use super::super::TsiDgramProxy;
+    use super::*;
+    use crate::virtio::Queue;
+    use crate::virtio::descriptor_utils::{DescriptorType, create_descriptor_chain};
+    use crate::virtio::queue::{Descriptor, VIRTQ_DESC_F_WRITE};
+    use crate::virtio::vsock::muxer_rxq::MuxerRxQ;
+    use crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE;
+
+    fn test_mem() -> GuestMemoryMmap {
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap()
+    }
+
+    fn rx_queue() -> Arc<Mutex<Queue>> {
+        let mut queue = Queue::new(8);
+        queue.size = 8;
+        queue.ready = true;
+        queue.desc_table = GuestAddress(0x1000);
+        queue.avail_ring = GuestAddress(0x2000);
+        queue.used_ring = GuestAddress(0x3000);
+        Arc::new(Mutex::new(queue))
+    }
+
+    fn post_buffer(mem: &GuestMemoryMmap, slot: u16, index: u16, addr: u64, len: u32) {
+        mem.write_obj(
+            Descriptor {
+                addr,
+                len,
+                flags: VIRTQ_DESC_F_WRITE,
+                next: 0,
+            },
+            GuestAddress(0x1000 + 16 * u64::from(index)),
+        )
+        .unwrap();
+        mem.write_obj::<u16>(index, GuestAddress(0x2004 + 2 * u64::from(slot)))
+            .unwrap();
+        mem.write_obj::<u16>(slot + 1, GuestAddress(0x2002))
+            .unwrap();
+    }
+
+    fn used_ring(mem: &GuestMemoryMmap, slot: usize) -> (u32, u32) {
+        let base = 0x3004 + 8 * slot as u64;
+        (
+            mem.read_obj::<u32>(GuestAddress(base)).unwrap(),
+            mem.read_obj::<u32>(GuestAddress(base + 4)).unwrap(),
+        )
+    }
+
+    fn used_idx(mem: &GuestMemoryMmap) -> u16 {
+        mem.read_obj::<u16>(GuestAddress(0x3002)).unwrap()
+    }
+
+    fn dgram_proxy(mem: &GuestMemoryMmap, queue: Arc<Mutex<Queue>>) -> TsiDgramProxy {
+        TsiDgramProxy::new(
+            (5000u64 << 32) | 620,
+            3,
+            TsiProxyCreate {
+                peer_port: 5000,
+                family: defs::LINUX_AF_UNIX,
+                _type: defs::SOCK_DGRAM,
+                protocol: 0,
+            },
+            mem.clone(),
+            queue,
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+        )
+        .unwrap()
+    }
+
+    fn credit_packet(mem: &GuestMemoryMmap) -> VsockPacket {
+        let mut header = [0u8; VSOCK_PKT_HDR_SIZE];
+        header[36..40].copy_from_slice(&65536u32.to_le_bytes());
+        let addr = GuestAddress(0x5000);
+        mem.write_slice(&header, addr).unwrap();
+        let chain = create_descriptor_chain(
+            mem,
+            GuestAddress(0x6000),
+            addr,
+            vec![(DescriptorType::Readable, VSOCK_PKT_HDR_SIZE as u32)],
+            0,
+        )
+        .unwrap();
+        VsockPacket::from_tx_virtq_head(&chain).unwrap()
+    }
+
+    #[test]
+    fn undersized_rx_buffer_is_consumed_and_disarms_polling() {
+        let mem = test_mem();
+        let queue = rx_queue();
+        let mut proxy = dgram_proxy(&mem, queue);
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("krun-dgram-rx-{}-{nonce}.sock", std::process::id()));
+        let addr = UnixAddr::new(path.to_str().unwrap()).unwrap();
+        bind(proxy.fd.as_raw_fd(), &addr).unwrap();
+        let peer = socket(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+        sendto(peer.as_raw_fd(), b"datagram", &addr, MsgFlags::empty()).unwrap();
+
+        // The data region is shorter than the datagram header, so the host
+        // socket stays readable while the buffer cannot be drained into.
+        post_buffer(&mem, 0, 0, 0x4000, VSOCK_PKT_HDR_SIZE as u32 + 16);
+
+        let update = process_event(&mut proxy, EventSet::IN);
+        assert_eq!(used_ring(&mem, 0), (0, 0));
+        assert_eq!(used_idx(&mem), 1);
+        assert!(update.signal_queue);
+        assert_eq!(
+            update.polling,
+            Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()))
+        );
+        assert!(matches!(
+            update.push_credit_req,
+            Some(MuxerRx::CreditRequest { .. })
+        ));
+
+        // The guest recycles its buffers and announces credit: polling
+        // resumes and the pending datagram is delivered.
+        let update = update_peer_credit(&mut proxy, &credit_packet(&mem));
+        assert_eq!(proxy.status, ProxyStatus::Connected);
+        assert_eq!(
+            update.polling,
+            Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::IN))
+        );
+
+        post_buffer(&mem, 1, 1, 0x4200, VSOCK_PKT_HDR_SIZE as u32 + 512);
+        let update = process_event(&mut proxy, EventSet::IN);
+        assert!(update.signal_queue);
+        assert_eq!(
+            used_ring(&mem, 1),
+            (
+                1,
+                (VSOCK_PKT_HDR_SIZE + DGRAM_HEADER_LEN + b"datagram".len()) as u32
+            )
+        );
+        let mut payload = [0u8; 8];
+        mem.read_slice(
+            &mut payload,
+            GuestAddress(0x4200 + (VSOCK_PKT_HDR_SIZE + DGRAM_HEADER_LEN) as u64),
+        )
+        .unwrap();
+        assert_eq!(&payload, b"datagram");
+
+        std::fs::remove_file(&path).unwrap();
+    }
 }
