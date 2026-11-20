@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 #[cfg(windows)]
-use utils::windows::RawFd;
+use utils::windows::{AsRawFd, RawFd};
 
 use super::super::Queue as VirtQueue;
 use super::muxer::{MuxerRx, ProxyMap, push_packet};
@@ -20,7 +20,13 @@ use crate::virtio::vsock::unix_proxy::{UnixAcceptorProxy, UnixProxy};
 use crossbeam_channel::Sender;
 use rand::{RngExt, rng, rngs::ThreadRng};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
+
+/// Reserved epoll data marking the guest-RX-available notification rather
+/// than a proxy id. No proxy can use it: the low word holds a local port
+/// below `u32::MAX` and guest socket ports never reach `u32::MAX`.
+const RX_AVAILABLE_ID: u64 = u64::MAX;
 
 pub struct MuxerThread {
     cid: u64,
@@ -32,6 +38,22 @@ pub struct MuxerThread {
     interrupt: InterruptTransport,
     reaper_sender: Sender<u64>,
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+    rx_available_evt: EventFd,
+    starved: Mutex<HashSet<u64>>,
+}
+
+/// Draws a local port for a reverse proxy until its id is free: inserting
+/// over an existing entry would drop the live proxy along with its
+/// connection. Filling the id space would need billions of live proxies,
+/// so the loop is effectively single-pass. The fixed TSI ports live below
+/// 1024 and cannot be drawn.
+fn draw_reverse_port(rng: &mut ThreadRng, occupied: impl Fn(u32) -> bool) -> u32 {
+    loop {
+        let candidate: u32 = rng.random_range(1024..u32::MAX);
+        if !occupied(candidate) {
+            return candidate;
+        }
+    }
 }
 
 impl MuxerThread {
@@ -46,6 +68,7 @@ impl MuxerThread {
         interrupt: InterruptTransport,
         reaper_sender: Sender<u64>,
         unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+        rx_available_evt: EventFd,
     ) -> Self {
         MuxerThread {
             cid,
@@ -57,6 +80,8 @@ impl MuxerThread {
             interrupt,
             reaper_sender,
             unix_ipc_port_map,
+            rx_available_evt,
+            starved: Mutex::new(HashSet::new()),
         }
     }
 
@@ -72,20 +97,19 @@ impl MuxerThread {
         let mut rxq = self.rxq.lock().unwrap();
         let mut drained = false;
 
-        while let Some(rx) = rxq.pop() {
-            if let Some(head) = queue.pop(&self.mem) {
-                if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-                    rx_to_pkt(self.cid, rx, &mut pkt);
-                    if let Err(e) =
-                        queue.add_used(&self.mem, head.index, pkt.hdr().len() as u32 + pkt.len())
-                    {
-                        error!("failed to add used elements to the queue: {e:?}");
-                    }
-                    drained = true;
-                }
-            } else {
-                rxq.push(rx);
+        while !rxq.is_empty() {
+            let Some(head) = queue.pop(&self.mem) else {
                 break;
+            };
+            let used_len = if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
+                rx_to_pkt(self.cid, rxq.pop().unwrap(), &mut pkt);
+                pkt.finish_rx().unwrap_or(0)
+            } else {
+                0
+            };
+            match queue.add_used(&self.mem, head.index, used_len) {
+                Ok(()) => drained = true,
+                Err(e) => error!("failed to add used elements to the queue: {e:?}"),
             }
         }
 
@@ -125,13 +149,13 @@ impl MuxerThread {
     }
 
     fn process_proxy_update(&self, id: u64, update: ProxyUpdate, thread_rng: &mut ThreadRng) {
-        if let Some(polling) = update.polling {
-            self.update_polling(polling.0, polling.1, polling.2);
-        }
-
         if let Some(credit_rx) = update.push_credit_req {
             debug!("send_credit_request");
             self.send_credit_request(credit_rx);
+        }
+
+        if update.rx_starved {
+            self.starved.lock().unwrap().insert(id);
         }
 
         match update.remove_proxy {
@@ -139,11 +163,13 @@ impl MuxerThread {
             ProxyRemoval::Immediate => {
                 warn!("immediately removing proxy: {id}");
                 self.proxy_map.write().unwrap().remove(&id);
+                self.starved.lock().unwrap().remove(&id);
             }
             ProxyRemoval::Deferred => {
                 warn!("deferring proxy removal: {id}");
                 if self.reaper_sender.send(id).is_err() {
                     self.proxy_map.write().unwrap().remove(&id);
+                    self.starved.lock().unwrap().remove(&id);
                 }
             }
         }
@@ -151,8 +177,11 @@ impl MuxerThread {
         let mut should_signal = update.signal_queue;
 
         if let Some((peer_port, accept_fd, family, proxy_type)) = update.new_proxy {
-            let local_port: u32 = thread_rng.random_range(1024..u32::MAX);
-            let new_id: u64 = ((peer_port as u64) << 32) | (local_port as u64);
+            let mut proxies = self.proxy_map.write().unwrap();
+            let local_port = draw_reverse_port(thread_rng, |candidate| {
+                proxies.contains_key(&(((peer_port as u64) << 32) | u64::from(candidate)))
+            });
+            let new_id = ((peer_port as u64) << 32) | u64::from(local_port);
             let new_proxy: Box<dyn Proxy> = match proxy_type {
                 NewProxyType::Tcp => Box::new(TsiStreamProxy::new_reverse(
                     new_id,
@@ -177,13 +206,10 @@ impl MuxerThread {
                     self.rxq.clone(),
                 )),
             };
-            self.proxy_map
-                .write()
-                .unwrap()
-                .insert(new_id, Mutex::new(new_proxy));
-            if let Some(proxy) = self.proxy_map.read().unwrap().get(&new_id) {
+            proxies.insert(new_id, Mutex::new(new_proxy));
+            if let Some(proxy) = proxies.get(&new_id) {
                 proxy.lock().unwrap().push_op_request();
-            };
+            }
             should_signal = true;
         }
 
@@ -216,9 +242,32 @@ impl MuxerThread {
         }
     }
 
+    fn resume_starved_proxies(&self) {
+        let starved: Vec<u64> = self.starved.lock().unwrap().drain().collect();
+        let proxies = self.proxy_map.read().unwrap();
+        for id in starved {
+            let Some(proxy) = proxies.get(&id) else {
+                // A proxy removed through the reaper can leave its id behind;
+                // the entry dies here.
+                continue;
+            };
+            let mut proxy = proxy.lock().unwrap();
+            if let Some((id, fd, events)) = proxy.resume_rx() {
+                self.update_polling(id, fd, events);
+            }
+        }
+    }
+
     fn work(mut self) {
         let mut thread_rng = rng();
         self.create_listening_ipc_sockets();
+        if let Err(e) = self.epoll.ctl(
+            ControlOperation::Add,
+            self.rx_available_evt.as_raw_fd(),
+            &EpollEvent::new(EventSet::IN, RX_AVAILABLE_ID),
+        ) {
+            error!("failed to register the rx-available event: {e:?}");
+        }
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
             if self.drain_rxq() {
@@ -234,6 +283,12 @@ impl MuxerThread {
                         debug!("Event: ev.data={} ev.fd={:?}", ev.data(), ev.fd());
                         let evset = EventSet::from_bits(ev.events).unwrap();
                         let id = ev.data();
+
+                        if id == RX_AVAILABLE_ID {
+                            let _ = self.rx_available_evt.read();
+                            self.resume_starved_proxies();
+                            continue;
+                        }
 
                         let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
                             let mut proxy = proxy_lock.lock().unwrap();
@@ -256,5 +311,20 @@ impl MuxerThread {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reverse_port_draw_retries_past_occupied_ids() {
+        let mut rng = rng();
+        let port = draw_reverse_port(&mut rng, |candidate| candidate < 3_000_000_000);
+        assert!(port >= 3_000_000_000);
+
+        let port = draw_reverse_port(&mut rng, |_| false);
+        assert!((1024..u32::MAX).contains(&port));
     }
 }

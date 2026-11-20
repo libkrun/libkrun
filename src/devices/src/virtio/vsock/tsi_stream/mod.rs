@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::io;
 use std::num::Wrapping;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::super::Queue as VirtQueue;
@@ -8,12 +10,14 @@ use super::defs;
 use super::defs::uapi;
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
-use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
+use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, VsockPacket};
 
 use super::proxy::{
     AddressFamily, AsRawFd, OwnedFd, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate,
     RawFd, RecvPkt,
 };
+#[cfg(windows)]
+use super::tsi_sockopt::GuestOnlyOptions;
 
 use utils::epoll::EventSet;
 use vm_memory::GuestMemoryMmap;
@@ -28,6 +32,95 @@ mod windows;
 #[cfg(windows)]
 use windows as sys;
 
+struct SendQueue {
+    buf: VecDeque<u8>,
+    limit: usize,
+    /// Bytes this queue may still claim from the shared device budget.
+    budget: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+enum EnqueueError {
+    Capacity,
+    Budget,
+    Alloc,
+}
+
+impl SendQueue {
+    fn new(limit: usize, budget: Arc<AtomicUsize>) -> Self {
+        SendQueue {
+            buf: VecDeque::new(),
+            limit,
+            budget,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    fn remaining(&self) -> usize {
+        self.limit - self.buf.len()
+    }
+
+    fn push(&mut self, data: &[u8]) -> Result<(), EnqueueError> {
+        if data.len() > self.remaining() {
+            return Err(EnqueueError::Capacity);
+        }
+        // Claim from the budget before touching the queue, so a failed push
+        // never leaks accounting.
+        let left = self.budget.fetch_sub(data.len(), Ordering::Relaxed);
+        if data.len() > left {
+            self.budget.fetch_add(data.len(), Ordering::Relaxed);
+            return Err(EnqueueError::Budget);
+        }
+        if let Err(error) = self.reserve(data.len()) {
+            self.budget.fetch_add(data.len(), Ordering::Relaxed);
+            return Err(error);
+        }
+        self.buf.extend(data);
+        Ok(())
+    }
+
+    fn reserve(&mut self, incoming: usize) -> Result<(), EnqueueError> {
+        let required = self.buf.len() + incoming;
+        if required > self.buf.capacity() {
+            let capacity = required.max(self.buf.capacity() * 2).min(self.limit);
+            self.buf
+                .try_reserve_exact(capacity - self.buf.len())
+                .map_err(|_| EnqueueError::Alloc)?;
+        }
+        Ok(())
+    }
+
+    fn front(&self, max: usize) -> &[u8] {
+        let (front, _) = self.buf.as_slices();
+        &front[..front.len().min(max)]
+    }
+
+    fn consume(&mut self, count: usize) {
+        self.buf.drain(..count);
+        self.budget.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn clear(&mut self) {
+        self.budget.fetch_add(self.buf.len(), Ordering::Relaxed);
+        self.buf = VecDeque::new();
+    }
+}
+
+impl Drop for SendQueue {
+    fn drop(&mut self) {
+        self.budget.fetch_add(self.buf.len(), Ordering::Relaxed);
+    }
+}
+
+#[cfg(unix)]
+const TX_DRAIN_BATCH: usize = 1024 * 1024;
+// Winsock only wakes a stalled writer again after a send reports WSAEWOULDBLOCK.
+#[cfg(windows)]
+const TX_DRAIN_BATCH: usize = defs::CONN_TX_BUF_SIZE;
+
 pub struct TsiStreamProxy {
     pub(crate) id: u64,
     pub(crate) cid: u64,
@@ -36,6 +129,8 @@ pub struct TsiStreamProxy {
     pub(crate) local_port: u32,
     pub(crate) peer_port: u32,
     pub(crate) control_port: u32,
+    pub(crate) connect_request_id: u64,
+    pub(crate) accept_request_id: u64,
     pub(crate) fd: OwnedFd,
     pub status: ProxyStatus,
     pub(crate) mem: GuestMemoryMmap,
@@ -43,20 +138,24 @@ pub struct TsiStreamProxy {
     pub(crate) rxq: Arc<Mutex<MuxerRxQ>>,
     pub(crate) rx_cnt: Wrapping<u32>,
     pub(crate) tx_cnt: Wrapping<u32>,
-    pub(crate) last_tx_cnt_sent: Wrapping<u32>,
     pub(crate) peer_buf_alloc: u32,
     pub(crate) peer_fwd_cnt: Wrapping<u32>,
     pub(crate) peer_shutdown: u32,
     pub(crate) host_read_closed: bool,
     pub(crate) push_cnt: Wrapping<u32>,
     pub(crate) pending_accepts: u64,
+    send_queue: SendQueue,
     #[cfg(target_os = "linux")]
     unixsock_path: Option<unix::PinnedUnixPath>,
     #[cfg(not(target_os = "linux"))]
     unixsock_path: Option<PathBuf>,
     #[cfg(target_os = "linux")]
     pub(crate) protected_unix_paths: Vec<PathBuf>,
+    #[cfg(windows)]
+    guest_options: GuestOnlyOptions,
 }
+
+const SHUTDOWN_MASK: u32 = uapi::VSOCK_FLAGS_SHUTDOWN_RCV | uapi::VSOCK_FLAGS_SHUTDOWN_SEND;
 
 impl TsiStreamProxy {
     #[allow(clippy::too_many_arguments)]
@@ -72,6 +171,7 @@ impl TsiStreamProxy {
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Result<Self, ProxyError> {
         let (fd, family) = sys::create_socket(id, family)?;
+        let send_budget = rxq.lock().unwrap().send_budget.clone();
 
         Ok(TsiStreamProxy {
             id,
@@ -81,6 +181,8 @@ impl TsiStreamProxy {
             local_port,
             peer_port,
             control_port,
+            connect_request_id: 0,
+            accept_request_id: 0,
             fd,
             status: ProxyStatus::Idle,
             mem,
@@ -88,16 +190,18 @@ impl TsiStreamProxy {
             rxq,
             rx_cnt: Wrapping(0),
             tx_cnt: Wrapping(0),
-            last_tx_cnt_sent: Wrapping(0),
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
             peer_shutdown: 0,
             host_read_closed: false,
             push_cnt: Wrapping(0),
             pending_accepts: 0,
+            send_queue: SendQueue::new(defs::CONN_TX_BUF_SIZE, send_budget),
             unixsock_path: None,
             #[cfg(target_os = "linux")]
             protected_unix_paths: Vec::new(),
+            #[cfg(windows)]
+            guest_options: GuestOnlyOptions::default(),
         })
     }
 
@@ -115,6 +219,7 @@ impl TsiStreamProxy {
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Self {
         debug!("new_reverse: id={id} local_port={local_port} peer_port={peer_port}");
+        let send_budget = rxq.lock().unwrap().send_budget.clone();
         TsiStreamProxy {
             id,
             cid,
@@ -123,6 +228,8 @@ impl TsiStreamProxy {
             local_port,
             peer_port,
             control_port: 0,
+            connect_request_id: 0,
+            accept_request_id: 0,
             fd,
             status: ProxyStatus::ReverseInit,
             mem,
@@ -130,16 +237,18 @@ impl TsiStreamProxy {
             rxq,
             rx_cnt: Wrapping(0),
             tx_cnt: Wrapping(0),
-            last_tx_cnt_sent: Wrapping(0),
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
             peer_shutdown: 0,
             host_read_closed: false,
             push_cnt: Wrapping(0),
             pending_accepts: 0,
+            send_queue: SendQueue::new(defs::CONN_TX_BUF_SIZE, send_budget),
             unixsock_path: None,
             #[cfg(target_os = "linux")]
             protected_unix_paths: Vec::new(),
+            #[cfg(windows)]
+            guest_options: GuestOnlyOptions::default(),
         }
     }
 
@@ -162,6 +271,193 @@ impl TsiStreamProxy {
         (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
     }
 
+    fn is_established(&self) -> bool {
+        matches!(
+            self.status,
+            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+        )
+    }
+
+    fn event_interest(&self) -> EventSet {
+        let mut interest = EventSet::empty();
+        if self.status == ProxyStatus::Connected
+            && !self.host_read_closed
+            && self.peer_shutdown & uapi::VSOCK_FLAGS_SHUTDOWN_RCV == 0
+        {
+            interest |= EventSet::IN | EventSet::READ_HANG_UP;
+        }
+        if !self.send_queue.is_empty() {
+            interest |= EventSet::OUT;
+            #[cfg(windows)]
+            {
+                interest |= EventSet::HANG_UP;
+            }
+        }
+        interest
+    }
+
+    fn polling_change(&self, previous: EventSet) -> Option<(u64, RawFd, EventSet)> {
+        let interest = self.event_interest();
+        (interest != previous).then(|| (self.id, self.fd.as_raw_fd(), interest))
+    }
+
+    fn send_data(&mut self, data: &[u8]) -> ProxyUpdate {
+        if data.is_empty()
+            || !self.is_established()
+            || self.peer_shutdown & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0
+        {
+            return ProxyUpdate::default();
+        }
+
+        if data.len() > self.send_queue.remaining() {
+            return self.abort_send(EnqueueError::Capacity);
+        }
+
+        let previous = self.event_interest();
+        let mut written = 0;
+        if self.send_queue.is_empty() {
+            written = match self.write_host(data) {
+                Ok(count) => count,
+                Err(err) => return self.fail_write(err),
+            };
+            self.tx_cnt += Wrapping(written as u32);
+        }
+        if written < data.len()
+            && let Err(error) = self.send_queue.push(&data[written..])
+        {
+            return self.abort_send(error);
+        }
+        if written > 0 {
+            self.stage_credit(false);
+        }
+
+        ProxyUpdate {
+            polling: self.polling_change(previous),
+            ..Default::default()
+        }
+    }
+
+    fn abort_send(&mut self, error: EnqueueError) -> ProxyUpdate {
+        match error {
+            EnqueueError::Capacity => warn!("send queue capacity exceeded: id={}", self.id),
+            EnqueueError::Budget => {
+                warn!("aggregate send queue budget exceeded: id={}", self.id)
+            }
+            EnqueueError::Alloc => error!("could not allocate send queue storage: id={}", self.id),
+        }
+        self.reset_after_error()
+    }
+
+    fn write_host(&self, data: &[u8]) -> io::Result<usize> {
+        match sys::try_write(&self.fd, data) {
+            Ok(0) => Err(io::ErrorKind::WriteZero.into()),
+            Err(err) if sys::is_retryable_write_error(&err) => Ok(0),
+            result => result,
+        }
+    }
+
+    fn fail_write(&mut self, err: io::Error) -> ProxyUpdate {
+        warn!("error writing to host socket: id={}, err={err}", self.id);
+        self.reset_after_error()
+    }
+
+    fn stop_stream(&mut self) {
+        self.send_queue.clear();
+        self.rxq.lock().unwrap().clear_stream_credit(self.id);
+        self.status = ProxyStatus::Closed;
+        sys::shutdown_write(&self.fd);
+        sys::shutdown_read(&self.fd);
+    }
+
+    fn reset_after_error(&mut self) -> ProxyUpdate {
+        self.stop_stream();
+        self.push_reset();
+        ProxyUpdate {
+            signal_queue: true,
+            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::empty())),
+            ..Default::default()
+        }
+    }
+
+    fn process_writable(&mut self) -> io::Result<bool> {
+        let mut written = 0;
+        while written < TX_DRAIN_BATCH && !self.send_queue.is_empty() {
+            let chunk = self.send_queue.front(TX_DRAIN_BATCH - written);
+            let count = self.write_host(chunk)?;
+            if count == 0 {
+                break;
+            }
+            self.send_queue.consume(count);
+            self.tx_cnt += Wrapping(count as u32);
+            written += count;
+        }
+        if written > 0 {
+            self.stage_credit(false);
+        }
+
+        if self.send_queue.is_empty() && self.peer_shutdown & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0 {
+            sys::shutdown_write(&self.fd);
+            return Ok(self.finish_peer_shutdown());
+        }
+        Ok(false)
+    }
+
+    fn stage_credit(&self, request: bool) {
+        self.rxq
+            .lock()
+            .unwrap()
+            .stage_stream_credit(self.id, self.tx_cnt.0, request);
+    }
+
+    fn finish_peer_shutdown(&mut self) -> bool {
+        if self.peer_shutdown != SHUTDOWN_MASK || !self.send_queue.is_empty() {
+            return false;
+        }
+        self.rxq.lock().unwrap().clear_stream_credit(self.id);
+        self.status = ProxyStatus::Closed;
+        self.push_reset();
+        true
+    }
+
+    fn read_host(&mut self, previous: EventSet) -> ProxyUpdate {
+        let (signal_queue, wait_credit) = self.recv_pkt();
+        if self.status == ProxyStatus::Closed {
+            return self.reset_after_error();
+        }
+        if wait_credit {
+            self.status = ProxyStatus::WaitingCreditUpdate;
+            self.stage_credit(true);
+        }
+        ProxyUpdate {
+            signal_queue,
+            polling: self.polling_change(previous),
+            ..Default::default()
+        }
+    }
+
+    fn process_connected_event(&mut self, events: EventSet) -> ProxyUpdate {
+        let previous = self.event_interest();
+        let mut update = ProxyUpdate::default();
+        let hangup = EventSet::HANG_UP;
+        #[cfg(target_os = "linux")]
+        let hangup = hangup | EventSet::ERROR;
+        // HUP can arrive with unread bytes. recv() determines when the host
+        // has half-closed, leaving pending writes independent of read EOF.
+        if previous.contains(EventSet::IN)
+            && events.intersects(EventSet::IN | EventSet::READ_HANG_UP | hangup)
+        {
+            update = self.read_host(previous);
+        }
+        if !self.send_queue.is_empty() && events.intersects(EventSet::OUT | hangup) {
+            match self.process_writable() {
+                Ok(signal_queue) => update.signal_queue |= signal_queue,
+                Err(err) => return self.fail_write(err),
+            }
+        }
+        update.polling = self.polling_change(previous);
+        update
+    }
+
     pub(crate) fn recv_pkt(&mut self) -> (bool, bool) {
         let mut have_used = false;
         let mut wait_credit = false;
@@ -171,6 +467,10 @@ impl TsiStreamProxy {
             let Some(head) = queue.pop(&self.mem) else {
                 break;
             };
+            // A head that cannot hold a packet is returned to the guest empty
+            // instead of being parked at the queue head, where a readable host
+            // socket would trip the event loop forever.
+            let mut bad_buffer = false;
             let len = match VsockPacket::from_rx_virtq_head(&head) {
                 Ok(mut pkt) => match sys::recv_to_pkt(self, &mut pkt) {
                     Ok(RecvPkt::WaitForCredit) => {
@@ -181,7 +481,7 @@ impl TsiStreamProxy {
                         self.rx_cnt += Wrapping(cnt as u32);
                         self.init_data_pkt(&mut pkt);
                         pkt.set_len(cnt as u32);
-                        pkt.hdr().len() + cnt
+                        pkt.finish_rx().unwrap_or(0) as usize
                     }
                     Ok(RecvPkt::Close) => {
                         self.host_read_closed = true;
@@ -189,9 +489,13 @@ impl TsiStreamProxy {
                         pkt.set_op(uapi::VSOCK_OP_SHUTDOWN)
                             .set_flags(uapi::VSOCK_FLAGS_SHUTDOWN_SEND)
                             .set_len(0);
-                        pkt.hdr().len()
+                        pkt.finish_rx().unwrap_or(0) as usize
                     }
                     Ok(RecvPkt::Error) => 0,
+                    Ok(RecvPkt::BadBuffer) => {
+                        bad_buffer = true;
+                        0
+                    }
                     Err(e) => {
                         debug!("recv_pkt: socket error: {e}");
                         self.status = ProxyStatus::Closed;
@@ -200,27 +504,43 @@ impl TsiStreamProxy {
                 },
                 Err(e) => {
                     debug!("recv_pkt: RX queue error: {e:?}");
+                    bad_buffer = true;
                     0
                 }
             };
+
+            if bad_buffer {
+                wait_credit = true;
+                have_used = true;
+                if let Err(e) = queue.add_used(&self.mem, head.index, 0) {
+                    error!("failed to add used elements to the queue: {e:?}");
+                }
+                continue;
+            }
 
             if len == 0 {
                 queue.undo_pop();
                 break;
             } else {
-                have_used = true;
                 self.push_cnt += Wrapping(len as u32);
                 debug!(
                     "recv_pkt: pushing packet with {} bytes, push_cnt={}",
                     len, self.push_cnt
                 );
-                if let Err(e) = queue.add_used(&self.mem, head.index, len as u32) {
-                    error!("failed to add used elements to the queue: {e:?}");
+                match queue.add_used(&self.mem, head.index, len as u32) {
+                    Ok(()) => have_used = true,
+                    Err(e) => error!("failed to add used elements to the queue: {e:?}"),
                 }
             }
         }
 
         debug!("recv_pkt: have_used={have_used}");
+        if have_used {
+            self.rxq
+                .lock()
+                .unwrap()
+                .stream_credit_piggybacked(self.id, self.tx_cnt.0);
+        }
         (have_used, wait_credit)
     }
 
@@ -232,7 +552,8 @@ impl TsiStreamProxy {
 
         // This response goes to the control port (DGRAM).
         let rx = MuxerRx::ConnResponse {
-            local_port: 1025,
+            request_id: self.connect_request_id,
+            operation: super::defs::TSI_OP_CONNECT,
             peer_port: self.control_port,
             result,
         };
@@ -255,6 +576,9 @@ impl TsiStreamProxy {
 }
 
 impl Proxy for TsiStreamProxy {
+    fn tsi_socket(&self) -> Option<(u16, AddressFamily)> {
+        Some((super::defs::SOCK_STREAM, self.family))
+    }
     fn id(&self) -> u64 {
         self.id
     }
@@ -264,10 +588,26 @@ impl Proxy for TsiStreamProxy {
     }
 
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
+        if self.status == ProxyStatus::Connecting {
+            let rx = MuxerRx::ConnResponse {
+                request_id: req.request_id,
+                operation: pkt.control_operation(),
+                peer_port: pkt.src_port(),
+                result: -114, // Linux EALREADY
+            };
+            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+            return ProxyUpdate::default();
+        }
+        self.control_port = pkt.src_port();
+        self.connect_request_id = req.request_id;
         sys::do_connect(self, pkt, req)
     }
 
     fn confirm_connect(&mut self, pkt: &VsockPacket) -> Option<ProxyUpdate> {
+        if self.status != ProxyStatus::AwaitingRequest {
+            return None;
+        }
+
         debug!(
             "confirm_connect: local_port={} peer_port={}, src_port={}, dst_port={}",
             pkt.dst_port(),
@@ -281,6 +621,7 @@ impl Proxy for TsiStreamProxy {
 
         self.local_port = pkt.dst_port();
         self.peer_port = pkt.src_port();
+        self.status = ProxyStatus::Connected;
 
         // This response goes to the connection.
         let rx = MuxerRx::OpResponse {
@@ -292,25 +633,35 @@ impl Proxy for TsiStreamProxy {
         // Now that the vsock transport is fully established, start listening
         // for events in the TCP socket again.
         Some(ProxyUpdate {
-            polling: Some((
-                self.id,
-                self.fd.as_raw_fd(),
-                EventSet::IN | EventSet::READ_HANG_UP,
-            )),
+            polling: Some((self.id, self.fd.as_raw_fd(), self.event_interest())),
             ..Default::default()
         })
     }
 
-    fn getpeername(&mut self, pkt: &VsockPacket) {
-        sys::do_getpeername(self, pkt)
+    fn socket_option(&self, level: u32, name: u32, value: Option<i32>) -> Result<i32, i32> {
+        #[cfg(windows)]
+        if let Some(result) = self.guest_options.apply(level, name, value) {
+            return Ok(result);
+        }
+        super::tsi_sockopt::socket_option(
+            self.as_raw_fd(),
+            self.family,
+            super::defs::SOCK_STREAM,
+            level,
+            name,
+            value,
+        )
+    }
+
+    fn getname(&mut self, pkt: &VsockPacket, peer: bool) {
+        sys::do_getname(self, pkt, peer)
     }
 
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
-        sys::sendmsg(self, pkt)
-    }
-
-    fn sendto_addr(&mut self, _req: TsiSendtoAddr) -> ProxyUpdate {
-        ProxyUpdate::default()
+        match pkt.buf() {
+            Some(buf) => self.send_data(buf),
+            None => ProxyUpdate::default(),
+        }
     }
 
     fn listen(
@@ -323,6 +674,17 @@ impl Proxy for TsiStreamProxy {
     }
 
     fn accept(&mut self, req: TsiAcceptReq) -> ProxyUpdate {
+        if self.status == ProxyStatus::WaitingOnAccept {
+            let rx = MuxerRx::AcceptResponse {
+                request_id: req.request_id,
+                operation: super::defs::TSI_OP_ACCEPT,
+                peer_port: self.control_port,
+                result: -16, // Linux EBUSY
+            };
+            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+            return ProxyUpdate::default();
+        }
+        self.accept_request_id = req.request_id;
         sys::do_accept(self, req)
     }
 
@@ -345,7 +707,18 @@ impl Proxy for TsiStreamProxy {
     }
 
     fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
-        sys::process_op_response(self, pkt)
+        if self.status != ProxyStatus::ReverseInit {
+            return ProxyUpdate::default();
+        }
+        self.peer_buf_alloc = pkt.buf_alloc();
+        self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
+        self.status = ProxyStatus::Connected;
+
+        ProxyUpdate {
+            polling: Some((self.id, self.fd.as_raw_fd(), self.event_interest())),
+            push_accept: Some((self.id, self.parent_id)),
+            ..Default::default()
+        }
     }
 
     fn enqueue_accept(&mut self) {
@@ -367,7 +740,8 @@ impl Proxy for TsiStreamProxy {
 
         // This packet goes to the control port (DGRAM).
         let rx = MuxerRx::AcceptResponse {
-            local_port: 1030,
+            request_id: self.accept_request_id,
+            operation: super::defs::TSI_OP_ACCEPT,
             peer_port: self.control_port,
             result,
         };
@@ -375,45 +749,64 @@ impl Proxy for TsiStreamProxy {
     }
 
     fn shutdown(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
-        const SHUTDOWN_MASK: u32 = uapi::VSOCK_FLAGS_SHUTDOWN_RCV | uapi::VSOCK_FLAGS_SHUTDOWN_SEND;
-
-        let shutdown = pkt.flags() & SHUTDOWN_MASK;
-        if shutdown == 0 || self.peer_shutdown == SHUTDOWN_MASK {
+        let shutdown = pkt.flags() & SHUTDOWN_MASK & !self.peer_shutdown;
+        if shutdown == 0 || !self.is_established() {
             return ProxyUpdate::default();
         }
 
+        let previous = self.event_interest();
         self.peer_shutdown |= shutdown;
-        sys::do_shutdown(self, pkt);
-
-        if self.peer_shutdown != SHUTDOWN_MASK {
-            return ProxyUpdate::default();
+        // SHUT_BOTH can fail on macOS after the peer has sent its FIN.
+        if shutdown & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0 {
+            sys::shutdown_read(&self.fd);
+        }
+        if shutdown & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0 && self.send_queue.is_empty() {
+            sys::shutdown_write(&self.fd);
         }
 
-        self.push_reset();
-        let mut update = self.release();
-        self.status = ProxyStatus::Closed;
-        update.signal_queue = true;
-        update
-    }
-
-    fn release(&mut self) -> ProxyUpdate {
-        debug!(
-            "release: id={}, tx_cnt={}, last_tx_cnt={}",
-            self.id, self.tx_cnt, self.last_tx_cnt_sent
-        );
-        let remove_proxy = if self.status == ProxyStatus::Listening {
-            ProxyRemoval::Immediate
-        } else {
-            ProxyRemoval::Deferred
-        };
         ProxyUpdate {
-            remove_proxy,
+            signal_queue: self.finish_peer_shutdown(),
+            polling: self.polling_change(previous),
             ..Default::default()
         }
     }
 
+    fn release(&mut self) -> ProxyUpdate {
+        debug!("release: id={}, tx_cnt={}", self.id, self.tx_cnt);
+        let remove_proxy = if matches!(
+            self.status,
+            ProxyStatus::Listening | ProxyStatus::WaitingOnAccept
+        ) {
+            ProxyRemoval::Immediate
+        } else {
+            ProxyRemoval::Deferred
+        };
+
+        // TSI RELEASE may arrive before the stream SHUTDOWN from guest close.
+        // Keep forwarding its queued bytes until shutdown or deferred removal.
+        self.host_read_closed = true;
+        ProxyUpdate {
+            remove_proxy,
+            polling: Some((self.id, self.fd.as_raw_fd(), self.event_interest())),
+            ..Default::default()
+        }
+    }
+
+    fn reset(&mut self) -> ProxyUpdate {
+        let update = self.release();
+        self.stop_stream();
+        ProxyUpdate {
+            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::empty())),
+            ..update
+        }
+    }
+
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate {
-        sys::process_event(self, evset)
+        if self.is_established() {
+            self.process_connected_event(evset)
+        } else {
+            sys::process_event(self, evset)
+        }
     }
 }
 
@@ -423,11 +816,303 @@ impl AsRawFd for TsiStreamProxy {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
 impl Drop for TsiStreamProxy {
     fn drop(&mut self) {
+        self.rxq.lock().unwrap().clear_stream_credit(self.id);
+        #[cfg(not(target_os = "linux"))]
         if let Some(path) = &self.unixsock_path {
             _ = std::fs::remove_file(path);
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    use nix::sys::socket::{setsockopt, sockopt};
+    use vm_memory::{Bytes, GuestAddress};
+
+    use super::*;
+    use crate::virtio::descriptor_utils::{DescriptorType, create_descriptor_chain};
+    use crate::virtio::queue::{
+        Descriptor, DescriptorChain, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+    };
+    use crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE;
+
+    fn stream_pair() -> (TsiStreamProxy, UnixStream) {
+        let (sender, reader) = UnixStream::pair().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        reader.set_nonblocking(true).unwrap();
+        setsockopt(&sender, sockopt::SndBuf, &4096).unwrap();
+        let queue = Arc::new(Mutex::new(VirtQueue::new(8)));
+        {
+            let mut configured = queue.lock().unwrap();
+            configured.size = 8;
+            configured.ready = true;
+            configured.desc_table = GuestAddress(0x1000);
+            configured.avail_ring = GuestAddress(0x2000);
+            configured.used_ring = GuestAddress(0x3000);
+        }
+        let mut proxy = TsiStreamProxy::new_reverse(
+            1024 << 32 | 620,
+            3,
+            1,
+            AddressFamily::Unix,
+            620,
+            1024,
+            sender.into(),
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+            queue,
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+        );
+        proxy.status = ProxyStatus::Connected;
+        (proxy, reader)
+    }
+
+    fn post_buffer(mem: &GuestMemoryMmap, slot: u16, index: u16, addr: u64, len: u32) {
+        mem.write_obj(
+            Descriptor {
+                addr,
+                len,
+                flags: VIRTQ_DESC_F_WRITE,
+                next: 0,
+            },
+            GuestAddress(0x1000 + 16 * u64::from(index)),
+        )
+        .unwrap();
+        mem.write_obj::<u16>(index, GuestAddress(0x2004 + 2 * u64::from(slot)))
+            .unwrap();
+        mem.write_obj::<u16>(slot + 1, GuestAddress(0x2002))
+            .unwrap();
+    }
+
+    fn post_unwritable_chain(mem: &GuestMemoryMmap, slot: u16) {
+        mem.write_obj(
+            Descriptor {
+                addr: 0x4000,
+                len: VSOCK_PKT_HDR_SIZE as u32,
+                flags: VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT,
+                next: 1,
+            },
+            GuestAddress(0x1000),
+        )
+        .unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: 0x4100,
+                len: 64,
+                flags: 0,
+                next: 0,
+            },
+            GuestAddress(0x1010),
+        )
+        .unwrap();
+        mem.write_obj::<u16>(0, GuestAddress(0x2004 + 2 * u64::from(slot)))
+            .unwrap();
+        mem.write_obj::<u16>(slot + 1, GuestAddress(0x2002))
+            .unwrap();
+    }
+
+    fn used_ring(mem: &GuestMemoryMmap, slot: usize) -> (u32, u32) {
+        let base = 0x3004 + 8 * slot as u64;
+        (
+            mem.read_obj::<u32>(GuestAddress(base)).unwrap(),
+            mem.read_obj::<u32>(GuestAddress(base + 4)).unwrap(),
+        )
+    }
+
+    fn used_idx(mem: &GuestMemoryMmap) -> u16 {
+        mem.read_obj::<u16>(GuestAddress(0x3002)).unwrap()
+    }
+
+    fn credit_packet(mem: &GuestMemoryMmap) -> VsockPacket {
+        let mut header = [0u8; VSOCK_PKT_HDR_SIZE];
+        header[36..40].copy_from_slice(&65536u32.to_le_bytes());
+        let addr = GuestAddress(0x5000);
+        mem.write_slice(&header, addr).unwrap();
+        let chain = create_descriptor_chain(
+            mem,
+            GuestAddress(0x6000),
+            addr,
+            vec![(DescriptorType::Readable, VSOCK_PKT_HDR_SIZE as u32)],
+            0,
+        )
+        .unwrap();
+        VsockPacket::from_tx_virtq_head(&chain).unwrap()
+    }
+
+    #[test]
+    fn short_write_and_would_block_preserve_data_through_release_and_shutdown() {
+        let (mut proxy, mut reader) = stream_pair();
+        let mut expected = vec![0x17; 128 * 1024];
+        proxy.send_data(&expected);
+        let written = proxy.tx_cnt.0 as usize;
+        assert!(written > 0 && written < expected.len());
+        proxy.process_event(EventSet::OUT);
+        assert_eq!(proxy.tx_cnt.0 as usize, written);
+
+        proxy.send_data(b"last frame");
+        expected.extend_from_slice(b"last frame");
+        assert_eq!(proxy.release().polling.unwrap().2, EventSet::OUT);
+        let table = GuestAddress(0x1000);
+        let mem = proxy.mem.clone();
+        mem.write_obj(
+            Descriptor {
+                addr: 0x2000,
+                len: VSOCK_PKT_HDR_SIZE as u32 + 1,
+                flags: VIRTQ_DESC_F_WRITE,
+                next: 0,
+            },
+            table,
+        )
+        .unwrap();
+        let head = DescriptorChain::checked_new(&mem, table, 8, 0).unwrap();
+        let mut pkt = VsockPacket::from_rx_virtq_head(&head).unwrap();
+        pkt.set_flags(uapi::VSOCK_FLAGS_SHUTDOWN_SEND);
+        proxy.shutdown(&pkt);
+        proxy.send_data(b"after shutdown");
+
+        let mut received = Vec::new();
+        for _ in 0..100 {
+            match reader.read_to_end(&mut received) {
+                Ok(_) => break,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    proxy.process_event(EventSet::OUT);
+                }
+                Err(err) => panic!("reading host socket: {err}"),
+            }
+        }
+        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+        assert!(proxy.event_interest().is_empty());
+        assert_eq!(received, expected);
+        assert!(matches!(
+            proxy.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::CreditUpdate { fwd_cnt, .. }) if fwd_cnt as usize == expected.len()
+        ));
+    }
+
+    #[test]
+    fn reset_discards_queued_bytes_and_credit() {
+        let (mut proxy, mut reader) = stream_pair();
+        proxy.send_data(&[0x17; 128 * 1024]);
+        assert!(!proxy.send_queue.is_empty());
+        let written = proxy.tx_cnt.0 as usize;
+        assert_eq!(proxy.reset().polling.unwrap().2, EventSet::empty());
+        proxy.process_event(EventSet::OUT);
+
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).unwrap();
+        assert_eq!(received.len(), written);
+        assert!(proxy.send_queue.is_empty());
+        assert!(proxy.rxq.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unwritable_rx_chain_is_consumed_and_disarms_polling() {
+        let (mut proxy, mut reader) = stream_pair();
+        let mem = proxy.mem.clone();
+        reader.write_all(b"payload").unwrap();
+
+        // The host socket is readable, but the only available buffer is a
+        // chain whose data descriptor is not writable.
+        post_unwritable_chain(&mem, 0);
+
+        let update = proxy.process_event(EventSet::IN);
+        assert_eq!(used_ring(&mem, 0), (0, 0));
+        assert_eq!(used_idx(&mem), 1);
+        assert!(update.signal_queue);
+        assert_eq!(update.polling.unwrap().2, EventSet::empty());
+
+        // The guest frees its buffers and announces credit: polling resumes.
+        let update = proxy.update_peer_credit(&credit_packet(&mem));
+        assert_eq!(proxy.status, ProxyStatus::Connected);
+        assert!(update.polling.unwrap().2.contains(EventSet::IN));
+
+        // A usable buffer now delivers the pending data.
+        post_buffer(&mem, 1, 0, 0x4000, VSOCK_PKT_HDR_SIZE as u32 + 256);
+        let update = proxy.process_event(EventSet::IN);
+        assert!(update.signal_queue);
+        assert_eq!(
+            used_ring(&mem, 1),
+            (0, (VSOCK_PKT_HDR_SIZE + b"payload".len()) as u32)
+        );
+        let mut payload = [0u8; 7];
+        mem.read_slice(
+            &mut payload,
+            GuestAddress(0x4000 + VSOCK_PKT_HDR_SIZE as u64),
+        )
+        .unwrap();
+        assert_eq!(&payload, b"payload");
+    }
+
+    #[test]
+    fn send_queue_accounts_against_the_shared_budget() {
+        let budget = Arc::new(AtomicUsize::new(1024));
+        let mut a = SendQueue::new(4096, budget.clone());
+        let mut b = SendQueue::new(4096, budget.clone());
+
+        a.push(&[0u8; 600]).unwrap();
+        assert_eq!(budget.load(Ordering::Relaxed), 424);
+        assert!(matches!(b.push(&[0u8; 600]), Err(EnqueueError::Budget)));
+        assert_eq!(budget.load(Ordering::Relaxed), 424);
+
+        a.consume(100);
+        assert_eq!(budget.load(Ordering::Relaxed), 524);
+        b.push(&[0u8; 500]).unwrap();
+        assert_eq!(budget.load(Ordering::Relaxed), 24);
+
+        a.clear();
+        assert_eq!(budget.load(Ordering::Relaxed), 524);
+        drop(a);
+        drop(b);
+        assert_eq!(budget.load(Ordering::Relaxed), 1024);
+
+        // A queue larger than the whole budget cannot claim it all.
+        let mut c = SendQueue::new(4096, Arc::new(AtomicUsize::new(64)));
+        assert!(matches!(c.push(&[0u8; 65]), Err(EnqueueError::Budget)));
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn send_data_resets_the_stream_when_the_budget_is_exhausted() {
+        let (sender, reader) = UnixStream::pair().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        reader.set_nonblocking(true).unwrap();
+        setsockopt(&sender, sockopt::SndBuf, &4096).unwrap();
+        let rxq = Arc::new(Mutex::new(MuxerRxQ::new()));
+        rxq.lock().unwrap().send_budget = Arc::new(AtomicUsize::new(64));
+        let queue = Arc::new(Mutex::new(VirtQueue::new(8)));
+        {
+            let mut configured = queue.lock().unwrap();
+            configured.size = 8;
+            configured.ready = true;
+            configured.desc_table = GuestAddress(0x1000);
+            configured.avail_ring = GuestAddress(0x2000);
+            configured.used_ring = GuestAddress(0x3000);
+        }
+        let mut proxy = TsiStreamProxy::new_reverse(
+            1024 << 32 | 620,
+            3,
+            1,
+            AddressFamily::Unix,
+            620,
+            1024,
+            sender.into(),
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+            queue,
+            rxq.clone(),
+        );
+        proxy.status = ProxyStatus::Connected;
+
+        let update = proxy.send_data(&[0x17; 128 * 1024]);
+        assert!(update.signal_queue);
+        assert_eq!(update.polling.unwrap().2, EventSet::empty());
+        assert!(proxy.send_queue.is_empty());
+        assert!(matches!(
+            rxq.lock().unwrap().pop(),
+            Some(MuxerRx::Reset { .. })
+        ));
     }
 }

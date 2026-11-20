@@ -28,7 +28,8 @@ use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::sys::socket::{
     AddressFamily, Backlog, MsgFlags, Shutdown, SockFlag, SockType, SockaddrLike, SockaddrStorage,
-    accept, bind, connect, getpeername, listen, recv, send, setsockopt, shutdown, socket, sockopt,
+    accept, bind, connect, getpeername, getsockname, getsockopt, listen, recv, send, setsockopt,
+    shutdown, socket, sockopt,
 };
 
 #[cfg(target_os = "macos")]
@@ -39,6 +40,7 @@ use super::super::packet::{TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListen
 use super::super::proxy::{
     NewProxyType, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
 };
+use super::super::tsi_wire::ECONNREFUSED;
 use utils::epoll::EventSet;
 
 #[cfg(target_os = "linux")]
@@ -167,7 +169,7 @@ impl Drop for PinnedUnixPath {
 }
 
 pub(crate) fn create_socket(
-    id: u64,
+    _id: u64,
     linux_family: u16,
 ) -> Result<(OwnedFd, AddressFamily), ProxyError> {
     let family = match linux_family {
@@ -180,45 +182,39 @@ pub(crate) fn create_socket(
     let fd = socket(family, SockType::Stream, SockFlag::empty(), None)
         .map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?;
 
-    // macOS forces us to do this here instead of just using SockFlag::SOCK_NONBLOCK above.
-    match fcntl(&fd, FcntlArg::F_GETFL) {
-        Ok(flags) => match OFlag::from_bits(flags) {
-            Some(flags) => {
-                if let Err(e) = fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)) {
-                    warn!("error switching to non-blocking: id={id}, err={e}");
-                }
-            }
-            None => error!("invalid fd flags id={id}"),
-        },
-        Err(e) => error!("couldn't obtain fd flags id={id}, err={e}"),
-    };
+    set_stream_socket_options(&fd).map_err(|e| ProxyError::CreatingSocket(e.into()))?;
 
-    if family == AddressFamily::Unix {
-        setsockopt(&fd, sockopt::ReuseAddr, &true).map_err(|e| {
-            ProxyError::SettingReuseAddr(std::io::Error::from_raw_os_error(e as i32))
-        })?;
-    } else {
-        setsockopt(&fd, sockopt::ReusePort, &true).map_err(|e| {
-            ProxyError::SettingReusePort(std::io::Error::from_raw_os_error(e as i32))
-        })?;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        // nix doesn't provide an abstraction for SO_NOSIGPIPE, fall back to libc.
-        let option_value: libc::c_int = 1;
-        unsafe {
-            libc::setsockopt(
-                fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_NOSIGPIPE,
-                &option_value as *const _ as *const libc::c_void,
-                mem::size_of_val(&option_value) as libc::socklen_t,
-            )
-        };
-    }
+    setsockopt(&fd, sockopt::ReuseAddr, &true)
+        .map_err(|e| ProxyError::SettingReuseAddr(e.into()))?;
 
     Ok((fd, family))
+}
+
+/// Applies the host port map to a guest listen address, preserving the
+/// address's ancillary IPv6 fields. Returns the address unchanged when no
+/// mapping applies.
+fn remap_listen_addr(
+    addr: &SockaddrStorage,
+    port_map: &HashMap<u16, u16>,
+) -> Result<SockaddrStorage, i32> {
+    if let Some(sin) = addr.as_sockaddr_in() {
+        debug!("sockaddr is ipv4");
+        if let Some(port) = port_map.get(&sin.port()) {
+            return Ok(SocketAddrV4::new(sin.ip(), *port).into());
+        }
+    } else if let Some(sin6) = addr.as_sockaddr_in6() {
+        debug!("sockaddr is ipv6");
+        if let Some(port) = port_map.get(&sin6.port()) {
+            return Ok(
+                SocketAddrV6::new(sin6.ip(), *port, sin6.flowinfo(), sin6.scope_id()).into(),
+            );
+        }
+    } else if addr.as_unix_addr().is_some() {
+        debug!("sockaddr is unix");
+    } else {
+        return Err(-libc::EINVAL);
+    }
+    Ok(*addr)
 }
 
 fn try_listen(
@@ -231,25 +227,9 @@ fn try_listen(
     }
 
     let addr: SockaddrStorage = if let Some(port_map) = host_port_map {
-        if let Some(sin) = req.addr.as_sockaddr_in() {
-            debug!("sockaddr is ipv4");
-            if let Some(port) = port_map.get(&sin.port()) {
-                SocketAddrV4::new(sin.ip(), *port).into()
-            } else {
-                req.addr
-            }
-        } else if let Some(sin6) = req.addr.as_sockaddr_in6() {
-            debug!("sockaddr is ipv6");
-            if let Some(port) = port_map.get(&sin6.port()) {
-                SocketAddrV6::new(sin6.ip(), *port, sin6.flowinfo(), sin6.flowinfo()).into()
-            } else {
-                req.addr
-            }
-        } else if req.addr.as_unix_addr().is_some() {
-            debug!("sockaddr is unix");
-            req.addr
-        } else {
-            return -libc::EINVAL;
+        match remap_listen_addr(&req.addr, port_map) {
+            Ok(addr) => addr,
+            Err(e) => return e,
         }
     } else {
         req.addr
@@ -370,23 +350,61 @@ pub(crate) fn recv_to_pkt(
         }
     } else {
         debug!("recv_pkt: pkt without buf");
-        Ok(RecvPkt::Error)
+        Ok(RecvPkt::BadBuffer)
     }
 }
 
-pub(crate) fn switch_to_connected(proxy: &mut super::TsiStreamProxy) {
-    proxy.status = ProxyStatus::Connected;
-    match fcntl(&proxy.fd, FcntlArg::F_GETFL) {
-        Ok(flags) => match OFlag::from_bits(flags) {
-            Some(flags) => {
-                if let Err(e) = fcntl(&proxy.fd, FcntlArg::F_SETFL(flags & !OFlag::O_NONBLOCK)) {
-                    warn!("error switching to blocking: id={}, err={}", proxy.id, e);
-                }
-            }
-            None => error!("invalid fd flags id={}", proxy.id),
-        },
-        Err(e) => error!("couldn't obtain fd flags id={}, err={}", proxy.id, e),
-    };
+pub(crate) fn try_write(fd: &OwnedFd, buf: &[u8]) -> io::Result<usize> {
+    #[cfg(target_os = "macos")]
+    let flags = MsgFlags::empty();
+    #[cfg(target_os = "linux")]
+    let flags = MsgFlags::MSG_NOSIGNAL;
+    send(fd.as_raw_fd(), buf, flags).map_err(|e| e.into())
+}
+
+pub(crate) fn is_retryable_write_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    )
+}
+
+pub(super) fn shutdown_write(fd: &OwnedFd) {
+    if let Err(e) = shutdown(fd.as_raw_fd(), Shutdown::Write) {
+        debug!("error sending shutdown(Write) to socket: {e}");
+    }
+}
+
+pub(super) fn shutdown_read(fd: &OwnedFd) {
+    if let Err(e) = shutdown(fd.as_raw_fd(), Shutdown::Read) {
+        debug!("error sending shutdown(Read) to socket: {e}");
+    }
+}
+
+fn set_stream_socket_options(fd: &OwnedFd) -> Result<(), Errno> {
+    let flags = fcntl(fd, FcntlArg::F_GETFL)?;
+    fcntl(
+        fd,
+        FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK),
+    )?;
+    #[cfg(target_os = "macos")]
+    {
+        // nix doesn't provide an abstraction for SO_NOSIGPIPE, fall back to libc.
+        let option_value: libc::c_int = 1;
+        if unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                &option_value as *const _ as *const libc::c_void,
+                mem::size_of_val(&option_value) as libc::socklen_t,
+            )
+        } < 0
+        {
+            return Err(Errno::last());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -410,8 +428,27 @@ fn finish_connect(proxy: &mut super::TsiStreamProxy) -> i32 {
         proxy.status = ProxyStatus::Closed;
         return -(e as i32);
     }
-    switch_to_connected(proxy);
+    // The host socket is connected, but the vsock transport is not
+    // established until the guest sends OP_REQUEST; read polling starts in
+    // `confirm_connect`.
+    proxy.status = ProxyStatus::AwaitingRequest;
     0
+}
+
+/// The pending error of a completed nonblocking connect, translated for
+/// the guest. Zero means the connection was established. Reading the
+/// option clears the error, so it is only consulted once an event has
+/// decided the connect's fate.
+fn connect_error(proxy: &super::TsiStreamProxy) -> i32 {
+    let error = getsockopt(&proxy.fd, sockopt::SocketError).unwrap_or(ECONNREFUSED);
+    if error == 0 {
+        return 0;
+    }
+    #[cfg(target_os = "macos")]
+    let code = linux_errno_raw(error);
+    #[cfg(target_os = "linux")]
+    let code = error;
+    code
 }
 
 fn get_addr_len(proxy: &super::TsiStreamProxy, addr: &SockaddrStorage) -> Option<u32> {
@@ -480,9 +517,6 @@ pub(crate) fn do_connect(
         if proxy.status == ProxyStatus::Closed {
             update.remove_proxy = ProxyRemoval::Immediate;
         }
-        if proxy.status == ProxyStatus::Connected {
-            update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::IN));
-        }
         proxy.push_connect_rsp(result);
     }
 
@@ -490,7 +524,7 @@ pub(crate) fn do_connect(
 }
 
 #[cfg(all(test, target_os = "linux"))]
-mod tests {
+mod protected_path_tests {
     use super::super::{MuxerRxQ, TsiStreamProxy, VirtQueue};
     use super::*;
     use std::mem;
@@ -655,34 +689,37 @@ mod tests {
     }
 }
 
-pub(crate) fn do_getpeername(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) {
+pub(crate) fn do_getname(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket, peer: bool) {
     debug!("getpeername: id={}", proxy.id);
 
-    let (result, addr_len, addr): (i32, u32, SockaddrStorage) =
-        match getpeername(proxy.fd.as_raw_fd()) {
-            Ok(addr) => {
-                if let Some(addr_len) = get_addr_len(proxy, &addr) {
-                    (0, addr_len, addr)
-                } else {
-                    #[cfg(target_os = "macos")]
-                    let errno = -linux_errno_raw(EINVAL);
-                    #[cfg(target_os = "linux")]
-                    let errno = -EINVAL;
-                    (errno, 0, addr)
-                }
-            }
-            Err(e) => {
+    let (result, addr_len, addr): (i32, u32, SockaddrStorage) = match if peer {
+        getpeername(proxy.fd.as_raw_fd())
+    } else {
+        getsockname(proxy.fd.as_raw_fd())
+    } {
+        Ok(addr) => {
+            if let Some(addr_len) = get_addr_len(proxy, &addr) {
+                (0, addr_len, addr)
+            } else {
                 #[cfg(target_os = "macos")]
-                let errno = -linux_errno_raw(e as i32);
+                let errno = -linux_errno_raw(EINVAL);
                 #[cfg(target_os = "linux")]
-                let errno = -(e as i32);
-                (
-                    errno,
-                    0,
-                    SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
-                )
+                let errno = -EINVAL;
+                (errno, 0, addr)
             }
-        };
+        }
+        Err(e) => {
+            #[cfg(target_os = "macos")]
+            let errno = -linux_errno_raw(e as i32);
+            #[cfg(target_os = "linux")]
+            let errno = -(e as i32);
+            (
+                errno,
+                0,
+                SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
+            )
+        }
+    };
 
     let data = TsiGetnameRsp {
         result,
@@ -694,62 +731,12 @@ pub(crate) fn do_getpeername(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacke
 
     // This response goes to the control port (DGRAM).
     let rx = MuxerRx::GetnameResponse {
-        local_port: pkt.dst_port(),
+        request_id: pkt.control_request_id(),
+        operation: pkt.control_operation(),
         peer_port: pkt.src_port(),
         data,
     };
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
-}
-
-pub(crate) fn sendmsg(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) -> ProxyUpdate {
-    debug!("sendmsg");
-
-    let mut update = ProxyUpdate::default();
-
-    let ret = if let Some(buf) = pkt.buf() {
-        #[cfg(target_os = "macos")]
-        let flags = MsgFlags::empty();
-        #[cfg(target_os = "linux")]
-        let flags = MsgFlags::MSG_NOSIGNAL;
-
-        match send(proxy.fd.as_raw_fd(), buf, flags) {
-            Ok(sent) => {
-                if sent != buf.len() {
-                    error!("couldn't set everything: buf={}, sent={}", buf.len(), sent);
-                }
-                proxy.tx_cnt += Wrapping(sent as u32);
-                sent as i32
-            }
-            Err(err) => {
-                #[cfg(target_os = "macos")]
-                let errno = -linux_errno_raw(err as i32);
-                #[cfg(target_os = "linux")]
-                let errno = -(err as i32);
-                errno
-            }
-        }
-    } else {
-        -libc::EINVAL
-    };
-
-    if ret > 0 && (proxy.tx_cnt - proxy.last_tx_cnt_sent).0 >= proxy.peer_buf_alloc / 2 {
-        debug!(
-            "sending credit update: id={}, tx_cnt={}, last_tx_cnt={}",
-            proxy.id, proxy.tx_cnt, proxy.last_tx_cnt_sent
-        );
-        proxy.last_tx_cnt_sent = proxy.tx_cnt;
-        // This packet goes to the connection.
-        let rx = MuxerRx::CreditUpdate {
-            local_port: pkt.dst_port(),
-            peer_port: pkt.src_port(),
-            fwd_cnt: proxy.tx_cnt.0,
-        };
-        push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
-        update.signal_queue = true;
-    }
-
-    debug!("sendmsg ret={ret}");
-    update
 }
 
 pub(crate) fn do_listen(
@@ -768,9 +755,11 @@ pub(crate) fn do_listen(
 
     // This packet goes to the control port (DGRAM).
     let rx = MuxerRx::ListenResponse {
-        local_port: pkt.dst_port(),
+        request_id: pkt.control_request_id(),
+        operation: pkt.control_operation(),
         peer_port: pkt.src_port(),
         result,
+        flags: req.response_flags(),
     };
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
 
@@ -792,9 +781,6 @@ pub(crate) fn do_accept(proxy: &mut super::TsiStreamProxy, req: TsiAcceptReq) ->
         proxy.pending_accepts -= 1;
         proxy.push_accept_rsp(0);
         update.signal_queue = true;
-    } else if (req.flags & libc::O_NONBLOCK as u32) != 0 {
-        proxy.push_accept_rsp(-libc::EWOULDBLOCK);
-        update.signal_queue = true;
     } else {
         proxy.status = ProxyStatus::WaitingOnAccept;
     }
@@ -815,161 +801,250 @@ pub(crate) fn update_peer_credit(
     proxy.peer_buf_alloc = pkt.buf_alloc();
     proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
-    if proxy.host_read_closed
-        || proxy.status != ProxyStatus::WaitingCreditUpdate
-        || proxy.peer_avail_credit() == 0
-    {
+    if proxy.status != ProxyStatus::WaitingCreditUpdate || proxy.peer_avail_credit() == 0 {
         return ProxyUpdate::default();
     }
 
+    let previous = proxy.event_interest();
     proxy.status = ProxyStatus::Connected;
-
     ProxyUpdate {
-        polling: Some((
-            proxy.id,
-            proxy.fd.as_raw_fd(),
-            EventSet::IN | EventSet::READ_HANG_UP,
-        )),
+        polling: proxy.polling_change(previous),
         ..Default::default()
-    }
-}
-
-pub(crate) fn process_op_response(
-    proxy: &mut super::TsiStreamProxy,
-    pkt: &VsockPacket,
-) -> ProxyUpdate {
-    debug!(
-        "process_op_response: id={} src_port={} dst_port={}",
-        proxy.id,
-        pkt.src_port(),
-        pkt.dst_port()
-    );
-
-    proxy.peer_buf_alloc = pkt.buf_alloc();
-    proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
-
-    switch_to_connected(proxy);
-
-    ProxyUpdate {
-        polling: Some((
-            proxy.id,
-            proxy.fd.as_raw_fd(),
-            EventSet::IN | EventSet::READ_HANG_UP,
-        )),
-        push_accept: Some((proxy.id, proxy.parent_id)),
-        ..Default::default()
-    }
-}
-
-pub(crate) fn do_shutdown(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) {
-    let recv_off = pkt.flags() & super::uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
-    let send_off = pkt.flags() & super::uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
-
-    // Shutdown each direction independently: on macOS, shutdown(SHUT_BOTH) on a
-    // CLOSE_WAIT socket returns ENOTCONN, preventing the FIN from being sent.
-    if send_off && let Err(e) = shutdown(proxy.fd.as_raw_fd(), Shutdown::Write) {
-        debug!("error sending shutdown(Write) to socket: {e}");
-    }
-    if recv_off && let Err(e) = shutdown(proxy.fd.as_raw_fd(), Shutdown::Read) {
-        debug!("error sending shutdown(Read) to socket: {e}");
     }
 }
 
 pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) -> ProxyUpdate {
-    let mut update = ProxyUpdate::default();
-
-    // A hung-up stream can still hold unread data: Linux reports EPOLLIN
-    // together with EPOLLHUP even while the peer keeps unread bytes buffered.
-    // Only recv() can establish EOF, so stay in the draining states.
-    if evset.contains(EventSet::HANG_UP)
-        && !matches!(
-            proxy.status,
-            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
-        )
-    {
-        debug!("process_event: HANG_UP");
-        if proxy.status == ProxyStatus::Connecting {
-            proxy.push_connect_rsp(-libc::ECONNREFUSED);
-        } else {
-            proxy.push_reset();
-        }
-
-        proxy.status = ProxyStatus::Closed;
-        update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-        update.signal_queue = true;
-        update.remove_proxy = if proxy.status == ProxyStatus::Listening {
-            ProxyRemoval::Immediate
-        } else {
-            ProxyRemoval::Deferred
-        };
-        return update;
-    }
-
-    if evset.intersects(EventSet::IN | EventSet::READ_HANG_UP | EventSet::HANG_UP) {
-        debug!("process_event: IN");
-        if proxy.status == ProxyStatus::Connected {
-            let (signal_queue, wait_credit) = proxy.recv_pkt();
-            update.signal_queue = signal_queue;
-
-            if wait_credit && proxy.status != ProxyStatus::WaitingCreditUpdate {
-                proxy.status = ProxyStatus::WaitingCreditUpdate;
-                let rx = MuxerRx::CreditRequest {
-                    local_port: proxy.local_port,
-                    peer_port: proxy.peer_port,
-                    fwd_cnt: proxy.tx_cnt.0,
-                };
-                update.push_credit_req = Some(rx);
-            }
-
-            if proxy.status == ProxyStatus::Closed {
-                debug!(
-                    "process_event: endpoint closed, sending reset: id={}",
-                    proxy.id
-                );
-                proxy.push_reset();
-                update.signal_queue = true;
-                update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-                update.remove_proxy = ProxyRemoval::Deferred;
-                return update;
-            } else if proxy.host_read_closed || proxy.status == ProxyStatus::WaitingCreditUpdate {
-                debug!("process_event: disabling read polling");
-                update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-            }
-        } else if proxy.status == ProxyStatus::Listening
-            || proxy.status == ProxyStatus::WaitingOnAccept
+    if proxy.status == ProxyStatus::Connecting {
+        // A failed nonblocking connect surfaces as a hangup or, on Linux,
+        // an error event; kqueue and Winsock only report writability, so
+        // the outcome is always confirmed through the pending socket
+        // error.
+        let mut failed = evset.contains(EventSet::HANG_UP);
+        #[cfg(target_os = "linux")]
         {
-            match accept(proxy.fd.as_raw_fd()) {
-                Ok(accept_fd) => {
-                    // Safe because we've just obtained the FD from the `accept` call above.
-                    let new_fd = unsafe { OwnedFd::from_raw_fd(accept_fd) };
-                    update.new_proxy =
-                        Some((proxy.peer_port, new_fd, proxy.family, NewProxyType::Tcp));
-                }
-                Err(e) => warn!("error accepting connection: id={}, err={}", proxy.id, e),
+            failed |= evset.contains(EventSet::ERROR);
+        }
+        if !failed && !evset.contains(EventSet::OUT) {
+            return ProxyUpdate::default();
+        }
+        let error = connect_error(proxy);
+        let result = if error != 0 {
+            proxy.status = ProxyStatus::Closed;
+            -error
+        } else if failed {
+            // The connect hung up without reporting a pending error.
+            proxy.status = ProxyStatus::Closed;
+            -ECONNREFUSED
+        } else {
+            finish_connect(proxy)
+        };
+        proxy.push_connect_rsp(result);
+        let remove_proxy =
+            if proxy.status == ProxyStatus::Closed && !evset.contains(EventSet::HANG_UP) {
+                ProxyRemoval::Immediate
+            } else {
+                ProxyRemoval::Keep
             };
-            update.signal_queue = true;
-            return update;
+        return ProxyUpdate {
+            polling: Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty())),
+            signal_queue: true,
+            remove_proxy,
+            ..Default::default()
+        };
+    }
+
+    if !matches!(
+        proxy.status,
+        ProxyStatus::Listening | ProxyStatus::WaitingOnAccept
+    ) {
+        return ProxyUpdate::default();
+    }
+    if evset.contains(EventSet::HANG_UP) {
+        return proxy.reset_after_error();
+    }
+    if !evset.contains(EventSet::IN) {
+        return ProxyUpdate::default();
+    }
+
+    let fd = match accept(proxy.fd.as_raw_fd()) {
+        Ok(fd) => fd,
+        Err(Errno::EAGAIN | Errno::EINTR) => return ProxyUpdate::default(),
+        Err(e) => {
+            warn!("error accepting connection: id={}, err={e}", proxy.id);
+            return ProxyUpdate::default();
+        }
+    };
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if let Err(e) = set_stream_socket_options(&fd) {
+        warn!("error setting up accepted socket: id={}, err={e}", proxy.id);
+        return ProxyUpdate::default();
+    }
+    ProxyUpdate {
+        new_proxy: Some((proxy.peer_port, fd, proxy.family, NewProxyType::Tcp)),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::poll::{PollFd, PollFlags, poll};
+    use std::net::Ipv6Addr;
+    use std::os::fd::AsFd;
+    use std::sync::{Arc, Mutex};
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    use crate::virtio::Queue as VirtQueue;
+    use crate::virtio::vsock::muxer_rxq::MuxerRxQ;
+    use crate::virtio::vsock::tsi_stream::TsiStreamProxy;
+
+    fn bound_listener(family: u16, sharing: bool) -> (OwnedFd, SockaddrStorage) {
+        let (fd, _) = create_socket(0, family).unwrap();
+        if sharing {
+            setsockopt(&fd, sockopt::ReusePort, &true).unwrap();
+        }
+        let addr: SockaddrStorage = if family == defs::LINUX_AF_INET {
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()
         } else {
-            debug!("EventSet::IN while not connected: {:?}", proxy.status);
+            SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0).into()
+        };
+        bind(fd.as_raw_fd(), &addr).unwrap();
+        listen(&fd, Backlog::new(8).unwrap()).unwrap();
+        let addr = getsockname(fd.as_raw_fd()).unwrap();
+        (fd, addr)
+    }
+
+    #[test]
+    fn default_tcp_reuse_options() {
+        for family in [defs::LINUX_AF_INET, defs::LINUX_AF_INET6] {
+            let (fd, _) = create_socket(0, family).unwrap();
+            assert!(getsockopt(&fd, sockopt::ReuseAddr).unwrap());
+            assert!(!getsockopt(&fd, sockopt::ReusePort).unwrap());
         }
     }
 
-    if evset.contains(EventSet::OUT) {
-        debug!("process_event: OUT");
-        if proxy.status == ProxyStatus::Connecting {
-            let result = finish_connect(proxy);
-            proxy.push_connect_rsp(result);
-            update.signal_queue = true;
-            // Stop listening for events in the TCP socket until we receive
-            // OP_REQUEST and the vsock transport is fully established.
-            update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-            if proxy.status == ProxyStatus::Closed {
-                update.remove_proxy = ProxyRemoval::Immediate;
-            }
-        } else {
-            debug!("EventSet::OUT while not connecting");
+    #[test]
+    fn default_tcp_listener_owns_address() {
+        for family in [defs::LINUX_AF_INET, defs::LINUX_AF_INET6] {
+            let (_first, addr) = bound_listener(family, false);
+            let (second, _) = create_socket(1, family).unwrap();
+            assert_eq!(bind(second.as_raw_fd(), &addr), Err(Errno::EADDRINUSE));
         }
     }
 
-    update
+    #[test]
+    fn explicit_reuseport_shares_listener() {
+        for family in [defs::LINUX_AF_INET, defs::LINUX_AF_INET6] {
+            let (_first, addr) = bound_listener(family, true);
+            let (second, _) = create_socket(1, family).unwrap();
+            setsockopt(&second, sockopt::ReusePort, &true).unwrap();
+            bind(second.as_raw_fd(), &addr).unwrap();
+            listen(&second, Backlog::new(8).unwrap()).unwrap();
+        }
+    }
+
+    fn connecting_proxy(fd: OwnedFd) -> TsiStreamProxy {
+        let mut proxy = TsiStreamProxy::new_reverse(
+            1024 << 32 | 620,
+            3,
+            1,
+            AddressFamily::Inet,
+            620,
+            1024,
+            fd,
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap(),
+            Arc::new(Mutex::new(VirtQueue::new(8))),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+        );
+        proxy.status = ProxyStatus::Connecting;
+        proxy
+    }
+
+    /// Writability settles a nonblocking connect: afterwards the pending
+    /// socket error holds the final outcome.
+    fn await_connect(fd: &OwnedFd) {
+        let mut pollfd = [PollFd::new(fd.as_fd(), PollFlags::POLLOUT)];
+        poll(&mut pollfd, u16::MAX).unwrap();
+    }
+
+    #[test]
+    fn refused_connect_reports_the_pending_socket_error() {
+        // Bind and drop a listener to get a refused port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let (fd, _) = create_socket(1, defs::LINUX_AF_INET).unwrap();
+        let addr: SockaddrStorage = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into();
+        let _ = connect(fd.as_raw_fd(), &addr);
+        await_connect(&fd);
+
+        let mut proxy = connecting_proxy(fd);
+        // kqueue and Winsock report a failed connect through writability
+        // alone.
+        let update = process_event(&mut proxy, EventSet::OUT);
+        assert_eq!(proxy.status, ProxyStatus::Closed);
+        assert!(update.signal_queue);
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Immediate));
+        assert!(matches!(
+            proxy.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::ConnResponse { result, .. }) if result == -ECONNREFUSED
+        ));
+    }
+
+    #[test]
+    fn completed_connect_confirms_and_awaits_the_guest_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let (fd, _) = create_socket(1, defs::LINUX_AF_INET).unwrap();
+        let addr: SockaddrStorage = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into();
+        let _ = connect(fd.as_raw_fd(), &addr);
+        await_connect(&fd);
+
+        let mut proxy = connecting_proxy(fd);
+        let update = process_event(&mut proxy, EventSet::OUT);
+        assert_eq!(proxy.status, ProxyStatus::AwaitingRequest);
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+        assert!(matches!(
+            proxy.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::ConnResponse { result: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn listen_port_mapping_preserves_the_ipv6_scope() {
+        let addr: SockaddrStorage = SocketAddrV6::new(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            5000,
+            0x1234_5678,
+            7,
+        )
+        .into();
+        let port_map = HashMap::from([(5000u16, 6000u16)]);
+
+        let mapped = remap_listen_addr(&addr, &port_map).unwrap();
+        let sin6 = mapped.as_sockaddr_in6().unwrap();
+        assert_eq!(sin6.port(), 6000);
+        assert_eq!(sin6.flowinfo(), 0x1234_5678);
+        assert_eq!(sin6.scope_id(), 7);
+
+        // Unmapped ports pass the address through untouched.
+        let unmapped = remap_listen_addr(&addr, &HashMap::new()).unwrap();
+        assert_eq!(unmapped.as_sockaddr_in6().unwrap().port(), 5000);
+        assert_eq!(unmapped.as_sockaddr_in6().unwrap().scope_id(), 7);
+
+        // The IPv4 path keeps remapping the port.
+        let v4: SockaddrStorage = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000).into();
+        let mapped = remap_listen_addr(&v4, &port_map).unwrap();
+        assert_eq!(mapped.as_sockaddr_in().unwrap().port(), 6000);
+        assert_eq!(
+            remap_listen_addr(&v4, &HashMap::new())
+                .unwrap()
+                .as_sockaddr_in()
+                .unwrap()
+                .port(),
+            5000
+        );
+    }
 }

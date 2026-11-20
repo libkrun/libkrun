@@ -52,6 +52,9 @@ RUNNER_FEATURES=""
 if [ "${KRUN_TEST_FFI}" = "1" ]; then
 	RUNNER_FEATURES="--no-default-features --features ffi"
 fi
+if [ -n "${KRUN_TEST_TSI_FAULTS}" ] && [ "${KRUN_TEST_FFI}" != "1" ]; then
+	RUNNER_FEATURES="$RUNNER_FEATURES --features tsi-fault-injection"
+fi
 cargo build -p runner $RUNNER_FEATURES
 
 # On macOS, the runner needs entitlements to use Hypervisor.framework

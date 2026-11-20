@@ -1497,7 +1497,11 @@ export_bitflags! {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct TsiFlags: u32 {
             const HIJACK_INET = 1;
+            /// Hijack AF_UNIX sockets. Unsupported on macOS hosts.
             const HIJACK_UNIX = 2;
+            /// Return INET TCP publication errors instead of guest-only fallback.
+            /// Combine with HIJACK_INET; UNIX and UDP behavior is unchanged.
+            const FAIL_ON_TCP_PUBLICATION_ERROR = 4;
         }
     }
 }
@@ -1508,6 +1512,8 @@ pub struct VsockDevice {
     tsi_flags: devices::virtio::TsiFlags,
     host_port_map: HashMap<u16, u16>,
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+    proxy_limit: Option<usize>,
+    send_queue_budget: Option<usize>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(send))]
@@ -1515,13 +1521,22 @@ impl VsockDevice {
     /// Create a new vsock device.
     ///
     /// `tsi_features` is a bitmask of TSI flags ([`TsiFlags::empty`] to disable).
+    /// On macOS, requesting [`TsiFlags::HIJACK_UNIX`] returns
+    /// [`VmmError::FeatureDisabled`]. Use [`TsiFlags::HIJACK_INET`] alone to
+    /// preserve native guest UNIX sockets while enabling Internet networking.
     pub fn new(cid: u64, tsi_features: TsiFlags) -> Result<Self, VmmError> {
+        if cfg!(target_os = "macos") && tsi_features.contains(TsiFlags::HIJACK_UNIX) {
+            return Err(VmmError::FeatureDisabled());
+        }
+
         let tsi_flags = devices::virtio::TsiFlags::from_bits_truncate(tsi_features.bits());
         Ok(Self {
             cid,
             tsi_flags,
             host_port_map: HashMap::new(),
             unix_ipc_port_map: HashMap::new(),
+            proxy_limit: None,
+            send_queue_budget: None,
         })
     }
 
@@ -1541,6 +1556,28 @@ impl VsockDevice {
         self.unix_ipc_port_map
             .insert(port, (PathBuf::from(path), listen));
     }
+
+    /// Cap the number of simultaneously live vsock proxies.
+    ///
+    /// Every proxy holds a host file descriptor, so an uncooperative guest
+    /// can otherwise exhaust the descriptors of the whole VMM process.
+    /// When the cap is reached, guest socket creation fails with `EMFILE`.
+    /// A limit of zero, the default, leaves the count unbounded.
+    pub fn set_proxy_limit(&mut self, limit: u32) {
+        self.proxy_limit = (limit != 0).then_some(limit as usize);
+    }
+
+    /// Cap the aggregate bytes stream connections may buffer towards slow
+    /// host peers, bounding guest-driven memory growth in the VMM.
+    ///
+    /// Each connection may legitimately queue up to its credit window, so
+    /// the cap only bites when many connections are fully backlogged at
+    /// once; a connection refused here is reset, like one overflowing its
+    /// own queue. A budget of zero, the default, leaves it unbounded.
+    pub fn set_send_queue_budget(&mut self, budget: u64) {
+        self.send_queue_budget =
+            (budget != 0).then_some(usize::try_from(budget).unwrap_or(usize::MAX));
+    }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export)]
@@ -1551,9 +1588,15 @@ impl<'a> AttachDevice<'a> for VsockDevice {
         let unix_ipc_port_map =
             (!self.unix_ipc_port_map.is_empty()).then_some(self.unix_ipc_port_map);
 
-        let vsock =
-            devices::virtio::Vsock::new(self.cid, host_port_map, unix_ipc_port_map, self.tsi_flags)
-                .map_err(|e| VmmError::Internal(format!("vsock: {e:?}")))?;
+        let vsock = devices::virtio::Vsock::new(
+            self.cid,
+            host_port_map,
+            unix_ipc_port_map,
+            self.tsi_flags,
+            self.proxy_limit,
+            self.send_queue_budget,
+        )
+        .map_err(|e| VmmError::Internal(format!("vsock: {e:?}")))?;
 
         let inner = Arc::new(Mutex::new(vsock));
         ctx.subscribe_events(inner.clone())?;
@@ -2280,10 +2323,40 @@ fn resolve_parent_dirs<'a, 'b>(
     Ok(current)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_vsock_accepts_inet_and_disabled_tsi() {
+        for flags in [
+            TsiFlags::empty(),
+            TsiFlags::HIJACK_INET,
+            TsiFlags::FAIL_ON_TCP_PUBLICATION_ERROR,
+            TsiFlags::HIJACK_INET | TsiFlags::FAIL_ON_TCP_PUBLICATION_ERROR,
+        ] {
+            assert!(VsockDevice::new(3, flags).is_ok(), "flags={flags:?}");
+        }
+    }
+
+    #[test]
+    fn test_vsock_unix_hijacking_host_support() {
+        for flags in [
+            TsiFlags::HIJACK_UNIX,
+            TsiFlags::HIJACK_UNIX | TsiFlags::HIJACK_INET,
+            TsiFlags::HIJACK_UNIX | TsiFlags::FAIL_ON_TCP_PUBLICATION_ERROR,
+            TsiFlags::all(),
+        ] {
+            let result = VsockDevice::new(3, flags);
+            if cfg!(target_os = "macos") {
+                assert!(matches!(result, Err(VmmError::FeatureDisabled())));
+            } else {
+                assert!(result.is_ok(), "flags={flags:?}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_balloon_replaces_guest_ram_only_in_the_replace_mode() {
         let mut balloon = BalloonDevice::new().unwrap();

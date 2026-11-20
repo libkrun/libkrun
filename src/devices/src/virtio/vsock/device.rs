@@ -50,15 +50,25 @@ pub struct Vsock {
 
 impl Vsock {
     /// Create a new virtio-vsock device with the given VM CID.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cid: u64,
         host_port_map: Option<HashMap<u16, u16>>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
         tsi_flags: TsiFlags,
+        proxy_limit: Option<usize>,
+        send_queue_budget: Option<usize>,
     ) -> super::Result<Vsock> {
         Ok(Vsock {
             cid,
-            muxer: VsockMuxer::new(cid, host_port_map, unix_ipc_port_map, tsi_flags)?,
+            muxer: VsockMuxer::new(
+                cid,
+                host_port_map,
+                unix_ipc_port_map,
+                tsi_flags,
+                proxy_limit,
+                send_queue_budget,
+            )?,
             queue_rx: None,
             queue_tx: None,
             queue_events: Vec::new(),
@@ -102,7 +112,7 @@ impl Vsock {
             let used_len = match VsockPacket::from_rx_virtq_head(&head) {
                 Ok(mut pkt) => {
                     if self.muxer.recv_pkt(&mut pkt).is_ok() {
-                        pkt.hdr().len() as u32 + pkt.len()
+                        pkt.finish_rx().unwrap_or(0)
                     } else {
                         // We are using a consuming iterator over the virtio buffers, so, if we can't
                         // fill in this buffer, we'll need to undo the last iterator step.

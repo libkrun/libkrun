@@ -31,6 +31,9 @@ impl Vsock {
             error!("Failed to get vsock rx queue event: {e:?}");
         } else {
             raise_irq |= self.process_stream_rx();
+            // The muxer thread may have paused proxies that ran out of RX
+            // buffers; the kick announces that the guest posted new ones.
+            self.muxer.notify_rx_available();
         }
         raise_irq
     }

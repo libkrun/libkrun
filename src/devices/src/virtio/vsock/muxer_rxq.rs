@@ -15,12 +15,20 @@
 /// connection pool to find it.  This walk is performed here, as part of building an RX queue from
 /// the connection pool. When an out-of-sync is drained, the muxer will discard it, and attempt to
 /// rebuild a synced one.
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use super::defs;
 use super::defs::uapi;
 use super::muxer::MuxerRx;
 use super::packet::{TsiAcceptRsp, TsiConnectRsp, TsiListenRsp, VsockPacket};
+
+#[derive(Default)]
+struct StreamCredit {
+    fwd_cnt: u32,
+    request_peer_credit: bool,
+}
 
 /// The muxer RX queue.
 pub struct MuxerRxQ {
@@ -28,6 +36,13 @@ pub struct MuxerRxQ {
     q: VecDeque<MuxerRx>,
     /// The RX queue sync status.
     synced: bool,
+    stream_credit: BTreeMap<u64, StreamCredit>,
+    /// Bytes the stream send queues may still claim from the device-wide
+    /// budget. Shared by every proxy through its `rxq` reference. Starts
+    /// unbounded; a configured muxer replaces it with the caller's budget.
+    pub(super) send_budget: Arc<AtomicUsize>,
+    #[cfg(feature = "tsi-fault-injection")]
+    pub(super) faults: super::tsi_control_faults::Injector,
 }
 
 impl MuxerRxQ {
@@ -38,7 +53,32 @@ impl MuxerRxQ {
         Self {
             q: VecDeque::with_capacity(Self::SIZE),
             synced: true,
+            stream_credit: BTreeMap::new(),
+            send_budget: Arc::new(AtomicUsize::new(usize::MAX)),
+            #[cfg(feature = "tsi-fault-injection")]
+            faults: super::tsi_control_faults::Injector::default(),
         }
+    }
+
+    // Keep the latest counter even if the guest has supplied no RX buffers.
+    pub fn stage_stream_credit(&mut self, id: u64, fwd_cnt: u32, request: bool) {
+        let pending = self.stream_credit.entry(id).or_default();
+        pending.fwd_cnt = fwd_cnt;
+        pending.request_peer_credit |= request;
+    }
+
+    pub fn stream_credit_piggybacked(&mut self, id: u64, fwd_cnt: u32) {
+        if let Some(pending) = self.stream_credit.get_mut(&id) {
+            if pending.request_peer_credit {
+                pending.fwd_cnt = fwd_cnt;
+            } else {
+                self.stream_credit.remove(&id);
+            }
+        }
+    }
+
+    pub fn clear_stream_credit(&mut self, id: u64) {
+        self.stream_credit.remove(&id);
     }
 
     /// Push a new RX item to the queue.
@@ -66,7 +106,25 @@ impl MuxerRxQ {
 
     /// Pop an RX item from the front of the queue.
     pub fn pop(&mut self) -> Option<MuxerRx> {
-        self.q.pop_front()
+        self.q.pop_front().or_else(|| {
+            let (id, credit) = self.stream_credit.pop_first()?;
+            let local_port = id as u32;
+            let peer_port = (id >> 32) as u32;
+            let fwd_cnt = credit.fwd_cnt;
+            Some(if credit.request_peer_credit {
+                MuxerRx::CreditRequest {
+                    local_port,
+                    peer_port,
+                    fwd_cnt,
+                }
+            } else {
+                MuxerRx::CreditUpdate {
+                    local_port,
+                    peer_port,
+                    fwd_cnt,
+                }
+            })
+        })
     }
 
     /// Check if the RX queue is synchronized with the connection pool.
@@ -74,24 +132,98 @@ impl MuxerRxQ {
         self.synced
     }
 
-    /// Get the total number of items in the queue.
-    pub fn len(&self) -> usize {
-        self.q.len()
-    }
-
     /// Check if the queue is empty.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.q.is_empty() && self.stream_credit.is_empty()
     }
 
     /// Check if the queue is full.
     pub fn is_full(&self) -> bool {
-        self.len() == Self::SIZE
+        self.q.len() == Self::SIZE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalesces_stream_credit_until_an_rx_buffer_is_available() {
+        let mut rxq = MuxerRxQ::new();
+        let id = 1024 << 32 | 620;
+        rxq.stage_stream_credit(id, u32::MAX, false);
+        rxq.stage_stream_credit(id, 10, false);
+        assert!(!rxq.is_empty());
+        assert!(matches!(
+            rxq.pop(),
+            Some(MuxerRx::CreditUpdate {
+                local_port: 620,
+                peer_port: 1024,
+                fwd_cnt: 10,
+            })
+        ));
+        assert!(rxq.is_empty());
+
+        rxq.stage_stream_credit(id, 20, false);
+        rxq.stream_credit_piggybacked(id, 20);
+        assert!(rxq.is_empty());
+
+        rxq.stage_stream_credit(id, 30, true);
+        rxq.stage_stream_credit(id, 40, false);
+        rxq.stream_credit_piggybacked(id, 50);
+        assert!(matches!(
+            rxq.pop(),
+            Some(MuxerRx::CreditRequest { fwd_cnt: 50, .. })
+        ));
+        assert!(rxq.is_empty());
     }
 }
 
 pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
     match rx {
+        #[cfg(feature = "tsi-fault-injection")]
+        MuxerRx::FaultPacket {
+            response,
+            fault,
+            peer_port,
+        } => {
+            super::tsi_control_faults::packet(cid, *response, fault, peer_port, pkt);
+        }
+        #[cfg(feature = "tsi-fault-injection")]
+        MuxerRx::FaultAck { peer_port, words } => {
+            super::tsi_control_faults::ack(cid, peer_port, words, pkt);
+        }
+        MuxerRx::SockoptResponse {
+            request_id,
+            operation,
+            peer_port,
+            result,
+            value,
+        } => {
+            pkt.set_op(uapi::VSOCK_OP_RW)
+                .set_src_cid(uapi::VSOCK_HOST_CID)
+                .set_dst_cid(cid)
+                .set_src_port(defs::TSI_CONTROL_PORT)
+                .set_dst_port(peer_port)
+                .set_type(uapi::VSOCK_TYPE_DGRAM);
+            pkt.write_sockopt_rsp(result, value, operation, request_id);
+        }
+        MuxerRx::FeatureResponse {
+            request_id,
+            operation,
+            peer_port,
+            result,
+            services,
+            features,
+        } => {
+            pkt.set_op(uapi::VSOCK_OP_RW)
+                .set_src_cid(uapi::VSOCK_HOST_CID)
+                .set_dst_cid(cid)
+                .set_src_port(defs::TSI_CONTROL_PORT)
+                .set_dst_port(peer_port)
+                .set_type(uapi::VSOCK_TYPE_DGRAM);
+            pkt.write_features_rsp(result, services, features, operation, request_id);
+        }
         MuxerRx::Reset {
             local_port,
             peer_port,
@@ -108,19 +240,19 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_fwd_cnt(0);
         }
         MuxerRx::ConnResponse {
-            local_port,
+            request_id,
+            operation,
             peer_port,
             result,
         } => {
             pkt.set_op(uapi::VSOCK_OP_RW)
                 .set_src_cid(uapi::VSOCK_HOST_CID)
                 .set_dst_cid(cid)
-                .set_src_port(local_port)
+                .set_src_port(defs::TSI_CONTROL_PORT)
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
-            pkt.write_connect_rsp(TsiConnectRsp { result });
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.write_connect_rsp(TsiConnectRsp { result }, operation, request_id);
         }
         MuxerRx::OpRequest {
             local_port,
@@ -151,19 +283,19 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
             pkt.set_len(0);
         }
         MuxerRx::GetnameResponse {
-            local_port,
+            request_id,
+            operation,
             peer_port,
             data,
         } => {
             pkt.set_op(uapi::VSOCK_OP_RW)
                 .set_src_cid(uapi::VSOCK_HOST_CID)
                 .set_dst_cid(cid)
-                .set_src_port(local_port)
+                .set_src_port(defs::TSI_CONTROL_PORT)
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
-            pkt.write_getname_rsp(data);
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.write_getname_rsp(data, operation, request_id);
         }
         MuxerRx::CreditRequest {
             local_port,
@@ -194,34 +326,35 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_fwd_cnt(fwd_cnt);
         }
         MuxerRx::ListenResponse {
-            local_port,
+            request_id,
+            operation,
             peer_port,
             result,
+            flags,
         } => {
             pkt.set_op(uapi::VSOCK_OP_RW)
                 .set_src_cid(uapi::VSOCK_HOST_CID)
                 .set_dst_cid(cid)
-                .set_src_port(local_port)
+                .set_src_port(defs::TSI_CONTROL_PORT)
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
-            pkt.write_listen_rsp(TsiListenRsp { result });
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.write_listen_rsp(TsiListenRsp { result, flags }, operation, request_id);
         }
         MuxerRx::AcceptResponse {
-            local_port,
+            request_id,
+            operation,
             peer_port,
             result,
         } => {
             pkt.set_op(uapi::VSOCK_OP_RW)
                 .set_src_cid(uapi::VSOCK_HOST_CID)
                 .set_dst_cid(cid)
-                .set_src_port(local_port)
+                .set_src_port(defs::TSI_CONTROL_PORT)
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
-            pkt.write_accept_rsp(TsiAcceptRsp { result });
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.write_accept_rsp(TsiAcceptRsp { result }, operation, request_id);
         }
     }
 }

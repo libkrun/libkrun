@@ -6,6 +6,7 @@ edition = "2024"
 default = ["static"]
 static = ["test_cases/static-linking"]
 ffi = ["test_cases/dynamic-linking"]
+tsi-fault-injection = ["test_cases/tsi-fault-injection"]
 
 [dependencies]
 test_cases = { path = "../test_cases" }

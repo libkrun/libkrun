@@ -16,8 +16,12 @@ mod proxy;
 mod reaper;
 #[cfg(target_os = "macos")]
 mod timesync;
+#[cfg(feature = "tsi-fault-injection")]
+mod tsi_control_faults;
 mod tsi_dgram;
+mod tsi_sockopt;
 mod tsi_stream;
+mod tsi_wire;
 mod unix_proxy;
 
 #[cfg(target_os = "windows")]
@@ -42,13 +46,15 @@ mod defs {
             const HIJACK_INET = 1 << 0;
             /// Hijack AF_UNIX sockets
             const HIJACK_UNIX = 1 << 1;
+            /// Return TCP host publication errors rather than falling back locally.
+            const FAIL_ON_TCP_PUBLICATION_ERROR = 1 << 2;
         }
     }
 
     impl TsiFlags {
         /// Returns true if any TSI hijacking is enabled.
         pub fn tsi_enabled(&self) -> bool {
-            !self.is_empty()
+            self.intersects(Self::HIJACK_INET | Self::HIJACK_UNIX)
         }
     }
 
@@ -82,16 +88,27 @@ mod defs {
     pub const SOCK_STREAM: u16 = 1;
     pub const SOCK_DGRAM: u16 = 2;
 
-    /// Misc
+    // The fixed TSI ports all live below the vsock ephemeral boundary:
+    // the guest reserves ports up to 1023 and reverse proxy ports are
+    // drawn from 1024 upwards, so no dynamically assigned port can alias
+    // them.
     pub const TSI_PROXY_PORT: u32 = 620;
-    pub const TSI_PROXY_CREATE: u32 = 1024;
-    pub const TSI_CONNECT: u32 = 1025;
-    pub const TSI_GETNAME: u32 = 1026;
-    pub const TSI_SENDTO_ADDR: u32 = 1027;
-    pub const TSI_SENDTO_DATA: u32 = 1028;
-    pub const TSI_LISTEN: u32 = 1029;
-    pub const TSI_ACCEPT: u32 = 1030;
-    pub const TSI_PROXY_RELEASE: u32 = 1031;
+    pub const TSI_CONTROL_PORT: u32 = 621;
+    pub const TSI_DATAGRAM: u32 = 622;
+
+    pub const TSI_OP_CREATE: u32 = 1;
+    pub const TSI_OP_CONNECT: u32 = 2;
+    pub const TSI_OP_GETNAME: u32 = 3;
+    pub const TSI_OP_LISTEN: u32 = 4;
+    pub const TSI_OP_ACCEPT: u32 = 5;
+    pub const TSI_OP_RELEASE: u32 = 6;
+    pub const TSI_OP_DISCONNECT: u32 = 7;
+    pub const TSI_OP_SETOPT: u32 = 8;
+    pub const TSI_OP_GETOPT: u32 = 9;
+    pub const TSI_OP_BIND: u32 = 10;
+    pub const TSI_OP_CAPABILITIES: u32 = 11;
+    pub const TSI_OP_ACTIVATE: u32 = 12;
+    pub const TSI_LISTEN_STRICT: u32 = 1;
 
     // Linux definitions that we need for cross-platform compatibility.
     pub const LINUX_AF_UNIX: u16 = 1;
@@ -182,3 +199,16 @@ pub enum VsockError {
 }
 
 type Result<T> = std::result::Result<T, VsockError>;
+
+#[cfg(test)]
+mod publication_flag_tests {
+    use super::TsiFlags;
+
+    #[test]
+    fn policy_does_not_enable_hijacking_by_itself() {
+        let policy = TsiFlags::FAIL_ON_TCP_PUBLICATION_ERROR;
+        assert!(!policy.tsi_enabled());
+        assert!((policy | TsiFlags::HIJACK_INET).tsi_enabled());
+        assert!((policy | TsiFlags::HIJACK_UNIX).tsi_enabled());
+    }
+}

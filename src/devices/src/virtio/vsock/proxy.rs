@@ -10,8 +10,15 @@ pub(super) use std::os::windows::io::OwnedSocket as OwnedFd;
 #[cfg(windows)]
 pub(super) use utils::windows::{AsRawFd, RawFd};
 
+#[cfg(target_os = "macos")]
+use super::super::linux_errno::linux_errno_raw;
+#[cfg(windows)]
+use super::super::linux_errno::wsa_errno_to_linux;
 use super::muxer::MuxerRx;
-use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
+use super::packet::{
+    TsiAcceptReq, TsiBindReq, TsiConnectReq, TsiDatagram, TsiListenReq, VsockPacket,
+};
+use super::tsi_wire;
 #[cfg(unix)]
 pub(super) use nix::sys::socket::AddressFamily;
 /// On Windows, reuse the WinSock `ADDRESS_FAMILY` type (a `u16`) directly so
@@ -25,6 +32,7 @@ use utils::epoll::EventSet;
 
 #[derive(Debug)]
 pub enum RecvPkt {
+    BadBuffer,
     Close,
     Error,
     Read(usize),
@@ -40,10 +48,33 @@ pub enum ProxyError {
     SettingReusePort(std::io::Error),
 }
 
+impl ProxyError {
+    pub fn linux_errno(&self) -> i32 {
+        let error = match self {
+            Self::CreatingSocket(e) | Self::SettingReuseAddr(e) | Self::SettingReusePort(e) => e,
+            Self::InvalidFamily => return tsi_wire::EAFNOSUPPORT,
+        };
+        let code = error.raw_os_error().unwrap_or(tsi_wire::EIO);
+        #[cfg(target_os = "linux")]
+        {
+            code
+        }
+        #[cfg(target_os = "macos")]
+        {
+            linux_errno_raw(code)
+        }
+        #[cfg(windows)]
+        {
+            wsa_errno_to_linux(code)
+        }
+    }
+}
+
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
 pub enum ProxyStatus {
     Idle,
     Connecting,
+    AwaitingRequest,
     Connected,
     Listening,
     Closed,
@@ -75,6 +106,7 @@ pub struct ProxyUpdate {
     pub new_proxy: Option<(u32, OwnedFd, AddressFamily, NewProxyType)>,
     pub push_accept: Option<(u64, u64)>,
     pub push_credit_req: Option<MuxerRx>,
+    pub rx_starved: bool,
 }
 
 impl fmt::Display for ProxyError {
@@ -84,6 +116,19 @@ impl fmt::Display for ProxyError {
 }
 
 pub trait Proxy: Send + AsRawFd {
+    fn is_tsi(&self) -> bool {
+        self.tsi_socket().is_some()
+    }
+    fn tsi_socket(&self) -> Option<(u16, AddressFamily)> {
+        None
+    }
+    fn activate(&mut self, features: u64) -> Result<u64, i32> {
+        if features == 0 {
+            Ok(0)
+        } else {
+            Err(-tsi_wire::EOPNOTSUPP)
+        }
+    }
     #[allow(dead_code)]
     fn id(&self) -> u64;
     #[allow(dead_code)]
@@ -92,16 +137,35 @@ pub trait Proxy: Send + AsRawFd {
     fn confirm_connect(&mut self, _pkt: &VsockPacket) -> Option<ProxyUpdate> {
         None
     }
-    fn getpeername(&mut self, pkt: &VsockPacket);
-    fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
-    fn sendto_addr(&mut self, req: TsiSendtoAddr) -> ProxyUpdate;
-    fn sendto_data(&mut self, _pkt: &VsockPacket) {}
+    fn disconnect(&mut self, _pkt: &VsockPacket) -> Option<ProxyUpdate> {
+        None
+    }
+    fn bind_datagram(
+        &mut self,
+        _req: TsiBindReq,
+        _host_port_map: &Option<HashMap<u16, u16>>,
+    ) -> Option<Result<ProxyUpdate, i32>> {
+        None
+    }
+    fn socket_option(&self, _level: u32, _name: u32, _value: Option<i32>) -> Result<i32, i32> {
+        Err(-tsi_wire::ENOPROTOOPT)
+    }
+    fn getname(&mut self, pkt: &VsockPacket, peer: bool);
+    fn sendmsg(&mut self, _pkt: &VsockPacket) -> ProxyUpdate {
+        ProxyUpdate::default()
+    }
+    fn send_datagram(&mut self, _datagram: TsiDatagram<'_>) -> ProxyUpdate {
+        ProxyUpdate::default()
+    }
+    fn record_datagram_error(&self, _errno: i32) {}
     fn listen(
         &mut self,
-        pkt: &VsockPacket,
-        req: TsiListenReq,
-        host_port_map: &Option<HashMap<u16, u16>>,
-    ) -> ProxyUpdate;
+        _pkt: &VsockPacket,
+        _req: TsiListenReq,
+        _host_port_map: &Option<HashMap<u16, u16>>,
+    ) -> ProxyUpdate {
+        ProxyUpdate::default()
+    }
     fn accept(&mut self, req: TsiAcceptReq) -> ProxyUpdate;
     fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
     fn push_op_request(&self) {}
@@ -112,7 +176,16 @@ pub trait Proxy: Send + AsRawFd {
         ProxyUpdate::default()
     }
     fn release(&mut self) -> ProxyUpdate;
+    fn reset(&mut self) -> ProxyUpdate {
+        self.release()
+    }
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate;
+    /// Clear the receive starvation state, if any, and return the polling
+    /// interest to resume. Called when the guest has made RX buffers
+    /// available again.
+    fn resume_rx(&mut self) -> Option<(u64, RawFd, EventSet)> {
+        None
+    }
 }
 
 #[cfg(windows)]

@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::mem::size_of;
+use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
 use std::num::Wrapping;
 use std::os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket, RawSocket};
 
-use utils::windows::RawFd;
 use windows_sys::Win32::Networking::WinSock::{
-    FIONBIO, INVALID_SOCKET, SD_BOTH, SD_RECEIVE, SD_SEND, SOCK_STREAM, SOCKADDR, SOCKET,
-    SOCKET_ERROR, WSAEINTR, WSAESHUTDOWN, WSAEWOULDBLOCK, WSAGetLastError, accept, bind,
-    closesocket, connect, getpeername, ioctlsocket, listen, recv, send, shutdown, socket,
+    AF_INET6, FIONBIO, INVALID_SOCKET, IPPROTO_IPV6, IPV6_V6ONLY, SD_RECEIVE, SD_SEND, SO_ERROR,
+    SOCK_STREAM, SOCKADDR, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAEINTR, WSAESHUTDOWN,
+    WSAEWOULDBLOCK, WSAGetLastError, accept, bind, closesocket, connect, getpeername, getsockname,
+    getsockopt, ioctlsocket, listen, recv, send, setsockopt, shutdown, socket,
 };
 
 use crate::virtio::vsock::windows::sockaddr_storage::{
@@ -21,8 +22,8 @@ use super::super::defs::uapi;
 use super::super::muxer::{MuxerRx, push_packet};
 use super::super::packet::{TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, VsockPacket};
 use super::super::proxy::{
-    AddressFamily, AsRawFd, NewProxyType, OwnedFd, Proxy, ProxyError, ProxyRemoval, ProxyStatus,
-    ProxyUpdate, RecvPkt, address_family_from_linux,
+    AddressFamily, AsRawFd, NewProxyType, OwnedFd, Proxy, ProxyError, ProxyStatus, ProxyUpdate,
+    RecvPkt, address_family_from_linux,
 };
 use utils::epoll::EventSet;
 
@@ -39,7 +40,45 @@ fn create_stream_socket(win_family: i32) -> Result<SOCKET, i32> {
         }
         return Err(e);
     }
+    // Linux guests expect dual-stack IPv6 sockets (bindv6only=0), but Winsock
+    // defaults to v6-only.
+    if win_family == AF_INET6 as i32
+        && unsafe {
+            setsockopt(
+                sock,
+                IPPROTO_IPV6,
+                IPV6_V6ONLY,
+                (&0u32 as *const u32).cast(),
+                size_of::<u32>() as i32,
+            )
+        } == SOCKET_ERROR
+    {
+        let e = unsafe { WSAGetLastError() };
+        unsafe {
+            closesocket(sock);
+        }
+        return Err(e);
+    }
     Ok(sock)
+}
+
+fn pending_socket_error(proxy: &super::TsiStreamProxy) -> i32 {
+    let mut error = 0i32;
+    let mut len = size_of::<i32>() as i32;
+    let result = unsafe {
+        getsockopt(
+            sock(proxy),
+            SOL_SOCKET,
+            SO_ERROR,
+            (&mut error as *mut i32).cast(),
+            &mut len,
+        )
+    };
+    if result == SOCKET_ERROR {
+        unsafe { WSAGetLastError() }
+    } else {
+        error
+    }
 }
 
 pub(crate) fn create_socket(
@@ -59,6 +98,48 @@ pub(crate) fn create_socket(
 
 fn sock(proxy: &super::TsiStreamProxy) -> SOCKET {
     proxy.fd.as_raw_socket() as SOCKET
+}
+
+pub(crate) fn try_write(fd: &OwnedSocket, buf: &[u8]) -> io::Result<usize> {
+    let sock = fd.as_raw_socket() as SOCKET;
+    let mut written = 0;
+    // A short successful send alone does not arrange another FD_WRITE wakeup.
+    while written < buf.len() {
+        let remaining = &buf[written..];
+        let res = unsafe { send(sock, remaining.as_ptr() as _, remaining.len() as i32, 0) };
+        if res == SOCKET_ERROR {
+            let error = unsafe { WSAGetLastError() };
+            if written > 0 && error == WSAEWOULDBLOCK {
+                break;
+            }
+            return Err(io::Error::from_raw_os_error(error));
+        }
+        if res == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        written += res as usize;
+    }
+    Ok(written)
+}
+
+pub(crate) fn is_retryable_write_error(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(WSAEWOULDBLOCK)
+}
+
+pub(super) fn shutdown_write(fd: &OwnedSocket) {
+    let res = unsafe { shutdown(fd.as_raw_socket() as SOCKET, SD_SEND) };
+    if res == SOCKET_ERROR {
+        let e = unsafe { WSAGetLastError() };
+        debug!("error sending shutdown(SD_SEND) to socket: {e}");
+    }
+}
+
+pub(super) fn shutdown_read(fd: &OwnedSocket) {
+    let res = unsafe { shutdown(fd.as_raw_socket() as SOCKET, SD_RECEIVE) };
+    if res == SOCKET_ERROR {
+        let e = unsafe { WSAGetLastError() };
+        debug!("error sending shutdown(SD_RECEIVE) to socket: {e}");
+    }
 }
 
 pub(crate) fn recv_to_pkt(
@@ -92,7 +173,7 @@ pub(crate) fn recv_to_pkt(
             }
         }
     } else {
-        Ok(RecvPkt::Error)
+        Ok(RecvPkt::BadBuffer)
     }
 }
 
@@ -109,6 +190,15 @@ fn try_listen(
         if let Some(v4) = req.addr.to_std_v4() {
             if let Some(&mapped_port) = port_map.get(&v4.port()) {
                 SocketAddrV4::new(*v4.ip(), mapped_port).into()
+            } else {
+                req.addr.clone()
+            }
+        } else if let Some(v6) = req.addr.to_std_v6() {
+            // Port overrides apply to IPv6 listeners too; without this a
+            // guest dual-stack listener publishes its IPv6 socket on the
+            // unmapped host port.
+            if let Some(&mapped_port) = port_map.get(&v6.port()) {
+                SocketAddrV6::new(*v6.ip(), mapped_port, v6.flowinfo(), v6.scope_id()).into()
             } else {
                 req.addr.clone()
             }
@@ -141,7 +231,10 @@ fn try_listen(
     let bind_res = unsafe { bind(sock(proxy), sa_bytes.as_ptr() as *const SOCKADDR, sa_len) };
     if bind_res == SOCKET_ERROR {
         let e = unsafe { WSAGetLastError() };
-        warn!("bind failed: id={} err={e}", proxy.id);
+        warn!(
+            "bind failed: id={} addr={:?} err={e}",
+            proxy.id, effective_addr
+        );
         return -wsa_errno_to_linux(e);
     }
 
@@ -177,7 +270,7 @@ pub(crate) fn do_connect(
     let res = unsafe { connect(sock(proxy), sa_bytes.as_ptr() as *const SOCKADDR, sa_len) };
 
     let result = if res == 0 {
-        proxy.status = ProxyStatus::Connected;
+        proxy.status = ProxyStatus::AwaitingRequest;
         0
     } else {
         let e = unsafe { WSAGetLastError() };
@@ -196,13 +289,6 @@ pub(crate) fn do_connect(
             proxy.fd.as_raw_fd(),
             EventSet::OUT | EventSet::EDGE_TRIGGERED,
         ));
-    } else if proxy.status == ProxyStatus::Connected {
-        update.polling = Some((
-            proxy.id,
-            proxy.fd.as_raw_fd(),
-            EventSet::IN | EventSet::READ_HANG_UP,
-        ));
-        proxy.push_connect_rsp(result);
     } else {
         proxy.push_connect_rsp(result);
     }
@@ -210,16 +296,16 @@ pub(crate) fn do_connect(
     update
 }
 
-pub(crate) fn do_getpeername(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) {
+pub(crate) fn do_getname(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket, peer: bool) {
     let mut sa_buf = [0u8; 128];
     let mut sa_len: i32 = 128;
 
     let res = unsafe {
-        getpeername(
-            sock(proxy),
-            sa_buf.as_mut_ptr() as *mut SOCKADDR,
-            &mut sa_len,
-        )
+        if peer {
+            getpeername(sock(proxy), sa_buf.as_mut_ptr().cast(), &mut sa_len)
+        } else {
+            getsockname(sock(proxy), sa_buf.as_mut_ptr().cast(), &mut sa_len)
+        }
     };
 
     let (result, addr_len, addr) = if res == 0 {
@@ -249,45 +335,12 @@ pub(crate) fn do_getpeername(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacke
         addr,
     };
     let rx = MuxerRx::GetnameResponse {
-        local_port: pkt.dst_port(),
+        request_id: pkt.control_request_id(),
+        operation: pkt.control_operation(),
         peer_port: pkt.src_port(),
         data,
     };
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
-}
-
-pub(crate) fn sendmsg(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) -> ProxyUpdate {
-    let mut update = ProxyUpdate::default();
-
-    let ret = if let Some(buf) = pkt.buf() {
-        let res = unsafe { send(sock(proxy), buf.as_ptr() as _, buf.len() as i32, 0) };
-
-        if res >= 0 {
-            proxy.tx_cnt += Wrapping(res as u32);
-            res
-        } else {
-            let e = unsafe { WSAGetLastError() };
-            if e != WSAEWOULDBLOCK {
-                debug!("send error: id={} err={e}", proxy.id);
-            }
-            -wsa_errno_to_linux(e)
-        }
-    } else {
-        -22 // LINUX_EINVAL
-    };
-
-    if ret > 0 && (proxy.tx_cnt - proxy.last_tx_cnt_sent).0 >= proxy.peer_buf_alloc / 2 {
-        proxy.last_tx_cnt_sent = proxy.tx_cnt;
-        let rx = MuxerRx::CreditUpdate {
-            local_port: pkt.dst_port(),
-            peer_port: pkt.src_port(),
-            fwd_cnt: proxy.tx_cnt.0,
-        };
-        push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
-        update.signal_queue = true;
-    }
-
-    update
 }
 
 pub(crate) fn update_peer_credit(
@@ -296,60 +349,17 @@ pub(crate) fn update_peer_credit(
 ) -> ProxyUpdate {
     proxy.peer_buf_alloc = pkt.buf_alloc();
     proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
-    let mut update = ProxyUpdate::default();
-
-    if proxy.host_read_closed || proxy.status == ProxyStatus::Closed {
-        return update;
+    if proxy.status != ProxyStatus::WaitingCreditUpdate || proxy.peer_avail_credit() == 0 {
+        return ProxyUpdate::default();
     }
 
-    // If we were deadlocked waiting for credit, and credit is now restored:
-    if proxy.status == ProxyStatus::WaitingCreditUpdate && proxy.peer_avail_credit() > 0 {
-        proxy.status = ProxyStatus::Connected;
-
-        // Proactively pull data to bypass the missed Windows edge-trigger
-        let (signal_queue, wait_credit) = proxy.recv_pkt();
-        update.signal_queue = signal_queue;
-
-        if proxy.status == ProxyStatus::Closed {
-            proxy.push_reset();
-            update.signal_queue = true;
-            update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-            update.remove_proxy = ProxyRemoval::Deferred;
-        } else if proxy.host_read_closed {
-            update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-        } else if wait_credit {
-            // We immediately ran out of credit again. Suspend again and ask for more.
-            proxy.status = ProxyStatus::WaitingCreditUpdate;
-            let rx = MuxerRx::CreditRequest {
-                local_port: proxy.local_port,
-                peer_port: proxy.peer_port,
-                fwd_cnt: proxy.tx_cnt.0,
-            };
-            update.push_credit_req = Some(rx);
-            update.polling = Some((
-                proxy.id,
-                proxy.fd.as_raw_socket() as RawFd,
-                EventSet::empty(),
-            ));
-        } else {
-            // Successfully drained, safe to listen for the next edge
-            update.polling = Some((
-                proxy.id,
-                proxy.fd.as_raw_socket() as RawFd,
-                EventSet::IN | EventSet::READ_HANG_UP,
-            ));
-        }
-    } else {
-        // Normal update (wasn't suspended)
-        proxy.status = ProxyStatus::Connected;
-        update.polling = Some((
-            proxy.id,
-            proxy.fd.as_raw_socket() as RawFd,
-            EventSet::IN | EventSet::READ_HANG_UP,
-        ));
+    let previous = proxy.event_interest();
+    proxy.status = ProxyStatus::Connected;
+    if proxy.event_interest().contains(EventSet::IN) {
+        // The previous FD_READ was consumed before recv could reenable it.
+        return proxy.read_host(previous);
     }
-
-    update
+    ProxyUpdate::default()
 }
 
 pub(crate) fn do_listen(
@@ -363,9 +373,11 @@ pub(crate) fn do_listen(
     let result = try_listen(proxy, &req, host_port_map);
 
     let rx = MuxerRx::ListenResponse {
-        local_port: pkt.dst_port(),
+        request_id: pkt.control_request_id(),
+        operation: pkt.control_operation(),
         peer_port: pkt.src_port(),
         result,
+        flags: req.response_flags(),
     };
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
 
@@ -381,13 +393,9 @@ pub(crate) fn do_listen(
 pub(crate) fn do_accept(proxy: &mut super::TsiStreamProxy, req: TsiAcceptReq) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
 
-    const O_NONBLOCK: u32 = 2048;
     if proxy.pending_accepts > 0 {
         proxy.pending_accepts -= 1;
         proxy.push_accept_rsp(0);
-        update.signal_queue = true;
-    } else if (req.flags & O_NONBLOCK) != 0 {
-        proxy.push_accept_rsp(-11); // LINUX_EAGAIN
         update.signal_queue = true;
     } else {
         proxy.status = ProxyStatus::WaitingOnAccept;
@@ -396,120 +404,64 @@ pub(crate) fn do_accept(proxy: &mut super::TsiStreamProxy, req: TsiAcceptReq) ->
     update
 }
 
-pub(crate) fn process_op_response(
-    proxy: &mut super::TsiStreamProxy,
-    pkt: &VsockPacket,
-) -> ProxyUpdate {
-    proxy.peer_buf_alloc = pkt.buf_alloc();
-    proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
-    proxy.status = ProxyStatus::Connected;
+pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) -> ProxyUpdate {
+    if proxy.status == ProxyStatus::Connecting {
+        if !evset.intersects(EventSet::OUT | EventSet::HANG_UP) {
+            return ProxyUpdate::default();
+        }
+
+        // FD_CONNECT also signals failed connection attempts.
+        let error = pending_socket_error(proxy);
+        let result = if error == 0 && !evset.contains(EventSet::HANG_UP) {
+            proxy.status = ProxyStatus::AwaitingRequest;
+            0
+        } else {
+            proxy.status = ProxyStatus::Closed;
+            if error == 0 {
+                -111
+            } else {
+                -wsa_errno_to_linux(error)
+            }
+        };
+        proxy.push_connect_rsp(result);
+        return ProxyUpdate {
+            polling: Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty())),
+            signal_queue: true,
+            ..Default::default()
+        };
+    }
+
+    if !matches!(
+        proxy.status,
+        ProxyStatus::Listening | ProxyStatus::WaitingOnAccept
+    ) {
+        return ProxyUpdate::default();
+    }
+    if evset.contains(EventSet::HANG_UP) {
+        return proxy.reset_after_error();
+    }
+    if !evset.contains(EventSet::IN) {
+        return ProxyUpdate::default();
+    }
+
+    let socket = unsafe { accept(sock(proxy), std::ptr::null_mut(), std::ptr::null_mut()) };
+    if socket == INVALID_SOCKET {
+        let e = unsafe { WSAGetLastError() };
+        if e != WSAEWOULDBLOCK {
+            warn!("accept error: id={} err={e}", proxy.id);
+        }
+        return ProxyUpdate::default();
+    }
+    let fd = unsafe { OwnedSocket::from_raw_socket(socket as RawSocket) };
+    let mut mode = 1;
+    if unsafe { ioctlsocket(socket, FIONBIO, &mut mode) } == SOCKET_ERROR {
+        let e = unsafe { WSAGetLastError() };
+        warn!("error setting up accepted socket: id={}, err={e}", proxy.id);
+        return ProxyUpdate::default();
+    }
 
     ProxyUpdate {
-        polling: Some((
-            proxy.id,
-            proxy.fd.as_raw_fd(),
-            EventSet::IN | EventSet::READ_HANG_UP,
-        )),
-        push_accept: Some((proxy.id, proxy.parent_id)),
+        new_proxy: Some((proxy.peer_port, fd, proxy.family, NewProxyType::Tcp)),
         ..Default::default()
     }
-}
-
-pub(crate) fn do_shutdown(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) {
-    let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
-    let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
-
-    let how = if recv_off && send_off {
-        SD_BOTH
-    } else if recv_off {
-        SD_RECEIVE
-    } else {
-        SD_SEND
-    };
-
-    unsafe {
-        shutdown(sock(proxy), how);
-    }
-}
-
-pub(crate) fn process_event(proxy: &mut super::TsiStreamProxy, evset: EventSet) -> ProxyUpdate {
-    let mut update = ProxyUpdate::default();
-
-    // A hung-up stream can still hold unread data. Only recv() can establish
-    // EOF, so stay in the draining states.
-    if evset.contains(EventSet::HANG_UP)
-        && !matches!(
-            proxy.status,
-            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
-        )
-    {
-        if proxy.status == ProxyStatus::Connecting {
-            proxy.push_connect_rsp(-111); // ECONNREFUSED
-        } else {
-            proxy.push_reset();
-        }
-        proxy.status = ProxyStatus::Closed;
-        update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-        update.signal_queue = true;
-        update.remove_proxy = if proxy.status == ProxyStatus::Listening {
-            ProxyRemoval::Immediate
-        } else {
-            ProxyRemoval::Deferred
-        };
-        return update;
-    }
-
-    if evset.intersects(EventSet::IN | EventSet::READ_HANG_UP | EventSet::HANG_UP) {
-        if proxy.status == ProxyStatus::Connected {
-            let (signal_queue, wait_credit) = proxy.recv_pkt();
-            update.signal_queue = signal_queue || wait_credit;
-
-            if wait_credit && proxy.status != ProxyStatus::WaitingCreditUpdate {
-                proxy.status = ProxyStatus::WaitingCreditUpdate;
-                let rx = MuxerRx::CreditRequest {
-                    local_port: proxy.local_port,
-                    peer_port: proxy.peer_port,
-                    fwd_cnt: proxy.tx_cnt.0,
-                };
-                update.push_credit_req = Some(rx);
-            }
-
-            if proxy.status == ProxyStatus::Closed {
-                proxy.push_reset();
-                update.signal_queue = true;
-                update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-                update.remove_proxy = ProxyRemoval::Deferred;
-                return update;
-            } else if proxy.host_read_closed || proxy.status == ProxyStatus::WaitingCreditUpdate {
-                update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-            }
-        } else if proxy.status == ProxyStatus::Listening
-            || proxy.status == ProxyStatus::WaitingOnAccept
-        {
-            let new_sock =
-                unsafe { accept(sock(proxy), std::ptr::null_mut(), std::ptr::null_mut()) };
-            if new_sock != INVALID_SOCKET {
-                let mut mode: u32 = 1;
-                unsafe {
-                    ioctlsocket(new_sock, FIONBIO, &mut mode);
-                }
-                let new_fd = unsafe { OwnedSocket::from_raw_socket(new_sock as RawSocket) };
-                update.new_proxy = Some((proxy.peer_port, new_fd, proxy.family, NewProxyType::Tcp));
-            } else {
-                let e = unsafe { WSAGetLastError() };
-                warn!("accept error: id={} err={e}", proxy.id);
-            }
-            update.signal_queue = true;
-            return update;
-        }
-    }
-
-    if evset.contains(EventSet::OUT) && proxy.status == ProxyStatus::Connecting {
-        proxy.status = ProxyStatus::Connected;
-        proxy.push_connect_rsp(0);
-        update.signal_queue = true;
-        update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-    }
-
-    update
 }
