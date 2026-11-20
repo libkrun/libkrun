@@ -329,9 +329,10 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
 
     if evset.intersects(EventSet::IN | EventSet::HANG_UP) {
         debug!("process_event: IN");
-        if proxy.status == ProxyStatus::Connected {
+        if proxy.status == ProxyStatus::Connected && !proxy.rx_starved {
             let (signal_queue, wait_credit) = proxy.recv_pkt();
             update.signal_queue = signal_queue;
+            update.rx_starved = proxy.rx_starved;
 
             if wait_credit && proxy.status != ProxyStatus::WaitingCreditUpdate {
                 proxy.status = ProxyStatus::WaitingCreditUpdate;
@@ -354,8 +355,7 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
                 update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
                 update.remove_proxy = ProxyRemoval::Deferred;
                 return update;
-            } else if proxy.status == ProxyStatus::WaitingCreditUpdate {
-                debug!("process_event: WaitingCreditUpdate");
+            } else if proxy.status == ProxyStatus::WaitingCreditUpdate || proxy.rx_starved {
                 update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
             }
         } else {
@@ -507,12 +507,23 @@ pub(crate) fn as_raw_acceptor_fd(proxy: &super::UnixAcceptorProxy) -> RawFd {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::io::Write;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+    use super::super::UnixProxy;
+    use super::*;
+    use crate::virtio::queue::VIRTQ_DESC_F_WRITE;
+    use crate::virtio::queue::tests::VirtQueue;
+    use crate::virtio::vsock::muxer_rxq::MuxerRxQ;
+    use crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE;
+    use crate::virtio::vsock::proxy::Proxy;
 
     fn socket_path(label: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
@@ -520,6 +531,54 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("krun-{label}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn rx_queue_refill_resumes_pending_stream_reads() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0), &mem, 2);
+        let mut proxy = UnixProxy::new_reverse(
+            1,
+            3,
+            620,
+            1024,
+            socket.into(),
+            mem.clone(),
+            Arc::new(Mutex::new(ring.create_queue())),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+        );
+        proxy.status = ProxyStatus::Connected;
+        proxy.peer_buf_alloc = 256;
+        peer.write_all(b"payload").unwrap();
+
+        ring.dtable[0].set(0x1000, VSOCK_PKT_HDR_SIZE as u32 + 3, VIRTQ_DESC_F_WRITE, 0);
+        ring.avail.ring[0].set(0);
+        ring.avail.idx.set(1);
+        let update = proxy.process_event(EventSet::IN);
+        assert!(update.rx_starved);
+        assert!(update.signal_queue);
+        assert_eq!(update.polling.unwrap().2, EventSet::empty());
+        assert_eq!(ring.used.idx.get(), 1);
+
+        ring.dtable[1].set(
+            0x2000,
+            VSOCK_PKT_HDR_SIZE as u32 + 32,
+            VIRTQ_DESC_F_WRITE,
+            0,
+        );
+        ring.avail.ring[1].set(1);
+        ring.avail.idx.set(2);
+        assert_eq!(proxy.resume_rx().unwrap().2, EventSet::IN);
+        assert!(proxy.process_event(EventSet::IN).signal_queue);
+        assert_eq!(ring.used.idx.get(), 2);
+        let mut payload = [0; 4];
+        mem.read_slice(
+            &mut payload,
+            GuestAddress(0x2000 + VSOCK_PKT_HDR_SIZE as u64),
+        )
+        .unwrap();
+        assert_eq!(&payload, b"load");
     }
 
     #[test]

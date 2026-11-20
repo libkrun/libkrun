@@ -46,6 +46,7 @@ pub struct UnixProxy {
     pub(crate) last_tx_cnt_sent: Wrapping<u32>,
     pub(crate) push_cnt: Wrapping<u32>,
     pub(crate) rx_cnt: Wrapping<u32>,
+    rx_starved: bool,
 }
 
 impl UnixProxy {
@@ -78,6 +79,7 @@ impl UnixProxy {
             last_tx_cnt_sent: Wrapping(0),
             push_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
+            rx_starved: false,
         })
     }
 
@@ -105,6 +107,7 @@ impl UnixProxy {
             queue,
             rxq,
             rx_cnt: Wrapping(0),
+            rx_starved: false,
             tx_cnt: Wrapping(0),
             last_tx_cnt_sent: Wrapping(0),
             peer_buf_alloc: 0,
@@ -153,7 +156,11 @@ impl UnixProxy {
         let mut wait_credit = false;
         let mut queue = self.queue.lock().unwrap();
 
-        while let Some(head) = queue.pop(&self.mem) {
+        loop {
+            let Some(head) = queue.pop(&self.mem) else {
+                self.rx_starved = true;
+                break;
+            };
             // A head that cannot hold a packet is returned to the guest empty
             // instead of being parked at the queue head, where a readable host
             // socket would trip the event loop forever.
@@ -277,7 +284,18 @@ impl Proxy for UnixProxy {
     }
 
     fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
-        sys::update_peer_credit(self, pkt)
+        self.peer_buf_alloc = pkt.buf_alloc();
+        self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
+
+        if self.status != ProxyStatus::WaitingCreditUpdate || self.peer_avail_credit() == 0 {
+            return ProxyUpdate::default();
+        }
+
+        self.status = ProxyStatus::Connected;
+        ProxyUpdate {
+            polling: (!self.rx_starved).then(|| (self.id, self.as_raw_fd(), EventSet::IN)),
+            ..Default::default()
+        }
     }
 
     fn push_op_request(&self) -> bool {
@@ -321,6 +339,13 @@ impl Proxy for UnixProxy {
 
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate {
         sys::process_event(self, evset)
+    }
+
+    fn resume_rx(&mut self) -> Option<(u64, RawFd, EventSet)> {
+        let was_starved = self.rx_starved;
+        self.rx_starved = false;
+        (was_starved && self.status == ProxyStatus::Connected)
+            .then(|| (self.id, self.as_raw_fd(), EventSet::IN))
     }
 }
 

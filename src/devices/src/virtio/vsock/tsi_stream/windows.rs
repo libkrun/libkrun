@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::io;
 use std::mem::size_of;
 use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
-use std::num::Wrapping;
 use std::os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket, RawSocket};
 
 use windows_sys::Win32::Networking::WinSock::{
@@ -378,25 +377,6 @@ pub(crate) fn do_getname(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket, p
         data,
     };
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
-}
-
-pub(crate) fn update_peer_credit(
-    proxy: &mut super::TsiStreamProxy,
-    pkt: &VsockPacket,
-) -> ProxyUpdate {
-    proxy.peer_buf_alloc = pkt.buf_alloc();
-    proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
-    if proxy.status != ProxyStatus::WaitingCreditUpdate || proxy.peer_avail_credit() == 0 {
-        return ProxyUpdate::default();
-    }
-
-    let previous = proxy.event_interest();
-    proxy.status = ProxyStatus::Connected;
-    if proxy.event_interest().contains(EventSet::IN) {
-        // The previous FD_READ was consumed before recv could reenable it.
-        return proxy.read_host(previous);
-    }
-    ProxyUpdate::default()
 }
 
 pub(crate) fn do_listen(

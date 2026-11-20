@@ -126,6 +126,7 @@ pub(crate) fn create(
         listening: false,
         family,
         protocol: req.protocol,
+        rx_starved: false,
         #[cfg(target_os = "macos")]
         icmp,
         mem,
@@ -700,6 +701,13 @@ pub(crate) fn process_event(proxy: &mut super::TsiDgramProxy, evset: EventSet) -
             debug!("process_event: WaitingCreditUpdate");
             update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
         }
+
+        // With no buffers left the level-triggered IN interest would spin
+        // over a readable socket; stop polling until the guest refills.
+        update.rx_starved = proxy.rx_starved;
+        if proxy.rx_starved {
+            update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
+        }
     }
 
     if evset.contains(EventSet::OUT) {
@@ -722,6 +730,7 @@ mod tests {
     use crate::virtio::queue::{Descriptor, VIRTQ_DESC_F_WRITE};
     use crate::virtio::vsock::muxer_rxq::MuxerRxQ;
     use crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE;
+    use crate::virtio::vsock::proxy::Proxy;
 
     fn test_mem() -> GuestMemoryMmap {
         GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap()
@@ -866,6 +875,79 @@ mod tests {
         .unwrap();
         assert_eq!(&payload, b"datagram");
 
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn rx_starvation_disarms_polling_until_buffers_return() {
+        let mem = test_mem();
+        let queue = rx_queue();
+        let mut proxy = dgram_proxy(&mem, queue);
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "krun-dgram-starve-{}-{nonce}.sock",
+            std::process::id()
+        ));
+        let addr = UnixAddr::new(path.to_str().unwrap()).unwrap();
+        bind(proxy.fd.as_raw_fd(), &addr).unwrap();
+        let peer = socket(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+        sendto(peer.as_raw_fd(), b"first", &addr, MsgFlags::empty()).unwrap();
+        sendto(peer.as_raw_fd(), b"second", &addr, MsgFlags::empty()).unwrap();
+
+        // One buffer delivers the first datagram; the second leaves the
+        // socket readable with no buffers left.
+        post_buffer(&mem, 0, 0, 0x4000, VSOCK_PKT_HDR_SIZE as u32 + 512);
+        let update = process_event(&mut proxy, EventSet::IN);
+        assert!(update.signal_queue);
+        assert_eq!(
+            used_ring(&mem, 0),
+            (
+                0,
+                (VSOCK_PKT_HDR_SIZE + DGRAM_HEADER_LEN + b"first".len()) as u32
+            )
+        );
+        assert!(proxy.rx_starved);
+        assert!(update.rx_starved);
+        assert_eq!(
+            update.polling,
+            Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()))
+        );
+
+        // The guest posts new buffers and kicks: polling resumes and the
+        // pending datagram is delivered.
+        let resumed = proxy.resume_rx().unwrap();
+        assert_eq!(resumed, (proxy.id, proxy.fd.as_raw_fd(), EventSet::IN));
+        assert!(!proxy.rx_starved);
+        post_buffer(&mem, 1, 1, 0x4200, VSOCK_PKT_HDR_SIZE as u32 + 512);
+        let update = process_event(&mut proxy, EventSet::IN);
+        assert!(update.signal_queue);
+        assert_eq!(
+            used_ring(&mem, 1),
+            (
+                1,
+                (VSOCK_PKT_HDR_SIZE + DGRAM_HEADER_LEN + b"second".len()) as u32
+            )
+        );
+
+        // A buffer parked over a drained socket keeps polling armed.
+        post_buffer(&mem, 2, 2, 0x4400, VSOCK_PKT_HDR_SIZE as u32 + 512);
+        let update = process_event(&mut proxy, EventSet::IN);
+        assert!(!update.rx_starved);
+        assert!(!update.signal_queue);
+        assert!(update.polling.is_none());
+        assert_eq!(used_idx(&mem), 2);
+
+        assert!(proxy.resume_rx().is_none());
         std::fs::remove_file(&path).unwrap();
     }
 }

@@ -35,6 +35,7 @@ use crossbeam_channel::{Sender, unbounded};
 #[cfg(unix)]
 use nix::sys::socket::SockaddrStorage;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
 
 use crate::virtio::InterruptTransport;
@@ -153,11 +154,8 @@ pub fn push_packet(
                         error!("failed to add used elements to the queue: {e:?}");
                     }
                     drop(queue);
-                    rxq_mutex.lock().unwrap().push(rx);
+                    delivered &= queue_or_warn(rxq_mutex, rx);
                 }
-            } else {
-                // A buffer that cannot hold the packet loses it.
-                delivered = false;
             }
         } else {
             drop(queue);
@@ -188,6 +186,7 @@ pub struct VsockMuxer {
     reaper_sender: Option<Sender<u64>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     tsi_flags: TsiFlags,
+    rx_available_evt: EventFd,
 }
 
 impl VsockMuxer {
@@ -222,6 +221,8 @@ impl VsockMuxer {
             reaper_sender: None,
             unix_ipc_port_map,
             tsi_flags,
+            rx_available_evt: EventFd::new(utils::eventfd::EFD_NONBLOCK)
+                .map_err(VsockError::EventFd)?,
         })
     }
 
@@ -254,6 +255,7 @@ impl VsockMuxer {
             interrupt.clone(),
             sender.clone(),
             self.unix_ipc_port_map.clone().unwrap_or_default(),
+            self.rx_available_evt.try_clone().unwrap(),
         );
         thread.run();
 
@@ -264,6 +266,14 @@ impl VsockMuxer {
 
     pub(crate) fn has_pending_rx(&self) -> bool {
         !self.rxq.lock().unwrap().is_empty()
+    }
+
+    /// Wake the muxer thread so it resumes proxies that stopped polling
+    /// after the guest ran out of RX buffers.
+    pub(crate) fn notify_rx_available(&self) {
+        if let Err(e) = self.rx_available_evt.write(1) {
+            error!("failed to notify rx buffers available: {e:?}");
+        }
     }
 
     pub(crate) fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> super::Result<()> {
