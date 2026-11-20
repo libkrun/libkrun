@@ -3725,6 +3725,11 @@
           "value": 64
         },
         {
+          "name": "NO_VIRGL",
+          "c_name": "KRUN_VIRGL_RENDERER_FLAGS_NO_VIRGL",
+          "value": 128
+        },
+        {
           "name": "USE_ASYNC_FENCE_CB",
           "c_name": "KRUN_VIRGL_RENDERER_FLAGS_USE_ASYNC_FENCE_CB",
           "value": 256
