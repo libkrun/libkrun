@@ -1962,6 +1962,21 @@ impl DisplayBackend {
         })
     }
 
+    /// Create a display backend without a display, for headless GPU
+    /// acceleration.
+    ///
+    /// No scanouts can be configured: every scanout operation is rejected, so
+    /// the GPU is only usable for off-screen rendering.
+    pub fn new_noop() -> Self {
+        use devices::display::NoopDisplayBackend;
+        use krun_display::IntoDisplayBackend;
+
+        Self {
+            inner: NoopDisplayBackend::into_display_backend(None),
+            displays: Vec::new(),
+        }
+    }
+
     pub fn add_display(&mut self, display: DisplayInfoBuilder) {
         self.displays.push(display.inner);
     }
@@ -1975,6 +1990,7 @@ export_bitflags! {
             const USE_EGL            = 0x001;
             const THREAD_SYNC        = 0x002;
             const VENUS              = 0x040;
+            const NO_VIRGL           = 0x080;
             const USE_ASYNC_FENCE_CB = 0x100;
             const RENDER_SERVER      = 0x200;
         }
@@ -2294,5 +2310,15 @@ mod tests {
 
         balloon.set_free_page_reporting_mode(FreePageReportingMode::Default);
         assert!(!balloon.requirements().replaces_guest_ram);
+    }
+}
+
+#[cfg(all(test, any(feature = "gpu", feature = "vhost-user")))]
+mod display_backend_tests {
+    use super::DisplayBackend;
+
+    #[test]
+    fn noop_display_backend_instantiates() {
+        DisplayBackend::new_noop().inner.create_instance().unwrap();
     }
 }
