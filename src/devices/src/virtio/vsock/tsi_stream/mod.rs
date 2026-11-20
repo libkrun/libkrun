@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::num::Wrapping;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::super::Queue as VirtQueue;
@@ -36,19 +37,23 @@ use windows as sys;
 struct SendQueue {
     buf: VecDeque<u8>,
     limit: usize,
+    /// Bytes this queue may still claim from the shared device budget.
+    budget: Arc<AtomicUsize>,
 }
 
 #[derive(Debug)]
 enum EnqueueError {
     Capacity,
+    Budget,
     Alloc,
 }
 
 impl SendQueue {
-    fn new(limit: usize) -> Self {
+    fn new(limit: usize, budget: Arc<AtomicUsize>) -> Self {
         SendQueue {
             buf: VecDeque::new(),
             limit,
+            budget,
         }
     }
 
@@ -64,14 +69,35 @@ impl SendQueue {
         if data.len() > self.remaining() {
             return Err(EnqueueError::Capacity);
         }
-        let required = self.buf.len() + data.len();
+        // Claim from the budget before touching the queue, so a failed push
+        // never leaks accounting. The claim is a compare-and-swap: subtracting
+        // first and rolling back on refusal would transiently wrap the
+        // counter, letting a concurrent claim read it as unlimited budget.
+        let claimed = self
+            .budget
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                (data.len() <= left).then(|| left - data.len())
+            })
+            .is_ok();
+        if !claimed {
+            return Err(EnqueueError::Budget);
+        }
+        if let Err(error) = self.reserve(data.len()) {
+            self.budget.fetch_add(data.len(), Ordering::Relaxed);
+            return Err(error);
+        }
+        self.buf.extend(data);
+        Ok(())
+    }
+
+    fn reserve(&mut self, incoming: usize) -> Result<(), EnqueueError> {
+        let required = self.buf.len() + incoming;
         if required > self.buf.capacity() {
             let capacity = required.max(self.buf.capacity() * 2).min(self.limit);
             self.buf
                 .try_reserve_exact(capacity - self.buf.len())
                 .map_err(|_| EnqueueError::Alloc)?;
         }
-        self.buf.extend(data);
         Ok(())
     }
 
@@ -82,10 +108,18 @@ impl SendQueue {
 
     fn consume(&mut self, count: usize) {
         self.buf.drain(..count);
+        self.budget.fetch_add(count, Ordering::Relaxed);
     }
 
     fn clear(&mut self) {
+        self.budget.fetch_add(self.buf.len(), Ordering::Relaxed);
         self.buf = VecDeque::new();
+    }
+}
+
+impl Drop for SendQueue {
+    fn drop(&mut self) {
+        self.budget.fetch_add(self.buf.len(), Ordering::Relaxed);
     }
 }
 
@@ -146,6 +180,7 @@ impl TsiStreamProxy {
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Result<Self, ProxyError> {
         let (fd, family) = sys::create_socket(id, family)?;
+        let send_budget = rxq.lock().unwrap().send_budget.clone();
 
         Ok(TsiStreamProxy {
             id,
@@ -171,7 +206,7 @@ impl TsiStreamProxy {
             rx_starved: false,
             push_cnt: Wrapping(0),
             pending_accepts: 0,
-            send_queue: SendQueue::new(defs::CONN_TX_BUF_SIZE),
+            send_queue: SendQueue::new(defs::CONN_TX_BUF_SIZE, send_budget),
             unixsock_path: None,
             #[cfg(target_os = "linux")]
             protected_unix_paths: Vec::new(),
@@ -194,6 +229,7 @@ impl TsiStreamProxy {
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Self {
         debug!("new_reverse: id={id} local_port={local_port} peer_port={peer_port}");
+        let send_budget = rxq.lock().unwrap().send_budget.clone();
         TsiStreamProxy {
             id,
             cid,
@@ -218,7 +254,7 @@ impl TsiStreamProxy {
             rx_starved: false,
             push_cnt: Wrapping(0),
             pending_accepts: 0,
-            send_queue: SendQueue::new(defs::CONN_TX_BUF_SIZE),
+            send_queue: SendQueue::new(defs::CONN_TX_BUF_SIZE, send_budget),
             unixsock_path: None,
             #[cfg(target_os = "linux")]
             protected_unix_paths: Vec::new(),
@@ -316,6 +352,9 @@ impl TsiStreamProxy {
     fn abort_send(&mut self, error: EnqueueError) -> ProxyUpdate {
         match error {
             EnqueueError::Capacity => warn!("send queue capacity exceeded: id={}", self.id),
+            EnqueueError::Budget => {
+                warn!("aggregate send queue budget exceeded: id={}", self.id)
+            }
             EnqueueError::Alloc => error!("could not allocate send queue storage: id={}", self.id),
         }
         self.reset_after_error()
@@ -1097,5 +1136,134 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&payload, b"payload");
+    }
+
+    #[test]
+    fn send_queue_accounts_against_the_shared_budget() {
+        let budget = Arc::new(AtomicUsize::new(1024));
+        let mut a = SendQueue::new(4096, budget.clone());
+        let mut b = SendQueue::new(4096, budget.clone());
+
+        a.push(&[0u8; 600]).unwrap();
+        assert_eq!(budget.load(Ordering::Relaxed), 424);
+        assert!(matches!(b.push(&[0u8; 600]), Err(EnqueueError::Budget)));
+        assert_eq!(budget.load(Ordering::Relaxed), 424);
+
+        a.consume(100);
+        assert_eq!(budget.load(Ordering::Relaxed), 524);
+        b.push(&[0u8; 500]).unwrap();
+        assert_eq!(budget.load(Ordering::Relaxed), 24);
+
+        a.clear();
+        assert_eq!(budget.load(Ordering::Relaxed), 524);
+        drop(a);
+        drop(b);
+        assert_eq!(budget.load(Ordering::Relaxed), 1024);
+
+        // A queue larger than the whole budget cannot claim it all.
+        let mut c = SendQueue::new(4096, Arc::new(AtomicUsize::new(64)));
+        assert!(matches!(c.push(&[0u8; 65]), Err(EnqueueError::Budget)));
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn send_data_resets_the_stream_when_the_budget_is_exhausted() {
+        let (sender, reader) = UnixStream::pair().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        reader.set_nonblocking(true).unwrap();
+        setsockopt(&sender, sockopt::SndBuf, &4096).unwrap();
+        let rxq = Arc::new(Mutex::new(MuxerRxQ::new()));
+        rxq.lock().unwrap().send_budget = Arc::new(AtomicUsize::new(64));
+        let queue = Arc::new(Mutex::new(VirtQueue::new(8)));
+        {
+            let mut configured = queue.lock().unwrap();
+            configured.size = 8;
+            configured.ready = true;
+            configured.desc_table = GuestAddress(0x1000);
+            configured.avail_ring = GuestAddress(0x2000);
+            configured.used_ring = GuestAddress(0x3000);
+        }
+        let mut proxy = TsiStreamProxy::new_reverse(
+            1024 << 32 | 620,
+            3,
+            1,
+            AddressFamily::Unix,
+            620,
+            1024,
+            sender.into(),
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+            queue,
+            rxq.clone(),
+        );
+        proxy.status = ProxyStatus::Connected;
+
+        let update = proxy.send_data(&[0x17; 128 * 1024]);
+        assert!(update.signal_queue);
+        assert_eq!(update.polling.unwrap().2, EventSet::empty());
+        assert!(proxy.send_queue.is_empty());
+        assert!(matches!(
+            rxq.lock().unwrap().pop(),
+            Some(MuxerRx::Reset { .. })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod send_queue_tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+
+    use super::SendQueue;
+
+    #[test]
+    fn concurrent_claims_never_exceed_the_budget() {
+        const TOTAL: usize = 256;
+        let budget = Arc::new(AtomicUsize::new(TOTAL));
+        let queues = (0..4)
+            .map(|_| Arc::new(Mutex::new(SendQueue::new(4096, budget.clone()))))
+            .collect::<Vec<_>>();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let monitor = {
+            let budget = budget.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    assert!(budget.load(Ordering::Relaxed) <= TOTAL);
+                }
+            })
+        };
+
+        // A big claim can only fail while a small claim from another queue is
+        // outstanding; that overlap is exactly where a subtract-then-rollback
+        // claim would let the small claim read the wrapped counter as
+        // unlimited budget.
+        let start = Arc::new(Barrier::new(4));
+        let handles: Vec<_> = queues
+            .into_iter()
+            .zip([224, 64, 224, 64])
+            .map(|(queue, chunk)| {
+                let start = start.clone();
+                thread::spawn(move || {
+                    let data = vec![0u8; chunk];
+                    start.wait();
+                    for _ in 0..20_000 {
+                        let mut queue = queue.lock().unwrap();
+                        if queue.push(&data).is_ok() {
+                            queue.consume(chunk);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        monitor.join().unwrap();
+
+        assert_eq!(budget.load(Ordering::Relaxed), TOTAL);
     }
 }

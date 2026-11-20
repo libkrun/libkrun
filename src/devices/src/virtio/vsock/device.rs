@@ -50,15 +50,25 @@ pub struct Vsock {
 
 impl Vsock {
     /// Create a new virtio-vsock device with the given VM CID.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cid: u64,
         host_port_map: Option<HashMap<u16, u16>>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
         tsi_flags: TsiFlags,
+        proxy_limit: Option<usize>,
+        send_queue_budget: Option<usize>,
     ) -> super::Result<Vsock> {
         Ok(Vsock {
             cid,
-            muxer: VsockMuxer::new(cid, host_port_map, unix_ipc_port_map, tsi_flags)?,
+            muxer: VsockMuxer::new(
+                cid,
+                host_port_map,
+                unix_ipc_port_map,
+                tsi_flags,
+                proxy_limit,
+                send_queue_budget,
+            )?,
             queue_rx: None,
             queue_tx: None,
             queue_events: Vec::new(),
