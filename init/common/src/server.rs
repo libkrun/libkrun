@@ -18,11 +18,14 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use crate::control::{
     self, ExecSpec, ExitStatus, Failure, IO_CHUNK_LEN, PROTOCOL_VERSION, Request, Response,
     STDIN_WINDOW, WindowSize,
 };
+
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub struct Server {
     listener: OwnedFd,
@@ -103,7 +106,18 @@ fn accept_loop(listener: OwnedFd, workload: Arc<OwnedFd>) {
                 continue;
             }
             eprintln!("krun-init: control server: accept: {err}");
-            return;
+            // The listener is closed when this thread returns, which frees the
+            // vsock port for a guest process to bind and impersonate the host's
+            // control endpoint. Keep it for transient failures (EMFILE,
+            // ENOMEM, ...) and give up only if the socket itself is unusable.
+            if matches!(
+                err.raw_os_error(),
+                Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK | libc::EOPNOTSUPP)
+            ) {
+                return;
+            }
+            thread::sleep(ACCEPT_RETRY_DELAY);
+            continue;
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         if !peer_is_host(&fd) {
@@ -971,11 +985,11 @@ mod tests {
     use crate::client::{Connection, Session, SessionIo};
     use crate::control::STDIN_WINDOW;
     use std::fs::File;
-    use std::os::unix::net::UnixStream;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::os::unix::process::ExitStatusExt;
     use std::process::Command;
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     fn connect(workload: Option<i32>) -> Connection {
         let (host, guest) = UnixStream::pair().unwrap();
@@ -1017,6 +1031,36 @@ mod tests {
             )
             .unwrap();
         (status, read_all(out_r), read_all(err_r))
+    }
+
+    #[test]
+    fn accept_loop_keeps_listening_after_transient_error() {
+        let path = std::env::temp_dir().join(format!("krun-accept-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        // With nothing to accept, accept4() fails with EAGAIN.
+        listener.set_nonblocking(true).unwrap();
+        let (_unused, workload) = pipe_pair();
+        // Detached on purpose: a loop that keeps its listener never returns.
+        let accepting = thread::spawn(move || {
+            accept_loop(OwnedFd::from(listener), Arc::new(workload));
+        });
+        thread::sleep(3 * ACCEPT_RETRY_DELAY);
+        let alive = !accepting.is_finished();
+        std::fs::remove_file(&path).unwrap();
+        assert!(alive, "the accept loop gave up and freed the port");
+    }
+
+    #[test]
+    fn accept_loop_stops_when_listener_is_unusable() {
+        // accept4() on a pipe fails with ENOTSOCK, which retrying cannot fix.
+        let (not_a_socket, workload) = pipe_pair();
+        let (done, stopped) = mpsc::channel();
+        thread::spawn(move || {
+            accept_loop(not_a_socket, Arc::new(workload));
+            let _ = done.send(());
+        });
+        assert!(stopped.recv_timeout(Duration::from_secs(3)).is_ok());
     }
 
     #[test]
