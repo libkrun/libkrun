@@ -3,8 +3,8 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket, RawSocket};
 use std::path::Path;
 use windows_sys::Win32::Networking::WinSock::{
     AF_UNIX, FIONBIO, INVALID_SOCKET, SD_BOTH, SD_RECEIVE, SD_SEND, SOCK_STREAM, SOCKADDR,
-    SOCKADDR_UN, SOCKET, SOCKET_ERROR, WSAECONNREFUSED, WSAEWOULDBLOCK, WSAGetLastError, accept,
-    bind, connect, ioctlsocket, listen, recv, send, shutdown, socket,
+    SOCKADDR_UN, SOCKET, SOCKET_ERROR, WSAECONNREFUSED, WSAEINTR, WSAESHUTDOWN, WSAEWOULDBLOCK,
+    WSAGetLastError, accept, bind, connect, ioctlsocket, listen, recv, send, shutdown, socket,
 };
 
 use super::super::super::linux_errno::wsa_errno_to_linux;
@@ -64,12 +64,15 @@ fn push_connect_rsp(proxy: &super::UnixProxy, result: i32) {
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
 }
 
-pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> RecvPkt {
+pub(crate) fn recv_to_pkt(
+    proxy: &super::UnixProxy,
+    pkt: &mut VsockPacket,
+) -> std::io::Result<RecvPkt> {
     if let Some(buf) = pkt.buf_mut() {
         let peer_credit = proxy.peer_avail_credit();
         let max_len = std::cmp::min(buf.len(), peer_credit);
         if max_len == 0 {
-            return RecvPkt::WaitForCredit;
+            return Ok(RecvPkt::WaitForCredit);
         }
 
         let res = unsafe {
@@ -82,21 +85,24 @@ pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> Re
         };
 
         if res > 0 {
-            RecvPkt::Read(res as usize)
+            Ok(RecvPkt::Read(res as usize))
         } else if res == 0 {
-            RecvPkt::Close
+            Ok(RecvPkt::Close)
         } else {
             let e = unsafe { WSAGetLastError() };
-            if e == WSAEWOULDBLOCK {
+            if e == WSAEWOULDBLOCK || e == WSAEINTR {
                 // Map WSAEWOULDBLOCK to an expected exit for the mod.rs loop without tearing down the proxy.
-                RecvPkt::Error
+                Ok(RecvPkt::Error)
+            } else if e == WSAESHUTDOWN
+                && proxy.peer_shutdown & super::uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0
+            {
+                Ok(RecvPkt::Close)
             } else {
-                warn!("unix proxy recv error: id={}, err={}", proxy.id, e);
-                RecvPkt::Error
+                Err(std::io::Error::from_raw_os_error(e))
             }
         }
     } else {
-        RecvPkt::Error
+        Ok(RecvPkt::Error)
     }
 }
 
@@ -185,7 +191,26 @@ pub(crate) fn sendmsg(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyU
             res
         } else {
             let e = unsafe { WSAGetLastError() };
-            -wsa_errno_to_linux(e)
+            if e == WSAEWOULDBLOCK {
+                // The socket stays non-blocking on Windows, so a full host
+                // buffer is a transient condition, not a dead peer.
+                0
+            } else {
+                // The host side is gone (e.g. the peer fully closed): reset
+                // the connection instead of silently dropping the guest's
+                // writes, or the guest blocks once its send window fills.
+                warn!("unix proxy send error: id={}, err={}", proxy.id, e);
+                proxy.push_reset();
+                proxy.status = ProxyStatus::Closed;
+                update.polling = Some((
+                    proxy.id,
+                    proxy.fd.as_raw_socket() as RawFd,
+                    EventSet::empty(),
+                ));
+                update.remove_proxy = ProxyRemoval::Deferred;
+                update.signal_queue = true;
+                return update;
+            }
         }
     } else {
         -22 // LINUX_EINVAL
@@ -209,6 +234,9 @@ pub(crate) fn update_peer_credit(proxy: &mut super::UnixProxy, pkt: &VsockPacket
     proxy.peer_buf_alloc = pkt.buf_alloc();
     proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
     let mut update = ProxyUpdate::default();
+    if proxy.host_read_closed {
+        return update;
+    }
 
     // If we were deadlocked waiting for credit, and credit is now restored:
     if proxy.status == ProxyStatus::WaitingCreditUpdate && proxy.peer_avail_credit() > 0 {
@@ -344,7 +372,7 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
                     EventSet::empty(),
                 ));
                 return update;
-            } else if proxy.status == ProxyStatus::WaitingCreditUpdate {
+            } else if proxy.host_read_closed || proxy.status == ProxyStatus::WaitingCreditUpdate {
                 update.polling = Some((
                     proxy.id,
                     proxy.fd.as_raw_socket() as RawFd,

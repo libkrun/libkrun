@@ -69,6 +69,16 @@ mod test_virtiofs_host_changes;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_virtiofs_host_changes::TestVirtiofsHostChanges;
 
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_vsock_unix_half_close;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_vsock_unix_half_close::TestVsockUnixHalfClose;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_vsock_unix_slow_reader;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_vsock_unix_slow_reader::TestVsockUnixSlowReader;
+
 mod test_tsi_tcp_guest_connect;
 use test_tsi_tcp_guest_connect::TestTsiTcpGuestConnect;
 
@@ -249,6 +259,10 @@ pub fn test_cases() -> Vec<TestCase> {
         ),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("init-control", Box::new(TestInitControl)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("vsock-unix-half-close", Box::new(TestVsockUnixHalfClose)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("vsock-unix-slow-reader", Box::new(TestVsockUnixSlowReader)),
         TestCase::new(
             "tsi-tcp-guest-connect",
             Box::new(TestTsiTcpGuestConnect::new()),
