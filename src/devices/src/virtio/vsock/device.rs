@@ -15,7 +15,7 @@ use vm_memory::GuestMemoryMmap;
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, Queue as VirtQueue, QueueConfig,
-    VirtioDevice,
+    VirtioDevice, VmmExitObserver,
 };
 use super::TsiFlags;
 use super::muxer::VsockMuxer;
@@ -177,6 +177,12 @@ impl Vsock {
         }
 
         have_used
+    }
+}
+
+impl VmmExitObserver for Vsock {
+    fn on_vmm_exit(&mut self) {
+        self.muxer.cleanup();
     }
 }
 
