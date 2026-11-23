@@ -213,12 +213,11 @@ pub fn storage_to_winsock(addr: &SockaddrStorage) -> Option<(Vec<u8>, i32)> {
             let mut sa: SOCKADDR_UN = unsafe { std::mem::zeroed() };
             sa.sun_family = AF_UNIX;
 
-            let pb = path.as_bytes();
-            for (i, &b) in pb.iter().enumerate() {
-                if i >= sa.sun_path.len() - 1 {
-                    break;
-                }
-                sa.sun_path[i] = b as i8;
+            if path.len() >= sa.sun_path.len() {
+                return None;
+            }
+            for (slot, byte) in sa.sun_path.iter_mut().zip(path.bytes()) {
+                *slot = byte as i8;
             }
 
             let len = std::mem::size_of::<SOCKADDR_UN>() as i32;
@@ -292,5 +291,22 @@ pub fn winsock_to_storage(buf: &[u8], len: i32) -> Option<SockaddrStorage> {
             })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_path_must_fit_with_terminator() {
+        let mut bytes = [b'x'; 110];
+        bytes[..2].copy_from_slice(&defs::LINUX_AF_UNIX.to_le_bytes());
+        let addr = SockaddrStorage::from_linux_bytes(&bytes, bytes.len() as u32).unwrap();
+        assert!(storage_to_winsock(&addr).is_none());
+
+        bytes[109] = 0;
+        let addr = SockaddrStorage::from_linux_bytes(&bytes, bytes.len() as u32).unwrap();
+        assert!(storage_to_winsock(&addr).is_some());
     }
 }

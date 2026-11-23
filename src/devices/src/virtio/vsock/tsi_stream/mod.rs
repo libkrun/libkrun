@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::num::Wrapping;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -156,8 +157,11 @@ pub struct TsiStreamProxy {
     send_queue: SendQueue,
     #[cfg(target_os = "linux")]
     unixsock_path: Option<unix::PinnedUnixPath>,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     unixsock_path: Option<PathBuf>,
+    // This field drops after fd, so the listener is closed before deletion.
+    #[cfg(windows)]
+    bound_unix_socket: Option<windows::BoundUnixSocket>,
     #[cfg(target_os = "linux")]
     pub(crate) protected_unix_paths: Vec<PathBuf>,
     #[cfg(windows)]
@@ -207,7 +211,10 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             send_queue: SendQueue::new(defs::CONN_TX_BUF_SIZE, send_budget),
+            #[cfg(unix)]
             unixsock_path: None,
+            #[cfg(windows)]
+            bound_unix_socket: None,
             #[cfg(target_os = "linux")]
             protected_unix_paths: Vec::new(),
             #[cfg(windows)]
@@ -255,7 +262,10 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             send_queue: SendQueue::new(defs::CONN_TX_BUF_SIZE, send_budget),
+            #[cfg(unix)]
             unixsock_path: None,
+            #[cfg(windows)]
+            bound_unix_socket: None,
             #[cfg(target_os = "linux")]
             protected_unix_paths: Vec::new(),
             #[cfg(windows)]
@@ -871,7 +881,7 @@ impl AsRawFd for TsiStreamProxy {
 impl Drop for TsiStreamProxy {
     fn drop(&mut self) {
         self.rxq.lock().unwrap().clear_stream_credit(self.id);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         if let Some(path) = &self.unixsock_path {
             _ = std::fs::remove_file(path);
         }
