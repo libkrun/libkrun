@@ -475,7 +475,7 @@ pub(crate) fn do_listen(
     update
 }
 
-pub(crate) fn do_accept(proxy: &mut super::TsiStreamProxy, req: TsiAcceptReq) -> ProxyUpdate {
+pub(crate) fn do_accept(proxy: &mut super::TsiStreamProxy, _req: TsiAcceptReq) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
 
     if proxy.pending_accepts > 0 {
