@@ -415,24 +415,17 @@ mod tests {
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
 
         let type_id = 0;
-        let id = String::from("foo");
-        if let Ok(addr) =
-            device_manager.register_virtio_device(guest_mem, dummy, &mut cmdline, type_id, &id)
-        {
-            assert!(device_manager.bus.get_device(addr).is_some());
-            assert_eq!(
-                addr,
-                device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id.clone())].addr
-            );
-            assert_eq!(
-                arch::IRQ_BASE,
-                device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id.clone())].irq
-            );
-        }
+        let addr = device_manager
+            .register_virtio_device(guest_mem, dummy, &mut cmdline, type_id, "foo")
+            .unwrap();
+        let info = &device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), "foo".into())];
+        assert!(device_manager.bus.get_device(addr).is_some());
+        assert_eq!(addr, info.addr);
+        assert_eq!(arch::IRQ_BASE, info.irq);
         assert!(
             !device_manager
                 .id_to_dev_info
-                .contains_key(&(DeviceType::Virtio(type_id), String::from("bar")))
+                .contains_key(&(DeviceType::Virtio(type_id), "bar".into()))
         );
     }
 
