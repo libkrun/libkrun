@@ -107,6 +107,9 @@ use test_net_perf::TestNetPerf;
 mod test_multiport_console;
 use test_multiport_console::TestMultiportConsole;
 
+mod test_console_term_size;
+use test_console_term_size::TestConsoleTermSize;
+
 #[cfg(any(feature = "host", target_os = "linux"))]
 mod test_virtiofs_root_ro;
 #[cfg(any(feature = "host", target_os = "linux"))]
@@ -551,6 +554,7 @@ pub fn test_cases() -> Vec<TestCase> {
         ),
         TestCase::new("net-vmnet-helper", Box::new(TestNet::new_vmnet_helper())),
         TestCase::new("multiport-console", Box::new(TestMultiportConsole)),
+        TestCase::new("console-term-size", Box::new(TestConsoleTermSize)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-root-ro", Box::new(TestVirtiofsRootRo)),
         TestCase::new("augmentfs", Box::new(TestAugmentFs)),
