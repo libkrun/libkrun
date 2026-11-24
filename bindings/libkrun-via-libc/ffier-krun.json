@@ -849,6 +849,39 @@
             "c_convention": "out_param"
           },
           "ffi_name": "krun_fs_device_set_cache_policy"
+        },
+        {
+          "name": "set_cache_timeouts",
+          "doc": [
+            " Set how long the guest may cache lookups and attributes, before attaching this device.",
+            "",
+            " Both default to 5000 ms. Files changed outside the guest can look stale until the",
+            " timeouts expire: a file that grew on the host is read with its old size. Use 0 for",
+            " directories the host modifies while the guest uses them, at the cost of one more",
+            " request to the server per lookup or attribute read. With `LinuxSimplified`",
+            " attributes are never cached, and `attr_timeout_ms` applies again after switching to",
+            " another mode. A NullFs device has no host-backed entries and returns `InvalidParam`."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "entry_timeout_ms",
+              "param_kind": "regular",
+              "type": "u32"
+            },
+            {
+              "name": "attr_timeout_ms",
+              "param_kind": "regular",
+              "type": "u32"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_fs_device_set_cache_timeouts"
         }
       ],
       "cfg": {
@@ -1806,6 +1839,49 @@
           }
         },
         {
+          "name": "add_serial_console",
+          "doc": [
+            " Add a legacy serial console device with the given Windows handles.",
+            "",
+            " Can be called multiple times to add multiple serial consoles (ttyS0, ttyS1, …).",
+            " The handles are borrowed, not duplicated. They must remain valid until the VMM exits."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "input_handle",
+              "param_kind": "regular",
+              "type": "BorrowedHandle",
+              "type_args": [
+                "a"
+              ],
+              "optional": true
+            },
+            {
+              "name": "output_handle",
+              "param_kind": "regular",
+              "type": "BorrowedHandle",
+              "type_args": [
+                "a"
+              ],
+              "optional": true
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vmm_builder_add_serial_console",
+          "cfg": {
+            "kind": "target_os",
+            "value": "windows"
+          }
+        },
+        {
           "name": "nested_virt",
           "receiver": "value",
           "params": [
@@ -1848,6 +1924,33 @@
           "ffi_name": "krun_vmm_builder_reset_exit_code"
         },
         {
+          "name": "invariant_tsc",
+          "doc": [
+            " Expose the host's invariant TSC capability to x86_64 guests.",
+            "",
+            " Disabled by default so Linux guests can prefer a paravirtual clock.",
+            " Enabling this preserves backend support for CPUID.80000007H:EDX[8];",
+            " it does not add support when the host lacks it."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "enabled",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vmm_builder_invariant_tsc"
+        },
+        {
           "name": "split_irqchip",
           "receiver": "value",
           "params": [
@@ -1866,6 +1969,34 @@
             "c_convention": "out_param"
           },
           "ffi_name": "krun_vmm_builder_split_irqchip"
+        },
+        {
+          "name": "transparent_huge_pages",
+          "doc": [
+            " Ask for transparent huge pages for guest memory.",
+            "",
+            " Advises `MADV_HUGEPAGE` on guest memory, so a host with THP set to",
+            " `madvise` backs it with huge pages. Building the VM fails if the host",
+            " kernel is built without transparent huge page support. Only supported",
+            " on Linux."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "enabled",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vmm_builder_transparent_huge_pages"
         },
         {
           "name": "acpi",
@@ -1999,6 +2130,13 @@
       "methods": [
         {
           "name": "pause",
+          "doc": [
+            " Request a VM pause. Success means the request was queued.",
+            " The VMM processes it asynchronously and logs any execution failures.",
+            "",
+            " Returns [`VmmError::FeatureDisabled`] on Windows, for SEV and TDX guests,",
+            " and with a split irqchip."
+          ],
           "receiver": "ref",
           "params": [],
           "ret": {
@@ -2011,6 +2149,12 @@
         },
         {
           "name": "resume",
+          "doc": [
+            " Request that a paused VM resume. Success means the request was queued.",
+            " The VMM processes it asynchronously and logs any execution failures.",
+            "",
+            " Returns [`VmmError::FeatureDisabled`] where [`VmmHandle::pause`] does."
+          ],
           "receiver": "ref",
           "params": [],
           "ret": {
@@ -2745,6 +2889,39 @@
             "type": "Self"
           },
           "ffi_name": "krun_display_info_builder_refresh_rate"
+        },
+        {
+          "name": "edid_name",
+          "doc": [
+            " Set the PNP manufacturer ID and product name of the generated EDID.",
+            "",
+            " `manufacturer` must be exactly 3 ASCII uppercase letters and",
+            " `display_name` at most 13 bytes, matching the EDID descriptor limits."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "manufacturer",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "display_name",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_display_info_builder_edid_name"
         }
       ],
       "cfg": {

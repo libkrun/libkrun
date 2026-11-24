@@ -259,15 +259,14 @@ impl BusDevice for Serial {
 }
 
 impl Subscriber for Serial {
-    /// Handle a read event (EPOLLIN) on the serial input fd.
-    fn process(&mut self, event: &EpollEvent, _: &mut EventManager) {
+    /// Handle a read event (EPOLLIN) or a hang-up on the serial input fd.
+    fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
         let source = event.fd();
         let event_set = event.event_set();
 
-        // TODO: also check for errors. Pending high level discussions on how we want
-        // to handle errors in devices.
-        let supported_events = EventSet::IN;
-        if !supported_events.contains(event_set) {
+        let readable = event_set.contains(EventSet::IN);
+        let hung_up = event_set.intersects(EventSet::HANG_UP | EventSet::READ_HANG_UP);
+        if !readable && !hung_up {
             warn!("Received unknown event: {event_set:?} from source: {source:?}");
             return;
         }
@@ -275,15 +274,29 @@ impl Subscriber for Serial {
         if let Some(input) = self.input.as_mut()
             && input.as_raw_fd() == source
         {
-            let mut out = [0u8; 32];
-            match input.read(&mut out[..]) {
-                Ok(count) => {
-                    self.raw_input(&out[..count])
-                        .unwrap_or_else(|e| warn!("Serial error on input: {e}"));
+            let mut closed = hung_up && !readable;
+            if readable {
+                let mut out = [0u8; 32];
+                match input.read(&mut out[..]) {
+                    Ok(0) => closed = true,
+                    Ok(count) => {
+                        self.raw_input(&out[..count])
+                            .unwrap_or_else(|e| warn!("Serial error on input: {e}"));
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(e) => {
+                        warn!("error while reading stdin: {e:?}");
+                        closed = true;
+                    }
                 }
-                Err(e) => {
-                    warn!("error while reading stdin: {e:?}");
-                }
+            }
+            // A closed input stays readable, so a level-triggered poll would report it forever.
+            if closed && let Err(e) = event_manager.unregister(source) {
+                warn!("Failed to unregister serial input: {e:?}");
             }
         }
     }
@@ -301,8 +314,10 @@ impl Subscriber for Serial {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io;
     use std::io::Write;
+    use std::os::fd::OwnedFd;
     use std::os::unix::io::{AsRawFd, RawFd};
     use std::sync::{Arc, Mutex};
 
@@ -444,6 +459,35 @@ mod tests {
         // Check if reading from the largest u8 offset returns 0.
         serial.read(0, 0xff, &mut data[..]);
         assert_eq!(data[0], 0);
+    }
+
+    #[test]
+    fn test_closed_input_is_unregistered() {
+        let (reader, mut writer) = io::pipe().unwrap();
+        let input = File::from(OwnedFd::from(reader));
+        let input_fd = input.as_raw_fd();
+        let intr_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let serial = Arc::new(Mutex::new(Serial::new_in_out(
+            intr_evt,
+            Box::new(input),
+            Box::new(io::sink()),
+        )));
+        let mut evmgr = EventManager::new().unwrap();
+        evmgr.add_subscriber(serial.clone()).unwrap();
+
+        writer.write_all(b"a").unwrap();
+        drop(writer);
+
+        // Bytes written before the hang-up are still delivered; EOF then unregisters the input.
+        for _ in 0..3 {
+            evmgr.run_with_timeout(50).unwrap();
+        }
+        let mut data = [0u8];
+        serial.lock().unwrap().read(0, u64::from(DATA), &mut data);
+        assert_eq!(data[0], b'a');
+
+        assert!(evmgr.unregister(input_fd).is_err());
+        assert_eq!(evmgr.run_with_timeout(50).unwrap(), 0);
     }
 
     #[test]

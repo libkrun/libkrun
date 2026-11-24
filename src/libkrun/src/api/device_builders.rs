@@ -242,7 +242,7 @@ impl<'a> AttachContext<'a> {
 
     #[cfg(windows)]
     pub fn setup_terminal_raw_mode(&mut self, handle: BorrowedHandle<'_>) {
-        setup_terminal_raw_mode(self.vmm, Some(handle), false);
+        setup_terminal_raw_mode(self.vmm, Some(handle), false, true);
     }
 
     /// Get the macOS memory mapping channel sender, if available.
@@ -738,6 +738,28 @@ impl<'a> FsDevice<'a> {
     /// A NullFs device has no host-backed file data and returns `InvalidParam`.
     pub fn set_cache_policy(&mut self, policy: CachePolicy) -> Result<(), VmmError> {
         if !self.inner.lock().unwrap().set_cache_policy(policy) {
+            return Err(VmmError::InvalidParam());
+        }
+        Ok(())
+    }
+
+    /// Set how long the guest may cache lookups and attributes, before attaching this device.
+    ///
+    /// Both default to 5000 ms. Files changed outside the guest can look stale until the
+    /// timeouts expire: a file that grew on the host is read with its old size. Use 0 for
+    /// directories the host modifies while the guest uses them, at the cost of one more
+    /// request to the server per lookup or attribute read. With `LinuxSimplified`
+    /// attributes are never cached, and `attr_timeout_ms` applies again after switching to
+    /// another mode. A NullFs device has no host-backed entries and returns `InvalidParam`.
+    pub fn set_cache_timeouts(
+        &mut self,
+        entry_timeout_ms: u32,
+        attr_timeout_ms: u32,
+    ) -> Result<(), VmmError> {
+        if !self.inner.lock().unwrap().set_cache_timeouts(
+            std::time::Duration::from_millis(entry_timeout_ms.into()),
+            std::time::Duration::from_millis(attr_timeout_ms.into()),
+        ) {
             return Err(VmmError::InvalidParam());
         }
         Ok(())
@@ -1895,6 +1917,26 @@ impl DisplayInfoBuilder {
             DisplayInfoEdid::Provided(_) => {}
         }
         self
+    }
+
+    /// Set the PNP manufacturer ID and product name of the generated EDID.
+    ///
+    /// `manufacturer` must be exactly 3 ASCII uppercase letters and
+    /// `display_name` at most 13 bytes, matching the EDID descriptor limits.
+    pub fn edid_name(mut self, manufacturer: &str, display_name: &str) -> Result<Self, VmmError> {
+        let DisplayInfoEdid::Generated(params) = &mut self.inner.edid else {
+            return Ok(self);
+        };
+        let mfr = manufacturer.as_bytes();
+        if mfr.len() != 3 || !mfr.iter().all(u8::is_ascii_uppercase) {
+            return Err(VmmError::InvalidParam());
+        }
+        if display_name.is_empty() || display_name.len() > 13 {
+            return Err(VmmError::InvalidParam());
+        }
+        params.manufacturer = [mfr[0], mfr[1], mfr[2]];
+        params.display_name = display_name.to_string();
+        Ok(self)
     }
 }
 

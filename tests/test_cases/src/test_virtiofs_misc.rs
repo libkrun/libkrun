@@ -834,6 +834,67 @@ mod guest {
         fs::metadata(sub.join("inner")).expect("stat inside non-UTF-8 dir");
     }
 
+    fn open_read_only(path: &str) -> fs::File {
+        fs::File::open(path).expect("open read-only")
+    }
+
+    /// Drops the guest page cache of the file first, so the read reaches the server.
+    fn read_at(file: &mut fs::File, offset: usize, len: usize) -> Vec<u8> {
+        // SAFETY: the descriptor belongs to `file`, and posix_fadvise touches no memory.
+        let ret = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        assert_eq!(ret, 0, "posix_fadvise(DONTNEED)");
+        let mut buf = vec![0; len];
+        file.seek(SeekFrom::Start(offset as u64)).expect("seek");
+        file.read_exact(&mut buf).expect("read");
+        buf
+    }
+
+    /// Many read-only handles of one file each read at their own offset, the last one keeps
+    /// reading after the others close, and they see what a writable handle writes.
+    fn test_read_only_handles_of_one_file() {
+        let path = "/test_read_only_handles_of_one_file";
+        let contents: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        fs::write(path, &contents).expect("write file");
+
+        let mut handles: Vec<fs::File> = (0..64).map(|_| open_read_only(path)).collect();
+        for (i, handle) in handles.iter_mut().enumerate() {
+            let offset = i * 1000;
+            assert_eq!(
+                read_at(handle, offset, 100),
+                contents[offset..offset + 100],
+                "handle {i} at offset {offset}"
+            );
+        }
+
+        let mut last = handles.pop().unwrap();
+        drop(handles);
+        assert_eq!(
+            read_at(&mut last, 4096, 4096),
+            contents[4096..8192],
+            "the last handle after the others closed"
+        );
+
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for writing");
+        writer.write_all(b"rewritten").expect("write");
+        drop(writer);
+        assert_eq!(
+            read_at(&mut last, 0, 9),
+            b"rewritten",
+            "a write seen by an open reader"
+        );
+        drop(last);
+
+        assert_eq!(
+            read_at(&mut open_read_only(path), 0, 9),
+            b"rewritten",
+            "a reader opened after every handle closed"
+        );
+        fs::remove_file(path).expect("remove file");
+    }
+
     impl Test for TestVirtioFsMisc {
         fn in_guest(self: Box<Self>) {
             run_subtests(&[
@@ -872,6 +933,10 @@ mod guest {
                 (
                     "readdirplus_name_removed_mid_listing",
                     test_readdirplus_name_removed_mid_listing,
+                ),
+                (
+                    "read_only_handles_of_one_file",
+                    test_read_only_handles_of_one_file,
                 ),
             ]);
         }

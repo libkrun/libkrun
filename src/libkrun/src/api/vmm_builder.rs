@@ -1,12 +1,15 @@
 use std::marker::PhantomData;
 #[cfg(not(target_os = "windows"))]
 use std::os::fd::{AsRawFd, BorrowedFd};
+#[cfg(target_os = "windows")]
+use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::vmm::VmCtl;
 use crate::vmm::Vmm as InnerVmm;
-#[cfg(unix)]
 use crate::vmm::resources::SerialConsoleConfig;
 use crate::vmm::resources::VmResources;
 use crate::vmm::vmm_config::machine_config::VmConfig;
@@ -14,7 +17,7 @@ use crossbeam_channel::unbounded;
 use polly::event_manager::EventManager;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use utils::eventfd::EventFd;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use utils::pollable_channel::PollableChannelSender;
 
 use super::device_builders::DeviceManager;
@@ -27,12 +30,13 @@ pub struct VmmBuilder<'a> {
     ram_mib: Option<u32>,
     payload: Option<Payload>,
     device_manager: Option<Box<dyn DeviceManager<'a> + 'a>>,
-    #[cfg(unix)]
     serial_consoles: Vec<SerialConsoleConfig>,
     kernel_console: Option<String>,
     nested_virt: bool,
     reset_exit_code: Option<u8>,
+    invariant_tsc: bool,
     split_irqchip: bool,
+    transparent_huge_pages: bool,
     acpi: bool,
     smbios_oem_strings: Vec<String>,
     shutdown_support: bool,
@@ -101,6 +105,25 @@ impl<'a> VmmBuilder<'a> {
         Ok(self)
     }
 
+    /// Add a legacy serial console device with the given Windows handles.
+    ///
+    /// Can be called multiple times to add multiple serial consoles (ttyS0, ttyS1, …).
+    /// The handles are borrowed, not duplicated. They must remain valid until the VMM exits.
+    #[cfg(target_os = "windows")]
+    pub fn add_serial_console(
+        mut self,
+        input_handle: Option<BorrowedHandle<'a>>,
+        output_handle: Option<BorrowedHandle<'a>>,
+    ) -> Result<Self, VmmError> {
+        self.serial_consoles.push(SerialConsoleConfig {
+            input_handle: input_handle
+                .map_or(INVALID_HANDLE_VALUE, |handle| handle.as_raw_handle()),
+            output_handle: output_handle
+                .map_or(INVALID_HANDLE_VALUE, |handle| handle.as_raw_handle()),
+        });
+        Ok(self)
+    }
+
     pub fn nested_virt(mut self, enabled: bool) -> Self {
         self.nested_virt = enabled;
         self
@@ -119,11 +142,38 @@ impl<'a> VmmBuilder<'a> {
         self
     }
 
+    /// Expose the host's invariant TSC capability to x86_64 guests.
+    ///
+    /// Disabled by default so Linux guests can prefer a paravirtual clock.
+    /// Enabling this preserves backend support for CPUID.80000007H:EDX[8];
+    /// it does not add support when the host lacks it.
+    pub fn invariant_tsc(mut self, enabled: bool) -> Result<Self, VmmError> {
+        if enabled && !cfg!(target_arch = "x86_64") {
+            return Err(VmmError::InvalidParam());
+        }
+        self.invariant_tsc = enabled;
+        Ok(self)
+    }
+
     pub fn split_irqchip(mut self, enabled: bool) -> Result<Self, VmmError> {
         if enabled && !cfg!(target_arch = "x86_64") {
             return Err(VmmError::InvalidParam());
         }
         self.split_irqchip = enabled;
+        Ok(self)
+    }
+
+    /// Ask for transparent huge pages for guest memory.
+    ///
+    /// Advises `MADV_HUGEPAGE` on guest memory, so a host with THP set to
+    /// `madvise` backs it with huge pages. Building the VM fails if the host
+    /// kernel is built without transparent huge page support. Only supported
+    /// on Linux.
+    pub fn transparent_huge_pages(mut self, enabled: bool) -> Result<Self, VmmError> {
+        if enabled && !cfg!(target_os = "linux") {
+            return Err(VmmError::InvalidParam());
+        }
+        self.transparent_huge_pages = enabled;
         Ok(self)
     }
 
@@ -169,6 +219,8 @@ enum VmmInner {
         _worker_sender: crossbeam_channel::Sender<utils::worker_message::WorkerMessage>,
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         shutdown_efd: Option<EventFd>,
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        pause_supported: bool,
     },
     #[cfg(feature = "aws-nitro")]
     Nitro(aws_nitro::enclave::NitroEnclave),
@@ -187,8 +239,10 @@ pub struct Vmm<'a> {
 // so that run() returns a RunningVmm with wait(). Then this handle
 // can be obtained from RunningVmm instead of requiring a pre-run call.
 pub struct VmmHandle {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     vm_ctl_tx: PollableChannelSender<VmCtl>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pause_supported: bool,
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     shutdown_efd: Option<EventFd>,
 }
@@ -196,8 +250,10 @@ pub struct VmmHandle {
 impl Clone for VmmHandle {
     fn clone(&self) -> Self {
         Self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             vm_ctl_tx: self.vm_ctl_tx.clone(),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            pause_supported: self.pause_supported,
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             shutdown_efd: self
                 .shutdown_efd
@@ -209,25 +265,40 @@ impl Clone for VmmHandle {
 
 #[cfg_attr(feature = "ffi", ffier::export(send))]
 impl VmmHandle {
+    /// Request a VM pause. Success means the request was queued.
+    /// The VMM processes it asynchronously and logs any execution failures.
+    ///
+    /// Returns [`VmmError::FeatureDisabled`] on Windows, for SEV and TDX guests,
+    /// and with a split irqchip.
     pub fn pause(&self) -> Result<(), VmmError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
+            if !self.pause_supported {
+                return Err(VmmError::FeatureDisabled());
+            }
             self.vm_ctl_tx
                 .send(VmCtl::Pause)
                 .map_err(|e| VmmError::Internal(format!("pause: {e}")))
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
         Err(VmmError::FeatureDisabled())
     }
 
+    /// Request that a paused VM resume. Success means the request was queued.
+    /// The VMM processes it asynchronously and logs any execution failures.
+    ///
+    /// Returns [`VmmError::FeatureDisabled`] where [`VmmHandle::pause`] does.
     pub fn resume(&self) -> Result<(), VmmError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
+            if !self.pause_supported {
+                return Err(VmmError::FeatureDisabled());
+            }
             self.vm_ctl_tx
                 .send(VmCtl::Resume)
                 .map_err(|e| VmmError::Internal(format!("resume: {e}")))
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
         Err(VmmError::FeatureDisabled())
     }
 
@@ -262,14 +333,18 @@ impl<'a> Vmm<'a> {
     pub fn handle(&self) -> Result<VmmHandle, VmmError> {
         match &self.inner {
             VmmInner::Vmm {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 vmm,
                 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
                 shutdown_efd,
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                pause_supported,
                 ..
             } => Ok(VmmHandle {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 vm_ctl_tx: vmm.lock().unwrap().vm_ctl_sender(),
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                pause_supported: *pause_supported,
                 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
                 shutdown_efd: shutdown_efd
                     .as_ref()
@@ -428,7 +503,14 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
 
     vm_resources.nested_enabled = builder_cfg.nested_virt;
     vm_resources.reset_exit_code = builder_cfg.reset_exit_code;
+    vm_resources.invariant_tsc = builder_cfg.invariant_tsc;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
+    #[cfg(target_os = "linux")]
+    {
+        vm_resources.transparent_huge_pages = builder_cfg.transparent_huge_pages;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = builder_cfg.transparent_huge_pages;
     vm_resources.acpi_enabled = builder_cfg.acpi;
     if !builder_cfg.smbios_oem_strings.is_empty() {
         vm_resources.smbios_oem_strings = Some(builder_cfg.smbios_oem_strings);
@@ -438,10 +520,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         vm_resources.kernel_console = Some(console);
     }
 
-    #[cfg(unix)]
-    {
-        vm_resources.serial_consoles = builder_cfg.serial_consoles;
-    }
+    vm_resources.serial_consoles = builder_cfg.serial_consoles;
 
     let mut event_manager =
         EventManager::new().map_err(|e| VmmError::Internal(format!("{e:?}")))?;
@@ -504,6 +583,9 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
             _worker_sender: sender,
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             shutdown_efd,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            pause_supported: !cfg!(any(feature = "amd-sev", feature = "tdx"))
+                && !builder_cfg.split_irqchip,
         },
         _lifetime: PhantomData,
     })

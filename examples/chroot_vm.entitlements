@@ -4,7 +4,5 @@
 <dict>
 	<key>com.apple.security.hypervisor</key>
 	<true/>
-	<key>com.apple.security.cs.disable-library-validationr</key>
-	<true/>
 </dict>
 </plist>

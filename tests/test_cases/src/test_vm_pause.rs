@@ -1,7 +1,8 @@
-//! Live pause/resume test. macOS/HVF only (the mechanism is HVF for now).
+//! Live pause/resume test, on macOS/HVF and Linux/KVM.
 //!
-//! Boots a 2-vCPU microVM running a fixed monotonic-clock workload, then from
-//! another thread pauses and resumes it across several cycles while asserting:
+//! Boots a 2-vCPU microVM running a fixed monotonic-clock workload. After the
+//! first heartbeat, another thread pauses and resumes the guest across several
+//! cycles while asserting:
 //!   - `DONE` present  -> every resume woke the guest (otherwise it hangs paused
 //!     forever and the runner times out).
 //!   - exactly `WORKLOAD_ITERS` heartbeats -> the guest ran to completion, no
@@ -9,22 +10,13 @@
 //!   - guest's own elapsed ms stays near the workload length -> the virtual timer
 //!     was frozen across each pause (no en-masse catch-up on wake), and the
 //!     per-vCPU offsets stayed in lockstep.
-//!   - a `resumed` marker file written only after the final `krun_vm_resume` ->
+//!   - a `resumed` marker file written after the final resume request ->
 //!     the pauses held the guest well past its natural completion time. A no-op
 //!     pause lets the guest power off (which `libc::exit`s the whole process,
 //!     killing the pause thread) before the marker is ever written.
 //!
-//! Two properties are checked by construction rather than by assertion, because
-//! a regression makes the whole run hang and trips the timeout:
-//!   - With 2 vCPUs, the core not running the workload is parked in WFE at pause
-//!     time. It can only acknowledge the pause if the park point also watches the
-//!     pause channel -- otherwise `Vmm::pause` blocks forever awaiting its ack.
-//!   - The second pause/resume in each cycle is a no-op that must return without
-//!     re-signalling the (already parked) vCPUs; a missing idempotency guard
-//!     deadlocks the event loop.
-//!   - A pause immediately followed by a resume reaches the event loop in a
-//!     single wakeup. Observing them out of order would no-op the resume and
-//!     leave the guest frozen.
+//! The schedule also exercises repeated pause and resume requests and a pause
+//! immediately followed by a resume.
 //!
 //! The process exits on guest poweroff, so host timing can't be measured around
 //! `vmm.run()` (it never returns) -- hence the marker rather than a timer.
@@ -35,6 +27,7 @@ pub struct TestVmPause;
 
 const WORKLOAD_ITERS: u32 = 50;
 const WORKLOAD_INTERVAL_MS: u64 = 100;
+const FIRST_HEARTBEAT_FILE: &str = "vm-pause-first-heartbeat";
 
 #[host]
 mod host {
@@ -45,7 +38,6 @@ mod host {
     const NUM_CPUS: u8 = 2;
     const WORKLOAD_MS: u64 = WORKLOAD_ITERS as u64 * WORKLOAD_INTERVAL_MS;
     const CYCLES: u32 = 2;
-    const SETTLE_MS: u64 = 1_500;
     const PAUSE_MS: u64 = 5_000;
     const GAP_MS: u64 = 1_500;
     const IDEM_GAP_MS: u64 = 200;
@@ -62,8 +54,8 @@ mod host {
 
     impl Test for TestVmPause {
         fn should_run(&self) -> ShouldRun {
-            if !cfg!(target_os = "macos") {
-                return ShouldRun::No("pause/resume is macOS/HVF only");
+            if !cfg!(any(target_os = "macos", target_os = "linux")) {
+                return ShouldRun::No("pause/resume is macOS/HVF and Linux/KVM only");
             }
             ShouldRun::Yes
         }
@@ -85,6 +77,8 @@ mod host {
                 .apply(&mut overlay, &mut payload)
                 .map_err(|e| anyhow::anyhow!("Config::apply: {e}"))?;
             rootfs.set_overlay(overlay);
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            payload.append_cmdline("clocksource=kvm-clock");
 
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
@@ -119,12 +113,13 @@ mod host {
                 .handle()
                 .map_err(|e| anyhow::anyhow!("vmm.handle: {e:?}"))?;
 
+            let first_heartbeat = root_dir.join(FIRST_HEARTBEAT_FILE);
             let marker = test_setup.tmp_dir.join("resumed");
             std::thread::spawn(move || {
-                sleep_ms(SETTLE_MS);
-                while handle.pause().is_err() {
-                    sleep_ms(50);
+                while !first_heartbeat.exists() {
+                    sleep_ms(10);
                 }
+                handle.pause().expect("tight pause");
                 handle.resume().expect("tight resume");
 
                 for cycle in 0..CYCLES {
@@ -200,6 +195,9 @@ mod guest {
             for i in 0..WORKLOAD_ITERS {
                 println!("HEARTBEAT {i}");
                 let _ = std::io::stdout().flush();
+                if i == 0 {
+                    std::fs::write(FIRST_HEARTBEAT_FILE, b"").expect("signal first heartbeat");
+                }
                 std::thread::sleep(std::time::Duration::from_millis(WORKLOAD_INTERVAL_MS));
             }
             println!("DONE {}", start.elapsed().as_millis());

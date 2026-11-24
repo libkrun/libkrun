@@ -79,7 +79,7 @@ fn check_terminal_responses(test_name: &str, control: VmCtl) {
         exit_code: Arc::new(AtomicI32::new(init_exit_code)),
         mmio_device_manager: MMIODeviceManager::new(
             &mut mmio_base,
-            IrqAllocator::new(IRQ_BASE, IRQ_MAX),
+            IrqAllocator::new(IRQ_BASE, IRQ_MAX, &[]),
         ),
         vm_ctl_tx,
         vm_ctl_rx,

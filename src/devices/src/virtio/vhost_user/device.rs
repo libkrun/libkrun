@@ -376,7 +376,8 @@ impl VhostUserDevice {
             .collect();
 
         let gpu_display_info = if device_type == VIRTIO_ID_GPU {
-            Some(gpu_display.unwrap_or_else(|| DisplayInfo::new(1024, 768)))
+            // Allow headless mode: no default display if None provided
+            gpu_display
         } else {
             None
         };

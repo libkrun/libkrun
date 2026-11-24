@@ -11,9 +11,14 @@ extern crate krun_init_cdylib as krun_init;
 mod test_vm_config;
 use test_vm_config::TestVmConfig;
 
-#[cfg(any(feature = "guest", target_os = "macos"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod test_invariant_tsc;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use test_invariant_tsc::TestInvariantTsc;
+
+#[cfg(any(feature = "guest", target_os = "macos", target_os = "linux"))]
 mod test_vm_pause;
-#[cfg(any(feature = "guest", target_os = "macos"))]
+#[cfg(any(feature = "guest", target_os = "macos", target_os = "linux"))]
 use test_vm_pause::TestVmPause;
 
 mod test_acpi_smp;
@@ -53,6 +58,16 @@ use test_vsock_guest_connect_refused::TestVsockGuestConnectRefused;
 mod test_vsock_guest_connect_emfile;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_vsock_guest_connect_emfile::TestVsockGuestConnectEmfile;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_init_control;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_init_control::TestInitControl;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_virtiofs_host_changes;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_virtiofs_host_changes::TestVirtiofsHostChanges;
 
 mod test_tsi_tcp_guest_connect;
 use test_tsi_tcp_guest_connect::TestTsiTcpGuestConnect;
@@ -179,7 +194,26 @@ pub fn test_cases() -> Vec<TestCase> {
                 ram_mib: 1024,
             }),
         ),
-        #[cfg(any(feature = "guest", target_os = "macos"))]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "cpu-invariant-tsc-default",
+            Box::new(TestInvariantTsc { enabled: None }),
+        ),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "cpu-invariant-tsc-disabled",
+            Box::new(TestInvariantTsc {
+                enabled: Some(false),
+            }),
+        ),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "cpu-invariant-tsc-enabled",
+            Box::new(TestInvariantTsc {
+                enabled: Some(true),
+            }),
+        ),
+        #[cfg(any(feature = "guest", target_os = "macos", target_os = "linux"))]
         TestCase::new("vm-pause", Box::new(TestVmPause)),
         TestCase::new("acpi-smp-4cpu", Box::new(TestAcpiSmp { num_cpus: 4 })),
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -213,6 +247,8 @@ pub fn test_cases() -> Vec<TestCase> {
             "vsock-guest-connect-emfile",
             Box::new(TestVsockGuestConnectEmfile),
         ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("init-control", Box::new(TestInitControl)),
         TestCase::new(
             "tsi-tcp-guest-connect",
             Box::new(TestTsiTcpGuestConnect::new()),
@@ -242,6 +278,8 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("virtiofs-misc", Box::new(TestVirtioFsMisc)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-fixed-owner", Box::new(TestVirtiofsFixedOwner)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("virtiofs-host-changes", Box::new(TestVirtiofsHostChanges)),
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         TestCase::new("virtio-pci", Box::new(TestVirtioPci)),
         #[cfg(target_os = "linux")]

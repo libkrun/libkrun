@@ -5,6 +5,7 @@
 //! 8254 Programmable Interval Timer (PIT) implementation directly ported from crosvm
 //! https://github.com/google/crosvm/blob/main/devices/src/pit.rs
 
+use std::array::from_fn;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -345,19 +346,15 @@ impl PitCounter {
 }
 
 pub struct Pit {
-    counters: Vec<Arc<Mutex<PitCounter>>>,
+    counters: [Arc<Mutex<PitCounter>>; NUM_OF_COUNTERS],
     stop_worker: Arc<AtomicBool>,
     worker_thread: Option<JoinHandle<()>>,
 }
 
 impl Pit {
     pub fn new(interrupt_evt: EventFd) -> Self {
-        let mut counters = Vec::with_capacity(NUM_OF_COUNTERS);
         let mut evt = Some(interrupt_evt);
-
-        for i in 0..NUM_OF_COUNTERS {
-            counters.push(Arc::new(Mutex::new(PitCounter::new(i, evt.take()))));
-        }
+        let counters = from_fn(|i| Arc::new(Mutex::new(PitCounter::new(i, evt.take()))));
 
         let stop_worker = Arc::new(AtomicBool::new(false));
         let worker_stop = stop_worker.clone();
@@ -414,9 +411,9 @@ impl Pit {
             let latch_count = (control_word & 0x20) == 0;
             let latch_status = (control_word & 0x10) == 0;
 
-            for i in 0..3 {
-                if (control_word & (1 << (i + 1))) != 0 {
-                    let mut ch = self.counters[i].lock().unwrap();
+            for (index, counter) in self.counters.iter().enumerate() {
+                if (control_word & (1 << (index + 1))) != 0 {
+                    let mut ch = counter.lock().unwrap();
                     if latch_count {
                         ch.latch_counter();
                     }

@@ -15,6 +15,7 @@ Provides virtualization-based isolation for standard OCI container workloads (e.
 - **Configuration**: Guest parameters (argv, environment, working directory, rlimits, mounts) constructed using `krun_init_blob::Builder` or parsed directly from OCI `config.json` via `Builder::from_oci_json()`.
 - **Filesystem**: Root filesystem mapped via `FsDevice` (virtiofs) with in-memory injection of the init binary (`/init.krun`) and configuration (`/.krun_config.json`) via `FsOverlay`.
 - **Networking**: Transparent Socket Impersonation (TSI) via `VsockDevice` (zero-configuration host network sharing) or virtual network interface via `NetDevice` paired with `passt` or `gvproxy`.
+- **Running-container control (Unix hosts)**: A runtime can configure `Builder::control_socket`, apply the init configuration with `Config::apply_with_vsock`, and connect with `Controller::open`. `Controller::exec_pipes` or `exec_tty` supplies the process and terminal operations needed for `podman exec` and health checks; `Controller::signal_entrypoint` supplies the workload signal needed for `podman stop`. The runtime must retain the control socket path and wire these calls into its container lifecycle. This channel is unavailable with `KRUN_INIT_PID1=1`.
 - **Consumers**: Podman / [`crun --krun`](https://github.com/containers/crun/blob/main/krun.1.md), `examples/chroot_vm.c`.
 
 ---

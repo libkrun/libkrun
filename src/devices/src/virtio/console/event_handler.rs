@@ -55,20 +55,16 @@ impl Console {
             .subscriber(self.activate_evt.as_raw_fd())
             .unwrap();
 
-        for queue_index in 0..self.queues.len() {
+        for (index, event) in self.queue_events.iter().enumerate().take(self.queues.len()) {
+            let fd = event.as_raw_fd();
             event_manager
                 .register(
-                    self.queue_events[queue_index].as_raw_fd(),
-                    EpollEvent::new(
-                        EventSet::IN,
-                        self.queue_events[queue_index].as_raw_fd() as u64,
-                    ),
+                    fd,
+                    EpollEvent::new(EventSet::IN, fd as u64),
                     self_subscriber.clone(),
                 )
                 .unwrap_or_else(|e| {
-                    error!(
-                        "Failed to register queue index {queue_index} with event manager: {e:?}"
-                    );
+                    error!("Failed to register queue index {index} with event manager: {e:?}");
                 });
         }
 

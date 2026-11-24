@@ -2,6 +2,7 @@
 members = [
     "src/libkrun",
     "init/init-blob",
+    "init/common",
     "src/input",
     "src/display",
     "src/utils",

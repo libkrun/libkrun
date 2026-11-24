@@ -338,6 +338,18 @@ typedef KrunResult (*krun_fs_device_set_fixed_owner_fn)(KrunFsDevice handle, uin
  */
 KrunResult krun_fs_device_set_cache_policy(KrunFsDevice handle, uint32_t policy, KrunError* err_out);
 typedef KrunResult (*krun_fs_device_set_cache_policy_fn)(KrunFsDevice handle, uint32_t policy, KrunError* err_out);
+/**
+ * Set how long the guest may cache lookups and attributes, before attaching this device.
+ *
+ * Both default to 5000 ms. Files changed outside the guest can look stale until the
+ * timeouts expire: a file that grew on the host is read with its old size. Use 0 for
+ * directories the host modifies while the guest uses them, at the cost of one more
+ * request to the server per lookup or attribute read. With `LinuxSimplified`
+ * attributes are never cached, and `attr_timeout_ms` applies again after switching to
+ * another mode. A NullFs device has no host-backed entries and returns `InvalidParam`.
+ */
+KrunResult krun_fs_device_set_cache_timeouts(KrunFsDevice handle, uint32_t entry_timeout_ms, uint32_t attr_timeout_ms, KrunError* err_out);
+typedef KrunResult (*krun_fs_device_set_cache_timeouts_fn)(KrunFsDevice handle, uint32_t entry_timeout_ms, uint32_t attr_timeout_ms, KrunError* err_out);
 void krun_fs_device_destroy(KrunFsDevice handle);
 typedef void (*krun_fs_device_destroy_fn)(KrunFsDevice handle);
 #endif
@@ -525,6 +537,16 @@ typedef void (*krun_vmm_builder_set_kernel_console_fn)(KrunVmmBuilder* handle, K
 KrunResult krun_vmm_builder_add_serial_console(KrunVmmBuilder* handle, int input_fd, int output_fd, KrunError* err_out);
 typedef KrunResult (*krun_vmm_builder_add_serial_console_fn)(KrunVmmBuilder* handle, int input_fd, int output_fd, KrunError* err_out);
 #endif
+#if defined(_WIN32)
+/**
+ * Add a legacy serial console device with the given Windows handles.
+ *
+ * Can be called multiple times to add multiple serial consoles (ttyS0, ttyS1, …).
+ * The handles are borrowed, not duplicated. They must remain valid until the VMM exits.
+ */
+KrunResult krun_vmm_builder_add_serial_console(KrunVmmBuilder* handle, void * input_handle, void * output_handle, KrunError* err_out);
+typedef KrunResult (*krun_vmm_builder_add_serial_console_fn)(KrunVmmBuilder* handle, void * input_handle, void * output_handle, KrunError* err_out);
+#endif
 void krun_vmm_builder_nested_virt(KrunVmmBuilder* handle, bool enabled);
 typedef void (*krun_vmm_builder_nested_virt_fn)(KrunVmmBuilder* handle, bool enabled);
 /**
@@ -539,8 +561,27 @@ typedef void (*krun_vmm_builder_nested_virt_fn)(KrunVmmBuilder* handle, bool ena
  */
 void krun_vmm_builder_reset_exit_code(KrunVmmBuilder* handle, uint8_t code);
 typedef void (*krun_vmm_builder_reset_exit_code_fn)(KrunVmmBuilder* handle, uint8_t code);
+/**
+ * Expose the host's invariant TSC capability to x86_64 guests.
+ *
+ * Disabled by default so Linux guests can prefer a paravirtual clock.
+ * Enabling this preserves backend support for CPUID.80000007H:EDX[8];
+ * it does not add support when the host lacks it.
+ */
+KrunResult krun_vmm_builder_invariant_tsc(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
+typedef KrunResult (*krun_vmm_builder_invariant_tsc_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 KrunResult krun_vmm_builder_split_irqchip(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 typedef KrunResult (*krun_vmm_builder_split_irqchip_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
+/**
+ * Ask for transparent huge pages for guest memory.
+ *
+ * Advises `MADV_HUGEPAGE` on guest memory, so a host with THP set to
+ * `madvise` backs it with huge pages. Building the VM fails if the host
+ * kernel is built without transparent huge page support. Only supported
+ * on Linux.
+ */
+KrunResult krun_vmm_builder_transparent_huge_pages(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
+typedef KrunResult (*krun_vmm_builder_transparent_huge_pages_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 /**
  * Enable ACPI table generation for x86_64 guests.
  *
@@ -583,8 +624,21 @@ typedef void (*krun_vmm_destroy_fn)(KrunVmm handle);
 
 /* VmmHandle --------------------------------------------------------- */
 
+/**
+ * Request a VM pause. Success means the request was queued.
+ * The VMM processes it asynchronously and logs any execution failures.
+ *
+ * Returns [`VmmError::FeatureDisabled`] on Windows, for SEV and TDX guests,
+ * and with a split irqchip.
+ */
 KrunResult krun_vmm_handle_pause(KrunVmmHandle handle, KrunError* err_out);
 typedef KrunResult (*krun_vmm_handle_pause_fn)(KrunVmmHandle handle, KrunError* err_out);
+/**
+ * Request that a paused VM resume. Success means the request was queued.
+ * The VMM processes it asynchronously and logs any execution failures.
+ *
+ * Returns [`VmmError::FeatureDisabled`] where [`VmmHandle::pause`] does.
+ */
 KrunResult krun_vmm_handle_resume(KrunVmmHandle handle, KrunError* err_out);
 typedef KrunResult (*krun_vmm_handle_resume_fn)(KrunVmmHandle handle, KrunError* err_out);
 /**
@@ -749,6 +803,14 @@ void krun_display_info_builder_physical_size(KrunDisplayInfoBuilder* handle, uin
 typedef void (*krun_display_info_builder_physical_size_fn)(KrunDisplayInfoBuilder* handle, uint16_t width_mm, uint16_t height_mm);
 void krun_display_info_builder_refresh_rate(KrunDisplayInfoBuilder* handle, uint32_t rate);
 typedef void (*krun_display_info_builder_refresh_rate_fn)(KrunDisplayInfoBuilder* handle, uint32_t rate);
+/**
+ * Set the PNP manufacturer ID and product name of the generated EDID.
+ *
+ * `manufacturer` must be exactly 3 ASCII uppercase letters and
+ * `display_name` at most 13 bytes, matching the EDID descriptor limits.
+ */
+KrunResult krun_display_info_builder_edid_name(KrunDisplayInfoBuilder* handle, KrunStr manufacturer, KrunStr display_name, KrunError* err_out);
+typedef KrunResult (*krun_display_info_builder_edid_name_fn)(KrunDisplayInfoBuilder* handle, KrunStr manufacturer, KrunStr display_name, KrunError* err_out);
 void krun_display_info_builder_destroy(KrunDisplayInfoBuilder handle);
 typedef void (*krun_display_info_builder_destroy_fn)(KrunDisplayInfoBuilder handle);
 #if (defined(__linux__) && !defined(__ANDROID__))

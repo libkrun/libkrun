@@ -117,9 +117,15 @@ impl PciHostManager {
         }
         let irq = self.irqs.alloc().map_err(|_| Error::IrqsExhausted)?;
         let intx_line = Arc::new(KvmPciIntxLine { vm, gsi: irq });
-        let transport =
-            VirtioPciTransport::new(guest_memory, device, irq as u8, intx_line, bar_base as u32)
-                .map_err(Error::CreateTransport)?;
+        let transport = VirtioPciTransport::new(
+            guest_memory,
+            device,
+            irq as u8,
+            intx_line,
+            None,
+            bar_base as u32,
+        )
+        .map_err(Error::CreateTransport)?;
 
         let function: Arc<Mutex<dyn PciFunction>> = Arc::new(Mutex::new(transport));
         self.root
@@ -225,7 +231,7 @@ mod tests {
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
 
-        let irqs = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX);
+        let irqs = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, arch::IRQ_RESERVED);
         let mut mmio = MMIODeviceManager::new(&mut 0xd000_0000, irqs.clone());
         let mut pci = PciHostManager::new(irqs);
 
@@ -244,12 +250,22 @@ mod tests {
             .register_virtio_device(vm.fd_shared(), guest_mem.clone(), dummy_device())
             .unwrap();
         let second = pci
+            .register_virtio_device(vm.fd_shared(), guest_mem.clone(), dummy_device())
+            .unwrap();
+        // The third PCI device would land on IRQ_RTC_CMOS and is pushed past
+        // it; allocation continues normally afterwards.
+        let third = pci
+            .register_virtio_device(vm.fd_shared(), guest_mem.clone(), dummy_device())
+            .unwrap();
+        let fourth = pci
             .register_virtio_device(vm.fd_shared(), guest_mem, dummy_device())
             .unwrap();
 
         assert_eq!(mmio_irq, arch::IRQ_BASE);
         assert_eq!(first.gsi, arch::IRQ_BASE + 1);
         assert_eq!(second.gsi, arch::IRQ_BASE + 2);
+        assert_eq!(third.gsi, arch::IRQ_RTC_CMOS + 1);
+        assert_eq!(fourth.gsi, arch::IRQ_RTC_CMOS + 2);
     }
 
     #[test]
@@ -258,7 +274,7 @@ mod tests {
         let mut arch_mem_info = arch::ArchMemoryInfo::default();
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
 
-        let irqs = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_BASE);
+        let irqs = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_BASE, &[]);
         // Another manager already took the only IRQ.
         irqs.alloc().unwrap();
         let mut pci = PciHostManager::new(irqs);

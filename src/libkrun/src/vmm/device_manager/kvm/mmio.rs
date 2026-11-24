@@ -325,11 +325,21 @@ mod tests {
     use devices::virtio::{
         ActivateResult, DeviceQueue, InterruptTransport, QueueConfig, VirtioDevice,
     };
+    use libc::{_SC_PAGESIZE, sysconf};
     use std::sync::Arc;
     use utils::errno;
     use vm_memory::{GuestAddress, GuestMemoryMmap};
 
     const QUEUE_CONFIG: &[QueueConfig] = &[QueueConfig::new(64)];
+
+    fn guest_memory() -> GuestMemoryMmap {
+        let page_size: usize = unsafe { sysconf(_SC_PAGESIZE).try_into().unwrap() };
+        GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), page_size),
+            (GuestAddress(page_size as u64), page_size),
+        ])
+        .unwrap()
+    }
 
     impl MMIODeviceManager {
         fn register_virtio_device(
@@ -412,15 +422,12 @@ mod tests {
 
     #[test]
     fn test_register_virtio_device() {
-        let start_addr1 = GuestAddress(0x0);
-        let start_addr2 = GuestAddress(0x1000);
-        let guest_mem =
-            GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+        let guest_mem = guest_memory();
         let mut arch_mem_info = arch::ArchMemoryInfo::default();
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
         let mut device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
         #[cfg(target_arch = "x86_64")]
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
@@ -439,15 +446,12 @@ mod tests {
 
     #[test]
     fn test_register_too_many_devices() {
-        let start_addr1 = GuestAddress(0x0);
-        let start_addr2 = GuestAddress(0x1000);
-        let guest_mem =
-            GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+        let guest_mem = guest_memory();
         let mut arch_mem_info = arch::ArchMemoryInfo::default();
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
         let mut device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
         #[cfg(target_arch = "x86_64")]
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
@@ -497,7 +501,7 @@ mod tests {
     fn test_error_messages() {
         let device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
         let e = Error::Cmdline(
@@ -543,15 +547,12 @@ mod tests {
 
     #[test]
     fn test_device_info() {
-        let start_addr1 = GuestAddress(0x0);
-        let start_addr2 = GuestAddress(0x1000);
-        let guest_mem =
-            GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+        let guest_mem = guest_memory();
         let mut arch_mem_info = arch::ArchMemoryInfo::default();
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
         let mut device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
@@ -578,15 +579,12 @@ mod tests {
     }
     #[test]
     fn test_virtio_mmio_devices() {
-        let start_addr1 = GuestAddress(0x0);
-        let start_addr2 = GuestAddress(0x1000);
-        let guest_mem =
-            GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+        let guest_mem = guest_memory();
         let mut arch_mem_info = arch::ArchMemoryInfo::default();
         let vm = builder::setup_vm(&guest_mem, &mut arch_mem_info, false).unwrap();
         let mut device_manager = MMIODeviceManager::new(
             &mut 0xd000_0000,
-            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX),
+            IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, &[]),
         );
         #[cfg(target_arch = "x86_64")]
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();

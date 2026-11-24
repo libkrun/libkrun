@@ -8,10 +8,14 @@
 
 use std::borrow::Cow;
 
+#[cfg(unix)]
+use crate::init_schema::ControlServerConfig;
 use crate::init_schema::{ConfigSchema, Mount};
 use crate::oci_schema::OciSchema;
 #[cfg(feature = "ffi")]
 use crate::{FfiBorrow, FfiType};
+#[cfg(unix)]
+use krun_init_common::control::DEFAULT_VSOCK_PORT;
 
 #[cfg(feature = "krun")]
 pub type VmmError = krun::VmmError;
@@ -44,6 +48,11 @@ pub enum ApplyError {
     #[error("overlay error: {0}")]
     #[cfg_attr(feature = "ffi", ffier(code = 2, opaque))]
     OverlayError(VmmError),
+    /// A control socket was configured but `apply` was used instead of `apply_with_vsock`.
+    #[cfg(unix)]
+    #[error("the control socket needs a vsock device, use apply_with_vsock")]
+    #[cfg_attr(feature = "ffi", ffier(code = 3))]
+    ControlSocketWithoutVsock(),
 }
 
 /// Guest-side path of the init binary (e.g. for `init=` kernel arg).
@@ -60,12 +69,21 @@ pub(crate) struct GuestFile {
     pub one_shot: bool,
 }
 
+/// Host endpoint of the guest control server.
+#[cfg(unix)]
+pub(crate) struct ControlEndpoint {
+    pub socket_path: String,
+    pub vsock_port: u32,
+}
+
 /// Built init configuration. Immutable after construction.
 ///
 /// Holds the init binary and serialized config JSON as guest files.
 /// The caller **must keep this value alive for the entire lifetime of the VM**.
 pub struct Config {
     files: Vec<GuestFile>,
+    #[cfg(unix)]
+    control: Option<ControlEndpoint>,
 }
 
 #[cfg(feature = "ffi")]
@@ -80,6 +98,8 @@ impl Config {
     ///
     /// Adds the init binary and associated configuration file(s) as overlay
     /// files, and appends the init kernel command line argument to the payload.
+    /// On Unix, a configured control socket needs a vsock device; use
+    /// `apply_with_vsock` in that case.
     ///
     /// The caller must keep this `Config` (or `KrunInitConfig`) alive for the
     /// entire lifetime of the VM; `apply` borrows data pointers that remain
@@ -89,6 +109,43 @@ impl Config {
         #[ffier(foreign = ::libkrun_via_libc, c_name = "KrunFsOverlay")]
         overlay: &mut libkrun_via_libc::FsOverlay<'a>,
         #[ffier(foreign = ::libkrun_via_libc, c_name = "KrunPayload")]
+        payload: &mut libkrun_via_libc::Payload,
+    ) -> Result<(), ApplyError> {
+        #[cfg(unix)]
+        if self.control.is_some() {
+            return Err(ApplyError::ControlSocketWithoutVsock());
+        }
+        self.apply_files(overlay, payload)
+    }
+
+    /// Like [`apply`](Self::apply), and also map the control server's vsock
+    /// port to the configured control socket on `vsock`.
+    #[cfg(unix)]
+    pub fn apply_with_vsock<'a>(
+        &'a self,
+        #[ffier(foreign = ::libkrun_via_libc, c_name = "KrunFsOverlay")]
+        overlay: &mut libkrun_via_libc::FsOverlay<'a>,
+        #[ffier(foreign = ::libkrun_via_libc, c_name = "KrunPayload")]
+        payload: &mut libkrun_via_libc::Payload,
+        #[ffier(foreign = ::libkrun_via_libc, c_name = "KrunVsockDevice")]
+        vsock: &mut libkrun_via_libc::VsockDevice,
+    ) -> Result<(), ApplyError> {
+        if let Some(control) = &self.control {
+            libkrun_via_libc::ffi::require(&[
+                libkrun_via_libc::ffi::Symbol::KrunVsockDeviceAddUnixPort,
+            ])
+            .map_err(|e| ApplyError::SymbolNotFound(e.to_string().into()))?;
+            vsock.add_unix_port(control.vsock_port, &control.socket_path, true);
+        }
+        self.apply_files(overlay, payload)
+    }
+}
+
+#[cfg(feature = "ffi")]
+impl Config {
+    fn apply_files<'a>(
+        &'a self,
+        overlay: &mut libkrun_via_libc::FsOverlay<'a>,
         payload: &mut libkrun_via_libc::Payload,
     ) -> Result<(), ApplyError> {
         libkrun_via_libc::ffi::require(&[
@@ -122,6 +179,33 @@ impl Config {
         overlay: &mut krun::FsOverlay<'a>,
         payload: &mut krun::Payload,
     ) -> Result<(), ApplyError> {
+        #[cfg(unix)]
+        if self.control.is_some() {
+            return Err(ApplyError::ControlSocketWithoutVsock());
+        }
+        self.apply_files(overlay, payload)
+    }
+
+    /// Like [`apply`](Self::apply), and also map the control server's vsock
+    /// port to the configured control socket on `vsock`.
+    #[cfg(unix)]
+    pub fn apply_with_vsock<'a>(
+        &'a self,
+        overlay: &mut krun::FsOverlay<'a>,
+        payload: &mut krun::Payload,
+        vsock: &mut krun::VsockDevice,
+    ) -> Result<(), ApplyError> {
+        if let Some(control) = &self.control {
+            vsock.add_unix_port(control.vsock_port, &control.socket_path, true);
+        }
+        self.apply_files(overlay, payload)
+    }
+
+    fn apply_files<'a>(
+        &'a self,
+        overlay: &mut krun::FsOverlay<'a>,
+        payload: &mut krun::Payload,
+    ) -> Result<(), ApplyError> {
         for file in &self.files {
             overlay
                 .add_file(file.path, &file.data, file.mode, file.one_shot)
@@ -133,10 +217,27 @@ impl Config {
 }
 
 /// Builder for [`Config`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
+#[cfg_attr(not(unix), derive(Default))]
 pub struct Builder {
     inner: ConfigSchema,
     rlimits: Vec<String>,
+    #[cfg(unix)]
+    control_socket: Option<String>,
+    #[cfg(unix)]
+    control_vsock_port: u32,
+}
+
+#[cfg(unix)]
+impl Default for Builder {
+    fn default() -> Self {
+        Self {
+            inner: ConfigSchema::default(),
+            rlimits: Vec::new(),
+            control_socket: None,
+            control_vsock_port: DEFAULT_VSOCK_PORT,
+        }
+    }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export)]
@@ -151,7 +252,7 @@ impl Builder {
             .map_err(|e| ConfigError::InvalidJson(e.to_string().into()))?;
         Ok(Self {
             inner: oci.into(),
-            rlimits: Vec::new(),
+            ..Self::default()
         })
     }
 
@@ -227,6 +328,28 @@ impl Builder {
         self
     }
 
+    /// Run a control server in the guest and expose it to the host as the
+    /// Unix socket `path`.
+    ///
+    /// The server lets the host start additional processes in the running
+    /// VM ([`Controller::exec_pipes`](crate::Controller::exec_pipes),
+    /// [`exec_tty`](crate::Controller::exec_tty)) and deliver signals to
+    /// the workload ([`signal_entrypoint`](crate::Controller::signal_entrypoint)).
+    /// [`Config::apply_with_vsock`] maps the server's vsock port to `path` on
+    /// the vsock device it is given. Not available when the workload runs as PID 1.
+    #[cfg(unix)]
+    pub fn control_socket(mut self, path: &str) -> Self {
+        self.control_socket = Some(path.to_string());
+        self
+    }
+
+    /// Override the guest vsock port of the control server.
+    #[cfg(unix)]
+    pub fn control_vsock_port(mut self, port: u32) -> Self {
+        self.control_vsock_port = port;
+        self
+    }
+
     /// Set the root disk to remount on boot.
     pub fn set_root_disk_remount(
         mut self,
@@ -271,9 +394,23 @@ impl Builder {
             self.inner.process.env.push(format!("KRUN_RLIMITS={value}"));
         }
 
+        #[cfg(unix)]
+        let control = self.control_socket.map(|socket_path| ControlEndpoint {
+            socket_path,
+            vsock_port: self.control_vsock_port,
+        });
+        #[cfg(unix)]
+        if control.is_some() {
+            self.inner.control_server = Some(ControlServerConfig {
+                vsock_port: self.control_vsock_port,
+            });
+        }
+
         let config_json =
             serde_json::to_vec(&self.inner).expect("ConfigSchema serialization cannot fail");
         Config {
+            #[cfg(unix)]
+            control,
             files: vec![
                 GuestFile {
                     path: INIT_PATH,
@@ -324,6 +461,35 @@ mod tests {
             json["process"]["env"],
             serde_json::json!(["HOME=/root", "TERM=xterm-256color", "KRUN_RLIMITS=7=0:0"])
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn control_server_is_configured_only_with_a_socket() {
+        let cfg = Config::builder().args(&["/bin/sh"]).build();
+        assert!(parse_config_json(&cfg).get("control_server").is_none());
+        assert!(cfg.control.is_none());
+
+        let cfg = Config::builder()
+            .args(&["/bin/sh"])
+            .control_socket("/run/krun-init.sock")
+            .build();
+        assert_eq!(
+            parse_config_json(&cfg)["control_server"],
+            serde_json::json!({"vsock_port": DEFAULT_VSOCK_PORT})
+        );
+        let control = cfg.control.as_ref().unwrap();
+        assert_eq!(control.socket_path, "/run/krun-init.sock");
+
+        let cfg = Config::builder()
+            .control_socket("/run/krun-init.sock")
+            .control_vsock_port(1024)
+            .build();
+        assert_eq!(
+            parse_config_json(&cfg)["control_server"]["vsock_port"],
+            1024
+        );
+        assert_eq!(cfg.control.as_ref().unwrap().vsock_port, 1024);
     }
 
     #[test]
