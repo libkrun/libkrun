@@ -155,6 +155,12 @@ typedef void (*krun_str_free_fn)(KrunStr s);
 void krun_free_object_array(KrunObjectArray a);
 typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 
+/* Fixed-layout value structs */
+typedef struct {
+    uint16_t cols;
+    uint16_t rows;
+} KrunTermSize;
+
 
 /* KernelFormat ------------------------------------------------------ */
 
@@ -396,12 +402,17 @@ typedef KrunResult (*krun_console_builder_add_tty_port_fn)(KrunConsoleBuilder ha
 #endif
 #if (defined(__unix__) || defined(__APPLE__))
 /**
- * Add a port with separate borrowed input and output fds (no terminal
- * properties). The caller retains responsibility for the descriptors.
- * Pass `None` to disable that direction.
+ * Add a port with separate input/output fds; pass `None` to disable a direction.
+ * With `term_size`, the guest sees the port as a console (`/dev/hvcN`) with that fixed
+ * size; the guest numbers hvc devices by port add order.
+ * `name` is still reported to the guest, but a Linux guest does not link it to the hvc
+ * device and refuses to open `/dev/virtio-ports/<name>` for consoles. Without
+ * `term_size`, the port is a data port (`/dev/vportNpM`).
+ *
+ * The descriptors are borrowed and must remain open and valid until the VMM exits.
  */
-KrunResult krun_console_builder_add_inout_port(KrunConsoleBuilder handle, KrunStr name, int input_fd, int output_fd, uint32_t* result, KrunError* err_out);
-typedef KrunResult (*krun_console_builder_add_inout_port_fn)(KrunConsoleBuilder handle, KrunStr name, int input_fd, int output_fd, uint32_t* result, KrunError* err_out);
+KrunResult krun_console_builder_add_inout_port(KrunConsoleBuilder handle, KrunStr name, int input_fd, int output_fd, const KrunTermSize* term_size, uint32_t* result, KrunError* err_out);
+typedef KrunResult (*krun_console_builder_add_inout_port_fn)(KrunConsoleBuilder handle, KrunStr name, int input_fd, int output_fd, const KrunTermSize* term_size, uint32_t* result, KrunError* err_out);
 #endif
 /** Build the console device. At least one port must have been added. */
 KrunConsoleDevice krun_console_builder_build(KrunConsoleBuilder handle, KrunError* err_out);
@@ -430,8 +441,18 @@ KrunResult krun_console_builder_add_tty_port(KrunConsoleBuilder handle, KrunStr 
 typedef KrunResult (*krun_console_builder_add_tty_port_fn)(KrunConsoleBuilder handle, KrunStr name, void * tty_fd, uint32_t* result, KrunError* err_out);
 #endif
 #if defined(_WIN32)
-KrunResult krun_console_builder_add_inout_port(KrunConsoleBuilder handle, KrunStr name, void * input_fd, void * output_fd, uint32_t* result, KrunError* err_out);
-typedef KrunResult (*krun_console_builder_add_inout_port_fn)(KrunConsoleBuilder handle, KrunStr name, void * input_fd, void * output_fd, uint32_t* result, KrunError* err_out);
+/**
+ * Add a port with separate input/output fds; pass `None` to disable a direction.
+ * With `term_size`, the guest sees the port as a console (`/dev/hvcN`) with that fixed
+ * size; the guest numbers hvc devices by port add order.
+ * `name` is still reported to the guest, but a Linux guest does not link it to the hvc
+ * device and refuses to open `/dev/virtio-ports/<name>` for consoles. Without
+ * `term_size`, the port is a data port (`/dev/vportNpM`).
+ *
+ * The descriptors are borrowed and must remain open and valid until the VMM exits.
+ */
+KrunResult krun_console_builder_add_inout_port(KrunConsoleBuilder handle, KrunStr name, void * input_fd, void * output_fd, const KrunTermSize* term_size, uint32_t* result, KrunError* err_out);
+typedef KrunResult (*krun_console_builder_add_inout_port_fn)(KrunConsoleBuilder handle, KrunStr name, void * input_fd, void * output_fd, const KrunTermSize* term_size, uint32_t* result, KrunError* err_out);
 #endif
 #if defined(_WIN32)
 KrunResult krun_console_builder_add_default_console(KrunConsoleBuilder handle, void * stdin, void * stdout, void * stderr, KrunError* err_out);

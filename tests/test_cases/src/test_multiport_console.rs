@@ -37,7 +37,7 @@ mod host {
         name: &str,
     ) -> anyhow::Result<()> {
         builder
-            .add_inout_port(name, Some(guest.as_fd()), Some(guest.as_fd()))
+            .add_inout_port(name, Some(guest.as_fd()), Some(guest.as_fd()), None)
             .map_err(|e| anyhow::anyhow!("add_inout_port: {e:?}"))?;
         spawn_ping_pong_responder(host);
         Ok(())
