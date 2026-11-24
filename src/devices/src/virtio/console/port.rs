@@ -18,6 +18,9 @@ pub struct PortDescription {
     pub input: Option<Box<dyn PortInput + Send>>,
     pub output: Option<Box<dyn PortOutput + Send>>,
     pub terminal: Option<Box<dyn PortTerminalProperties>>,
+    /// Expose this port as a console (`/dev/hvcN`) rather than a data port.
+    /// Terminal ports are always consoles; this flag covers plain fd ports.
+    pub console: bool,
 }
 
 impl PortDescription {
@@ -31,6 +34,7 @@ impl PortDescription {
             input,
             output,
             terminal: Some(terminal),
+            console: true,
         }
     }
 
@@ -43,6 +47,7 @@ impl PortDescription {
             input: None,
             output: Some(output),
             terminal: None,
+            console: false,
         }
     }
 
@@ -55,6 +60,7 @@ impl PortDescription {
             input: Some(input),
             output: None,
             terminal: None,
+            console: false,
         }
     }
 }
@@ -77,6 +83,7 @@ pub(crate) struct Port {
     input: Option<Arc<Mutex<Box<dyn PortInput + Send>>>>,
     output: Option<Arc<Mutex<Box<dyn PortOutput + Send>>>>,
     terminal: Option<Box<dyn PortTerminalProperties>>,
+    console: bool,
 }
 
 impl Port {
@@ -89,6 +96,7 @@ impl Port {
             output: description
                 .output
                 .map(|output| Arc::new(Mutex::new(output))),
+            console: description.console || description.terminal.is_some(),
             terminal: description.terminal,
         }
     }
@@ -99,6 +107,11 @@ impl Port {
 
     pub fn terminal(&self) -> Option<&dyn PortTerminalProperties> {
         self.terminal.as_deref()
+    }
+
+    /// Whether the guest should see this port as a console (`/dev/hvcN`).
+    pub fn is_console(&self) -> bool {
+        self.console
     }
 
     pub fn notify_rx(&self) {

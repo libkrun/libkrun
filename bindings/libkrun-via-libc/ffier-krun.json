@@ -990,9 +990,8 @@
         {
           "name": "add_inout_port",
           "doc": [
-            " Add a port with separate borrowed input and output fds (no terminal",
-            " properties). The caller retains responsibility for the descriptors.",
-            " Pass `None` to disable that direction."
+            " Add a data port (`/dev/vportNpM`) with borrowed input/output fds; pass",
+            " `None` to disable a direction."
           ],
           "receiver": "mut",
           "params": [
@@ -1030,6 +1029,52 @@
             "c_convention": "out_param"
           },
           "ffi_name": "krun_console_builder_add_inout_port",
+          "cfg": {
+            "kind": "unix"
+          }
+        },
+        {
+          "name": "add_console_port",
+          "doc": [
+            " Like [`add_inout_port`](Self::add_inout_port), but the port is exposed to",
+            " the guest as a console (`/dev/hvcN`) instead of a data port."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "name",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "input_fd",
+              "param_kind": "regular",
+              "type": "BorrowedFd",
+              "type_args": [
+                "a"
+              ],
+              "optional": true
+            },
+            {
+              "name": "output_fd",
+              "param_kind": "regular",
+              "type": "BorrowedFd",
+              "type_args": [
+                "a"
+              ],
+              "optional": true
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "u32"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_console_builder_add_console_port",
           "cfg": {
             "kind": "unix"
           }

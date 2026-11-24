@@ -212,16 +212,16 @@ impl Console {
                         continue;
                     }
 
-                    if let Some(term) = self.ports[cmd.id as usize].terminal() {
+                    // Announce console ports so the guest exposes them as
+                    // /dev/hvcN; other ports stay data ports. All start opened.
+                    if self.ports[cmd.id as usize].is_console() {
                         self.control.mark_console_port(mem, cmd.id);
-                        self.control.port_open(cmd.id, true);
+                    }
+                    self.control.port_open(cmd.id, true);
+                    if let Some(term) = self.ports[cmd.id as usize].terminal() {
                         let (cols, rows) = term.get_win_size();
                         self.control
                             .console_resize(cmd.id, VirtioConsoleResize { cols, rows });
-                    } else {
-                        // We start with all ports open, this makes sense for now,
-                        // because underlying file descriptors STDIN, STDOUT, STDERR are always open too
-                        self.control.port_open(cmd.id, true)
                     }
 
                     let name = self.ports[cmd.id as usize].name();
