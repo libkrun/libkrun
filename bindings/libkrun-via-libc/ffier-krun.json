@@ -395,6 +395,13 @@
         }
       }
     },
+    "TermSize": {
+      "kind": {
+        "value_struct": {
+          "c_name": "KrunTermSize"
+        }
+      }
+    },
     "TsiFlags": {
       "kind": {
         "bitflags": {
@@ -990,9 +997,14 @@
         {
           "name": "add_inout_port",
           "doc": [
-            " Add a port with separate borrowed input and output fds (no terminal",
-            " properties). The caller retains responsibility for the descriptors.",
-            " Pass `None` to disable that direction."
+            " Add a port with separate input/output fds; pass `None` to disable a direction.",
+            " With `term_size`, the guest sees the port as a console (`/dev/hvcN`) with that fixed",
+            " size; the guest numbers hvc devices by port add order.",
+            " `name` is still reported to the guest, but a Linux guest does not link it to the hvc",
+            " device and refuses to open `/dev/virtio-ports/<name>` for consoles. Without",
+            " `term_size`, the port is a data port (`/dev/vportNpM`).",
+            "",
+            " The descriptors are borrowed and must remain open and valid until the VMM exits."
           ],
           "receiver": "mut",
           "params": [
@@ -1018,6 +1030,13 @@
               "type_args": [
                 "a"
               ],
+              "optional": true
+            },
+            {
+              "name": "term_size",
+              "param_kind": "regular",
+              "type": "TermSize",
+              "ref_kind": "shared",
               "optional": true
             }
           ],
@@ -1146,6 +1165,16 @@
         },
         {
           "name": "add_inout_port",
+          "doc": [
+            " Add a port with separate input/output fds; pass `None` to disable a direction.",
+            " With `term_size`, the guest sees the port as a console (`/dev/hvcN`) with that fixed",
+            " size; the guest numbers hvc devices by port add order.",
+            " `name` is still reported to the guest, but a Linux guest does not link it to the hvc",
+            " device and refuses to open `/dev/virtio-ports/<name>` for consoles. Without",
+            " `term_size`, the port is a data port (`/dev/vportNpM`).",
+            "",
+            " The descriptors are borrowed and must remain open and valid until the VMM exits."
+          ],
           "receiver": "mut",
           "params": [
             {
@@ -1170,6 +1199,13 @@
               "type_args": [
                 "a"
               ],
+              "optional": true
+            },
+            {
+              "name": "term_size",
+              "param_kind": "regular",
+              "type": "TermSize",
+              "ref_kind": "shared",
               "optional": true
             }
           ],
@@ -3340,6 +3376,22 @@
         "kind": "feature",
         "value": "input"
       }
+    }
+  ],
+  "value_structs": [
+    {
+      "name": "TermSize",
+      "c_name": "KrunTermSize",
+      "fields": [
+        {
+          "name": "cols",
+          "type": "u16"
+        },
+        {
+          "name": "rows",
+          "type": "u16"
+        }
+      ]
     }
   ],
   "errors": [

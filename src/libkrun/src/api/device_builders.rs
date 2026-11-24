@@ -856,6 +856,15 @@ pub struct ConsoleDevice<'a> {
     _lifetime: PhantomData<&'a ()>,
 }
 
+/// Fixed terminal size reported to the guest for a console port.
+#[cfg_attr(feature = "ffi", ffier::export)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TermSize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
 /// Builder for configuring a [`ConsoleDevice`].
 ///
 /// Add one or more ports with [`add_tty_port`](ConsoleBuilder::add_tty_port),
@@ -912,15 +921,21 @@ impl<'a> ConsoleBuilder<'a> {
         Ok(index)
     }
 
-    /// Add a port with separate borrowed input and output fds (no terminal
-    /// properties). The caller retains responsibility for the descriptors.
-    /// Pass `None` to disable that direction.
+    /// Add a port with separate input/output fds; pass `None` to disable a direction.
+    /// With `term_size`, the guest sees the port as a console (`/dev/hvcN`) with that fixed
+    /// size; the guest numbers hvc devices by port add order.
+    /// `name` is still reported to the guest, but a Linux guest does not link it to the hvc
+    /// device and refuses to open `/dev/virtio-ports/<name>` for consoles. Without
+    /// `term_size`, the port is a data port (`/dev/vportNpM`).
+    ///
+    /// The descriptors are borrowed and must remain open and valid until the VMM exits.
     #[cfg(unix)]
     pub fn add_inout_port(
         &mut self,
         name: &str,
         input_fd: Option<BorrowedFd<'a>>,
         output_fd: Option<BorrowedFd<'a>>,
+        term_size: Option<&TermSize>,
     ) -> Result<u32, VmmError> {
         let index = self.ports.len() as u32;
         let input = input_fd
@@ -943,7 +958,9 @@ impl<'a> ConsoleBuilder<'a> {
             name: name.to_string().into(),
             input,
             output,
-            terminal: None,
+            terminal: term_size.map(|s| -> Box<dyn port_io::PortTerminalProperties> {
+                port_io::term_fixed_size(s.cols, s.rows)
+            }),
         });
         Ok(index)
     }
@@ -1050,13 +1067,13 @@ impl<'a> ConsoleBuilder<'a> {
 
         // Named redirect ports for non-terminal fds
         if stdin.is_some() && !stdin_is_tty {
-            self.add_inout_port("krun-stdin", stdin, None)?;
+            self.add_inout_port("krun-stdin", stdin, None, None)?;
         }
         if stdout.is_some() && !stdout_is_tty {
-            self.add_inout_port("krun-stdout", None, stdout)?;
+            self.add_inout_port("krun-stdout", None, stdout, None)?;
         }
         if stderr.is_some() && !stderr_is_tty {
-            self.add_inout_port("krun-stderr", None, stderr)?;
+            self.add_inout_port("krun-stderr", None, stderr, None)?;
         }
 
         Ok(())
@@ -1073,12 +1090,21 @@ impl<'a> ConsoleBuilder<'a> {
         Ok(index)
     }
 
+    /// Add a port with separate input/output fds; pass `None` to disable a direction.
+    /// With `term_size`, the guest sees the port as a console (`/dev/hvcN`) with that fixed
+    /// size; the guest numbers hvc devices by port add order.
+    /// `name` is still reported to the guest, but a Linux guest does not link it to the hvc
+    /// device and refuses to open `/dev/virtio-ports/<name>` for consoles. Without
+    /// `term_size`, the port is a data port (`/dev/vportNpM`).
+    ///
+    /// The descriptors are borrowed and must remain open and valid until the VMM exits.
     #[cfg(windows)]
     pub fn add_inout_port(
         &mut self,
         name: &str,
         input_fd: Option<BorrowedHandle<'a>>,
         output_fd: Option<BorrowedHandle<'a>>,
+        term_size: Option<&TermSize>,
     ) -> Result<u32, VmmError> {
         let index = self.ports.len() as u32;
         let input = input_fd
@@ -1101,7 +1127,9 @@ impl<'a> ConsoleBuilder<'a> {
             name: name.to_string().into(),
             input,
             output,
-            terminal: None,
+            terminal: term_size.map(|s| -> Box<dyn port_io::PortTerminalProperties> {
+                port_io::term_fixed_size(s.cols, s.rows)
+            }),
         });
         Ok(index)
     }
@@ -1187,13 +1215,13 @@ impl<'a> ConsoleBuilder<'a> {
 
         // Named redirect ports for non-terminal fds
         if stdin.is_some() && !stdin_is_tty {
-            self.add_inout_port("krun-stdin", stdin, None)?;
+            self.add_inout_port("krun-stdin", stdin, None, None)?;
         }
         if stdout.is_some() && !stdout_is_tty {
-            self.add_inout_port("krun-stdout", None, stdout)?;
+            self.add_inout_port("krun-stdout", None, stdout, None)?;
         }
         if stderr.is_some() && !stderr_is_tty {
-            self.add_inout_port("krun-stderr", None, stderr)?;
+            self.add_inout_port("krun-stderr", None, stderr, None)?;
         }
 
         Ok(())

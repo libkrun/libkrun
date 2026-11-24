@@ -53,7 +53,7 @@ pub use device_builders::{
     AttachContext, AttachDevice, DeviceManager, DeviceRequirements, MmioDeviceManager,
     ResolvedShmRegion, TsiFlags, VsockDevice,
 };
-pub use device_builders::{ConsoleBuilder, ConsoleDevice};
+pub use device_builders::{ConsoleBuilder, ConsoleDevice, TermSize};
 #[cfg(any(feature = "gpu", feature = "vhost-user"))]
 pub use device_builders::{DisplayBackend, DisplayInfoBuilder};
 #[cfg(feature = "gpu")]
@@ -88,6 +88,7 @@ ffier::library_definition!("krun", library_tag = 1,
     crate::api::device_builders::FsDevice<'_> = 3,
     crate::api::device_builders::ConsoleDevice<'_> = 4,
     crate::api::device_builders::ConsoleBuilder<'_> = 5,
+    value crate::api::device_builders::TermSize,
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     crate::api::device_builders::FsOverlay<'_> = 6,
     crate::api::payload::Payload = 8,

@@ -225,7 +225,7 @@ int main(int argc, char *const argv[])
             return 1;
         }
         uint32_t port_idx;
-        CHECK(krun_console_builder_add_inout_port(cb, KRUN_STR("fifo_inout"), in_fd, out_fd, &port_idx, &krun_err));
+        CHECK(krun_console_builder_add_inout_port(cb, KRUN_STR("fifo_inout"), in_fd, out_fd, NULL, &port_idx, &krun_err));
 
         fprintf(stderr, "\n=== Console ports configured ===\n");
         for (int i = 0; i < num_consoles; i++) {
