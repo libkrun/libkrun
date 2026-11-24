@@ -1218,22 +1218,6 @@ impl<'a> ConsoleBuilder<'a> {
         index
     }
 
-    /// Add an output-only console port with fake terminal properties.
-    pub fn add_console_port(
-        &mut self,
-        name: &str,
-        output: Box<dyn devices::virtio::port_io::PortOutput + Send>,
-    ) -> u32 {
-        let index = self.ports.len() as u32;
-        self.ports.push(PortDescription {
-            name: name.to_string().into(),
-            input: None,
-            output: Some(output),
-            terminal: Some(port_io::term_fixed_size(80, 24)),
-        });
-        index
-    }
-
     #[cfg(not(target_os = "windows"))]
     fn add_tty_port_inner(&mut self, name: &str, tty_fd: BorrowedFd<'a>) -> Result<(), VmmError> {
         let raw_fd = tty_fd.as_raw_fd();
