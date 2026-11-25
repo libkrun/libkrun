@@ -69,6 +69,11 @@ mod test_virtiofs_host_changes;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_virtiofs_host_changes::TestVirtiofsHostChanges;
 
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_virtiofs_append;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_virtiofs_append::TestVirtiofsAppend;
+
 mod test_tsi_tcp_guest_connect;
 use test_tsi_tcp_guest_connect::TestTsiTcpGuestConnect;
 
@@ -280,6 +285,8 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("virtiofs-fixed-owner", Box::new(TestVirtiofsFixedOwner)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-host-changes", Box::new(TestVirtiofsHostChanges)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("virtiofs-append", Box::new(TestVirtiofsAppend)),
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         TestCase::new("virtio-pci", Box::new(TestVirtioPci)),
         #[cfg(target_os = "linux")]
