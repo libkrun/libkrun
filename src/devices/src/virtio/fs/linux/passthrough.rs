@@ -454,15 +454,9 @@ impl PassthroughFs {
             flags |= libc::O_RDWR;
         }
 
-        // When writeback caching is enabled the kernel is responsible for handling `O_APPEND`.
-        // However, this breaks atomicity as the file may have changed on disk, invalidating the
-        // cached copy of the data in the kernel and the offset that the kernel thinks is the end of
-        // the file. Just allow this for now as it is the user's responsibility to enable writeback
-        // caching only for directories that are not shared. It also means that we need to clear the
-        // `O_APPEND` flag.
-        if writeback && flags & libc::O_APPEND != 0 {
-            flags &= !libc::O_APPEND;
-        }
+        // Page cache writeback must land at its offset, which `O_APPEND` would ignore.
+        // `write()` appends the guest's own writes instead.
+        flags &= !libc::O_APPEND;
 
         // Safe because this doesn't modify any memory and we check the return value. We don't
         // really check `flags` because if the kernel can't handle poorly specified flags then we
@@ -1136,7 +1130,10 @@ impl FileSystem for PassthroughFs {
             libc::openat(
                 data.file.as_raw_fd(),
                 name.as_ptr(),
-                flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                (flags as i32 & !libc::O_APPEND)
+                    | libc::O_CREAT
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW,
                 mode & !(umask & 0o777),
             )
         };
@@ -1208,9 +1205,9 @@ impl FileSystem for PassthroughFs {
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
-        _delayed_write: bool,
+        delayed_write: bool,
         kill_priv: bool,
-        _flags: u32,
+        flags: u32,
     ) -> io::Result<usize> {
         let _killpriv_guard = if kill_priv {
             // We need to drop FSETID during a write so that the kernel will remove setuid
@@ -1233,7 +1230,13 @@ impl FileSystem for PassthroughFs {
         // This is safe because read_to uses pwritev64, so the underlying file descriptor
         // offset is not affected by this operation.
         let f = data.file.read().unwrap();
-        r.read_to(&f, size as usize, offset)
+        // With writeback caching the kernel handles `O_APPEND`.
+        let writeback = self.writeback.load(Ordering::Relaxed);
+        if flags & libc::O_APPEND as u32 != 0 && !delayed_write && !writeback {
+            r.append_to(&f, size as usize)
+        } else {
+            r.read_to(&f, size as usize, offset)
+        }
     }
 
     fn getattr(
