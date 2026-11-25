@@ -196,6 +196,8 @@ fn create_chosen_node<T: DeviceInfoForFDT + Clone + Debug>(
 ) -> Result<()> {
     let chosen_node = fdt.begin_node("chosen")?;
     fdt.property_string("bootargs", cmdline)?;
+    fdt.property_u64("kaslr-seed", rand::random())?;
+    fdt.property("rng-seed", &rand::random::<[u8; 64]>())?;
 
     // If we have a legacy serial device, tell the guest this is the default console.
     // Clever guests will still switch to a better console (like virtio-console) if
