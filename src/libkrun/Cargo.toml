@@ -15,6 +15,7 @@ tdx = ["blk", "tee", "kbs-types", "serde", "serde_json", "dep:tdx", "devices/tdx
 net = ["devices/net"]
 blk = ["devices/blk"]
 gpu = ["devices/gpu", "krun_display"]
+gfxstream = ["devices/gfxstream"]
 input = ["krun_input", "devices/input"]
 virgl_resource_map2 = ["devices/virgl_resource_map2"]
 aws-nitro = ["devices/aws-nitro", "dep:aws-nitro", "aws-nitro/aws-nitro", "dep:nitro-enclaves"]

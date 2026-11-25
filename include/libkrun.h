@@ -222,14 +222,6 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 #define KRUN_TSI_FLAGS_HIJACK_INET 1
 #define KRUN_TSI_FLAGS_HIJACK_UNIX 2
 
-/* VirglRendererFlags ------------------------------------------------ */
-
-#define KRUN_VIRGL_RENDERER_FLAGS_USE_EGL 1
-#define KRUN_VIRGL_RENDERER_FLAGS_THREAD_SYNC 2
-#define KRUN_VIRGL_RENDERER_FLAGS_VENUS 64
-#define KRUN_VIRGL_RENDERER_FLAGS_USE_ASYNC_FENCE_CB 256
-#define KRUN_VIRGL_RENDERER_FLAGS_RENDER_SERVER 512
-
 /* NetFlags ---------------------------------------------------------- */
 
 #define KRUN_NET_FLAGS_VFKIT 1
@@ -866,8 +858,20 @@ typedef void (*krun_display_backend_destroy_fn)(KrunDisplayBackend handle);
 
 /* GpuDevice --------------------------------------------------------- */
 
-KrunGpuDevice krun_gpu_device_new(uint32_t virgl_flags, KrunDisplayBackend backend);
-typedef KrunGpuDevice (*krun_gpu_device_new_fn)(uint32_t virgl_flags, KrunDisplayBackend backend);
+/** Creates a GPU device backed by virglrenderer. */
+KrunGpuDevice krun_gpu_device_virgl(KrunDisplayBackend backend);
+typedef KrunGpuDevice (*krun_gpu_device_virgl_fn)(KrunDisplayBackend backend);
+/** Creates a GPU device backed by gfxstream. */
+KrunGpuDevice krun_gpu_device_gfxstream(KrunDisplayBackend backend);
+typedef KrunGpuDevice (*krun_gpu_device_gfxstream_fn)(KrunDisplayBackend backend);
+void krun_gpu_device_use_egl(KrunGpuDevice* handle, bool enable);
+typedef void (*krun_gpu_device_use_egl_fn)(KrunGpuDevice* handle, bool enable);
+void krun_gpu_device_use_gles(KrunGpuDevice* handle, bool enable);
+typedef void (*krun_gpu_device_use_gles_fn)(KrunGpuDevice* handle, bool enable);
+void krun_gpu_device_render_server(KrunGpuDevice* handle, bool enable);
+typedef void (*krun_gpu_device_render_server_fn)(KrunGpuDevice* handle, bool enable);
+void krun_gpu_device_venus(KrunGpuDevice* handle, bool enable);
+typedef void (*krun_gpu_device_venus_fn)(KrunGpuDevice* handle, bool enable);
 void krun_gpu_device_shm_size(KrunGpuDevice* handle, size_t size);
 typedef void (*krun_gpu_device_shm_size_fn)(KrunGpuDevice* handle, size_t size);
 void krun_gpu_device_destroy(KrunGpuDevice handle);
