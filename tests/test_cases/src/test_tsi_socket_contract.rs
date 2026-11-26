@@ -361,7 +361,7 @@ mod guest {
             let fd = socket.as_raw_fd();
             option(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, Some(1));
             option(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, Some(65536));
-            for count in [0, 1, 3072, 8192] {
+            for count in [0, 1, 3072, 8192, 60000] {
                 let payload: Vec<_> = (0..count).map(|i| (i % 251) as u8).collect();
                 assert_eq!(socket.send_to(&payload, address).unwrap(), count);
                 let mut data = vec![0; count + 1];

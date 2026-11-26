@@ -166,6 +166,13 @@ mod defs {
         //pub const VSOCK_TYPE_SEQPACKET: u16 = 2;
         pub const VSOCK_TYPE_DGRAM: u16 = 3;
 
+        /// DGRAM RW boundary flags, defined in
+        /// `/include/uapi/linux/virtio_vsock.h`: START marks the first RW
+        /// packet of a datagram and EOM the last. Both are set for a
+        /// datagram that fits in one packet.
+        pub const VSOCK_DGRAM_EOM: u32 = 1;
+        pub const VSOCK_DGRAM_START: u32 = 4;
+
         pub const VSOCK_HOST_CID: u64 = 2;
     }
 }

@@ -177,6 +177,14 @@ Datagram sends are asynchronous. The private guest data socket connects to the
 host VSOCK endpoint even if the application socket is unconnected. The host
 socket enforces connected peer filtering.
 
+On the VSOCK transport, datagram RW packets carry boundary flags
+(`VIRTIO_VSOCK_DGRAM_START`, `VIRTIO_VSOCK_DGRAM_EOM`). Every host reply
+carries both flags when it fits one packet; a frame larger than a guest RX
+buffer is split into consecutive fragments, with START on the first and EOM on
+the last, which the guest reassembles. The device forwards only whole guest
+datagrams: a data packet missing either boundary is a fragment it cannot
+reassemble and is dropped.
+
 On Linux hosts, UNIX frames carry a Linux `sockaddr_un`: a little endian
 `AF_UNIX` followed by the pathname or the abstract name with its leading NUL.
 An unnamed sender has address length 2. Destinations require an address longer

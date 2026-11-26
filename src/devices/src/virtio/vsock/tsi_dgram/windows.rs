@@ -280,6 +280,8 @@ pub(crate) fn create(
         family: af,
         protocol: req.protocol,
         rx_starved: false,
+        dgram_scratch: Vec::new(),
+        pending_dgram: None,
         mem,
         queue,
         rxq,
@@ -302,14 +304,13 @@ pub(crate) fn init_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) {
         .set_fwd_cnt(proxy.tx_cnt.0);
 }
 
-pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -> RecvPkt {
-    let Some(buf) = pkt.buf_mut() else {
-        return RecvPkt::BadBuffer;
-    };
-    if buf.len() < DGRAM_HEADER_LEN {
-        return RecvPkt::BadBuffer;
+pub(crate) fn recv_datagram(proxy: &mut super::TsiDgramProxy) -> RecvPkt {
+    let scratch = &mut proxy.dgram_scratch;
+    if scratch.len() != DGRAM_MAX_SIZE {
+        scratch.resize(DGRAM_MAX_SIZE, 0);
     }
-    let capacity = buf.len().min(DGRAM_MAX_SIZE) - DGRAM_HEADER_LEN;
+    let buf = &mut scratch[..];
+    let capacity = buf.len() - DGRAM_HEADER_LEN;
     let mut addr = [0u8; 128];
     let mut addr_len = addr.len() as i32;
     let mut data = WSABUF {
@@ -330,7 +331,13 @@ pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -
     };
     let mut received = 0;
     let result = unsafe {
-        proxy.recv_msg.unwrap()(sock(proxy), &mut message, &mut received, null_mut(), None)
+        proxy.recv_msg.unwrap()(
+            proxy.fd.as_raw_socket() as SOCKET,
+            &mut message,
+            &mut received,
+            null_mut(),
+            None,
+        )
     };
     addr_len = message.namelen;
     let (count, truncated) = if result >= 0 {
@@ -341,7 +348,7 @@ pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -
             (capacity, true)
         } else {
             if let Some(error) = datagram_error(error, proxy.host_connected) {
-                proxy.record_error(error);
+                super::TsiDgramProxy::record_error_on(&proxy.pending_error, error);
             }
             return RecvPkt::Error;
         }

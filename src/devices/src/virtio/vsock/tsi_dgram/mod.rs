@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Networking::WinSock::LPFN_WSARECVMSG;
 
 use super::super::Queue as VirtQueue;
+use super::defs::uapi;
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
     TsiAcceptReq, TsiBindReq, TsiConnectReq, TsiDatagram, TsiProxyCreate, VsockPacket,
@@ -54,6 +55,14 @@ pub struct TsiDgramProxy {
     /// The guest RX queue ran dry while the host socket may still be
     /// readable; IN polling stays off until the guest posts new buffers.
     pub(crate) rx_starved: bool,
+    /// Receive scratch holding the TSI frame of the datagram in flight,
+    /// sized `DGRAM_MAX_SIZE` on first use.
+    pub(crate) dgram_scratch: Vec<u8>,
+    /// A datagram caught mid-fragmentation when guest RX buffers ran out.
+    /// Its undelivered tail resumes when buffers return; if other traffic
+    /// reaches the guest first, its START marker makes the guest drop the
+    /// stale fragments and the datagram is lost.
+    pub(crate) pending_dgram: Option<PendingDgram>,
     #[cfg(target_os = "macos")]
     icmp: Option<icmp_macos::IcmpSocket>,
     pub(crate) mem: GuestMemoryMmap,
@@ -67,12 +76,24 @@ pub struct TsiDgramProxy {
     pub(crate) guest_options: GuestOnlyOptions,
 }
 
+/// A datagram in `dgram_scratch` that has only been partially delivered to
+/// the guest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct PendingDgram {
+    /// Total frame length (TSI header plus payload).
+    pub(crate) len: usize,
+    /// Frame bytes already written to the guest.
+    pub(crate) offset: usize,
+}
+
 impl TsiDgramProxy {
     pub(crate) fn record_error(&self, error: i32) {
+        Self::record_error_on(&self.pending_error, error);
+    }
+
+    pub(crate) fn record_error_on(pending_error: &AtomicI32, error: i32) {
         if error > 0 && !matches!(error, 4 | 11) {
-            let _ =
-                self.pending_error
-                    .compare_exchange(0, error, Ordering::Relaxed, Ordering::Relaxed);
+            let _ = pending_error.compare_exchange(0, error, Ordering::Relaxed, Ordering::Relaxed);
         }
     }
 
@@ -91,41 +112,55 @@ impl TsiDgramProxy {
         let mut have_used = false;
         let mut wait_credit = false;
         let mut parked = false;
-        let mut queue = self.queue.lock().unwrap();
+        let mut pending = self.pending_dgram.take();
+        // Bound the guard to a local clone so the receive step can borrow the
+        // proxy mutably inside the loop.
+        let queue = self.queue.clone();
+        let mut queue = queue.lock().unwrap();
 
-        while let Some(head) = queue.pop(&self.mem) {
+        loop {
+            if pending.is_none() {
+                match sys::recv_datagram(self) {
+                    RecvPkt::Read(len) => pending = Some(PendingDgram { len, offset: 0 }),
+                    RecvPkt::Close => {
+                        self.status = ProxyStatus::Closed;
+                        parked = true;
+                        break;
+                    }
+                    // Nothing readable on the host socket.
+                    RecvPkt::Error | RecvPkt::WaitForCredit | RecvPkt::BadBuffer => {
+                        parked = true;
+                        break;
+                    }
+                }
+            }
+
+            let Some(head) = queue.pop(&self.mem) else {
+                // Out of guest buffers, possibly mid-datagram.
+                break;
+            };
             // A head that cannot hold a packet is returned to the guest empty
             // instead of being parked at the queue head, where a readable host
             // socket would trip the event loop forever.
             let mut bad_buffer = false;
-            let len = match VsockPacket::from_rx_virtq_head(&head) {
-                Ok(mut pkt) => match sys::recv_to_pkt(self, &mut pkt) {
-                    RecvPkt::WaitForCredit => {
-                        wait_credit = true;
-                        0
-                    }
-                    RecvPkt::Read(cnt) => {
-                        self.rx_cnt += Wrapping(cnt as u32);
-                        sys::init_pkt(self, &mut pkt);
-                        pkt.set_len(cnt as u32);
-                        pkt.finish_rx().unwrap_or(0) as usize
-                    }
-                    RecvPkt::Close => {
-                        self.status = ProxyStatus::Closed;
-                        0
-                    }
-                    RecvPkt::Error => 0,
-                    RecvPkt::BadBuffer => {
+            match VsockPacket::from_rx_virtq_head(&head) {
+                Ok(mut pkt) => {
+                    if write_dgram_fragment(&*self, &mut pending, &mut pkt) {
+                        self.rx_cnt += Wrapping(pkt.len());
+                        let len = pkt.finish_rx().unwrap_or(0) as usize;
+                        have_used = true;
+                        if let Err(e) = queue.add_used(&self.mem, head.index, len as u32) {
+                            error!("failed to add used elements to the queue: {e:?}");
+                        }
+                    } else {
                         bad_buffer = true;
-                        0
                     }
-                },
+                }
                 Err(e) => {
                     debug!("recv_pkt: RX queue error: {e:?}");
                     bad_buffer = true;
-                    0
                 }
-            };
+            }
 
             if bad_buffer {
                 wait_credit = true;
@@ -133,30 +168,62 @@ impl TsiDgramProxy {
                 if let Err(e) = queue.add_used(&self.mem, head.index, 0) {
                     error!("failed to add used elements to the queue: {e:?}");
                 }
-                continue;
-            }
-
-            if len == 0 {
-                queue.undo_pop();
-                parked = true;
-                break;
-            } else {
-                have_used = true;
-                debug!("recv_pkt: pushing packet with {len} bytes");
-                if let Err(e) = queue.add_used(&self.mem, head.index, len as u32) {
-                    error!("failed to add used elements to the queue: {e:?}");
-                }
             }
         }
 
+        self.pending_dgram = pending;
         debug!("recv_pkt: have_used={have_used}");
-        // A buffer parked on an empty socket means the host side is drained
-        // and polling can stay armed. Running out of buffers instead leaves
-        // the level-triggered IN interest armed over a possibly readable
+        // A pass that ended over a drained host socket means polling can
+        // stay armed. Running out of buffers instead leaves the
+        // level-triggered IN interest armed over a possibly readable
         // socket, which would spin the event loop until the guest refills.
         self.rx_starved = !parked;
         (have_used, wait_credit)
     }
+}
+
+/// Write one fragment of the pending datagram into `pkt`. Returns `false`
+/// when the buffer cannot hold any fragment byte and must be returned to
+/// the guest empty.
+fn write_dgram_fragment(
+    proxy: &TsiDgramProxy,
+    pending: &mut Option<PendingDgram>,
+    pkt: &mut VsockPacket,
+) -> bool {
+    let Some(state) = *pending else {
+        return false;
+    };
+    let Some(buf) = pkt.buf_mut() else {
+        return false;
+    };
+    let frame = &proxy.dgram_scratch[..state.len];
+    let count = buf.len().min(frame.len() - state.offset);
+    if count == 0 {
+        return false;
+    }
+    buf[..count].copy_from_slice(&frame[state.offset..state.offset + count]);
+
+    let start = state.offset == 0;
+    let end = state.offset + count == frame.len();
+    let mut flags = 0;
+    if start {
+        flags |= uapi::VSOCK_DGRAM_START;
+    }
+    if end {
+        flags |= uapi::VSOCK_DGRAM_EOM;
+    }
+    sys::init_pkt(proxy, pkt);
+    pkt.set_flags(flags).set_len(count as u32);
+
+    if end {
+        *pending = None;
+    } else {
+        *pending = Some(PendingDgram {
+            len: state.len,
+            offset: state.offset + count,
+        });
+    }
+    true
 }
 
 impl Proxy for TsiDgramProxy {
