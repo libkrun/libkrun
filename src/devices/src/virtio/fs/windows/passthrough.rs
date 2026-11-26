@@ -2690,18 +2690,12 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<usize> {
         debug!("read: {inode:?}");
 
-        // Instead of opening a new file handle, if we have a valid handle we borrow it
-        let borrowed_file = if let Some(raw_h) = as_file_handle(handle) {
-            // We use ManuallyDrop to ensure `file` is NEVER dropped,
-            // preventing handle closure even if `write_from` panics.
-            let file = unsafe { std::fs::File::from_raw_handle(raw_h as _) };
-            Some(ManuallyDrop::new(file))
-        } else {
-            None
-        };
+        // Borrowed, not owned: release() closes the guest handle.
+        let borrowed_file = as_file_handle(handle)
+            .map(|raw_h| ManuallyDrop::new(unsafe { File::from_raw_handle(raw_h as _) }));
 
         let opened_file;
-        let file_ref: &std::fs::File = match &borrowed_file {
+        let file_ref: &File = match &borrowed_file {
             Some(file) => file,
             None => {
                 opened_file = self
@@ -2728,16 +2722,14 @@ impl FileSystem for PassthroughFs {
         _flags: u32,
     ) -> io::Result<usize> {
         // POSIX Compliance: Writing to a Read-Only FD should return EBADF
-        if is_handle_read_only(handle) {
-            return Err(ebadf());
-        }
-
-        let result = {
-            let file = self
-                .reopen_inode(inode, handle, GENERIC_READ | GENERIC_WRITE)
-                .map_err(win_err_to_linux)?;
-            r.read_to(&file, size as usize, offset)
+        let raw_h = match as_file_handle(handle) {
+            Some(raw_h) if !is_handle_read_only(handle) => raw_h,
+            _ => return Err(ebadf()),
         };
+
+        // Borrowed, not owned: release() closes the guest handle.
+        let file = ManuallyDrop::new(unsafe { File::from_raw_handle(raw_h as _) });
+        let result = r.read_to(&file, size as usize, offset);
 
         // Only process kill_priv if the write was successful, and log any errors
         if result.is_ok()
