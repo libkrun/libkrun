@@ -45,7 +45,8 @@ impl TimesyncThread {
                 .set_dst_cid(self.cid)
                 .set_src_port(TSYNC_PORT)
                 .set_dst_port(TSYNC_PORT)
-                .set_type(uapi::VSOCK_TYPE_DGRAM);
+                .set_type(uapi::VSOCK_TYPE_DGRAM)
+                .set_flags(uapi::VSOCK_DGRAM_START | uapi::VSOCK_DGRAM_EOM);
 
             pkt.write_time_sync(time);
             pkt.set_len(8);

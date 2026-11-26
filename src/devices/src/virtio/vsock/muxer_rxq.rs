@@ -167,7 +167,8 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_dst_cid(cid)
                 .set_src_port(defs::TSI_CONTROL_PORT)
                 .set_dst_port(peer_port)
-                .set_type(uapi::VSOCK_TYPE_DGRAM);
+                .set_type(uapi::VSOCK_TYPE_DGRAM)
+                .set_flags(uapi::VSOCK_DGRAM_START | uapi::VSOCK_DGRAM_EOM);
             pkt.write_sockopt_rsp(result, value, operation, request_id);
         }
         MuxerRx::FeatureResponse {
@@ -183,7 +184,8 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_dst_cid(cid)
                 .set_src_port(defs::TSI_CONTROL_PORT)
                 .set_dst_port(peer_port)
-                .set_type(uapi::VSOCK_TYPE_DGRAM);
+                .set_type(uapi::VSOCK_TYPE_DGRAM)
+                .set_flags(uapi::VSOCK_DGRAM_START | uapi::VSOCK_DGRAM_EOM);
             pkt.write_features_rsp(result, services, features, operation, request_id);
         }
         MuxerRx::Reset {
@@ -212,7 +214,8 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_dst_cid(cid)
                 .set_src_port(defs::TSI_CONTROL_PORT)
                 .set_dst_port(peer_port)
-                .set_type(uapi::VSOCK_TYPE_DGRAM);
+                .set_type(uapi::VSOCK_TYPE_DGRAM)
+                .set_flags(uapi::VSOCK_DGRAM_START | uapi::VSOCK_DGRAM_EOM);
 
             pkt.write_connect_rsp(TsiConnectRsp { result }, operation, request_id);
         }
@@ -255,7 +258,8 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_dst_cid(cid)
                 .set_src_port(defs::TSI_CONTROL_PORT)
                 .set_dst_port(peer_port)
-                .set_type(uapi::VSOCK_TYPE_DGRAM);
+                .set_type(uapi::VSOCK_TYPE_DGRAM)
+                .set_flags(uapi::VSOCK_DGRAM_START | uapi::VSOCK_DGRAM_EOM);
 
             pkt.write_getname_rsp(data, operation, request_id);
         }
@@ -299,7 +303,8 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_dst_cid(cid)
                 .set_src_port(defs::TSI_CONTROL_PORT)
                 .set_dst_port(peer_port)
-                .set_type(uapi::VSOCK_TYPE_DGRAM);
+                .set_type(uapi::VSOCK_TYPE_DGRAM)
+                .set_flags(uapi::VSOCK_DGRAM_START | uapi::VSOCK_DGRAM_EOM);
 
             pkt.write_listen_rsp(TsiListenRsp { result, flags }, operation, request_id);
         }
@@ -314,7 +319,8 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_dst_cid(cid)
                 .set_src_port(defs::TSI_CONTROL_PORT)
                 .set_dst_port(peer_port)
-                .set_type(uapi::VSOCK_TYPE_DGRAM);
+                .set_type(uapi::VSOCK_TYPE_DGRAM)
+                .set_flags(uapi::VSOCK_DGRAM_START | uapi::VSOCK_DGRAM_EOM);
 
             pkt.write_accept_rsp(TsiAcceptRsp { result }, operation, request_id);
         }

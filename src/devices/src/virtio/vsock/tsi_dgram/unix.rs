@@ -3,6 +3,8 @@ use std::io::{Error as IoError, IoSlice, IoSliceMut};
 use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
 use std::num::Wrapping;
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
 
 use nix::errno::Errno;
@@ -127,6 +129,8 @@ pub(crate) fn create(
         family,
         protocol: req.protocol,
         rx_starved: false,
+        dgram_scratch: Vec::new(),
+        pending_dgram: None,
         #[cfg(target_os = "macos")]
         icmp,
         mem,
@@ -154,47 +158,47 @@ pub(crate) fn init_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) {
         .set_fwd_cnt(proxy.tx_cnt.0);
 }
 
-fn record_socket_error(proxy: &super::TsiDgramProxy, error: Errno) {
+fn record_socket_error_at(pending_error: &std::sync::atomic::AtomicI32, error: Errno) {
     #[cfg(target_os = "linux")]
     let code = error as i32;
     #[cfg(target_os = "macos")]
     let code = linux_errno_raw(error as i32);
-    proxy.record_error(code);
+    super::TsiDgramProxy::record_error_on(pending_error, code);
 }
 
-pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -> RecvPkt {
-    let Some(buf) = pkt.buf_mut() else {
-        return RecvPkt::BadBuffer;
-    };
-    if buf.len() < DGRAM_HEADER_LEN {
-        return RecvPkt::BadBuffer;
+fn record_socket_error(proxy: &super::TsiDgramProxy, error: Errno) {
+    record_socket_error_at(&proxy.pending_error, error);
+}
+
+/// Receive one datagram from the host socket into the proxy scratch buffer,
+/// prefixed with its TSI datagram header. Returns the frame length on
+/// success; `RecvPkt::Error` when the socket holds nothing readable.
+pub(crate) fn recv_datagram(proxy: &mut super::TsiDgramProxy) -> RecvPkt {
+    let scratch = &mut proxy.dgram_scratch;
+    if scratch.len() != DGRAM_MAX_SIZE {
+        scratch.resize(DGRAM_MAX_SIZE, 0);
     }
-    let capacity = buf.len().min(DGRAM_MAX_SIZE) - DGRAM_HEADER_LEN;
+    let buf = &mut scratch[..];
     #[cfg(target_os = "linux")]
     if proxy.family == AddressFamily::Unix {
-        return recv_unix(proxy, buf, capacity);
+        return recv_unix(proxy.fd.as_raw_fd(), &proxy.pending_error, buf);
     }
     #[cfg(target_os = "macos")]
-    if let Some(icmp) = &proxy.icmp {
-        return match icmp.receive(
-            proxy.fd.as_raw_fd(),
-            &mut buf[DGRAM_HEADER_LEN..DGRAM_HEADER_LEN + capacity],
-        ) {
+    if let Some(icmp) = proxy.icmp.as_ref() {
+        return match icmp.receive(proxy.fd.as_raw_fd(), &mut buf[DGRAM_HEADER_LEN..]) {
             Ok((count, truncated, address, info)) => {
-                finish_receive(buf, capacity, count, truncated, Some(address), Some(info))
+                finish_receive(buf, count, truncated, Some(address), Some(info))
             }
             Err(error) => {
                 if !matches!(error, Errno::EAGAIN | Errno::EINTR) {
-                    record_socket_error(proxy, error);
+                    record_socket_error_at(&proxy.pending_error, error);
                 }
                 RecvPkt::Error
             }
         };
     }
     let (count, truncated, address, info) = {
-        let mut iov = [IoSliceMut::new(
-            &mut buf[DGRAM_HEADER_LEN..DGRAM_HEADER_LEN + capacity],
-        )];
+        let mut iov = [IoSliceMut::new(&mut buf[DGRAM_HEADER_LEN..])];
         let mut control = nix::cmsg_space!(libc::in_pktinfo, libc::in6_pktinfo, libc::c_int);
         #[cfg(target_os = "linux")]
         let receive_flags = MsgFlags::MSG_TRUNC;
@@ -255,18 +259,17 @@ pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -
             }
             Err(error) => {
                 if !matches!(error, Errno::EAGAIN | Errno::EINTR) {
-                    record_socket_error(proxy, error);
+                    record_socket_error_at(&proxy.pending_error, error);
                 }
                 return RecvPkt::Error;
             }
         }
     };
-    finish_receive(buf, capacity, count, truncated, address, info)
+    finish_receive(buf, count, truncated, address, info)
 }
 
 fn finish_receive(
     buf: &mut [u8],
-    capacity: usize,
     count: usize,
     truncated: bool,
     address: Option<SockaddrStorage>,
@@ -291,18 +294,20 @@ fn finish_receive(
     } else {
         return RecvPkt::Error;
     };
+    let capacity = buf.len() - DGRAM_HEADER_LEN;
     encode_header(buf, &addr[..addr_len], count, truncated, info);
     RecvPkt::Read(DGRAM_HEADER_LEN + count.min(capacity))
 }
 
 #[cfg(target_os = "linux")]
-fn recv_unix(proxy: &super::TsiDgramProxy, buf: &mut [u8], capacity: usize) -> RecvPkt {
+fn recv_unix(fd: RawFd, pending_error: &std::sync::atomic::AtomicI32, buf: &mut [u8]) -> RecvPkt {
     let mut addr = [0u8; size_of::<libc::sockaddr_storage>()];
     let mut len = addr.len() as libc::socklen_t;
-    let data = &mut buf[DGRAM_HEADER_LEN..DGRAM_HEADER_LEN + capacity];
+    let data = &mut buf[DGRAM_HEADER_LEN..];
+    let capacity = data.len();
     let count = unsafe {
         libc::recvfrom(
-            proxy.fd.as_raw_fd(),
+            fd,
             data.as_mut_ptr().cast(),
             data.len(),
             libc::MSG_TRUNC,
@@ -311,7 +316,7 @@ fn recv_unix(proxy: &super::TsiDgramProxy, buf: &mut [u8], capacity: usize) -> R
         )
     };
     if count < 0 {
-        record_socket_error(proxy, Errno::last());
+        record_socket_error_at(pending_error, Errno::last());
         return RecvPkt::Error;
     }
     let count = count as usize;
@@ -723,6 +728,7 @@ mod tests {
 
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
+    use super::super::PendingDgram;
     use super::super::TsiDgramProxy;
     use super::*;
     use crate::virtio::Queue;
@@ -808,8 +814,13 @@ mod tests {
         VsockPacket::from_tx_virtq_head(&chain).unwrap()
     }
 
+    fn flags_at(mem: &GuestMemoryMmap, addr: u64) -> u32 {
+        // VSOCK packet header flags field offset.
+        mem.read_obj::<u32>(GuestAddress(addr + 32)).unwrap()
+    }
+
     #[test]
-    fn undersized_rx_buffer_is_consumed_and_disarms_polling() {
+    fn unusable_rx_buffer_is_consumed_and_disarms_polling() {
         let mem = test_mem();
         let queue = rx_queue();
         let mut proxy = dgram_proxy(&mem, queue);
@@ -831,9 +842,9 @@ mod tests {
         .unwrap();
         sendto(peer.as_raw_fd(), b"datagram", &addr, MsgFlags::empty()).unwrap();
 
-        // The data region is shorter than the datagram header, so the host
-        // socket stays readable while the buffer cannot be drained into.
-        post_buffer(&mem, 0, 0, 0x4000, VSOCK_PKT_HDR_SIZE as u32 + 16);
+        // The buffer has no data region, so it cannot hold a fragment and is
+        // returned to the guest empty while the datagram stays pending.
+        post_buffer(&mem, 0, 0, 0x4000, VSOCK_PKT_HDR_SIZE as u32);
 
         let update = process_event(&mut proxy, EventSet::IN);
         assert_eq!(used_ring(&mem, 0), (0, 0));
@@ -849,7 +860,7 @@ mod tests {
         ));
 
         // The guest recycles its buffers and announces credit: polling
-        // resumes and the pending datagram is delivered.
+        // resumes and the pending datagram is delivered whole.
         let update = update_peer_credit(&mut proxy, &credit_packet(&mem));
         assert_eq!(proxy.status, ProxyStatus::Connected);
         assert_eq!(
@@ -867,6 +878,10 @@ mod tests {
                 (VSOCK_PKT_HDR_SIZE + DGRAM_HEADER_LEN + b"datagram".len()) as u32
             )
         );
+        assert_eq!(
+            flags_at(&mem, 0x4200),
+            uapi::VSOCK_DGRAM_START | uapi::VSOCK_DGRAM_EOM
+        );
         let mut payload = [0u8; 8];
         mem.read_slice(
             &mut payload,
@@ -874,6 +889,149 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&payload, b"datagram");
+        assert!(proxy.pending_dgram.is_none());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn large_datagram_fragments_across_rx_buffers() {
+        let mem = test_mem();
+        let queue = rx_queue();
+        let mut proxy = dgram_proxy(&mem, queue);
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "krun-dgram-frag-{}-{nonce}.sock",
+            std::process::id()
+        ));
+        let addr = UnixAddr::new(path.to_str().unwrap()).unwrap();
+        bind(proxy.fd.as_raw_fd(), &addr).unwrap();
+        let peer = socket(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+        let payload: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
+        sendto(peer.as_raw_fd(), &payload, &addr, MsgFlags::empty()).unwrap();
+
+        // Neither buffer alone holds the frame, so the datagram is delivered
+        // as a START fragment followed by an EOM fragment.
+        post_buffer(&mem, 0, 0, 0x4000, VSOCK_PKT_HDR_SIZE as u32 + 400);
+        post_buffer(&mem, 1, 1, 0x4400, VSOCK_PKT_HDR_SIZE as u32 + 800);
+        let update = process_event(&mut proxy, EventSet::IN);
+        assert!(update.signal_queue);
+        assert!(!update.rx_starved);
+        assert!(update.polling.is_none());
+
+        let frame = DGRAM_HEADER_LEN + payload.len();
+        assert_eq!(used_ring(&mem, 0), (0, (VSOCK_PKT_HDR_SIZE + 400) as u32));
+        assert_eq!(
+            used_ring(&mem, 1),
+            (1, (VSOCK_PKT_HDR_SIZE + (frame - 400)) as u32)
+        );
+        assert_eq!(used_idx(&mem), 2);
+        assert_eq!(flags_at(&mem, 0x4000), uapi::VSOCK_DGRAM_START);
+        assert_eq!(flags_at(&mem, 0x4400), uapi::VSOCK_DGRAM_EOM);
+
+        // The fragments reassemble into the original frame, whose TSI
+        // header reports the whole datagram length.
+        let mut assembled = vec![0u8; frame];
+        mem.read_slice(
+            &mut assembled[..400],
+            GuestAddress(0x4000 + VSOCK_PKT_HDR_SIZE as u64),
+        )
+        .unwrap();
+        mem.read_slice(
+            &mut assembled[400..],
+            GuestAddress(0x4400 + VSOCK_PKT_HDR_SIZE as u64),
+        )
+        .unwrap();
+        assert_eq!(&assembled[DGRAM_HEADER_LEN..], &payload[..]);
+        let reported = mem.read_obj::<u32>(GuestAddress(0x4000 + VSOCK_PKT_HDR_SIZE as u64 + 8));
+        assert_eq!(reported.unwrap(), payload.len() as u32);
+        assert!(proxy.pending_dgram.is_none());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn fragmented_datagram_resumes_when_buffers_return() {
+        let mem = test_mem();
+        let queue = rx_queue();
+        let mut proxy = dgram_proxy(&mem, queue);
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "krun-dgram-resume-{}-{nonce}.sock",
+            std::process::id()
+        ));
+        let addr = UnixAddr::new(path.to_str().unwrap()).unwrap();
+        bind(proxy.fd.as_raw_fd(), &addr).unwrap();
+        let peer = socket(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+        let payload: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
+        sendto(peer.as_raw_fd(), &payload, &addr, MsgFlags::empty()).unwrap();
+
+        // The single buffer only carries the first fragment; the datagram
+        // stays pending with polling disarmed until buffers return.
+        post_buffer(&mem, 0, 0, 0x4000, VSOCK_PKT_HDR_SIZE as u32 + 400);
+        let update = process_event(&mut proxy, EventSet::IN);
+        assert!(update.signal_queue);
+        assert_eq!(used_ring(&mem, 0), (0, (VSOCK_PKT_HDR_SIZE + 400) as u32));
+        assert_eq!(flags_at(&mem, 0x4000), uapi::VSOCK_DGRAM_START);
+        assert!(proxy.rx_starved);
+        assert_eq!(
+            update.polling,
+            Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()))
+        );
+        let frame = DGRAM_HEADER_LEN + payload.len();
+        assert_eq!(
+            proxy.pending_dgram,
+            Some(PendingDgram {
+                len: frame,
+                offset: 400
+            })
+        );
+
+        let resumed = proxy.resume_rx().unwrap();
+        assert_eq!(resumed, (proxy.id, proxy.fd.as_raw_fd(), EventSet::IN));
+        post_buffer(&mem, 1, 1, 0x4400, VSOCK_PKT_HDR_SIZE as u32 + 800);
+        let update = process_event(&mut proxy, EventSet::IN);
+        assert!(update.signal_queue);
+        assert_eq!(
+            used_ring(&mem, 1),
+            (1, (VSOCK_PKT_HDR_SIZE + (frame - 400)) as u32)
+        );
+        // The continuation carries no START marker.
+        assert_eq!(flags_at(&mem, 0x4400), uapi::VSOCK_DGRAM_EOM);
+
+        let mut assembled = vec![0u8; frame];
+        mem.read_slice(
+            &mut assembled[..400],
+            GuestAddress(0x4000 + VSOCK_PKT_HDR_SIZE as u64),
+        )
+        .unwrap();
+        mem.read_slice(
+            &mut assembled[400..],
+            GuestAddress(0x4400 + VSOCK_PKT_HDR_SIZE as u64),
+        )
+        .unwrap();
+        assert_eq!(&assembled[DGRAM_HEADER_LEN..], &payload[..]);
+        assert!(proxy.pending_dgram.is_none());
 
         std::fs::remove_file(&path).unwrap();
     }

@@ -306,6 +306,7 @@ pub(super) fn ack(cid: u64, peer_port: u32, words: [u32; 5], pkt: &mut VsockPack
         .set_src_port(PORT)
         .set_dst_port(peer_port)
         .set_type(uapi::VSOCK_TYPE_DGRAM)
+        .set_flags(uapi::VSOCK_DGRAM_START | uapi::VSOCK_DGRAM_EOM)
         .set_len(20);
     for (word, bytes) in words
         .iter()

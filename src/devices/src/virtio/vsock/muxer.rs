@@ -853,6 +853,16 @@ impl VsockMuxer {
     }
 
     fn process_dgram_rw(&self, pkt: &VsockPacket) {
+        if pkt.flags() != uapi::VSOCK_DGRAM_START | uapi::VSOCK_DGRAM_EOM {
+            // Every datagram the device forwards to the host socket is
+            // delivered whole, so a guest packet without both boundaries is
+            // a fragment it cannot reassemble.
+            debug!(
+                "dropping datagram without START/EOM boundaries: src={}",
+                pkt.src_port()
+            );
+            return;
+        }
         let Some(datagram) = pkt.read_datagram() else {
             return;
         };
