@@ -396,12 +396,19 @@ typedef KrunResult (*krun_console_builder_add_tty_port_fn)(KrunConsoleBuilder ha
 #endif
 #if (defined(__unix__) || defined(__APPLE__))
 /**
- * Add a port with separate borrowed input and output fds (no terminal
- * properties). The caller retains responsibility for the descriptors.
- * Pass `None` to disable that direction.
+ * Add a data port (`/dev/vportNpM`) with borrowed input/output fds; pass
+ * `None` to disable a direction.
  */
 KrunResult krun_console_builder_add_inout_port(KrunConsoleBuilder handle, KrunStr name, int input_fd, int output_fd, uint32_t* result, KrunError* err_out);
 typedef KrunResult (*krun_console_builder_add_inout_port_fn)(KrunConsoleBuilder handle, KrunStr name, int input_fd, int output_fd, uint32_t* result, KrunError* err_out);
+#endif
+#if (defined(__unix__) || defined(__APPLE__))
+/**
+ * Like [`add_inout_port`](Self::add_inout_port), but the port is exposed to
+ * the guest as a console (`/dev/hvcN`) instead of a data port.
+ */
+KrunResult krun_console_builder_add_console_port(KrunConsoleBuilder handle, KrunStr name, int input_fd, int output_fd, uint32_t* result, KrunError* err_out);
+typedef KrunResult (*krun_console_builder_add_console_port_fn)(KrunConsoleBuilder handle, KrunStr name, int input_fd, int output_fd, uint32_t* result, KrunError* err_out);
 #endif
 /** Build the console device. At least one port must have been added. */
 KrunConsoleDevice krun_console_builder_build(KrunConsoleBuilder handle, KrunError* err_out);

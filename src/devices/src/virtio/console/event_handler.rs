@@ -133,7 +133,8 @@ impl Subscriber for Console {
                 self.read_control_queue_event(event);
                 raise_irq |= self.process_control_rx();
             } else if source == control_rxq {
-                raise_irq |= self.read_queue_event(CONTROL_RXQ_INDEX, event)
+                raise_irq |=
+                    self.read_queue_event(CONTROL_RXQ_INDEX, event) && self.process_control_rx()
             }
             /* Guest signaled input/output on port */
             else if let Some(queue_index) = self
