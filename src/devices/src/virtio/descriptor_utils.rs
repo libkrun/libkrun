@@ -5,9 +5,13 @@
 use std::cmp;
 use std::collections::VecDeque;
 use std::fmt::{self, Display};
+#[cfg(target_os = "linux")]
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::{MaybeUninit, size_of};
 use std::ops::Deref;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::ptr::copy_nonoverlapping;
 use std::result;
 
@@ -264,6 +268,36 @@ impl<'a> Reader<'a> {
     ) -> io::Result<usize> {
         self.buffer
             .consume(count, |bufs| dst.write_vectored_at_volatile(bufs, off))
+    }
+
+    /// Like `read_to_at`, but appends to the end of `dst`.
+    #[cfg(target_os = "linux")]
+    pub fn append_to(&mut self, dst: &File, count: usize) -> io::Result<usize> {
+        self.buffer.consume(count, |bufs| {
+            let iovecs: Vec<libc::iovec> = bufs
+                .iter()
+                .map(|s| libc::iovec {
+                    iov_base: s.ptr_guard_mut().as_ptr().cast(),
+                    iov_len: s.len(),
+                })
+                .collect();
+
+            // SAFETY: the kernel only accesses the bytes inside the buffers.
+            let ret = unsafe {
+                libc::pwritev2(
+                    dst.as_raw_fd(),
+                    iovecs.as_ptr(),
+                    iovecs.len() as libc::c_int,
+                    0,
+                    libc::RWF_APPEND,
+                )
+            };
+            if ret < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(ret as usize)
+            }
+        })
     }
 
     pub fn read_exact_to<F: FileReadWriteVolatile>(

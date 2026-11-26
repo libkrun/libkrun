@@ -42,6 +42,11 @@ impl ZeroCopyReader for ZCReader<'_> {
     fn read_to(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
         self.0.read_to_at(f, count, off)
     }
+
+    #[cfg(target_os = "linux")]
+    fn append_to(&mut self, f: &File, count: usize) -> io::Result<usize> {
+        self.0.append_to(f, count)
+    }
 }
 
 impl io::Read for ZCReader<'_> {

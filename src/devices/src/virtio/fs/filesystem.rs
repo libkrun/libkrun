@@ -154,6 +154,10 @@ pub trait ZeroCopyReader {
     /// an error of the kind `io::ErrorKind::WriteZero`.
     fn read_to(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize>;
 
+    /// Like `read_to`, but appends to the end of `f`.
+    #[cfg(target_os = "linux")]
+    fn append_to(&mut self, f: &File, count: usize) -> io::Result<usize>;
+
     /// Copies exactly `count` bytes of data from `self` into `f` at offset `off`. `off + count`
     /// must be less than `u64::MAX`.
     ///
@@ -217,6 +221,10 @@ pub trait ZeroCopyReader {
 impl<R: ZeroCopyReader> ZeroCopyReader for &mut R {
     fn read_to(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
         (**self).read_to(f, count, off)
+    }
+    #[cfg(target_os = "linux")]
+    fn append_to(&mut self, f: &File, count: usize) -> io::Result<usize> {
+        (**self).append_to(f, count)
     }
     fn read_exact_to(&mut self, f: &mut File, count: usize, off: u64) -> io::Result<()> {
         (**self).read_exact_to(f, count, off)
