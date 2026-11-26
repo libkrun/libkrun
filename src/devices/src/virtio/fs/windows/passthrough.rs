@@ -7,14 +7,15 @@ pub use super::super::{CachePolicy, PermissionSemantics};
 use std::collections::BTreeMap;
 use std::ffi::{CStr, OsString};
 use std::fs::{self, File};
+use std::io::{self, Read};
 use std::mem::{self, ManuallyDrop};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
+use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{io, ptr};
 
 use libc::S_IFREG;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
@@ -158,9 +159,28 @@ struct InodeData {
     // `setattr` can bring them back; a host process editing the streams directly is
     // not noticed until the inode is forgotten.
     privs_dropped: AtomicBool,
+    // The override_stat stream as last read, with the entry's ChangeTime then.
+    override_stat: Mutex<Option<(i64, OverrideStat)>>,
 }
 
 impl InodeData {
+    /// The override_stat stream of this entry, open as `handle` with ChangeTime `change_time`.
+    fn override_stat(&self, change_time: i64, handle: HANDLE) -> OverrideStat {
+        let mut cached = self.override_stat.lock().unwrap();
+        if let Some((cached_at, value)) = *cached
+            && cached_at == change_time
+        {
+            return value;
+        }
+        let value = read_override_stat_by_handle(handle);
+        // Writing a stream moves ChangeTime only to the next timestamp tick, so a change
+        // made in the tick this was read in would go unnoticed: keep only what was read
+        // once ChangeTime had settled.
+        *cached =
+            (filetime_now() - change_time >= SETTLED_CHANGE_TIME).then_some((change_time, value));
+        value
+    }
+
     fn get_path(&self) -> Arc<PathBuf> {
         Arc::clone(&self.path.read().unwrap())
     }
@@ -344,6 +364,17 @@ type FileInfo = FILE_STAT_INFORMATION;
 /// `(uid, gid, mode)` as stored in the override_stat stream.
 type OverrideStat = (Option<u32>, Option<u32>, Option<u32>);
 
+/// How long after its last change an entry's override_stat stream is trusted to stay as read:
+/// one second, in FILETIME units.
+const SETTLED_CHANGE_TIME: i64 = 10_000_000;
+
+fn filetime_now() -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    unix_to_filetime(now.as_secs() as i64, now.subsec_nanos()) as i64
+}
+
 fn query_information<T>(handle: HANDLE, info: &mut T, class: i32) -> NTSTATUS {
     let mut iosb: IO_STATUS_BLOCK = unsafe { mem::zeroed() };
     unsafe {
@@ -447,24 +478,6 @@ pub fn is_handle_read_only(handle: u64) -> bool {
     // handling catch any violations later.
     handle_access(raw_handle)
         .is_some_and(|access| access & (FILE_WRITE_DATA | FILE_APPEND_DATA) == 0)
-}
-
-/// Build a `stat64` from `FILE_STAT_INFORMATION`, applying the override_stat xattr when available.
-fn file_info_to_stat64(
-    ctx: &Context,
-    semantics: PermissionSemantics,
-    info: &FileInfo,
-    ino: u64,
-    path: &Path,
-    handle: HANDLE,
-) -> stat64 {
-    let override_stat = match semantics {
-        PermissionSemantics::LinuxSimplified | PermissionSemantics::LinuxSimplifiedFixedOwner => {
-            None
-        }
-        PermissionSemantics::LinuxComplete => read_override_stat(path).ok(),
-    };
-    build_stat64(ctx, semantics, info, ino, handle, override_stat)
 }
 
 fn build_stat64(
@@ -695,9 +708,14 @@ fn remove_security_capability(path: &Path) -> bool {
     true
 }
 
-/// Write data to an ADS stream relative to an open file/directory handle.
-/// `stream_suffix` must include the leading colon, e.g. `":stat"`.
-fn write_ads_by_handle(file_handle: HANDLE, stream_suffix: &str, data: &[u8]) -> io::Result<()> {
+/// Open an ADS stream relative to an open file/directory handle, which spares resolving the
+/// entry's path again. `stream_suffix` must include the leading colon, e.g. `":stat"`.
+fn open_ads_by_handle(
+    file_handle: HANDLE,
+    stream_suffix: &str,
+    desired_access: u32,
+    create_disposition: u32,
+) -> io::Result<HANDLE> {
     let mut wide: Vec<u16> = stream_suffix.encode_utf16().collect();
     wide.push(0);
     let byte_len = (wide.len() - 1) * 2;
@@ -723,13 +741,13 @@ fn write_ads_by_handle(file_handle: HANDLE, stream_suffix: &str, data: &[u8]) ->
     let status = unsafe {
         NtCreateFile(
             &mut h,
-            GENERIC_WRITE | SYNCHRONIZE,
+            desired_access | SYNCHRONIZE,
             &oa,
             &mut iosb,
             std::ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_OVERWRITE_IF,
+            create_disposition,
             FILE_SYNCHRONOUS_IO_NONALERT,
             std::ptr::null(),
             0,
@@ -737,8 +755,30 @@ fn write_ads_by_handle(file_handle: HANDLE, stream_suffix: &str, data: &[u8]) ->
     };
 
     if status < 0 {
-        return Err(nt_status_to_io_error(status));
+        Err(nt_status_to_io_error(status))
+    } else {
+        Ok(h)
     }
+}
+
+/// Read the override_stat stream of the entry open as `file_handle`.
+fn read_override_stat_by_handle(file_handle: HANDLE) -> OverrideStat {
+    let Ok(h) = open_ads_by_handle(file_handle, OVERRIDE_STAT_STREAM, GENERIC_READ, FILE_OPEN)
+    else {
+        return (None, None, None);
+    };
+    let mut stream = unsafe { File::from_raw_handle(h as RawHandle) };
+    let mut buf = [0u8; 64];
+    match stream.read(&mut buf) {
+        Ok(n) => parse_override_stat(&buf[..n]).unwrap_or((None, None, None)),
+        Err(_) => (None, None, None),
+    }
+}
+
+/// Write data to an ADS stream relative to an open file/directory handle.
+/// `stream_suffix` must include the leading colon, e.g. `":stat"`.
+fn write_ads_by_handle(file_handle: HANDLE, stream_suffix: &str, data: &[u8]) -> io::Result<()> {
+    let h = open_ads_by_handle(file_handle, stream_suffix, GENERIC_WRITE, FILE_OVERWRITE_IF)?;
 
     let mut write_iosb: IO_STATUS_BLOCK = unsafe { mem::zeroed() };
     let write_status = unsafe {
@@ -1357,6 +1397,33 @@ impl PassthroughFs {
         Ok(self.inode_data(inode)?.get_path())
     }
 
+    /// The attributes of `data`, from `info` queried on `handle`. `known_override` spares
+    /// reading back an override_stat just written.
+    fn attr_of(
+        &self,
+        ctx: &Context,
+        data: &InodeData,
+        info: &FileInfo,
+        handle: HANDLE,
+        known_override: Option<OverrideStat>,
+    ) -> stat64 {
+        let override_stat = match self.cfg.semantics {
+            PermissionSemantics::LinuxComplete => {
+                Some(known_override.unwrap_or_else(|| data.override_stat(info.ChangeTime, handle)))
+            }
+            PermissionSemantics::LinuxSimplified
+            | PermissionSemantics::LinuxSimplifiedFixedOwner => None,
+        };
+        build_stat64(
+            ctx,
+            self.cfg.semantics,
+            info,
+            data.inode,
+            handle,
+            override_stat,
+        )
+    }
+
     /// Drop the capability stream and the suid/sgid bits, as a write or truncating open by
     /// an unprivileged guest process requires.
     fn kill_priv(&self, data: &InodeData) {
@@ -1452,11 +1519,11 @@ impl PassthroughFs {
             volume_serial,
         };
 
-        let inode = {
+        let data = {
             let handle_existing = |existing: &Arc<InodeData>| {
                 existing.refcount.fetch_add(1, Ordering::Acquire);
                 existing.update_path_if_changed(child_path);
-                existing.inode
+                Arc::clone(existing)
             };
 
             let map = self.inodes.read().unwrap();
@@ -1474,46 +1541,28 @@ impl PassthroughFs {
                 } else {
                     // Safe to create a new one now
                     let inode = self.inode_alloc.next();
-                    write_map.insert(
+                    let data = Arc::new(InodeData {
                         inode,
-                        alt_key,
-                        Arc::new(InodeData {
-                            inode,
-                            parent_inode: parent,
-                            file_index: file_info.FileId as u64,
-                            volume_serial,
-                            is_mount_point: file_info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT
-                                != 0
-                                && file_info.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT,
-                            path: RwLock::new(Arc::new(child_path.to_path_buf())),
-                            wide_path: RwLock::new(Arc::new(path_to_wide(child_path))),
-                            refcount: AtomicU64::new(1),
-                            privs_dropped: AtomicBool::new(false),
-                        }),
-                    );
-                    inode
+                        parent_inode: parent,
+                        file_index: file_info.FileId as u64,
+                        volume_serial,
+                        is_mount_point: file_info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT
+                            != 0
+                            && file_info.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT,
+                        path: RwLock::new(Arc::new(child_path.to_path_buf())),
+                        wide_path: RwLock::new(Arc::new(path_to_wide(child_path))),
+                        refcount: AtomicU64::new(1),
+                        privs_dropped: AtomicBool::new(false),
+                        override_stat: Mutex::new(None),
+                    });
+                    write_map.insert(inode, alt_key, Arc::clone(&data));
+                    data
                 }
             }
         };
+        let inode = data.inode;
 
-        let st = match known_override {
-            Some(override_stat) => build_stat64(
-                ctx,
-                self.cfg.semantics,
-                &file_info,
-                inode,
-                handle,
-                Some(override_stat),
-            ),
-            None => file_info_to_stat64(
-                ctx,
-                self.cfg.semantics,
-                &file_info,
-                inode,
-                child_path,
-                handle,
-            ),
-        };
+        let st = self.attr_of(ctx, &data, &file_info, handle, known_override);
 
         let mut attr_flags = 0u32;
         if st.st_mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32
@@ -1553,7 +1602,8 @@ impl PassthroughFs {
         inode: Inode,
         handle: Option<Handle>,
     ) -> io::Result<(stat64, Duration)> {
-        let path = self.inode_path(inode)?;
+        let data = self.inode_data(inode)?;
+        let path = data.get_path();
 
         let (raw_h, _guard) = match handle.and_then(as_file_handle) {
             Some(h) => (h as HANDLE, None),
@@ -1576,7 +1626,7 @@ impl PassthroughFs {
 
         let info = get_file_info_by_handle(raw_h).map_err(win_err_to_linux)?;
 
-        let stat = file_info_to_stat64(ctx, self.cfg.semantics, &info, inode, &path, raw_h);
+        let stat = self.attr_of(ctx, &data, &info, raw_h, None);
         Ok((stat, self.cfg.attr_timeout))
     }
 
@@ -1856,6 +1906,7 @@ impl FileSystem for PassthroughFs {
                 wide_path: RwLock::new(Arc::new(path_to_wide(&root_path))),
                 refcount: AtomicU64::new(2),
                 privs_dropped: AtomicBool::new(false),
+                override_stat: Mutex::new(None),
             }),
         );
 
@@ -2345,17 +2396,7 @@ impl FileSystem for PassthroughFs {
             info.ChangeTime = now_ft as i64;
         }
 
-        let stat = match known_override {
-            Some(override_stat) => build_stat64(
-                &ctx,
-                self.cfg.semantics,
-                &info,
-                inode,
-                h,
-                Some(override_stat),
-            ),
-            None => file_info_to_stat64(&ctx, self.cfg.semantics, &info, inode, &path, h),
-        };
+        let stat = self.attr_of(&ctx, &data, &info, h, known_override);
         Ok((stat, self.cfg.attr_timeout))
     }
 
@@ -3496,6 +3537,88 @@ mod tests {
             );
         }
         assert_eq!(fs::read(&stream).unwrap(), b"0:0:0644");
+    }
+
+    fn open_attributes(path: &Path, access: u32) -> HandleGuard {
+        let flags = OpenFlags {
+            desired_access: access,
+            create_disposition: FILE_OPEN,
+            create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        };
+        HandleGuard(open_handle(path, &flags).unwrap())
+    }
+
+    fn change_time(path: &Path) -> i64 {
+        let h = open_attributes(path, FILE_READ_ATTRIBUTES);
+        get_file_info_by_handle(h.as_raw()).unwrap().ChangeTime
+    }
+
+    fn set_change_time(path: &Path, change_time: i64) {
+        let h = open_attributes(path, FILE_WRITE_ATTRIBUTES);
+        // Zero leaves a time or the attributes as they are.
+        let info = FILE_BASIC_INFO {
+            ChangeTime: change_time,
+            ..unsafe { mem::zeroed() }
+        };
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                h.as_raw(),
+                FileBasicInfo,
+                &info as *const FILE_BASIC_INFO as *const _,
+                mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        };
+        assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+    }
+
+    /// Write the override_stat stream as a host process would, then put ChangeTime back to
+    /// `change_time`, as if the write had landed in the same timestamp tick.
+    fn rewrite_override_stat_keeping(path: &Path, value: &[u8], change_time: i64) {
+        fs::write(ads_stream_path(path, OVERRIDE_STAT_STREAM), value).unwrap();
+        set_change_time(path, change_time);
+    }
+
+    #[test]
+    fn a_host_edit_of_override_stat_is_seen() {
+        let share = Share::new("override-edit");
+        let fs = share.served();
+        let file = inside(&fs);
+        let path = share.root.join("sub").join("inside.txt");
+        set_change_time(&path, filetime_now() - 3600 * SETTLED_CHANGE_TIME);
+        assert_eq!(permissions(&fs, file), 0o644);
+
+        fs::write(ads_stream_path(&path, OVERRIDE_STAT_STREAM), b"0:0:04755").unwrap();
+        assert_eq!(permissions(&fs, file), 0o4755);
+    }
+
+    #[test]
+    fn override_stat_is_read_once_while_change_time_is_settled() {
+        let share = Share::new("override-cached");
+        let fs = share.served();
+        let file = inside(&fs);
+        let path = share.root.join("sub").join("inside.txt");
+        let settled = filetime_now() - 3600 * SETTLED_CHANGE_TIME;
+        set_change_time(&path, settled);
+        assert_eq!(permissions(&fs, file), 0o644);
+
+        // Only a getattr that skips reading the stream still reports the old mode.
+        rewrite_override_stat_keeping(&path, b"0:0:04755", settled);
+        assert_eq!(change_time(&path), settled);
+        assert_eq!(permissions(&fs, file), 0o644);
+    }
+
+    #[test]
+    fn override_stat_is_read_again_while_change_time_is_recent() {
+        let share = Share::new("override-recent");
+        let fs = share.served();
+        let file = inside(&fs);
+        let path = share.root.join("sub").join("inside.txt");
+        let recent = filetime_now();
+        set_change_time(&path, recent);
+        assert_eq!(permissions(&fs, file), 0o644);
+
+        rewrite_override_stat_keeping(&path, b"0:0:04755", recent);
+        assert_eq!(permissions(&fs, file), 0o4755);
     }
 
     const LINUX_O_RDWR: u32 = 2;
