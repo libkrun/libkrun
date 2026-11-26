@@ -33,7 +33,6 @@ make TDX=1        # Intel TDX — produces libkrun-tdx.so
 
 # Other optional features
 make VHOST_USER=1
-make VIRGL_RESOURCE_MAP2=1
 
 # After building, install to /usr/local (or PREFIX=...) with matching feature options
 make install

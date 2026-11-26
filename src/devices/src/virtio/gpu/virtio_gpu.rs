@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::io::IoSliceMut;
-#[cfg(target_os = "linux")]
 use std::os::unix::io::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -18,25 +17,15 @@ use krun_display::{
     DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, Rect, ResourceFormat,
 };
 use libc::c_void;
-#[cfg(any(
-    all(target_os = "linux", feature = "virgl_resource_map2"),
-    target_os = "macos"
-))]
-use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_DMABUF;
-#[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
-use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD;
-#[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
-use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_SHM;
+use rutabaga_gfx::{
+    RUTABAGA_HANDLE_TYPE_MEM_DMABUF, RUTABAGA_MAP_ACCESS_MASK, RUTABAGA_MAP_ACCESS_READ,
+    RUTABAGA_MAP_ACCESS_RW, RUTABAGA_MAP_ACCESS_WRITE, RUTABAGA_MAP_CACHE_MASK,
+    RUTABAGA_PATH_TYPE_WAYLAND, ResourceCreate3D, ResourceCreateBlob, Rutabaga, RutabagaBuilder,
+    RutabagaDescriptor, RutabagaFence, RutabagaFenceHandler, RutabagaIovec, RutabagaPath,
+    RutabagaResult, Transfer3D, VirtioFsLookup,
+};
 #[cfg(target_os = "linux")]
-use rutabaga_gfx::{
-    RUTABAGA_MAP_ACCESS_MASK, RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW,
-    RUTABAGA_MAP_ACCESS_WRITE, RUTABAGA_PATH_TYPE_PIPEWIRE, RUTABAGA_PATH_TYPE_X11,
-};
-use rutabaga_gfx::{
-    RUTABAGA_MAP_CACHE_MASK, RUTABAGA_PATH_TYPE_WAYLAND, ResourceCreate3D, ResourceCreateBlob,
-    Rutabaga, RutabagaBuilder, RutabagaDescriptor, RutabagaFence, RutabagaFenceHandler,
-    RutabagaIovec, RutabagaPath, RutabagaResult, Transfer3D, VirtioFsLookup,
-};
+use rutabaga_gfx::{RUTABAGA_PATH_TYPE_PIPEWIRE, RUTABAGA_PATH_TYPE_X11};
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
@@ -153,8 +142,17 @@ struct VirtioGpuResource {
     scanouts: AssociatedScanouts,
     format: Option<ResourceFormat>,
     size: u64, // only for blob resources
-    shmem_offset: Option<u64>,
+    shmem_mapping: Option<ShmMapping>,
     rutabaga_external_mapping: bool,
+}
+
+/// A blob resource placed into the shm region.
+#[derive(Copy, Clone)]
+struct ShmMapping {
+    offset: u64,
+    /// The mapping was mmap'd directly from an exported dmabuf, so rutabaga
+    /// knows nothing about it and can't unmap it.
+    dmabuf: bool,
 }
 
 impl VirtioGpuResource {
@@ -174,7 +172,7 @@ impl VirtioGpuResource {
             scanouts: Default::default(),
             size,
             format,
-            shmem_offset: None,
+            shmem_mapping: None,
             rutabaga_external_mapping: false,
         }
     }
@@ -812,69 +810,6 @@ impl VirtioGpu {
     /// rutabaga as ExternalMapping.
     /// When sandboxing is enabled, external_blob is set and opaque fds must be mapped in the
     /// hypervisor process by Vulkano using metadata provided by Rutabaga::vulkan_info().
-    #[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
-    pub fn resource_map_blob(
-        &mut self,
-        resource_id: u32,
-        shm_region: &VirtioShmRegion,
-        offset: u64,
-    ) -> VirtioGpuResult {
-        let resource = self
-            .resources
-            .get_mut(&resource_id)
-            .ok_or(ErrInvalidResourceId)?;
-
-        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
-
-        if let Ok(export) = self.rutabaga.export_blob(resource_id)
-            && let Some(mesa_handle) = export.as_mesa_handle()
-        {
-            if mesa_handle.handle_type != RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD {
-                let prot = match map_info & RUTABAGA_MAP_ACCESS_MASK {
-                    RUTABAGA_MAP_ACCESS_READ => libc::PROT_READ,
-                    RUTABAGA_MAP_ACCESS_WRITE => libc::PROT_WRITE,
-                    RUTABAGA_MAP_ACCESS_RW => libc::PROT_READ | libc::PROT_WRITE,
-                    _ => return Err(ErrUnspec),
-                };
-
-                let addr = checked_blob_map_addr(
-                    shm_region.host_addr,
-                    offset,
-                    resource.size,
-                    shm_region.size as u64,
-                )
-                .ok_or(ErrUnspec)?;
-                debug!(
-                    "mapping: host_addr={:x}, addr={:x}, size={}",
-                    shm_region.host_addr, addr, resource.size
-                );
-                let ret = unsafe {
-                    libc::mmap(
-                        addr as *mut libc::c_void,
-                        resource.size as usize,
-                        prot,
-                        libc::MAP_SHARED | libc::MAP_FIXED,
-                        mesa_handle.os_handle.as_fd().as_raw_fd(),
-                        0 as libc::off_t,
-                    )
-                };
-                if ret == libc::MAP_FAILED {
-                    return Err(ErrUnspec);
-                }
-            } else {
-                return Err(ErrUnspec);
-            }
-        } else {
-            return Err(ErrUnspec);
-        }
-
-        resource.shmem_offset = Some(offset);
-        // Access flags not a part of the virtio-gpu spec.
-        Ok(OkMapInfo {
-            map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
-        })
-    }
-    #[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
     pub fn resource_map_blob(
         &mut self,
         resource_id: u32,
@@ -902,100 +837,79 @@ impl VirtioGpu {
             shm_region.size as u64,
         )
         .ok_or(ErrUnspec)?;
+        // Checked before anything is placed, so a failure can't leak a placement.
+        #[cfg(target_os = "macos")]
+        let guest_addr = checked_blob_map_addr(
+            shm_region.guest_addr,
+            offset,
+            resource.size,
+            shm_region.size as u64,
+        )
+        .ok_or(ErrUnspec)?;
 
-        if let Ok(export) = self.rutabaga.export_blob(resource_id) {
-            if let Some(mesa_handle) = export.as_mesa_handle() {
-                if mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_SHM
-                    || mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF
-                {
-                    let ret = unsafe {
-                        libc::mmap(
-                            addr as *mut libc::c_void,
-                            resource.size as usize,
-                            prot,
-                            libc::MAP_SHARED | libc::MAP_FIXED,
-                            mesa_handle.os_handle.as_fd().as_raw_fd(),
-                            0 as libc::off_t,
-                        )
-                    };
-                    if ret == libc::MAP_FAILED {
-                        error!(
-                            "failed to mmap resource in shm region(handle_type={:#x})",
-                            mesa_handle.handle_type
-                        );
-                        return Err(ErrUnspec);
-                    }
-                } else {
-                    self.rutabaga.resource_map(
-                        resource_id,
-                        addr,
-                        resource.size,
-                        prot,
-                        libc::MAP_SHARED | libc::MAP_FIXED,
-                    )?;
-                }
-            } else {
-                return Err(ErrUnspec);
-            }
-        }
+        debug!(
+            "mapping resource {resource_id}: addr={addr:x}, size={}",
+            resource.size
+        );
 
-        resource.shmem_offset = Some(offset);
-        // Access flags not a part of the virtio-gpu spec.
-        Ok(OkMapInfo {
-            map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
-        })
-    }
-    #[cfg(target_os = "macos")]
-    pub fn resource_map_blob(
-        &mut self,
-        resource_id: u32,
-        shm_region: &VirtioShmRegion,
-        offset: u64,
-    ) -> VirtioGpuResult {
-        let resource = self
-            .resources
-            .get_mut(&resource_id)
-            .ok_or(ErrInvalidResourceId)?;
+        let export = self
+            .rutabaga
+            .export_blob(resource_id)
+            .map_err(|_| ErrUnspec)?;
+        let Some(mesa_handle) = export.as_mesa_handle() else {
+            return Err(ErrUnspec);
+        };
 
-        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
-        let map_ptr = self.rutabaga.map(resource_id).map_err(|_| ErrUnspec)?.ptr;
-
-        if let Ok(export) = self.rutabaga.export_blob(resource_id)
-            && let Some(mesa_handle) = export.as_mesa_handle()
-        {
-            if mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
-                let guest_addr = checked_blob_map_addr(
-                    shm_region.guest_addr,
-                    offset,
-                    resource.size,
-                    shm_region.size as u64,
+        // Dmabufs are mapped by us; every other handle is placed by rutabaga,
+        // which tracks the placement and can release it.
+        let dmabuf = mesa_handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF;
+        if dmabuf {
+            let ret = unsafe {
+                libc::mmap(
+                    addr as *mut libc::c_void,
+                    resource.size as usize,
+                    prot,
+                    libc::MAP_SHARED | libc::MAP_FIXED,
+                    mesa_handle.os_handle.as_fd().as_raw_fd(),
+                    0 as libc::off_t,
                 )
-                .ok_or(ErrUnspec)?;
-                debug!(
-                    "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
-                    map_ptr, guest_addr, resource.size
+            };
+            if ret == libc::MAP_FAILED {
+                error!(
+                    "failed to mmap resource in shm region(handle_type={:#x})",
+                    mesa_handle.handle_type
                 );
-
-                let (reply_sender, reply_receiver) = unbounded();
-                self.map_sender
-                    .send(WorkerMessage::GpuAddMapping(
-                        reply_sender,
-                        map_ptr,
-                        guest_addr,
-                        resource.size,
-                    ))
-                    .unwrap();
-                if !reply_receiver.recv().unwrap() {
-                    return Err(ErrUnspec);
-                }
-            } else {
                 return Err(ErrUnspec);
             }
         } else {
-            return Err(ErrUnspec);
+            self.rutabaga.map_placed(resource_id, addr)?;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let (reply_sender, reply_receiver) = unbounded();
+            self.map_sender
+                .send(WorkerMessage::GpuAddMapping(
+                    reply_sender,
+                    addr,
+                    guest_addr,
+                    resource.size,
+                ))
+                .unwrap();
+            if !reply_receiver.recv().unwrap() {
+                // The guest can't see the placement, so release it before
+                // failing the map.
+                Self::release_blob_placement(
+                    &mut self.rutabaga,
+                    resource_id,
+                    addr,
+                    resource.size,
+                    dmabuf,
+                );
+                return Err(ErrUnspec);
+            }
         }
 
-        resource.shmem_offset = Some(offset);
+        resource.shmem_mapping = Some(ShmMapping { offset, dmabuf });
         // Access flags not a part of the virtio-gpu spec.
         Ok(OkMapInfo {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
@@ -1003,7 +917,6 @@ impl VirtioGpu {
     }
 
     /// Uses the hypervisor to unmap the blob resource.
-    #[cfg(target_os = "linux")]
     pub fn resource_unmap_blob(
         &mut self,
         resource_id: u32,
@@ -1016,70 +929,89 @@ impl VirtioGpu {
 
         // The guest unmaps a blob it asked to map even when the mapping
         // failed, and there's nothing in the window to take back.
-        let Some(shmem_offset) = resource.shmem_offset else {
+        let Some(mapping) = resource.shmem_mapping else {
             return Ok(OkNoData);
         };
 
-        let addr = shm_region.host_addr + shmem_offset;
+        debug!(
+            "unmapping resource {resource_id}: offset={:x}, size={}",
+            mapping.offset, resource.size
+        );
 
-        let ret = unsafe {
-            libc::mmap(
-                addr as *mut libc::c_void,
-                resource.size as usize,
-                libc::PROT_NONE,
-                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_FIXED,
-                -1,
-                0_i64,
-            )
+        #[cfg(target_os = "macos")]
+        {
+            let guest_addr = shm_region.guest_addr + mapping.offset;
+            let (reply_sender, reply_receiver) = unbounded();
+            self.map_sender
+                .send(WorkerMessage::GpuRemoveMapping(
+                    reply_sender,
+                    guest_addr,
+                    resource.size,
+                ))
+                .unwrap();
+            if !reply_receiver.recv().unwrap() {
+                error!("failed to remove guest mapping for resource {resource_id}");
+                // The guest has relinquished the region and won't access it
+                // again, so release the placement even though the hypervisor
+                // couldn't drop its mapping. A future placement at the same
+                // offset replaces the stale mapping.
+                Self::release_blob_placement(
+                    &mut self.rutabaga,
+                    resource_id,
+                    shm_region.host_addr + mapping.offset,
+                    resource.size,
+                    mapping.dmabuf,
+                );
+                resource.shmem_mapping = None;
+                return Err(ErrUnspec);
+            }
         };
-        if ret == libc::MAP_FAILED {
-            error!("failed to unmap blob resource");
-            return Err(ErrUnspec);
-        }
 
-        resource.shmem_offset = None;
+        let addr = shm_region.host_addr + mapping.offset;
+        Self::release_blob_placement(
+            &mut self.rutabaga,
+            resource_id,
+            addr,
+            resource.size,
+            mapping.dmabuf,
+        );
+
+        resource.shmem_mapping = None;
 
         Ok(OkNoData)
     }
-    #[cfg(target_os = "macos")]
-    pub fn resource_unmap_blob(
-        &mut self,
+
+    /// Releases a blob placement in the shm region.
+    ///
+    /// Dmabuf mappings are mmap'd by us and unknown to rutabaga, so they are
+    /// replaced with inaccessible anonymous memory. Every other placement was
+    /// made by rutabaga, which knows how to undo it. Failures are only logged:
+    /// this is also used to clean up after a failed map, where there is
+    /// nothing better to do than leaving the range unusable.
+    fn release_blob_placement(
+        rutabaga: &mut Rutabaga,
         resource_id: u32,
-        shm_region: &VirtioShmRegion,
-    ) -> VirtioGpuResult {
-        let resource = self
-            .resources
-            .get_mut(&resource_id)
-            .ok_or(ErrInvalidResourceId)?;
-
-        debug!("resource_unmap_blob");
-        // The guest unmaps a blob it asked to map even when the mapping
-        // failed, and there's nothing in the window to take back.
-        let Some(shmem_offset) = resource.shmem_offset else {
-            return Ok(OkNoData);
-        };
-
-        let guest_addr = shm_region.guest_addr + shmem_offset;
-        debug!(
-            "unmapping: guest_addr={:x}, size={}",
-            guest_addr, resource.size
-        );
-
-        let (reply_sender, reply_receiver) = unbounded();
-        self.map_sender
-            .send(WorkerMessage::GpuRemoveMapping(
-                reply_sender,
-                guest_addr,
-                resource.size,
-            ))
-            .unwrap();
-        if !reply_receiver.recv().unwrap() {
-            return Err(ErrUnspec);
+        addr: u64,
+        size: u64,
+        dmabuf: bool,
+    ) {
+        if dmabuf {
+            let ret = unsafe {
+                libc::mmap(
+                    addr as *mut libc::c_void,
+                    size as usize,
+                    libc::PROT_NONE,
+                    libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_FIXED,
+                    -1,
+                    0_i64,
+                )
+            };
+            if ret == libc::MAP_FAILED {
+                error!("failed to release dmabuf mapping at {addr:x}");
+            }
+        } else if let Err(err) = rutabaga.unmap(resource_id) {
+            warn!("error unmapping resource_id={resource_id}: {err}");
         }
-
-        resource.shmem_offset = None;
-
-        Ok(OkNoData)
     }
 }
 

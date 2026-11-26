@@ -30,9 +30,6 @@ ifeq ($(TDX),1)
     VARIANT = -tdx
     FEATURE_FLAGS := --features tdx
 endif
-ifeq ($(VIRGL_RESOURCE_MAP2),1)
-	FEATURE_FLAGS += --features virgl_resource_map2
-endif
 # Test targets require the block device (BLK) feature for FreeBSD disk tests
 # and the NET feature for gvproxy-based network tests. The FFI feature (weak
 # linking tests) is enabled by default (see FFI below). Enable BLK/NET
