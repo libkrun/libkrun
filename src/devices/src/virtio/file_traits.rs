@@ -22,6 +22,8 @@ use super::block::device::DiskProperties;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
+use windows_sys::Win32::Foundation::ERROR_HANDLE_EOF;
+#[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::OVERLAPPED;
@@ -514,7 +516,12 @@ macro_rules! volatile_impl {
                 if ret != 0 {
                     Ok(bytes_read as usize)
                 } else {
-                    Err(Error::last_os_error())
+                    let err = Error::last_os_error();
+                    if err.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+                        Ok(0)
+                    } else {
+                        Err(err)
+                    }
                 }
             }
             fn read_vectored_at_volatile(
