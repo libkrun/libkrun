@@ -82,6 +82,9 @@ pub(crate) struct DiskProperties {
     pub(crate) file: Arc<RwLock<FormatAccess<Box<dyn DynStorage>>>>,
     nsectors: u64,
     image_id: Vec<u8>,
+    /// Whether reads and writes go through a buffer of our own instead of guest memory, see
+    /// [`DiskProperties::with_direct_io`].
+    bounce_guest_io: bool,
 }
 
 impl DiskProperties {
@@ -106,7 +109,25 @@ impl DiskProperties {
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id: disk_image_id,
             file: disk_image,
+            bounce_guest_io: false,
         })
+    }
+
+    /// Tells the disk whether its image was opened for direct I/O.
+    ///
+    /// On macOS, direct I/O is F_NOCACHE, and XNU then DMAs straight into or out of the
+    /// buffers of a request, wiring and committing whole 16 KiB host pages while the guest
+    /// buffers are usually 4 KiB pages that share a host page with other guest pages. Guest
+    /// memory is not handed to the host kernel for such a disk: reads and writes go through a
+    /// host-page-aligned buffer of our own, and the data is copied to or from guest memory. The
+    /// image file is still opened with F_NOCACHE, so it stays out of the host's cache.
+    pub fn with_direct_io(mut self, direct_io: bool) -> Self {
+        self.bounce_guest_io = cfg!(target_os = "macos") && direct_io;
+        self
+    }
+
+    pub(crate) fn bounce_guest_io(&self) -> bool {
+        self.bounce_guest_io
     }
 
     pub fn nsectors(&self) -> u64 {
@@ -246,6 +267,7 @@ pub struct Block {
     cache_type: CacheType,
     disk_image: Arc<RwLock<FormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
+    direct_io: bool,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
     parallel_reads: bool,
@@ -325,7 +347,8 @@ impl Block {
         let disk_image = Arc::new(RwLock::new(disk_image));
 
         let disk_properties =
-            DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
+            DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?
+                .with_direct_io(direct_io);
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
@@ -363,6 +386,7 @@ impl Block {
             cache_type,
             disk_image,
             disk_image_id,
+            direct_io,
             avail_features,
             acked_features: 0u64,
             device_state: DeviceState::Inactive,
@@ -462,7 +486,8 @@ impl VirtioDevice for Block {
                 self.disk_image_id.clone(),
                 self.cache_type,
             )
-            .map_err(|_| ActivateError::BadActivate)?,
+            .map_err(|_| ActivateError::BadActivate)?
+            .with_direct_io(self.direct_io),
         };
 
         let worker = BlockWorker::new(
@@ -533,6 +558,94 @@ mod tests {
             &image_id,
             &long_id.as_bytes()[..VIRTIO_BLK_ID_BYTES as usize]
         );
+    }
+
+    #[test]
+    fn bounced_io_matches_guest_memory_io() {
+        use crate::virtio::file_traits::FileReadWriteAtVolatile;
+        use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend};
+
+        let open = |path: &str, bounce: bool| {
+            let file = ImagoFile::open(StorageOpenOptions::new().write(true).filename(path))
+                .expect("open image");
+            let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), true)
+                .expect("open raw image");
+            let mut disk = DiskProperties::new(
+                Arc::new(RwLock::new(FormatAccess::new(raw))),
+                Vec::new(),
+                CacheType::Unsafe,
+            )
+            .expect("disk properties");
+            disk.bounce_guest_io = bounce;
+            disk
+        };
+
+        let pattern: Vec<u8> = (0..0x4000u32).map(|i| (i * 7 + i / 512) as u8).collect();
+        // Segments as a guest might hand them over: odd lengths, not page aligned, and one of
+        // them empty.
+        let segments = [
+            (0x1000u64, 512usize),
+            (0x3200, 0),
+            (0x5000, 0x2600),
+            (0x9a00, 0x1200),
+        ];
+        let total: usize = segments.iter().map(|s| s.1).sum();
+
+        let mut read_back = Vec::new();
+        for bounce in [false, true] {
+            let backing = TempFile::new().expect("create backing file");
+            backing
+                .as_file()
+                .set_len(0x10000)
+                .expect("size backing file");
+            let disk = open(backing.as_path().to_str().unwrap(), bounce);
+            let mem: GuestMemoryMmap =
+                GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+
+            let mut done = 0;
+            for (addr, len) in segments {
+                mem.write_slice(&pattern[done..done + len], GuestAddress(addr))
+                    .unwrap();
+                done += len;
+            }
+            let slices: Vec<_> = segments
+                .iter()
+                .map(|&(addr, len)| mem.get_slice(GuestAddress(addr), len).unwrap())
+                .collect();
+            assert_eq!(
+                disk.write_vectored_at_volatile(&slices, 1024).unwrap(),
+                total
+            );
+
+            let mut on_disk = vec![0u8; total];
+            disk.file
+                .read()
+                .unwrap()
+                .read(&mut on_disk, 1024)
+                .expect("read image");
+            assert_eq!(on_disk, pattern[..total]);
+
+            mem.write_slice(&vec![0xaa; 0x10000], GuestAddress(0))
+                .unwrap();
+            assert_eq!(
+                disk.read_vectored_at_volatile(&slices, 1024).unwrap(),
+                total
+            );
+            let mut whole = vec![0u8; 0x10000];
+            mem.read_slice(&mut whole, GuestAddress(0)).unwrap();
+            read_back.push(whole);
+        }
+        // Same guest memory afterwards: the segments hold the data, and nothing around them
+        // was touched.
+        assert_eq!(read_back[0], read_back[1]);
+        let mut done = 0;
+        for (addr, len) in segments {
+            let addr = addr as usize;
+            assert_eq!(read_back[1][addr..addr + len], pattern[done..done + len]);
+            done += len;
+        }
+        assert_eq!(read_back[1][0], 0xaa);
+        assert_eq!(read_back[1][0x1000 + 512], 0xaa);
     }
 
     #[test]
