@@ -1,3 +1,4 @@
+pub mod build_capabilities;
 pub mod device_builders;
 pub mod error;
 pub mod logging;
@@ -67,6 +68,7 @@ pub use logging::{LogLevel, LogOptions, LogStyle, init_log};
 pub use payload::{KernelFormat, Payload};
 pub use vmm_builder::{Vmm, VmmBuilder, VmmHandle, check_nested_virt};
 
+pub use build_capabilities::{BuildCapabilityFlags, build_capability_flags};
 #[cfg(feature = "net")]
 pub use devices::virtio::net::device::VirtioNetBackend;
 pub use devices::virtio::port_io;
@@ -156,7 +158,9 @@ ffier::library_definition!("krun", library_tag = 1,
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     enum devices::virtio::fs::CachePolicy,
     fn crate::api::logging::init_log_fn::init_log,
+    fn crate::api::build_capabilities::build_capability_flags,
     fn crate::api::vmm_builder::check_nested_virt,
+    bitflags crate::api::build_capabilities::BuildCapabilityFlags,
     bitflags crate::api::logging::LogOptions,
     bitflags crate::api::device_builders::TsiFlags,
     #[cfg(feature = "gpu")]
