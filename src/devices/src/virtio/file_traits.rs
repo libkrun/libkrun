@@ -8,7 +8,7 @@ use std::io::{Error, ErrorKind, Result};
 use std::os::unix::io::AsRawFd;
 
 #[cfg(feature = "blk")]
-use imago::io_buffers::{IoVector, IoVectorMut};
+use imago::io_buffers::{IoBuffer, IoVector, IoVectorMut};
 use vm_memory::VolatileSlice;
 
 #[cfg(unix)]
@@ -578,6 +578,80 @@ macro_rules! volatile_impl {
 
 volatile_impl!(File);
 
+/// A buffer for one request of `len` bytes, aligned to the host page size so that the request
+/// still bypasses the host cache when the image was opened for direct I/O. See
+/// `DiskProperties::with_direct_io()`.
+#[cfg(feature = "blk")]
+fn bounce_buffer(len: usize) -> Result<IoBuffer> {
+    // SAFETY: sysconf() has no preconditions.
+    #[cfg(unix)]
+    let page_size = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+        size if size > 0 => size as usize,
+        _ => 16384,
+    };
+    // Only used on macOS; this keeps the code built and tested everywhere.
+    #[cfg(not(unix))]
+    let page_size = 4096;
+    IoBuffer::new(len, page_size)
+}
+
+#[cfg(feature = "blk")]
+impl DiskProperties {
+    /// Reads into a buffer of our own, then copies into the guest buffers in order. On error,
+    /// the guest buffers are left as they were.
+    fn bounced_read(&self, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
+        let total: usize = bufs.iter().map(|s| s.len()).sum();
+        if total == 0 {
+            return Ok(0);
+        }
+        let mut buffer = bounce_buffer(total)?;
+        self.file
+            .read()
+            .unwrap()
+            .readv(IoVectorMut::from(&mut buffer), offset)?;
+        let data = buffer.as_ref().into_slice();
+        let mut done = 0;
+        for slice in bufs.iter().filter(|s| !s.is_empty()) {
+            let guard = slice.ptr_guard_mut();
+            // SAFETY: the guard is valid for `slice.len()` bytes of guest memory, `data` holds
+            // `total` bytes, the sum of all the lengths, and the two don't overlap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(data[done..].as_ptr(), guard.as_ptr(), guard.len())
+            };
+            done += guard.len();
+        }
+        Ok(total)
+    }
+
+    /// Copies the guest buffers in order into a buffer of our own, then writes that.
+    fn bounced_write(&self, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
+        let total: usize = bufs.iter().map(|s| s.len()).sum();
+        if total == 0 {
+            return Ok(0);
+        }
+        let mut buffer = bounce_buffer(total)?;
+        let data = buffer.as_mut().into_slice();
+        let mut done = 0;
+        for slice in bufs.iter().filter(|s| !s.is_empty()) {
+            let guard = slice.ptr_guard();
+            // SAFETY: as in bounced_read(), with the copy going the other way.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    guard.as_ptr(),
+                    data[done..].as_mut_ptr(),
+                    guard.len(),
+                )
+            };
+            done += guard.len();
+        }
+        self.file
+            .write()
+            .unwrap()
+            .writev(IoVector::from(&buffer), offset)?;
+        Ok(total)
+    }
+}
+
 #[cfg(feature = "blk")]
 impl FileReadWriteAtVolatile for DiskProperties {
     fn read_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
@@ -587,6 +661,10 @@ impl FileReadWriteAtVolatile for DiskProperties {
     fn read_vectored_at_volatile(&self, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
         if bufs.is_empty() {
             return Ok(0);
+        }
+
+        if self.bounce_guest_io() {
+            return self.bounced_read(bufs, offset);
         }
 
         let (iovec, _guard) = IoVectorMut::from_volatile_slice(bufs);
@@ -605,6 +683,10 @@ impl FileReadWriteAtVolatile for DiskProperties {
     fn write_vectored_at_volatile(&self, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
         if bufs.is_empty() {
             return Ok(0);
+        }
+
+        if self.bounce_guest_io() {
+            return self.bounced_write(bufs, offset);
         }
 
         let (iovec, _guard) = IoVector::from_volatile_slice(bufs);
