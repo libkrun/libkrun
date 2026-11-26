@@ -45,6 +45,11 @@ Create an `MmioDeviceManager` with `MmioDeviceManager::new()` (C API: `krun_mmio
   for directories accessed exclusively through this filesystem.
   `set_cache_timeouts()` sets how long lookups and attributes are cached (5000 ms by
   default); use 0 for directories the host modifies while the guest uses them.
+  On Windows hosts, `PermissionSemantics::LinuxComplete` stores each entry's Linux owner
+  and mode in the `$LXUID`, `$LXGID` and `$LXMOD` extended attributes, the format WSL
+  uses for DrvFs metadata. Volumes without extended attributes, such as ReFS, and
+  entries whose extended attributes cannot be written keep them in the
+  `user.containers.override_stat` stream instead.
 - **Network**:
   - **TSI (Transparent Socket Impersonation)**: Built into `VsockDevice` with `TsiFlags::HIJACK_INET` and port forwarding.
   - **Virtio-net**: `NetDevice` connected via Unix stream or datagram socket (e.g. to `passt` or `gvproxy`).

@@ -7,7 +7,7 @@ pub use super::super::{CachePolicy, PermissionSemantics};
 use std::collections::BTreeMap;
 use std::ffi::{CStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io;
 use std::mem::{self, ManuallyDrop};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{FromRawHandle, RawHandle};
@@ -23,25 +23,28 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FILE_ACCESS_INFORMATION, FILE_ALL_INFORMATION, FILE_CREATE, FILE_DIRECTORY_FILE,
     FILE_DISPOSITION_INFORMATION, FILE_ID_BOTH_DIR_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
     FILE_OPEN_BY_FILE_ID, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE, FILE_OVERWRITE_IF,
-    FILE_STAT_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileAccessInformation, FileAllInformation,
-    FileAttributeTagInformation, FileDispositionInformation, FileIdBothDirectoryInformation,
-    FileStatInformation, IO_REPARSE_TAG_LX_SYMLINK, NtCreateFile, NtQueryDirectoryFile,
-    NtQueryInformationByName, NtQueryInformationFile, NtSetInformationFile, NtWriteFile,
-    RtlNtStatusToDosErrorNoTeb,
+    FILE_STAT_INFORMATION, FILE_STAT_LX_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileAccessInformation, FileAllInformation, FileAttributeTagInformation,
+    FileDispositionInformation, FileIdBothDirectoryInformation, FileStatInformation,
+    FileStatLxInformation, IO_REPARSE_TAG_LX_SYMLINK, LX_FILE_METADATA_HAS_GID,
+    LX_FILE_METADATA_HAS_MODE, LX_FILE_METADATA_HAS_UID, NtCreateFile, NtQueryDirectoryFile,
+    NtQueryInformationByName, NtQueryInformationFile, NtSetEaFile, NtSetInformationFile,
+    NtWriteFile, RtlNtStatusToDosErrorNoTeb,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_NAME, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    INVALID_HANDLE_VALUE, NTSTATUS, STATUS_BUFFER_OVERFLOW, STATUS_INVALID_DEVICE_REQUEST,
-    STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_NO_MORE_FILES,
-    STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED, UNICODE_STRING,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME,
+    ERROR_PATH_NOT_FOUND, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
+    STATUS_BUFFER_OVERFLOW, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_INFO_CLASS,
+    STATUS_INVALID_PARAMETER, STATUS_NO_MORE_FILES, STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED,
+    UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DeleteFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
     FILE_BASIC_INFO, FILE_END_OF_FILE_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileBasicInfo,
-    FileEndOfFileInfo, GetDiskFreeSpaceExW, GetVolumeInformationByHandleW, GetVolumePathNameW,
-    SetFileInformationByHandle,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+    FileBasicInfo, FileEndOfFileInfo, GetDiskFreeSpaceExW, GetVolumeInformationByHandleW,
+    GetVolumePathNameW, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
@@ -160,12 +163,12 @@ struct InodeData {
     // `setattr` can bring them back; a host process editing the streams directly is
     // not noticed until the inode is forgotten.
     privs_dropped: AtomicBool,
-    // The override_stat stream as last read, with the entry's ChangeTime then.
+    // The stored owner and mode as last read, with the entry's ChangeTime then.
     override_stat: Mutex<Option<(i64, OverrideStat)>>,
 }
 
 impl InodeData {
-    /// The override_stat stream of this entry, whose ChangeTime is `change_time`, calling
+    /// The stored owner and mode of this entry, whose ChangeTime is `change_time`, calling
     /// `read` when it has to be read from the host.
     fn override_stat(&self, change_time: i64, read: impl FnOnce() -> OverrideStat) -> OverrideStat {
         let mut cached = self.override_stat.lock().unwrap();
@@ -175,7 +178,7 @@ impl InodeData {
             return value;
         }
         let value = read();
-        // Writing a stream moves ChangeTime only to the next timestamp tick, so a change
+        // Writing metadata moves ChangeTime only to the next timestamp tick, so a change
         // made in the tick this was read in would go unnoticed: keep only what was read
         // once ChangeTime had settled.
         *cached =
@@ -363,10 +366,21 @@ fn unix_to_filetime(secs: i64, nsec: u32) -> u64 {
 
 type FileInfo = FILE_STAT_INFORMATION;
 
-/// `(uid, gid, mode)` as stored in the override_stat stream.
+/// `(uid, gid, mode)` as stored for an entry.
 type OverrideStat = (Option<u32>, Option<u32>, Option<u32>);
 
-/// How long after its last change an entry's override_stat stream is trusted to stay as read:
+/// What a caller already knows of an entry's stored ownership and mode.
+#[derive(Clone, Copy)]
+enum Stored {
+    /// Just written, or queried along with the entry's attributes.
+    Known(OverrideStat),
+    /// The entry has no WSL metadata extended attributes, so only the override_stat stream,
+    /// written where those cannot be, can hold them.
+    NotInAttributes,
+    Unknown,
+}
+
+/// How long after its last change an entry's stored owner and mode are trusted to stay as read:
 /// one second, in FILETIME units.
 const SETTLED_CHANGE_TIME: i64 = 10_000_000;
 
@@ -408,6 +422,50 @@ fn get_file_info_by_handle(handle: HANDLE) -> io::Result<FileInfo> {
 /// Like an open with `FILE_OPEN_REPARSE_POINT`, a reparse point describes itself, not its
 /// target. `None` when the file system cannot answer by name.
 fn get_file_info_by_name(path: &Path) -> io::Result<Option<FileInfo>> {
+    query_information_by_name(path, FileStatInformation)
+}
+
+/// As `get_file_info_by_name`, with the WSL metadata extended attributes.
+fn get_lx_info_by_name(path: &Path) -> io::Result<Option<FILE_STAT_LX_INFORMATION>> {
+    query_information_by_name(path, FileStatLxInformation)
+}
+
+/// `path`'s attributes and the ownership and mode its WSL metadata extended attributes hold,
+/// queried by name. `None` when the file system cannot answer by name.
+fn query_by_name(path: &Path) -> io::Result<Option<(FileInfo, Option<OverrideStat>)>> {
+    let lx = match get_lx_info_by_name(path) {
+        Ok(lx) => lx,
+        // A missing name is the common failure and the plain query would only repeat it;
+        // any other may be the file system refusing just this information class.
+        Err(e) if is_missing(&e) => return Err(e),
+        Err(_) => None,
+    };
+    if let Some(lx) = lx {
+        let info = FileInfo {
+            FileId: lx.FileId,
+            CreationTime: lx.CreationTime,
+            LastAccessTime: lx.LastAccessTime,
+            LastWriteTime: lx.LastWriteTime,
+            ChangeTime: lx.ChangeTime,
+            AllocationSize: lx.AllocationSize,
+            EndOfFile: lx.EndOfFile,
+            FileAttributes: lx.FileAttributes,
+            ReparseTag: lx.ReparseTag,
+            NumberOfLinks: lx.NumberOfLinks,
+            EffectiveAccess: lx.EffectiveAccess,
+        };
+        return Ok(Some((info, lx_metadata(&lx))));
+    }
+    Ok(get_file_info_by_name(path)?.map(|info| (info, None)))
+}
+
+fn is_missing(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(code)
+        if code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_PATH_NOT_FOUND as i32)
+}
+
+/// `T` must be the plain-data structure `class` fills.
+fn query_information_by_name<T>(path: &Path, class: i32) -> io::Result<Option<T>> {
     let mut nt_path = path_to_nt_wide(path);
     let byte_len = (nt_path.len() - 1) * 2;
     let mut us = UNICODE_STRING {
@@ -424,14 +482,14 @@ fn get_file_info_by_name(path: &Path) -> io::Result<Option<FileInfo>> {
         SecurityQualityOfService: ptr::null(),
     };
     let mut iosb: IO_STATUS_BLOCK = unsafe { mem::zeroed() };
-    let mut info = FileInfo::default();
+    let mut info: T = unsafe { mem::zeroed() };
     let status = unsafe {
         NtQueryInformationByName(
             &oa,
             &mut iosb,
-            &mut info as *mut FileInfo as *mut core::ffi::c_void,
-            mem::size_of::<FileInfo>() as u32,
-            FileStatInformation,
+            &mut info as *mut T as *mut core::ffi::c_void,
+            mem::size_of::<T>() as u32,
+            class,
         )
     };
     match status {
@@ -686,51 +744,156 @@ fn parse_override_stat(buf: &[u8]) -> io::Result<(Option<u32>, Option<u32>, Opti
     Ok((uid, gid, mode))
 }
 
-fn write_override_stat(
-    path: &Path,
-    owner: Option<(u32, u32)>,
-    mode: Option<u32>,
-) -> io::Result<()> {
-    let buf = if is_valid_owner(owner)
-        && let Some(m) = mode
-    {
-        let (uid, gid) = owner.unwrap();
-        format!("{}:{}:0{:o}", uid, gid, m)
-    } else {
-        let (orig_uid, orig_gid, orig_mode) = read_override_stat(path)?;
-        let (uid, gid) = match owner {
-            Some((u, g)) => {
-                let uid = if u < UID_MAX { Some(u) } else { orig_uid };
-                let gid = if g < UID_MAX { Some(g) } else { orig_gid };
-                (uid, gid)
-            }
-            None => (orig_uid, orig_gid),
-        };
-
-        let mut s = String::new();
-        match uid {
-            Some(u) => s.push_str(&u.to_string()),
-            None => s.push('x'),
-        }
-        s.push(':');
-        match gid {
-            Some(g) => s.push_str(&g.to_string()),
-            None => s.push('x'),
-        }
-        s.push(':');
-        match mode.or(orig_mode) {
-            Some(m) => s.push_str(&format!("0{:o}", m)),
-            None => s.push('x'),
-        }
-        s
-    };
-
-    let ads = ads_stream_path(path, OVERRIDE_STAT_STREAM);
-    fs::write(&ads, buf.as_bytes()).map_err(win_err_to_linux)
+fn format_override_stat((uid, gid, mode): OverrideStat) -> String {
+    let field = |value: Option<u32>, format: fn(u32) -> String| value.map_or("x".into(), format);
+    format!(
+        "{}:{}:{}",
+        field(uid, |u| u.to_string()),
+        field(gid, |g| g.to_string()),
+        field(mode, |m| format!("0{m:o}")),
+    )
 }
 
-fn is_valid_owner(owner: Option<(u32, u32)>) -> bool {
-    matches!(owner, Some((u, g)) if u < UID_MAX && g < UID_MAX)
+fn write_override_stream(path: &Path, stat: OverrideStat) -> io::Result<()> {
+    let ads = ads_stream_path(path, OVERRIDE_STAT_STREAM);
+    fs::write(&ads, format_override_stat(stat)).map_err(win_err_to_linux)
+}
+
+/// Where an entry's ownership and mode are stored.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StoredIn {
+    Attributes,
+    Stream,
+    Nowhere,
+}
+
+/// The ownership and mode the WSL metadata extended attributes of `lx` hold, if any.
+fn lx_metadata(lx: &FILE_STAT_LX_INFORMATION) -> Option<OverrideStat> {
+    let has = |flag| lx.LxFlags & flag != 0;
+    (has(LX_FILE_METADATA_HAS_UID)
+        || has(LX_FILE_METADATA_HAS_GID)
+        || has(LX_FILE_METADATA_HAS_MODE))
+    .then(|| {
+        (
+            has(LX_FILE_METADATA_HAS_UID).then_some(lx.LxUid),
+            has(LX_FILE_METADATA_HAS_GID).then_some(lx.LxGid),
+            has(LX_FILE_METADATA_HAS_MODE).then_some(lx.LxMode),
+        )
+    })
+}
+
+/// The ownership and mode stored for the entry at `path`: its WSL metadata extended
+/// attributes, or else the override_stat stream that keeps them where those cannot be written.
+fn read_metadata(path: &Path) -> (OverrideStat, StoredIn) {
+    if let Ok(Some(lx)) = get_lx_info_by_name(path)
+        && let Some(stored) = lx_metadata(&lx)
+    {
+        return (stored, StoredIn::Attributes);
+    }
+    match read_override_stat(path).unwrap_or((None, None, None)) {
+        (None, None, None) => ((None, None, None), StoredIn::Nowhere),
+        stored => (stored, StoredIn::Stream),
+    }
+}
+
+/// Set the WSL metadata extended attributes of the entry at `path` for the values given,
+/// leaving the others alone.
+fn write_lx_metadata(path: &Path, stat: OverrideStat) -> io::Result<()> {
+    let h = HandleGuard(open_handle(
+        path,
+        &OpenFlags {
+            desired_access: FILE_WRITE_EA,
+            create_disposition: FILE_OPEN,
+            create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        },
+    )?);
+    set_lx_metadata(h.as_raw(), stat)
+}
+
+/// As `write_lx_metadata`, through `handle`, which needs `FILE_WRITE_EA` access.
+fn set_lx_metadata(handle: HANDLE, (uid, gid, mode): OverrideStat) -> io::Result<()> {
+    let attributes: Vec<(&[u8], u32)> = [
+        (b"$LXUID".as_slice(), uid),
+        (b"$LXGID".as_slice(), gid),
+        (b"$LXMOD".as_slice(), mode),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| Some((name, value?)))
+    .collect();
+
+    // A FILE_FULL_EA_INFORMATION list: each entry is NextEntryOffset, Flags, EaNameLength,
+    // EaValueLength, the NUL-terminated name and the value, padded to 4 bytes but the last.
+    let mut buf = Vec::new();
+    for (i, (name, value)) in attributes.iter().enumerate() {
+        let start = buf.len();
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.push(0);
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(&(mem::size_of::<u32>() as u16).to_le_bytes());
+        buf.extend_from_slice(name);
+        buf.push(0);
+        buf.extend_from_slice(&value.to_le_bytes());
+        if i + 1 < attributes.len() {
+            buf.resize(buf.len().next_multiple_of(4), 0);
+            let next = (buf.len() - start) as u32;
+            buf[start..start + 4].copy_from_slice(&next.to_le_bytes());
+        }
+    }
+
+    let mut iosb: IO_STATUS_BLOCK = unsafe { mem::zeroed() };
+    let status = unsafe {
+        NtSetEaFile(
+            handle,
+            &mut iosb,
+            buf.as_ptr() as *const core::ffi::c_void,
+            buf.len() as u32,
+        )
+    };
+    if status < 0 {
+        Err(nt_status_to_io_error(status))
+    } else {
+        Ok(())
+    }
+}
+
+/// Store ownership and mode for the entry at `path`, whose current ones were read as
+/// `stored_in`. They go to the WSL metadata extended attributes, which the by-name query a
+/// lookup makes returns for free. When those cannot be written, the override_stat stream
+/// keeps them instead, unless extended attributes already hold values it would not override.
+fn write_metadata(path: &Path, stat: OverrideStat, stored_in: StoredIn) -> io::Result<()> {
+    match write_lx_metadata(path, stat) {
+        Ok(()) => Ok(()),
+        Err(e) if stored_in == StoredIn::Attributes => Err(win_err_to_linux(e)),
+        Err(e) => {
+            debug!("WSL metadata of {}: {e}, using the stream", path.display());
+            write_override_stream(path, stat)
+        }
+    }
+}
+
+/// As `write_metadata`, for an entry just created at `path`, and still open as `handle` when
+/// given.
+fn write_new_metadata(path: &Path, handle: Option<HANDLE>, stat: OverrideStat) -> io::Result<()> {
+    let result = match handle {
+        Some(h) => match set_lx_metadata(h, stat) {
+            // A handle opened for reading only lacks FILE_WRITE_EA.
+            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                write_lx_metadata(path, stat)
+            }
+            result => result,
+        },
+        None => write_lx_metadata(path, stat),
+    };
+    let Err(e) = result else { return Ok(()) };
+    debug!("WSL metadata of {}: {e}, using the stream", path.display());
+    match handle {
+        Some(h) => write_ads_by_handle(
+            h,
+            OVERRIDE_STAT_STREAM,
+            format_override_stat(stat).as_bytes(),
+        ),
+        None => write_override_stream(path, stat),
+    }
 }
 
 /// Delete the ADS stream that emulates `security.capability`. Returns whether the stream
@@ -803,20 +966,6 @@ fn open_ads_by_handle(
         Err(nt_status_to_io_error(status))
     } else {
         Ok(h)
-    }
-}
-
-/// Read the override_stat stream of the entry open as `file_handle`.
-fn read_override_stat_by_handle(file_handle: HANDLE) -> OverrideStat {
-    let Ok(h) = open_ads_by_handle(file_handle, OVERRIDE_STAT_STREAM, GENERIC_READ, FILE_OPEN)
-    else {
-        return (None, None, None);
-    };
-    let mut stream = unsafe { File::from_raw_handle(h as RawHandle) };
-    let mut buf = [0u8; 64];
-    match stream.read(&mut buf) {
-        Ok(n) => parse_override_stat(&buf[..n]).unwrap_or((None, None, None)),
-        Err(_) => (None, None, None),
     }
 }
 
@@ -1443,24 +1592,25 @@ impl PassthroughFs {
     }
 
     /// The attributes of `data`, from `info` queried on `handle`, or by name when there is no
-    /// handle. `known_override` spares reading back an override_stat just written.
+    /// handle.
     fn attr_of(
         &self,
         ctx: &Context,
         data: &InodeData,
         info: &FileInfo,
         handle: Option<HANDLE>,
-        known_override: Option<OverrideStat>,
+        stored: Stored,
     ) -> stat64 {
-        let read_override = || match handle {
-            Some(h) => read_override_stat_by_handle(h),
-            None => read_override_stat(&data.get_path()).unwrap_or((None, None, None)),
-        };
         let override_stat = match self.cfg.semantics {
-            PermissionSemantics::LinuxComplete => Some(
-                known_override
-                    .unwrap_or_else(|| data.override_stat(info.ChangeTime, read_override)),
-            ),
+            PermissionSemantics::LinuxComplete => Some(match stored {
+                Stored::Known(stat) => stat,
+                Stored::NotInAttributes => data.override_stat(info.ChangeTime, || {
+                    read_override_stat(&data.get_path()).unwrap_or((None, None, None))
+                }),
+                Stored::Unknown => {
+                    data.override_stat(info.ChangeTime, || read_metadata(&data.get_path()).0)
+                }
+            }),
             PermissionSemantics::LinuxSimplified
             | PermissionSemantics::LinuxSimplifiedFixedOwner => None,
         };
@@ -1485,10 +1635,10 @@ impl PassthroughFs {
 
         let path = data.get_path();
         let mut dropped = remove_security_capability(&path);
-        if let Ok((_, _, Some(mode))) = read_override_stat(&path) {
+        if let ((uid, gid, Some(mode)), stored_in) = read_metadata(&path) {
             let new_mode = clear_suid_sgid(mode);
             if new_mode != mode
-                && let Err(e) = write_override_stat(&path, None, Some(new_mode))
+                && let Err(e) = write_metadata(&path, (uid, gid, Some(new_mode)), stored_in)
             {
                 error!("clear suid/sgid for inode {}: {e}", data.inode);
                 dropped = false;
@@ -1531,7 +1681,7 @@ impl PassthroughFs {
         // A child of a mount point needs a handle to learn its volume, and a symlink one to
         // read its target.
         if !parent_data.is_mount_point
-            && let Some(info) = get_file_info_by_name(&child_path).map_err(win_err_to_linux)?
+            && let Some((info, stored)) = query_by_name(&child_path).map_err(win_err_to_linux)?
             && info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
         {
             return self.entry_from_info(
@@ -1542,7 +1692,7 @@ impl PassthroughFs {
                 &info,
                 parent_data.volume_serial,
                 None,
-                None,
+                stored.map_or(Stored::NotInAttributes, Stored::Known),
             );
         }
 
@@ -1590,7 +1740,7 @@ impl PassthroughFs {
             &file_info,
             volume_serial,
             Some(handle),
-            known_override,
+            known_override.map_or(Stored::Unknown, Stored::Known),
         )
     }
 
@@ -1605,7 +1755,7 @@ impl PassthroughFs {
         file_info: &FileInfo,
         volume_serial: u32,
         handle: Option<HANDLE>,
-        known_override: Option<OverrideStat>,
+        stored: Stored,
     ) -> io::Result<Entry> {
         let alt_key = InodeAltKey {
             file_index: file_info.FileId as u64,
@@ -1655,7 +1805,7 @@ impl PassthroughFs {
         };
         let inode = data.inode;
 
-        let st = self.attr_of(ctx, &data, file_info, handle, known_override);
+        let st = self.attr_of(ctx, &data, file_info, handle, stored);
 
         let mut attr_flags = 0u32;
         if st.st_mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32
@@ -1705,10 +1855,11 @@ impl PassthroughFs {
             }
             _ => {
                 // A symlink needs a handle to read its target.
-                if let Some(info) = get_file_info_by_name(&path).map_err(win_err_to_linux)?
+                if let Some((info, stored)) = query_by_name(&path).map_err(win_err_to_linux)?
                     && info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
                 {
-                    let stat = self.attr_of(ctx, &data, &info, None, None);
+                    let stored = stored.map_or(Stored::NotInAttributes, Stored::Known);
+                    let stat = self.attr_of(ctx, &data, &info, None, stored);
                     return Ok((stat, self.cfg.attr_timeout));
                 }
                 let h = open_handle(
@@ -1727,7 +1878,7 @@ impl PassthroughFs {
 
         let info = get_file_info_by_handle(raw_h).map_err(win_err_to_linux)?;
 
-        let stat = self.attr_of(ctx, &data, &info, Some(raw_h), None);
+        let stat = self.attr_of(ctx, &data, &info, Some(raw_h), Stored::Unknown);
         Ok((stat, self.cfg.attr_timeout))
     }
 
@@ -2163,17 +2314,24 @@ impl FileSystem for PassthroughFs {
         );
 
         let dir_mode = mode & !umask;
+        let child_path = child_path(parent_data.get_path().as_path(), name)?;
         if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
             if let Some(secctx) = extensions.secctx {
                 let stream_name = format!(":{}", secctx.name.to_string_lossy());
                 write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
             }
 
-            let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, dir_mode);
-            write_ads_by_handle(child_g.as_raw(), OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
+            write_new_metadata(
+                &child_path,
+                Some(child_g.as_raw()),
+                (
+                    Some(ctx.uid),
+                    Some(ctx.gid),
+                    Some(libc::S_IFDIR as u32 | dir_mode),
+                ),
+            )?;
         }
 
-        let child_path = child_path(parent_data.get_path().as_path(), name)?;
         self.entry_from_handle(
             &ctx,
             parent,
@@ -2345,8 +2503,8 @@ impl FileSystem for PassthroughFs {
                     || needs_suid_clear
                 {
                     // Single read to inspect current state
-                    let (mut current_uid, mut current_gid, mut current_mode) =
-                        read_override_stat(&path).unwrap_or((Some(u32::MAX), Some(u32::MAX), None));
+                    let ((mut current_uid, mut current_gid, mut current_mode), stored_in) =
+                        read_metadata(&path);
 
                     let mut override_changed = false;
 
@@ -2355,13 +2513,18 @@ impl FileSystem for PassthroughFs {
                         override_changed = true;
                     }
 
+                    // An out-of-range id keeps the stored one.
                     if valid.contains(SetattrValid::UID) {
-                        current_uid = Some(attr.st_uid);
+                        if attr.st_uid < UID_MAX {
+                            current_uid = Some(attr.st_uid);
+                        }
                         override_changed = true;
                     }
 
                     if valid.contains(SetattrValid::GID) {
-                        current_gid = Some(attr.st_gid);
+                        if attr.st_gid < UID_MAX {
+                            current_gid = Some(attr.st_gid);
+                        }
                         override_changed = true;
                     }
 
@@ -2382,17 +2545,11 @@ impl FileSystem for PassthroughFs {
 
                     // Single unified write if metadata changed
                     if override_changed {
-                        // An out-of-range id keeps the stored one, so a chown
-                        // of a single id still persists when the other is unset.
-                        let owner_param = (
-                            current_uid.unwrap_or(u32::MAX),
-                            current_gid.unwrap_or(u32::MAX),
-                        );
-                        write_override_stat(&path, Some(owner_param), current_mode)?;
+                        write_metadata(&path, (current_uid, current_gid, current_mode), stored_in)?;
                         data.privs_dropped.store(false, Ordering::Relaxed);
                     }
 
-                    // The stream now holds these values, so the reply can
+                    // The stored metadata now holds these values, so the reply can
                     // skip reading it back.
                     known_override = Some((current_uid, current_gid, current_mode));
                 }
@@ -2497,7 +2654,13 @@ impl FileSystem for PassthroughFs {
             info.ChangeTime = now_ft as i64;
         }
 
-        let stat = self.attr_of(&ctx, &data, &info, Some(h), known_override);
+        let stat = self.attr_of(
+            &ctx,
+            &data,
+            &info,
+            Some(h),
+            known_override.map_or(Stored::Unknown, Stored::Known),
+        );
         Ok((stat, self.cfg.attr_timeout))
     }
 
@@ -2585,10 +2748,10 @@ impl FileSystem for PassthroughFs {
                 write_secctx(&link_path, secctx, true)?;
             }
 
-            write_override_stat(
+            write_new_metadata(
                 &link_path,
-                Some((ctx.uid, ctx.gid)),
-                Some(S_IFLNK as u32 | 0o777),
+                None,
+                (Some(ctx.uid), Some(ctx.gid), Some(S_IFLNK as u32 | 0o777)),
             )?;
         }
 
@@ -2636,6 +2799,7 @@ impl FileSystem for PassthroughFs {
         );
 
         let node_mode = mode & !umask;
+        let child_path = child_path(parent_data.get_path().as_path(), name)?;
         if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
             // Write security context via the active handle
             if let Some(secctx) = extensions.secctx {
@@ -2643,14 +2807,15 @@ impl FileSystem for PassthroughFs {
                 write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
             }
 
-            // Write ownership and mode to ADS via the active handle
-            // Note: The `mode` parameter naturally contains the file type bits
-            // (S_IFIFO, S_IFCHR, S_IFSOCK, etc.) which will be persisted here.
-            let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, node_mode);
-            write_ads_by_handle(child_g.as_raw(), OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
+            // The mode carries the node's type (S_IFIFO, S_IFCHR, S_IFSOCK, ...), which only
+            // the stored metadata records: on the host it is an empty file.
+            write_new_metadata(
+                &child_path,
+                Some(child_g.as_raw()),
+                (Some(ctx.uid), Some(ctx.gid), Some(node_mode)),
+            )?;
         }
 
-        let child_path = child_path(parent_data.get_path().as_path(), name)?;
         self.entry_from_handle(
             &ctx,
             parent,
@@ -2813,8 +2978,11 @@ impl FileSystem for PassthroughFs {
                     write_ads_by_handle(h, &stream_name, &secctx.secctx)?;
                 }
 
-                let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, file_mode);
-                write_ads_by_handle(h, OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
+                write_new_metadata(
+                    &child_path,
+                    Some(h),
+                    (Some(ctx.uid), Some(ctx.gid), Some(file_mode)),
+                )?;
             }
 
             self.entry_from_handle(
@@ -3800,6 +3968,160 @@ mod tests {
         }
     }
 
+    const USER: Context = Context {
+        uid: 1000,
+        gid: 1001,
+        pid: 0,
+    };
+
+    fn stored_lx(path: &Path) -> Option<OverrideStat> {
+        lx_metadata(&get_lx_info_by_name(path).unwrap().unwrap())
+    }
+
+    fn override_stream(path: &Path) -> PathBuf {
+        ads_stream_path(path, OVERRIDE_STAT_STREAM)
+    }
+
+    #[test]
+    fn new_entries_keep_their_metadata_in_wsl_extended_attributes() {
+        let share = Share::new("lx-new");
+        let fs = share.served();
+        fs.create(
+            USER,
+            fuse::ROOT_ID,
+            c"file",
+            0o640,
+            false,
+            LINUX_O_CREAT as u32,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+        fs.mkdir(USER, fuse::ROOT_ID, c"dir", 0o750, 0, Extensions::default())
+            .unwrap();
+
+        let file = share.root.join("file");
+        let dir = share.root.join("dir");
+        assert_eq!(
+            stored_lx(&file),
+            Some((Some(1000), Some(1001), Some(S_IFREG as u32 | 0o640)))
+        );
+        assert_eq!(
+            stored_lx(&dir),
+            Some((Some(1000), Some(1001), Some(libc::S_IFDIR as u32 | 0o750)))
+        );
+        assert!(!override_stream(&file).exists());
+        assert!(!override_stream(&dir).exists());
+    }
+
+    #[test]
+    fn wsl_metadata_takes_precedence_over_the_override_stream() {
+        let share = Share::new("lx-precedence");
+        let fs = share.served();
+        let file = inside(&fs);
+        let path = share.root.join("sub").join("inside.txt");
+        fs::write(override_stream(&path), b"1:1:0600").unwrap();
+        write_lx_metadata(
+            &path,
+            (Some(1000), Some(1001), Some(S_IFREG as u32 | 0o644)),
+        )
+        .unwrap();
+
+        let (attr, _) = fs.getattr(CTX, file, None).unwrap();
+        assert_eq!((attr.st_uid, attr.st_gid), (1000, 1001));
+        assert_eq!(attr.st_mode, S_IFREG as u32 | 0o644);
+    }
+
+    #[test]
+    fn a_host_edit_of_wsl_metadata_is_seen_through_an_open_handle() {
+        let share = Share::new("lx-edit");
+        let fs = share.served();
+        let file = inside(&fs);
+        let path = share.root.join("sub").join("inside.txt");
+        set_change_time(&path, filetime_now() - 3600 * SETTLED_CHANGE_TIME);
+        let (handle, _) = fs.open(CTX, file, false, 0).unwrap();
+        let mode = |fs: &PassthroughFs| fs.getattr(CTX, file, handle).unwrap().0.st_mode & 0o7777;
+        assert_eq!(mode(&fs), 0o644);
+
+        write_lx_metadata(&path, (None, None, Some(S_IFREG as u32 | 0o600))).unwrap();
+        assert_eq!(mode(&fs), 0o600);
+
+        fs.release(CTX, file, 0, handle.unwrap(), false, false, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_chmod_of_an_entry_kept_in_the_stream_writes_wsl_extended_attributes() {
+        let share = Share::new("lx-from-stream");
+        let fs = share.served();
+        let file = inside(&fs);
+        let path = share.root.join("sub").join("inside.txt");
+        fs::write(override_stream(&path), b"1000:1001:0600").unwrap();
+
+        let mut attr: stat64 = unsafe { mem::zeroed() };
+        attr.st_mode = S_IFREG as u32 | 0o640;
+        let (reply, _) = fs
+            .setattr(CTX, file, attr, None, SetattrValid::MODE)
+            .unwrap();
+
+        assert_eq!((reply.st_uid, reply.st_gid), (1000, 1001));
+        assert_eq!(
+            stored_lx(&path),
+            Some((Some(1000), Some(1001), Some(S_IFREG as u32 | 0o640)))
+        );
+        let (attr, _) = fs.getattr(CTX, file, None).unwrap();
+        assert_eq!(
+            (attr.st_uid, attr.st_gid, attr.st_mode),
+            (1000, 1001, S_IFREG as u32 | 0o640)
+        );
+    }
+
+    #[test]
+    fn a_symlinks_metadata_stays_on_the_link() {
+        let share = Share::new("lx-symlink");
+        let fs = share.served();
+        fs::write(share.root.join("target.txt"), b"0123456789").unwrap();
+        if let Err(e) = fs.symlink(
+            USER,
+            c"target.txt",
+            fuse::ROOT_ID,
+            c"link",
+            Extensions::default(),
+        ) {
+            eprintln!("skipped: this host cannot create symlinks: {e}");
+            return;
+        }
+
+        assert_eq!(
+            stored_lx(&share.root.join("link")),
+            Some((Some(1000), Some(1001), Some(S_IFLNK as u32 | 0o777)))
+        );
+        assert_eq!(stored_lx(&share.root.join("target.txt")), None);
+    }
+
+    #[test]
+    fn a_symlink_to_a_nested_target_is_created() {
+        let share = Share::new("symlink-nested");
+        let fs = share.served();
+        let entry = match fs.symlink(
+            USER,
+            c"sub/inside.txt",
+            fuse::ROOT_ID,
+            c"link",
+            Extensions::default(),
+        ) {
+            Ok(entry) => entry,
+            Err(e) if !share.root.join("link").exists() => {
+                eprintln!("skipped: this host cannot create symlinks: {e}");
+                return;
+            }
+            Err(e) => panic!("the link was made but the symlink failed: {e}"),
+        };
+
+        assert_eq!(entry.attr.st_mode & libc::S_IFMT as u32, S_IFLNK as u32);
+        assert_eq!(fs.readlink(CTX, entry.inode).unwrap(), b"sub/inside.txt");
+    }
+
     const LINUX_O_RDWR: u32 = 2;
 
     /// The payload of a guest write.
@@ -3880,18 +4202,18 @@ mod tests {
     }
 
     #[test]
-    fn a_write_after_privileges_were_dropped_does_no_stream_io() {
+    fn a_write_after_privileges_were_dropped_does_no_metadata_io() {
         let share = Share::new("kill-priv-once");
         let fs = share.served();
         let (file, handle) = create_setuid(&fs);
         write_as_unprivileged(&fs, file, handle);
 
-        // Streams only a host process could have written since: a later write
-        // leaving them in place shows it touched no stream.
+        // Privileges only a host process could have restored since: a later write
+        // leaving them in place shows it touched no metadata.
         let path = share.root.join("setuid");
         let capability = ads_stream_path(&path, SECURITY_CAPABILITY_STREAM);
         fs::write(&capability, b"cap").unwrap();
-        fs::write(ads_stream_path(&path, OVERRIDE_STAT_STREAM), b"0:0:04755").unwrap();
+        write_lx_metadata(&path, (None, None, Some(S_IFREG as u32 | 0o4755))).unwrap();
 
         write_as_unprivileged(&fs, file, handle);
         assert!(capability.exists());
