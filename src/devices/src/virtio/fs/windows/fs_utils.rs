@@ -24,7 +24,7 @@ pub fn enosys() -> io::Error {
 }
 
 pub fn win_err_to_linux(e: io::Error) -> io::Error {
-    println!("win_err_to_linux: {:?}", e.raw_os_error());
+    log::trace!("win_err_to_linux: {:?}", e.raw_os_error());
     // Try to map highly specific Windows raw error codes first
     let linux_errno = if let Some(code) = e.raw_os_error() {
         match code as u32 {
