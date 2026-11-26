@@ -259,6 +259,30 @@ fn path_to_wide(p: &Path) -> Vec<u16> {
         .collect()
 }
 
+/// Put a path under the `\\?\` prefix that makes Win32 take it verbatim. The shared directory
+/// is stored this way so that a call taking a path, such as `rename` or `link`, reaches the
+/// entry a name spells: Win32 otherwise drops the dots and spaces that end a path, while
+/// `lookup` and `create` go through the NT namespace, which keeps them. `path_to_nt_wide` turns
+/// the prefix into its `\??\` form. A `/` becomes `\`, as a verbatim path takes no `/` for a
+/// separator.
+fn verbatim(path: &Path) -> PathBuf {
+    const SEP: u16 = b'\\' as u16;
+    let prefix = [SEP, SEP, b'?' as u16, SEP];
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .map(|c| if c == b'/' as u16 { SEP } else { c })
+        .collect();
+    if wide.starts_with(&prefix) {
+        PathBuf::from(OsString::from_wide(&wide))
+    } else {
+        let mut prefixed = Vec::with_capacity(prefix.len() + wide.len());
+        prefixed.extend_from_slice(&prefix);
+        prefixed.extend_from_slice(&wide);
+        PathBuf::from(OsString::from_wide(&prefixed))
+    }
+}
+
 fn cstr_to_path(name: &CStr) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(name.to_bytes()).as_ref())
 }
@@ -826,9 +850,9 @@ fn ads_xattr_path(base: &Path, name: &CStr) -> PathBuf {
 ///
 /// An xattr is a stream appended to the entry's path after a `:`, so a name holding one more
 /// reaches a stream the request did not name — `:$DATA` is the entry's own contents — and a name
-/// holding a separator reaches the streams of another entry. Windows drops the dots and spaces
-/// that end a path before NTFS sees it, so a name ending in either reaches the stream named
-/// without them.
+/// holding a separator reaches the streams of another entry. A name may not end in a dot or a
+/// space either: Win32 drops them from a path without the `\\?\` prefix, where such a name would
+/// reach the stream named without them.
 fn check_xattr_name(name: &CStr) -> io::Result<()> {
     let bytes = name.to_bytes();
     if bytes.is_empty()
@@ -1800,7 +1824,7 @@ impl FileSystem for PassthroughFs {
     type Handle = Handle;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
-        let root_path = PathBuf::from(&self.cfg.root_dir);
+        let root_path = verbatim(Path::new(&self.cfg.root_dir));
         let file_info = {
             let mut root_h = self.root_handle.write().unwrap();
             // destroy() closes the root handle; a later init() remounts.
@@ -2398,7 +2422,7 @@ impl FileSystem for PassthroughFs {
         let parent_path = self.inode_path(parent)?;
         let link_path = child_path(parent_path.as_path(), name)?;
         let depth = parent_path
-            .strip_prefix(&self.cfg.root_dir)
+            .strip_prefix(self.inode_path(fuse::ROOT_ID)?.as_path())
             .map_or(0, |below| below.components().count());
         check_symlink_target(linkname, depth)?;
         let target = cstr_to_path(linkname);
@@ -3369,6 +3393,26 @@ mod tests {
     }
 
     #[test]
+    fn a_symlink_below_the_shared_root_may_name_an_entry_of_the_root() {
+        let share = Share::new("symlink-up");
+        fs::write(share.root.join("top"), b"top").unwrap();
+        let cfg = Config {
+            root_dir: share.root.to_str().unwrap().to_owned(),
+            semantics: PermissionSemantics::LinuxSimplified,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let sub = fs.lookup(CTX, fuse::ROOT_ID, c"sub").unwrap().inode;
+
+        fs.symlink(CTX, c"../top", sub, c"up", Extensions::default())
+            .unwrap();
+
+        let made = fs::symlink_metadata(share.root.join("sub").join("up")).unwrap();
+        assert!(made.file_type().is_symlink());
+    }
+
+    #[test]
     fn an_xattr_name_that_is_not_one_stream_is_refused() {
         for name in [
             c":$DATA",
@@ -3489,5 +3533,115 @@ mod tests {
             );
         }
         assert_eq!(fs::read(&stream).unwrap(), b"0:0:0644");
+    }
+
+    /// The entry names the host directory holds, as NTFS stores them.
+    fn host_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_rename_onto_a_trailing_dot_name_keeps_the_sibling() {
+        let share = Share::new("rename-to-dot");
+        fs::write(share.root.join("a"), b"from a").unwrap();
+        fs::write(share.root.join("b"), b"from b").unwrap();
+        let fs = share.served();
+
+        fs.rename(CTX, fuse::ROOT_ID, c"a", fuse::ROOT_ID, c"b.", 0)
+            .unwrap();
+
+        assert_eq!(fs::read(share.root.join("b")).unwrap(), b"from b");
+        assert_eq!(
+            fs::read(verbatim(&share.root.join("b."))).unwrap(),
+            b"from a"
+        );
+        assert!(!host_names(&share.root).contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn a_rename_from_a_trailing_dot_name_moves_the_literal_entry() {
+        let share = Share::new("rename-from-dot");
+        fs::write(share.root.join("b"), b"from b").unwrap();
+        fs::write(verbatim(&share.root.join("b.")), b"from b dot").unwrap();
+        let fs = share.served();
+
+        fs.rename(CTX, fuse::ROOT_ID, c"b.", fuse::ROOT_ID, c"c", 0)
+            .unwrap();
+
+        assert_eq!(fs::read(share.root.join("b")).unwrap(), b"from b");
+        assert_eq!(fs::read(share.root.join("c")).unwrap(), b"from b dot");
+        assert!(!host_names(&share.root).contains(&"b.".to_string()));
+    }
+
+    #[test]
+    fn a_noreplace_rename_through_a_trailing_dot_keeps_the_sibling() {
+        let share = Share::new("noreplace-dot");
+        fs::write(share.root.join("a"), b"from a").unwrap();
+        fs::write(share.root.join("b"), b"from b").unwrap();
+        let fs = share.served();
+
+        fs.rename(
+            CTX,
+            fuse::ROOT_ID,
+            c"a",
+            fuse::ROOT_ID,
+            c"b.",
+            LINUX_RENAME_NOREPLACE as u32,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(share.root.join("b")).unwrap(), b"from b");
+        assert_eq!(
+            fs::read(verbatim(&share.root.join("b."))).unwrap(),
+            b"from a"
+        );
+    }
+
+    #[test]
+    fn an_exchange_through_a_trailing_dot_swaps_the_literal_entries() {
+        let share = Share::new("exchange-dot");
+        fs::write(share.root.join("b"), b"victim b").unwrap();
+        fs::write(verbatim(&share.root.join("b.")), b"from b dot").unwrap();
+        fs::write(share.root.join("c"), b"from c").unwrap();
+        let fs = share.served();
+
+        fs.rename(
+            CTX,
+            fuse::ROOT_ID,
+            c"b.",
+            fuse::ROOT_ID,
+            c"c",
+            LINUX_RENAME_EXCHANGE as u32,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(share.root.join("b")).unwrap(), b"victim b");
+        assert_eq!(
+            fs::read(verbatim(&share.root.join("b."))).unwrap(),
+            b"from c"
+        );
+        assert_eq!(fs::read(share.root.join("c")).unwrap(), b"from b dot");
+    }
+
+    #[test]
+    fn a_link_through_a_trailing_dot_name_keeps_the_sibling() {
+        let share = Share::new("link-dot");
+        fs::write(share.root.join("a"), b"from a").unwrap();
+        fs::write(share.root.join("b"), b"from b").unwrap();
+        let fs = share.served();
+        let a = fs.lookup(CTX, fuse::ROOT_ID, c"a").unwrap().inode;
+
+        fs.link(CTX, a, fuse::ROOT_ID, c"b.").unwrap();
+
+        assert_eq!(fs::read(share.root.join("b")).unwrap(), b"from b");
+        assert_eq!(
+            fs::read(verbatim(&share.root.join("b."))).unwrap(),
+            b"from a"
+        );
     }
 }
