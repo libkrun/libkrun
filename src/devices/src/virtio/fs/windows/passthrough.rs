@@ -152,6 +152,12 @@ struct InodeData {
     path: RwLock<Arc<PathBuf>>,
     wide_path: RwLock<Arc<Vec<u16>>>,
     refcount: AtomicU64,
+    // Set once a write has dropped the capability stream and the suid/sgid bits, so the
+    // guest's kill-priv flag on every later write costs no host I/O. Only this server
+    // writes `override_stat` and the guest cannot set `security.capability`, so only
+    // `setattr` can bring them back; a host process editing the streams directly is
+    // not noticed until the inode is forgotten.
+    privs_dropped: AtomicBool,
 }
 
 impl InodeData {
@@ -669,8 +675,9 @@ fn is_valid_owner(owner: Option<(u32, u32)>) -> bool {
     matches!(owner, Some((u, g)) if u < UID_MAX && g < UID_MAX)
 }
 
-/// Delete the ADS stream that emulates `security.capability`.
-fn remove_security_capability(path: &Path) {
+/// Delete the ADS stream that emulates `security.capability`. Returns whether the stream
+/// is gone, including when it never existed.
+fn remove_security_capability(path: &Path) -> bool {
     let ads = ads_stream_path(path, SECURITY_CAPABILITY_STREAM);
     let wide: Vec<u16> = ads
         .as_os_str()
@@ -682,8 +689,10 @@ fn remove_security_capability(path: &Path) {
         let e = io::Error::last_os_error();
         if e.raw_os_error() != Some(2) {
             warn!("remove security.capability ADS: {e}");
+            return false;
         }
     }
+    true
 }
 
 /// Write data to an ADS stream relative to an open file/directory handle.
@@ -1348,6 +1357,31 @@ impl PassthroughFs {
         Ok(self.inode_data(inode)?.get_path())
     }
 
+    /// Drop the capability stream and the suid/sgid bits, as a write or truncating open by
+    /// an unprivileged guest process requires.
+    fn kill_priv(&self, data: &InodeData) {
+        if !matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete)
+            || data.privs_dropped.swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+
+        let path = data.get_path();
+        let mut dropped = remove_security_capability(&path);
+        if let Ok((_, _, Some(mode))) = read_override_stat(&path) {
+            let new_mode = clear_suid_sgid(mode);
+            if new_mode != mode
+                && let Err(e) = write_override_stat(&path, None, Some(new_mode))
+            {
+                error!("clear suid/sgid for inode {}: {e}", data.inode);
+                dropped = false;
+            }
+        }
+        if !dropped {
+            data.privs_dropped.store(false, Ordering::Relaxed);
+        }
+    }
+
     fn do_lookup(&self, ctx: &Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
         let name_bytes = name.to_bytes();
         if name_bytes == b"." {
@@ -1454,6 +1488,7 @@ impl PassthroughFs {
                             path: RwLock::new(Arc::new(child_path.to_path_buf())),
                             wide_path: RwLock::new(Arc::new(path_to_wide(child_path))),
                             refcount: AtomicU64::new(1),
+                            privs_dropped: AtomicBool::new(false),
                         }),
                     );
                     inode
@@ -1589,17 +1624,8 @@ impl PassthroughFs {
         let data = self.inode_data(inode)?;
         let h = self.open_inode(&data, &oflags).map_err(win_err_to_linux)?;
 
-        if kill_priv && matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
-            let path = data.get_path();
-            remove_security_capability(&path);
-            if let Ok((_, _, Some(mode))) = read_override_stat(&path) {
-                let new_mode = clear_suid_sgid(mode);
-                if new_mode != mode
-                    && let Err(e) = write_override_stat(&path, None, Some(new_mode))
-                {
-                    error!("clear suid/sgid for inode {inode}: {e}");
-                }
-            }
+        if kill_priv {
+            self.kill_priv(&data);
         }
 
         let mut opts = OpenOptions::empty();
@@ -1829,6 +1855,7 @@ impl FileSystem for PassthroughFs {
                 path: RwLock::new(Arc::new(root_path.clone())),
                 wide_path: RwLock::new(Arc::new(path_to_wide(&root_path))),
                 refcount: AtomicU64::new(2),
+                privs_dropped: AtomicBool::new(false),
             }),
         );
 
@@ -2210,6 +2237,7 @@ impl FileSystem for PassthroughFs {
                             current_gid.unwrap_or(u32::MAX),
                         );
                         write_override_stat(&path, Some(owner_param), current_mode)?;
+                        data.privs_dropped.store(false, Ordering::Relaxed);
                     }
 
                     // The stream now holds these values, so the reply can
@@ -2731,23 +2759,9 @@ impl FileSystem for PassthroughFs {
         let file = ManuallyDrop::new(unsafe { File::from_raw_handle(raw_h as _) });
         let result = r.read_to(&file, size as usize, offset);
 
-        // Only process kill_priv if the write was successful, and log any errors
-        if result.is_ok()
-            && kill_priv
-            && matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete)
-        {
-            let path = self.inode_path(inode)?;
-            remove_security_capability(&path);
-
-            if let Ok((_, _, Some(mode))) = read_override_stat(&path) {
-                let new_mode = clear_suid_sgid(mode);
-                if new_mode != mode {
-                    // Update mode in xattr (ADS)
-                    if let Err(err) = write_override_stat(&path, None, Some(new_mode)) {
-                        error!("Couldn't clear suid/sgid for inode {inode}: {err}");
-                    }
-                }
-            }
+        if result.is_ok() && kill_priv {
+            let data = self.inode_data(inode)?;
+            self.kill_priv(&data);
         }
 
         result
@@ -3171,6 +3185,7 @@ impl FileSystem for PassthroughFs {
 mod tests {
     use std::env;
     use std::ffi::CString;
+    use std::os::windows::fs::FileExt;
     use std::process;
 
     use super::*;
@@ -3481,5 +3496,106 @@ mod tests {
             );
         }
         assert_eq!(fs::read(&stream).unwrap(), b"0:0:0644");
+    }
+
+    const LINUX_O_RDWR: u32 = 2;
+
+    /// The payload of a guest write.
+    struct Payload<'a>(&'a [u8]);
+
+    impl io::Read for Payload<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl ZeroCopyReader for Payload<'_> {
+        fn read_to(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
+            let n = f.seek_write(&self.0[..count.min(self.0.len())], off)?;
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    /// A setuid file created by the guest, with the handle the create opened.
+    fn create_setuid(fs: &PassthroughFs) -> (Inode, Handle) {
+        let (entry, handle, _) = fs
+            .create(
+                CTX,
+                fuse::ROOT_ID,
+                c"setuid",
+                0o4755,
+                false,
+                LINUX_O_CREAT as u32 | LINUX_O_RDWR,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        (entry.inode, handle.unwrap())
+    }
+
+    fn write_as_unprivileged(fs: &PassthroughFs, inode: Inode, handle: Handle) {
+        fs.write(
+            CTX,
+            inode,
+            handle,
+            Payload(b"data"),
+            4,
+            0,
+            None,
+            false,
+            true,
+            0,
+        )
+        .unwrap();
+    }
+
+    fn permissions(fs: &PassthroughFs, inode: Inode) -> u32 {
+        fs.getattr(CTX, inode, None).unwrap().0.st_mode & 0o7777
+    }
+
+    #[test]
+    fn a_write_drops_suid_again_after_a_chmod_restores_it() {
+        let share = Share::new("kill-priv-chmod");
+        let fs = share.served();
+        let (file, handle) = create_setuid(&fs);
+        assert_eq!(permissions(&fs, file), 0o4755);
+
+        write_as_unprivileged(&fs, file, handle);
+        assert_eq!(permissions(&fs, file), 0o755);
+
+        let mut attr: stat64 = unsafe { mem::zeroed() };
+        attr.st_mode = 0o4755;
+        fs.setattr(CTX, file, attr, None, SetattrValid::MODE)
+            .unwrap();
+        assert_eq!(permissions(&fs, file), 0o4755);
+
+        write_as_unprivileged(&fs, file, handle);
+        assert_eq!(permissions(&fs, file), 0o755);
+
+        fs.release(CTX, file, 0, handle, false, false, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_write_after_privileges_were_dropped_does_no_stream_io() {
+        let share = Share::new("kill-priv-once");
+        let fs = share.served();
+        let (file, handle) = create_setuid(&fs);
+        write_as_unprivileged(&fs, file, handle);
+
+        // Streams only a host process could have written since: a later write
+        // leaving them in place shows it touched no stream.
+        let path = share.root.join("setuid");
+        let capability = ads_stream_path(&path, SECURITY_CAPABILITY_STREAM);
+        fs::write(&capability, b"cap").unwrap();
+        fs::write(ads_stream_path(&path, OVERRIDE_STAT_STREAM), b"0:0:04755").unwrap();
+
+        write_as_unprivileged(&fs, file, handle);
+        assert!(capability.exists());
+        assert_eq!(permissions(&fs, file), 0o4755);
+
+        fs.release(CTX, file, 0, handle, false, false, None)
+            .unwrap();
     }
 }
