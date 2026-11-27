@@ -197,9 +197,7 @@ impl NetWorker {
         if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
             error!("error disabling queue notifications: {e:?}");
         }
-        if let Err(e) = self.process_rx() {
-            log::error!("Failed to process rx: {e:?} (triggered by queue event)")
-        };
+        self.process_rx_until_blocked("queue event");
         if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
             error!("error disabling queue notifications: {e:?}");
         }
@@ -218,11 +216,40 @@ impl NetWorker {
         if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
             error!("error disabling queue notifications: {e:?}");
         }
-        if let Err(e) = self.process_rx() {
-            log::error!("Failed to process rx: {e:?} (triggered by backend socket readable)");
-        };
-        if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
+        self.process_rx_until_blocked("backend socket readable");
+        if !self.rx_has_deferred_frame
+            && let Err(e) = self.rx_q.queue.disable_notification(&self.mem)
+        {
             error!("error disabling queue notifications: {e:?}");
+        }
+    }
+
+    // With EVENT_IDX the guest only notifies once it passes the last published avail_event, and
+    // one published before a pass that deferred a frame is never passed again. Two passes that
+    // take no descriptor mean pop() refuses them: stop rather than spin.
+    fn process_rx_until_blocked(&mut self, trigger: &str) {
+        let mut idle_passes = 0;
+        loop {
+            let next_avail = self.rx_q.queue.next_avail;
+            if let Err(e) = self.process_rx() {
+                log::error!("Failed to process rx: {e:?} (triggered by {trigger})");
+            }
+            if !self.rx_has_deferred_frame {
+                return;
+            }
+            idle_passes = if self.rx_q.queue.next_avail == next_avail {
+                idle_passes + 1
+            } else {
+                0
+            };
+            match self.rx_q.queue.enable_notification(&self.mem) {
+                Ok(true) if idle_passes < 2 => continue,
+                Ok(_) => return,
+                Err(e) => {
+                    error!("error enabling queue notifications: {e:?}");
+                    return;
+                }
+            }
         }
     }
 
@@ -245,15 +272,15 @@ impl NetWorker {
     fn process_rx(&mut self) -> result::Result<(), RxError> {
         // if we have a deferred frame we try to process it first,
         // if that is not possible, we don't continue processing other frames
+        let mut signal_queue = false;
         if self.rx_has_deferred_frame {
             if self.write_frame_to_guest() {
                 self.rx_has_deferred_frame = false;
+                signal_queue = true;
             } else {
                 return Ok(());
             }
         }
-
-        let mut signal_queue = false;
 
         // Read as many frames as possible.
         let result = loop {
