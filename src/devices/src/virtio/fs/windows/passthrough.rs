@@ -601,28 +601,41 @@ fn build_stat64(
 
     let mut size = info.EndOfFile;
 
+    let stored_mode = override_stat.and_then(|(_, _, mode)| mode);
+
     let (base_mode, nlink) = if is_symlink {
         if let Some(Ok(target)) = handle.map(read_lx_symlink_by_handle) {
             // st_size MUST match the exact length returned by readlink()
             size = target.len() as i64;
         }
-        (S_IFLNK | 0o777, 1)
+        (S_IFLNK as u32 | 0o777, 1u32)
     } else if is_directory {
-        (libc::S_IFDIR | 0o755, 2u32)
+        let mode_bits = match semantics {
+            PermissionSemantics::LinuxSimplified
+            | PermissionSemantics::LinuxSimplifiedFixedOwner => {
+                stored_mode.map_or(0o755, |mode| mode & 0o777)
+            }
+            PermissionSemantics::LinuxComplete => 0o755,
+        };
+        (libc::S_IFDIR as u32 | mode_bits, 2u32)
     } else {
         let is_readonly = (file_attributes & FILE_ATTRIBUTE_READONLY) != 0;
         let mode_bits = match semantics {
             PermissionSemantics::LinuxSimplified
             | PermissionSemantics::LinuxSimplifiedFixedOwner => {
-                if is_readonly {
-                    0o444
-                } else {
-                    0o644
+                // The Read-Only attribute decides writability, so the stored
+                // owner-write bit gives way to it; every other permission bit
+                // a chmod keeps is reported as stored.
+                let write = if is_readonly { 0 } else { 0o200 };
+                match stored_mode {
+                    Some(mode) => write | (mode & 0o777 & !0o200),
+                    None if is_readonly => 0o444,
+                    None => 0o644,
                 }
             }
             PermissionSemantics::LinuxComplete => 0o644,
         };
-        (libc::S_IFREG | mode_bits, info.NumberOfLinks)
+        (libc::S_IFREG as u32 | mode_bits, info.NumberOfLinks)
     };
 
     let access = info.LastAccessTime as u64;
@@ -633,7 +646,7 @@ fn build_stat64(
         st_dev: 0,
         st_ino: ino,
         st_nlink: nlink,
-        st_mode: base_mode as u32,
+        st_mode: base_mode,
         st_uid: 0,
         st_gid: 0,
         st_rdev: 0,
@@ -1601,18 +1614,14 @@ impl PassthroughFs {
         handle: Option<HANDLE>,
         stored: Stored,
     ) -> stat64 {
-        let override_stat = match self.cfg.semantics {
-            PermissionSemantics::LinuxComplete => Some(match stored {
-                Stored::Known(stat) => stat,
-                Stored::NotInAttributes => data.override_stat(info.ChangeTime, || {
-                    read_override_stat(&data.get_path()).unwrap_or((None, None, None))
-                }),
-                Stored::Unknown => {
-                    data.override_stat(info.ChangeTime, || read_metadata(&data.get_path()).0)
-                }
-            }),
-            PermissionSemantics::LinuxSimplified
-            | PermissionSemantics::LinuxSimplifiedFixedOwner => None,
+        let override_stat = match stored {
+            Stored::Known(stat) => Some(stat),
+            Stored::NotInAttributes => Some(data.override_stat(info.ChangeTime, || {
+                read_override_stat(&data.get_path()).unwrap_or((None, None, None))
+            })),
+            Stored::Unknown => {
+                Some(data.override_stat(info.ChangeTime, || read_metadata(&data.get_path()).0))
+            }
         };
         build_stat64(
             ctx,
@@ -2315,21 +2324,32 @@ impl FileSystem for PassthroughFs {
 
         let dir_mode = mode & !umask;
         let child_path = child_path(parent_data.get_path().as_path(), name)?;
-        if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
-            if let Some(secctx) = extensions.secctx {
-                let stream_name = format!(":{}", secctx.name.to_string_lossy());
-                write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
-            }
+        match self.cfg.semantics {
+            PermissionSemantics::LinuxComplete => {
+                if let Some(secctx) = extensions.secctx {
+                    let stream_name = format!(":{}", secctx.name.to_string_lossy());
+                    write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
+                }
 
-            write_new_metadata(
-                &child_path,
-                Some(child_g.as_raw()),
-                (
-                    Some(ctx.uid),
-                    Some(ctx.gid),
-                    Some(libc::S_IFDIR as u32 | dir_mode),
-                ),
-            )?;
+                write_new_metadata(
+                    &child_path,
+                    Some(child_g.as_raw()),
+                    (
+                        Some(ctx.uid),
+                        Some(ctx.gid),
+                        Some(libc::S_IFDIR as u32 | dir_mode),
+                    ),
+                )?;
+            }
+            _ => {
+                if let Err(e) = write_new_metadata(
+                    &child_path,
+                    Some(child_g.as_raw()),
+                    (None, None, Some(libc::S_IFDIR as u32 | dir_mode)),
+                ) {
+                    debug!("keep the mode of {}: {e}", child_path.display());
+                }
+            }
         }
 
         self.entry_from_handle(
@@ -2488,9 +2508,14 @@ impl FileSystem for PassthroughFs {
                 // In LinuxSimplified mode:
                 // 1. UID/GID changes (chown) are ignored since ownership is dynamically returned as ctx.uid/gid.
                 // 2. Extended attribute (ADS) overrides are not written.
-                // 3. chmod maps POSIX write permissions to the native Windows Read-Only attribute.
+                // 3. permission bits are saved in the WSL metadata
                 if valid.contains(SetattrValid::MODE) {
                     mode_writable = Some((attr.st_mode & 0o200) != 0);
+                    let mode = attr.st_mode & !0o7000;
+                    match write_lx_metadata(&path, (None, None, Some(mode))) {
+                        Ok(()) => known_override = Some((None, None, Some(mode))),
+                        Err(e) => debug!("keep the mode of {}: {e}", path.display()),
+                    }
                 }
             }
             PermissionSemantics::LinuxComplete => {
@@ -2800,20 +2825,31 @@ impl FileSystem for PassthroughFs {
 
         let node_mode = mode & !umask;
         let child_path = child_path(parent_data.get_path().as_path(), name)?;
-        if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
-            // Write security context via the active handle
-            if let Some(secctx) = extensions.secctx {
-                let stream_name = format!(":{}", secctx.name.to_string_lossy());
-                write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
-            }
+        match self.cfg.semantics {
+            PermissionSemantics::LinuxComplete => {
+                // Write security context via the active handle
+                if let Some(secctx) = extensions.secctx {
+                    let stream_name = format!(":{}", secctx.name.to_string_lossy());
+                    write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
+                }
 
-            // The mode carries the node's type (S_IFIFO, S_IFCHR, S_IFSOCK, ...), which only
-            // the stored metadata records: on the host it is an empty file.
-            write_new_metadata(
-                &child_path,
-                Some(child_g.as_raw()),
-                (Some(ctx.uid), Some(ctx.gid), Some(node_mode)),
-            )?;
+                // The mode carries the node's type (S_IFIFO, S_IFCHR, S_IFSOCK, ...), which only
+                // the stored metadata records: on the host it is an empty file.
+                write_new_metadata(
+                    &child_path,
+                    Some(child_g.as_raw()),
+                    (Some(ctx.uid), Some(ctx.gid), Some(node_mode)),
+                )?;
+            }
+            _ => {
+                if let Err(e) = write_new_metadata(
+                    &child_path,
+                    Some(child_g.as_raw()),
+                    (None, None, Some(node_mode & 0o777)),
+                ) {
+                    debug!("keep the mode of {}: {e}", child_path.display());
+                }
+            }
         }
 
         self.entry_from_handle(
@@ -2983,6 +3019,12 @@ impl FileSystem for PassthroughFs {
                     Some(h),
                     (Some(ctx.uid), Some(ctx.gid), Some(file_mode)),
                 )?;
+            } else {
+                if let Err(e) =
+                    write_new_metadata(&child_path, Some(h), (None, None, Some(file_mode)))
+                {
+                    debug!("keep the mode of {}: {e}", child_path.display());
+                }
             }
 
             self.entry_from_handle(
@@ -3130,11 +3172,6 @@ impl FileSystem for PassthroughFs {
     }
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
-        if matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) {
-            // Directories and files owned by ctx always have access unless host-level denied
-            return Ok(());
-        }
-
         // POSIX access mode constants (since Windows libc doesn't define them)
         const F_OK: u32 = 0;
         const X_OK: u32 = 1;
@@ -3531,8 +3568,13 @@ mod tests {
         }
 
         fn served(&self) -> PassthroughFs {
+            self.served_as(Config::default().semantics)
+        }
+
+        fn served_as(&self, semantics: PermissionSemantics) -> PassthroughFs {
             let cfg = Config {
                 root_dir: self.root.to_str().unwrap().to_owned(),
+                semantics,
                 ..Default::default()
             };
             let fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
@@ -4074,6 +4116,163 @@ mod tests {
             (attr.st_uid, attr.st_gid, attr.st_mode),
             (1000, 1001, S_IFREG as u32 | 0o640)
         );
+    }
+
+    #[test]
+    fn a_chmod_of_a_directory_in_simplified_semantics_keeps_its_mode() {
+        let share = Share::new("simplified-dir-chmod");
+        let fs = share.served_as(PermissionSemantics::LinuxSimplified);
+        let entry = fs
+            .mkdir(CTX, fuse::ROOT_ID, c"dir", 0o755, 0, Extensions::default())
+            .unwrap();
+
+        let mut attr: stat64 = unsafe { mem::zeroed() };
+        attr.st_mode = libc::S_IFDIR as u32 | 0o700;
+        let (reply, _) = fs
+            .setattr(CTX, entry.inode, attr, None, SetattrValid::MODE)
+            .unwrap();
+        assert_eq!(reply.st_mode, libc::S_IFDIR as u32 | 0o700);
+
+        let (attr, _) = fs.getattr(CTX, entry.inode, None).unwrap();
+        assert_eq!(attr.st_mode, libc::S_IFDIR as u32 | 0o700);
+    }
+
+    #[test]
+    fn a_chmod_in_simplified_semantics_keeps_the_permission_bits() {
+        let share = Share::new("simplified-chmod");
+        let fs = share.served_as(PermissionSemantics::LinuxSimplified);
+        let file = inside(&fs);
+        let path = share.root.join("sub").join("inside.txt");
+
+        let mut attr: stat64 = unsafe { mem::zeroed() };
+        attr.st_mode = S_IFREG as u32 | 0o755;
+        let (reply, _) = fs
+            .setattr(CTX, file, attr, None, SetattrValid::MODE)
+            .unwrap();
+        assert_eq!(reply.st_mode, S_IFREG as u32 | 0o755);
+        assert_eq!(
+            stored_lx(&path),
+            Some((None, None, Some(S_IFREG as u32 | 0o755)))
+        );
+        let (mut attr, _) = fs.getattr(CTX, file, None).unwrap();
+        assert_eq!(attr.st_mode, S_IFREG as u32 | 0o755);
+
+        // A chmod that drops them drops the stored ones too.
+        attr.st_mode = S_IFREG as u32 | 0o644;
+        fs.setattr(CTX, file, attr, None, SetattrValid::MODE)
+            .unwrap();
+        let (mut attr, _) = fs.getattr(CTX, file, None).unwrap();
+        assert_eq!(attr.st_mode, S_IFREG as u32 | 0o644);
+
+        // Only the owner's write bit gives way to the Read-Only attribute:
+        // the group and other ones round-trip as stored.
+        attr.st_mode = S_IFREG as u32 | 0o777;
+        fs.setattr(CTX, file, attr, None, SetattrValid::MODE)
+            .unwrap();
+        let (attr, _) = fs.getattr(CTX, file, None).unwrap();
+        assert_eq!(attr.st_mode, S_IFREG as u32 | 0o777);
+    }
+
+    #[test]
+    fn a_chmod_in_simplified_semantics_maps_write_permission_to_the_read_only_attribute() {
+        let share = Share::new("simplified-readonly");
+        let fs = share.served_as(PermissionSemantics::LinuxSimplified);
+        let file = inside(&fs);
+        let path = share.root.join("sub").join("inside.txt");
+
+        let mut attr: stat64 = unsafe { mem::zeroed() };
+        attr.st_mode = S_IFREG as u32 | 0o555;
+        fs.setattr(CTX, file, attr, None, SetattrValid::MODE)
+            .unwrap();
+        assert!(fs::metadata(&path).unwrap().permissions().readonly());
+        let (mut attr, _) = fs.getattr(CTX, file, None).unwrap();
+        assert_eq!(attr.st_mode, S_IFREG as u32 | 0o555);
+
+        attr.st_mode = S_IFREG as u32 | 0o755;
+        fs.setattr(CTX, file, attr, None, SetattrValid::MODE)
+            .unwrap();
+        assert!(!fs::metadata(&path).unwrap().permissions().readonly());
+        let (attr, _) = fs.getattr(CTX, file, None).unwrap();
+        assert_eq!(attr.st_mode, S_IFREG as u32 | 0o755);
+    }
+
+    #[test]
+    fn a_mode_the_host_keeps_is_reported_in_simplified_semantics() {
+        let share = Share::new("simplified-host-mode");
+        let fs = share.served_as(PermissionSemantics::LinuxSimplified);
+        let file = inside(&fs);
+        let path = share.root.join("sub").join("inside.txt");
+        write_lx_metadata(
+            &path,
+            (Some(1000), Some(1001), Some(S_IFREG as u32 | 0o750)),
+        )
+        .unwrap();
+
+        let (attr, _) = fs.getattr(CTX, file, None).unwrap();
+        assert_eq!(attr.st_mode, S_IFREG as u32 | 0o750);
+        // Ownership stays the requester's, not the stored one.
+        assert_eq!((attr.st_uid, attr.st_gid), (CTX.uid, CTX.gid));
+        let (attr, _) = fs.getattr(USER, file, None).unwrap();
+        assert_eq!((attr.st_uid, attr.st_gid), (USER.uid, USER.gid));
+    }
+
+    #[test]
+    fn a_file_created_in_simplified_semantics_keeps_its_mode() {
+        let share = Share::new("simplified-create");
+        let fs = share.served_as(PermissionSemantics::LinuxSimplified);
+        let (entry, handle, _) = fs
+            .create(
+                USER,
+                fuse::ROOT_ID,
+                c"script",
+                0o755,
+                false,
+                LINUX_O_CREAT as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        assert_eq!(entry.attr.st_mode, S_IFREG as u32 | 0o755);
+        assert_eq!(entry.attr.st_uid, USER.uid);
+        assert_eq!(
+            stored_lx(&share.root.join("script")),
+            Some((None, None, Some(S_IFREG as u32 | 0o755)))
+        );
+        let (attr, _) = fs.getattr(USER, entry.inode, None).unwrap();
+        assert_eq!(attr.st_mode, S_IFREG as u32 | 0o755);
+        fs.release(USER, entry.inode, 0, handle.unwrap(), false, false, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_directory_created_in_simplified_semantics_keeps_its_mode() {
+        let share = Share::new("simplified-mkdir");
+        let fs = share.served_as(PermissionSemantics::LinuxSimplified);
+        let entry = fs
+            .mkdir(USER, fuse::ROOT_ID, c"dir", 0o700, 0, Extensions::default())
+            .unwrap();
+        assert_eq!(entry.attr.st_mode, libc::S_IFDIR as u32 | 0o700);
+        let (attr, _) = fs.getattr(USER, entry.inode, None).unwrap();
+        assert_eq!(attr.st_mode, libc::S_IFDIR as u32 | 0o700);
+    }
+
+    #[test]
+    fn access_in_simplified_semantics_checks_the_execute_bits() {
+        let share = Share::new("simplified-access");
+        let fs = share.served_as(PermissionSemantics::LinuxSimplified);
+        let file = inside(&fs);
+
+        refused(
+            fs.access(CTX, file, 1),
+            eacces(),
+            "a file no chmod made executable passed an X_OK check",
+        );
+
+        let mut attr: stat64 = unsafe { mem::zeroed() };
+        attr.st_mode = S_IFREG as u32 | 0o755;
+        fs.setattr(CTX, file, attr, None, SetattrValid::MODE)
+            .unwrap();
+        fs.access(CTX, file, 1).unwrap();
     }
 
     #[test]

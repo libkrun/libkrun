@@ -83,8 +83,9 @@ pub enum PermissionSemantics {
     #[default]
     LinuxComplete = 0,
     /// Report ownership as the requesting guest process's uid and gid, ignore ownership
-    /// changes, and store permission bits on the host without extended attributes or idmaps.
-    /// Unsupported on Linux hosts.
+    /// changes, and store permission bits on the host without idmaps. A Windows host
+    /// keeps no permission bits, so they are stored in the WSL metadata extended
+    /// attributes instead. Unsupported on Linux hosts.
     LinuxSimplified = 1,
     /// As `LinuxSimplified`, but report ownership as the uid and gid set with
     /// `set_fixed_owner`, so attributes are the same for every caller and stay cacheable.
