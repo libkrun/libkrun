@@ -528,11 +528,15 @@ impl BlockWorker {
             }
             VIRTIO_BLK_T_OUT => {
                 let data_len = reader.available_bytes();
+                let offset = request_header
+                    .sector
+                    .checked_mul(512)
+                    .ok_or(RequestError::InvalidDataLength)?;
                 if !data_len.is_multiple_of(512) {
                     Err(RequestError::InvalidDataLength)
                 } else {
                     reader
-                        .read_to_at(disk, data_len, request_header.sector * 512)
+                        .read_to_at(disk, data_len, offset)
                         .map_err(RequestError::ReadingFromDescriptor)
                 }
             }
@@ -561,13 +565,14 @@ impl BlockWorker {
                 let discard_write_data: DiscardWriteData = reader
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
+                let offset = discard_write_data
+                    .sector
+                    .checked_mul(512)
+                    .ok_or(RequestError::InvalidDataLength)?;
                 disk.file
                     .write()
                     .unwrap()
-                    .discard_to_any(
-                        discard_write_data.sector * 512,
-                        discard_write_data.num_sectors as u64 * 512,
-                    )
+                    .discard_to_any(offset, discard_write_data.num_sectors as u64 * 512)
                     .map_err(RequestError::Discarding)?;
                 Ok(0)
             }
@@ -575,21 +580,19 @@ impl BlockWorker {
                 let discard_write_data: DiscardWriteData = reader
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
+                let offset = discard_write_data
+                    .sector
+                    .checked_mul(512)
+                    .ok_or(RequestError::InvalidDataLength)?;
                 let unmap = (discard_write_data.flags & VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP) != 0;
                 let mut diskfile = disk.file.write().unwrap();
                 if unmap {
                     diskfile
-                        .discard_to_zero(
-                            discard_write_data.sector * 512,
-                            discard_write_data.num_sectors as u64 * 512,
-                        )
+                        .discard_to_zero(offset, discard_write_data.num_sectors as u64 * 512)
                         .map_err(RequestError::DiscardingToZero)?;
                 } else {
                     diskfile
-                        .write_zeroes(
-                            discard_write_data.sector * 512,
-                            discard_write_data.num_sectors as u64 * 512,
-                        )
+                        .write_zeroes(offset, discard_write_data.num_sectors as u64 * 512)
                         .map_err(RequestError::WritingZeroes)?;
                 }
                 Ok(0)
@@ -630,10 +633,11 @@ mod tests {
         let file = File::open(
             StorageOpenOptions::new()
                 .filename(backing.as_path().to_str().unwrap())
+                .write(true)
                 .direct(direct_io),
         )
         .unwrap();
-        let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), false).unwrap();
+        let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), true).unwrap();
         DiskProperties::new(
             Arc::new(RwLock::new(FormatAccess::new(raw))),
             Vec::new(),
@@ -885,5 +889,47 @@ mod tests {
         let mut status = [0; 1];
         mem.read_slice(&mut status, GuestAddress(0x10c)).unwrap();
         assert_eq!(status, [VIRTIO_BLK_S_IOERR as u8]);
+    }
+
+    #[test]
+    fn sector_offset_overflow_is_rejected() {
+        // 2^55 * 512 wraps to 0.
+        let range = DiscardWriteData {
+            sector: 1 << 55,
+            num_sectors: 1,
+            flags: 0,
+        };
+        for (request_type, sector, body) in [
+            (VIRTIO_BLK_T_OUT, 1 << 55, vec![0xaa; 512]),
+            (VIRTIO_BLK_T_WRITE_ZEROES, 0, range.as_slice().to_vec()),
+            (VIRTIO_BLK_T_DISCARD, 0, range.as_slice().to_vec()),
+        ] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+            mem.write_slice(&body, GuestAddress(0x100)).unwrap();
+            let chain = create_descriptor_chain(
+                &mem,
+                GuestAddress(0),
+                GuestAddress(0x100),
+                vec![
+                    (DescriptorType::Readable, body.len() as u32),
+                    (DescriptorType::Writable, 1),
+                ],
+                0,
+            )
+            .unwrap();
+            let mut reader = Reader::new(&mem, chain.clone()).unwrap();
+            let mut writer = Writer::new(&mem, chain).unwrap();
+            let disk = test_disk(false);
+            let header = RequestHeader {
+                request_type,
+                sector,
+                ..Default::default()
+            };
+
+            assert!(BlockWorker::process_request(header, &mut reader, &mut writer, &disk).is_err());
+            let mut data = [0u8; 512];
+            disk.file.read().unwrap().read(&mut data[..], 0).unwrap();
+            assert_eq!(data, [0x11; 512]);
+        }
     }
 }
