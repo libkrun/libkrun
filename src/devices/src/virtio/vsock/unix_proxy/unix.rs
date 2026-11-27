@@ -291,17 +291,8 @@ pub(crate) fn release(proxy: &mut super::UnixProxy) -> ProxyUpdate {
         proxy.id, proxy.tx_cnt, proxy.last_tx_cnt_sent
     );
 
-    // A connection that never reached Connected carries no data and is not
-    // registered for polling yet, so there is nothing to reserve its id for.
-    // Keeping it would leave the accepted host socket open, and its peer
-    // blocked, until the reaper reclaims the proxy.
-    let remove_proxy = match proxy.status {
-        ProxyStatus::ReverseInit | ProxyStatus::Connecting => ProxyRemoval::Immediate,
-        _ => ProxyRemoval::Deferred,
-    };
-
     ProxyUpdate {
-        remove_proxy,
+        remove_proxy: ProxyRemoval::Immediate,
         ..Default::default()
     }
 }
@@ -324,7 +315,7 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
         proxy.status = ProxyStatus::Closed;
         update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
         update.signal_queue = true;
-        update.remove_proxy = ProxyRemoval::Deferred;
+        update.remove_proxy = ProxyRemoval::Immediate;
 
         return update;
     }
@@ -355,7 +346,7 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
                 proxy.push_reset();
                 update.signal_queue = true;
                 update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
-                update.remove_proxy = ProxyRemoval::Deferred;
+                update.remove_proxy = ProxyRemoval::Immediate;
                 return update;
             } else if proxy.host_read_closed
                 || proxy.status == ProxyStatus::WaitingCreditUpdate
