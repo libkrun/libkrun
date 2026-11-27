@@ -180,19 +180,6 @@ pub trait RutabagaComponent {
         Err(RutabagaError::Unsupported)
     }
 
-    /// Implementations must map the blob resource on success, on the specified address and
-    /// honoring prot and flags.
-    fn resource_map(
-        &self,
-        _resource_id: u32,
-        _addr: u64,
-        _size: u64,
-        _prot: i32,
-        _flags: i32,
-    ) -> RutabagaResult<()> {
-        Err(RutabagaError::Unsupported)
-    }
-
     /// Implementations must map the blob resource on success.  This is typically done by
     /// glMapBufferRange(...) or vkMapMemory.
     fn map(&self, _resource_id: u32) -> RutabagaResult<RutabagaMapping> {
@@ -762,33 +749,6 @@ impl Rutabaga {
 
         self.resources.insert(resource_id, resource);
         Ok(())
-    }
-
-    pub fn resource_map(
-        &mut self,
-        resource_id: u32,
-        addr: u64,
-        size: u64,
-        prot: i32,
-        flags: i32,
-    ) -> RutabagaResult<()> {
-        let resource = self
-            .resources
-            .get_mut(&resource_id)
-            .ok_or(RutabagaError::InvalidResourceId)?;
-
-        let component_type = calculate_component(resource.component_mask)?;
-        if component_type == RutabagaComponentType::CrossDomain {
-            resource.mapping = None;
-            return Ok(());
-        }
-
-        let component = self
-            .components
-            .get(&component_type)
-            .ok_or(RutabagaError::InvalidComponent)?;
-
-        component.resource_map(resource_id, addr, size, prot, flags)
     }
 
     /// Returns a memory mapping of the blob resource.

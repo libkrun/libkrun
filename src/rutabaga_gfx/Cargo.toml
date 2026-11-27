@@ -13,7 +13,6 @@ gfxstream_stub = []
 gpu = []
 virgl_renderer = []
 virgl_renderer_next = []
-virgl_resource_map2 = []
 minigbm = []
 # To try out Vulkano, delete the following line and uncomment the line in "dependencies". Vulkano
 # features are just a prototype and not integrated yet into the ChromeOS build system.
