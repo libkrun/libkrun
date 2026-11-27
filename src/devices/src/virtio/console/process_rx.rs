@@ -16,6 +16,16 @@ use crate::virtio::console::console_control::ConsoleControl;
 use crate::virtio::console::port_io::PortInput;
 use crate::virtio::{DescriptorChain, InterruptTransport, Queue};
 
+/// Outcome of an RX worker's run.
+pub(crate) enum RxExit {
+    /// Told to stop (real VM shutdown): the worker is exiting for good.
+    Stopped(Queue),
+    /// Told to pause (guest-initiated port close while the VM keeps
+    /// running): the worker stopped promptly, handing back the queue so
+    /// it can be held by the port and reused when the guest reopens it.
+    Paused(Queue),
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_rx(
     mem: GuestMemoryMmap,
@@ -26,14 +36,20 @@ pub(crate) fn process_rx(
     port_id: u32,
     stopfd: utils::eventfd::EventFd,
     stop: Arc<AtomicBool>,
-) {
+    pausefd: utils::eventfd::EventFd,
+    pause: Arc<AtomicBool>,
+) -> RxExit {
     let mem = &mem;
     let mut eof = false;
 
     let mut input = input.lock().unwrap();
     loop {
-        let Some(head) = pop_head_blocking(&mut queue, mem, &interrupt, &stop) else {
-            return;
+        let Some(head) = pop_head_blocking(&mut queue, mem, &interrupt, &stop, &pause) else {
+            return if stop.load(Ordering::Acquire) {
+                RxExit::Stopped(queue)
+            } else {
+                RxExit::Paused(queue)
+            };
         };
 
         let head_index = head.index;
@@ -68,15 +84,18 @@ pub(crate) fn process_rx(
             interrupt.signal_used_queue();
             log::trace!("signaling EOF on port {port_id}");
             control.port_open(port_id, false);
-            return;
+            return RxExit::Stopped(queue);
         } else if bytes_read == 0 {
             queue.undo_pop();
             interrupt.signal_used_queue();
-            input.wait_until_readable(Some(&stopfd));
+            input.wait_until_readable(&[&stopfd, &pausefd]);
         }
 
         if stop.load(Ordering::Acquire) {
-            return;
+            return RxExit::Stopped(queue);
+        }
+        if pause.load(Ordering::Acquire) {
+            return RxExit::Paused(queue);
         }
     }
 }
@@ -86,13 +105,14 @@ fn pop_head_blocking<'mem>(
     mem: &'mem GuestMemoryMmap,
     interrupt: &InterruptTransport,
     stop: &AtomicBool,
+    pause: &AtomicBool,
 ) -> Option<DescriptorChain<'mem>> {
     loop {
         match queue.pop(mem) {
             Some(descriptor) => break Some(descriptor),
             None => {
                 interrupt.signal_used_queue();
-                if stop.load(Ordering::Acquire) {
+                if stop.load(Ordering::Acquire) || pause.load(Ordering::Acquire) {
                     break None;
                 }
                 thread::park();

@@ -7,15 +7,16 @@ use utils::eventfd::EventFd;
 use utils::windows::AsRawFd;
 use vm_memory::VolatileSlice;
 use windows_sys::Win32::{
-    Foundation::FALSE,
+    Foundation::{CloseHandle, ERROR_IO_PENDING, FALSE, GetLastError, WAIT_OBJECT_0},
     Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType, ReadFile, WriteFile},
     System::{
         Console::{
             CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetNumberOfConsoleInputEvents,
             INPUT_RECORD, ReadConsoleInputW,
         },
+        IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
         Pipes::PeekNamedPipe,
-        Threading::{INFINITE, WaitForMultipleObjects, WaitForSingleObject},
+        Threading::{CreateEventW, INFINITE, WaitForMultipleObjects, WaitForSingleObject},
     },
 };
 
@@ -54,8 +55,6 @@ pub fn output_file(file: File) -> Result<Box<dyn PortOutput + Send>, io::Error> 
 pub fn output_to_handle_dup(
     handle: *mut core::ffi::c_void,
 ) -> Result<Box<dyn PortOutput + Send>, io::Error> {
-    // We skip make_non_blocking() on Windows and rely on the background
-    // tx_thread to safely execute a blocking write.
     let owned_handle = dup_handle(handle)?;
     Ok(Box::new(PortOutputHandle(owned_handle)))
 }
@@ -129,15 +128,13 @@ impl PortInput for PortInputHandle {
         Ok(bytes_read as usize)
     }
 
-    fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
+    fn wait_until_readable(&self, cancel_fds: &[&EventFd]) {
         if !self.handle.is_terminal() {
             std::thread::sleep(std::time::Duration::from_millis(10));
             return;
         }
         let mut handles = vec![self.as_raw_handle()];
-        if let Some(s) = stopfd {
-            handles.push(s.as_raw_fd());
-        }
+        handles.extend(cancel_fds.iter().map(|s| s.as_raw_fd()));
         wait_for_handles(&handles);
     }
 }
@@ -187,8 +184,8 @@ impl PortInput for PortInputEmpty {
         Ok(0)
     }
 
-    fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
-        let handles: Vec<_> = stopfd.iter().map(|s| s.as_raw_fd()).collect();
+    fn wait_until_readable(&self, cancel_fds: &[&EventFd]) {
+        let handles: Vec<_> = cancel_fds.iter().map(|s| s.as_raw_fd()).collect();
         wait_for_handles(&handles);
     }
 }
@@ -202,10 +199,37 @@ impl AsRawHandle for PortOutputHandle {
 }
 
 impl PortOutput for PortOutputHandle {
-    fn write_volatile(&mut self, buf: &VolatileSlice) -> io::Result<usize> {
+    fn write_volatile(
+        &mut self,
+        buf: &VolatileSlice,
+        pausefd: Option<&EventFd>,
+    ) -> io::Result<usize> {
         let len = u32::try_from(buf.len()).map_err(|_| {
             io::Error::new(ErrorKind::InvalidInput, "buffer length exceeds u32::MAX")
         })?;
+
+        // Issue the write as overlapped I/O so that, if the peer never
+        // drains it (e.g. a full pipe) and the port is being paused (not a
+        // real VM shutdown), we can cancel the pending write instead of
+        // blocking this thread indefinitely. `pausefd` must only be set by
+        // callers performing a pause, never by real VM shutdown -- shutdown
+        // must keep blocking here until the sink actually accepts the data.
+        let overlapped_event = unsafe {
+            CreateEventW(
+                std::ptr::null(),
+                1, /* manual reset */
+                0,
+                std::ptr::null(),
+            )
+        };
+        if overlapped_event.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let _guard = HandleGuard(overlapped_event);
+
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.hEvent = overlapped_event;
+
         let mut bytes_written: u32 = 0;
         let ret = unsafe {
             WriteFile(
@@ -213,20 +237,77 @@ impl PortOutput for PortOutputHandle {
                 buf.ptr_guard().as_ptr(),
                 len,
                 &mut bytes_written,
-                std::ptr::null_mut(),
+                &mut overlapped,
             )
         };
-        if ret == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(bytes_written as usize)
+
+        if ret != 0 {
+            // Completed synchronously.
+            return Ok(bytes_written as usize);
         }
+
+        let err = unsafe { GetLastError() };
+        if err != ERROR_IO_PENDING {
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+
+        let mut handles = vec![overlapped_event];
+        if let Some(pausefd) = pausefd {
+            handles.push(pausefd.as_raw_fd());
+        }
+        let wait_ret = unsafe {
+            WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), FALSE, INFINITE)
+        };
+
+        if wait_ret != WAIT_OBJECT_0 {
+            // The stop signal (or some other handle) fired first: cancel
+            // the still-pending write instead of waiting for it to
+            // complete on its own.
+            unsafe {
+                CancelIoEx(self.as_raw_handle(), &overlapped);
+            }
+        }
+
+        // Whether the write completed or was just canceled above,
+        // GetOverlappedResult (with bWait=TRUE) blocks only long enough to
+        // observe its final outcome, which is bounded now that
+        // cancellation has been requested.
+        let overlapped_ret = unsafe {
+            GetOverlappedResult(
+                self.as_raw_handle(),
+                &overlapped,
+                &mut bytes_written,
+                1, /* wait for completion/cancellation to settle */
+            )
+        };
+        if overlapped_ret == 0 {
+            let err = io::Error::last_os_error();
+            if bytes_written > 0 {
+                // A partial write happened before cancellation; report it
+                // instead of discarding it, same as a short write would be
+                // reported on Unix.
+                return Ok(bytes_written as usize);
+            }
+            return Err(err);
+        }
+        Ok(bytes_written as usize)
     }
 
-    fn wait_until_writable(&self) {
-        // Because WriteFile is blocking, `write_volatile` will natively pause the
-        // thread until space is available. It will never return io::ErrorKind::WouldBlock.
-        // Therefore, `process_tx` will never invoke this function on Windows.
+    fn wait_until_writable(&self, _pausefd: Option<&EventFd>) {
+        // All waiting happens inside `write_volatile`'s overlapped I/O
+        // handling above (it never returns `io::ErrorKind::WouldBlock`),
+        // so `process_tx` never invokes this function on Windows.
+    }
+}
+
+/// Closes the wrapped Windows HANDLE on drop.
+struct HandleGuard(*mut core::ffi::c_void);
+
+impl Drop for HandleGuard {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
     }
 }
 
